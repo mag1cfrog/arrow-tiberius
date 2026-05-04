@@ -35,6 +35,9 @@ Arrow Rust evidence in this document is pinned to version 58.2.0.
 Tiberius evidence in this document is pinned to version 0.12.3, the current
 crates.io release inspected during this issue.
 
+`arrow-odbc` evidence in this document is pinned to version 23.2.0, the
+current crates.io release inspected during this issue.
+
 Later implementation issues should prefer split Arrow crates such as
 `arrow-schema = "58.2.0"` and `arrow-array = "58.2.0"` over the umbrella
 `arrow` crate unless the umbrella crate is specifically needed. Cargo caret
@@ -165,9 +168,15 @@ Facts to capture in later sections:
 
 Primary sources:
 
+- `arrow-odbc` 23.2.0 crate metadata: <https://crates.io/crates/arrow-odbc/23.2.0>
 - `arrow-odbc` crate docs: <https://docs.rs/arrow-odbc/latest/arrow_odbc/>
 - `arrow-odbc` package page: <https://docs.rs/crate/arrow-odbc/latest>
 - `arrow-odbc` repository: <https://github.com/pacman82/arrow-odbc>
+- Local source references inspected from the crates.io package:
+  - `Readme.md`
+  - `Cargo.toml.orig`
+  - `src/lib.rs`
+  - `src/odbc_writer.rs`
 
 Facts to capture in later sections:
 
@@ -770,7 +779,163 @@ Planning implications:
 
 ## arrow-odbc Evidence
 
-TODO: Capture existing Arrow read/write support and benchmark boundary.
+Evidence is pinned to `arrow-odbc` 23.2.0.
+
+### Public Scope And Dependencies
+
+Sources:
+
+- `arrow-odbc` crate metadata: <https://crates.io/crates/arrow-odbc/23.2.0>
+- `arrow-odbc` crate docs: <https://docs.rs/arrow-odbc/latest/arrow_odbc/>
+- Local source `Cargo.toml.orig`.
+- Local source `Readme.md`.
+
+Evidence:
+
+- `arrow-odbc` describes itself as reading/writing Apache Arrow arrays from/to
+  ODBC data sources.
+- Version 23.2.0 is MIT licensed.
+- Version 23.2.0 depends on the umbrella `arrow` crate with requirement
+  `>= 29, < 59`, and on `odbc-api` with requirement `>= 23, < 26`.
+- The crate re-exports both `arrow` and `odbc_api` to help downstream crates
+  avoid version mismatches.
+- The Rust crate is distinct from the Python `arrow-odbc` wheel.
+
+Planning implications:
+
+- `arrow-odbc` is compatible with Arrow 58 through its broad `arrow` range, but
+  it uses the umbrella `arrow` crate rather than the split-crate dependency
+  style planned for `arrow-tiberius`.
+- `arrow-odbc` should not be a default runtime dependency of `arrow-tiberius`;
+  it is useful as a benchmark/reference dependency behind optional benchmark
+  setup.
+
+### Read Path
+
+Sources:
+
+- `arrow-odbc` crate docs: <https://docs.rs/arrow-odbc/latest/arrow_odbc/>
+- Local source `src/lib.rs`.
+- Local source `Readme.md`.
+
+Evidence:
+
+- `OdbcReaderBuilder` builds an Arrow reader from an ODBC cursor.
+- `OdbcReader` and `ConcurrentOdbcReader` implement Arrow's
+  `RecordBatchReader` trait.
+- `arrow_schema_from` can query ODBC result metadata and create an Arrow schema.
+- `ConcurrentOdbcReader` fetches ODBC batches on a dedicated system thread,
+  trading memory for overlap between database fetch and application-side Arrow
+  work.
+
+Planning implications:
+
+- `arrow-odbc` has a mature read-side story, but read-side comparison is outside
+  `arrow-tiberius` v0.1.
+- Future SQL Server-to-Arrow work can use `arrow-odbc` as a reference for API
+  shape and benchmark dimensions, but should not drive the v0.1 write MVP.
+
+### Write Path
+
+Sources:
+
+- `insert_into_table`: <https://docs.rs/arrow-odbc/latest/arrow_odbc/fn.insert_into_table.html>
+- `OdbcWriter`: <https://docs.rs/arrow-odbc/latest/arrow_odbc/struct.OdbcWriter.html>
+- Local source `src/odbc_writer.rs`.
+- Local source `Readme.md`.
+
+Evidence:
+
+- `insert_into_table` streams Arrow record batches into a database table using
+  an ODBC connection, a `RecordBatchReader`, target table name, and batch size.
+- `OdbcWriter` inserts batches from an Arrow `RecordBatchReader` into a
+  database.
+- `OdbcWriter::write_batch` writes a single `RecordBatch` into bound ODBC array
+  parameter buffers, flushing when buffers reach configured row capacity.
+- `OdbcWriter::write_all` consumes an iterator of `RecordBatch` results and
+  flushes remaining rows at the end.
+- `OdbcWriter::with_connection` generates an `INSERT INTO <table> (...) VALUES
+  (?, ...)` statement from the Arrow schema and prepares it.
+- The prepared-statement path can also be used for statements that are not a
+  simple one-to-one table insert, as long as the prepared statement has one
+  placeholder per schema column.
+
+Planning implications:
+
+- `arrow-odbc` is a fair external write-path reference for existing-table
+  insertion from Arrow batches.
+- Benchmarks should compare equivalent generated Arrow batches, equivalent SQL
+  Server table schemas, comparable batch/chunk sizes, and explicit flush/finish
+  behavior.
+- `arrow-tiberius` should not claim full `arrow-odbc` parity; the relevant
+  comparison is SQL Server write-path insertion over an overlapping type set.
+
+### Arrow-To-ODBC Mapping
+
+Sources:
+
+- Local source `Readme.md`.
+- Local source `src/odbc_writer.rs`.
+
+Evidence:
+
+- The README lists insertion mappings including:
+  - `Utf8` and `LargeUtf8` to ODBC `VarChar`.
+  - `Decimal128` and `Decimal256` to ODBC `Decimal`.
+  - signed integers to the expected integer ODBC types.
+  - `UInt8` to ODBC `TinyInt`.
+  - `Float16` and `Float32` to ODBC `Real`, and `Float64` to ODBC `Double`.
+  - timezone-free timestamps to ODBC `Timestamp(7)`.
+  - timezone-aware timestamps to fixed-width `VarChar`.
+  - `Date32` and `Date64` to ODBC `Date`.
+  - `Binary` and fixed-size binary to ODBC `Varbinary`.
+  - all other types unsupported for insertion.
+- The README explicitly says the insertion mapping is not optimal yet.
+- Source-level write strategies support `Utf8`, `LargeUtf8`, `Boolean`, signed
+  integers, `UInt8`, floats, timestamps, dates, selected time types, binary,
+  fixed-size binary, and decimals. Unsupported Arrow data types produce
+  `WriterError::UnsupportedArrowDataType`.
+
+Planning implications:
+
+- `arrow-odbc` mapping choices are useful evidence, not a binding plan for
+  SQL Server/Tiberius.
+- `arrow-tiberius` should be stricter than `arrow-odbc` where SQL Server
+  semantics require it, especially for Unicode strings, timezone-aware
+  timestamps, decimal precision/scale, and unsupported nested types.
+- The benchmark overlap should start with conservative shared types:
+  booleans, signed integers, `UInt8`, `Float32`, `Float64`, UTF-8 strings,
+  binary, `Decimal128` within SQL Server limits, `Date32`, and selected
+  timezone-free timestamps.
+
+### ODBC Deployment Boundary
+
+Sources:
+
+- Local source `Readme.md`.
+- Local source `Contributing.md`.
+
+Evidence:
+
+- Building `arrow-odbc` requires linking against an ODBC driver manager.
+- Windows includes an ODBC driver manager. Linux and macOS generally require
+  installing UnixODBC.
+- SQL Server use requires a SQL Server ODBC driver such as Microsoft ODBC
+  Driver 18 for SQL Server.
+- The crate has `narrow` and `wide` feature flags for ODBC text API behavior.
+  The source comments describe narrow UTF-8 behavior as the default assumption
+  on Linux and wide UTF-16 behavior as the default on Windows.
+
+Planning implications:
+
+- ODBC setup is a real deployment and benchmark prerequisite. This supports
+  keeping `arrow-odbc` out of the default `arrow-tiberius` runtime dependency
+  graph.
+- Benchmark docs should list ODBC driver manager and SQL Server ODBC driver
+  prerequisites separately from Tiberius benchmark prerequisites.
+- `arrow-odbc` benchmark failures caused by missing driver-manager or driver
+  setup should be reported as skipped/blocked environment cases, not as
+  `arrow-tiberius` failures.
 
 ## Candidate v0.1 Mapping Matrix
 
