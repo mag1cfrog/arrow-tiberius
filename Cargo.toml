@@ -1,0 +1,20 @@
+[workspace]
+members = ["."]
+resolver = "3"
+
+[package]
+name = "arrow-tiberius"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/mag1cfrog/arrow-tiberius"
+description = "Apache Arrow and SQL Server bridge through Tiberius"
+readme = "README.md"
+keywords = ["arrow", "sql-server", "tiberius", "tds"]
+categories = ["database"]
+
+[lib]
+name = "arrow_tiberius"
+path = "src/lib.rs"
+
+[dependencies]
