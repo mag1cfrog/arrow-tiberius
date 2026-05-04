@@ -944,7 +944,7 @@ the smallest useful v0.1 surface that can be implemented against Arrow Rust
 58.2.0, SQL Server 2016, and a minimal Tiberius fork exposing bulk metadata and
 raw-row sending.
 
-| Arrow source type | Candidate SQL Server target | Tiberius representation | Null handling | Constraints | Status | SQL Server 2016 compat-100 note | Test fixture idea | Sources | Open question |
+| Arrow source type | Candidate SQL Server target | Tiberius representation | Null handling | Constraints | Status | SQL Server 2016 compat-100 note | Test fixture idea | Sources | Policy decision |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Boolean | `bit` | `ColumnData::Bit` / raw bit encoding | Arrow null maps to SQL `NULL`; non-null maps to `0` or `1` | none beyond field nullability | `supported-exact` | no special compat-100 issue | nullable and non-nullable bool batch with true/false/null | Arrow `DataType`; SQL Server `bit`; Tiberius `ColumnData` | none |
 | Int8 | `smallint` | widen to `ColumnData::I16` / raw `smallint` | Arrow null maps to SQL `NULL` | widening is exact for all values | `supported-exact` | no special compat-100 issue | min/max/null `Int8` batch | Arrow numeric types; SQL Server integer ranges; Tiberius `ColumnData` | none |
@@ -954,44 +954,86 @@ raw-row sending.
 | UInt8 | `tinyint` | `ColumnData::U8` / raw `tinyint` | Arrow null maps to SQL `NULL` | SQL Server `tinyint` is unsigned 0 through 255 | `supported-exact` | no special compat-100 issue | min/max/null `UInt8` batch | Arrow numeric types; SQL Server integer ranges; Tiberius `ColumnData` | none |
 | UInt16 | `int` | widen to `ColumnData::I32` / raw `int` | Arrow null maps to SQL `NULL` | widening is exact for all values | `supported-exact` | no special compat-100 issue | min/max/null `UInt16` batch | Arrow numeric types; SQL Server integer ranges; Tiberius `ColumnData` | none |
 | UInt32 | `bigint` | widen to `ColumnData::I64` / raw `bigint` | Arrow null maps to SQL `NULL` | widening is exact for all values | `supported-exact` | no special compat-100 issue | min/max/null `UInt32` batch | Arrow numeric types; SQL Server integer ranges; Tiberius `ColumnData` | none |
-| UInt64 | policy-selected `decimal(20,0)` or checked `bigint` | `ColumnData::Numeric` for decimal or checked `ColumnData::I64` for bigint | Arrow null maps to SQL `NULL` | values can exceed `bigint`; decimal path must keep scale 0 | `supported-policy-dependent` | no special compat-100 issue | values at `i64::MAX`, `i64::MAX + 1`, and `u64::MAX` | Arrow numeric types; SQL Server integer and decimal ranges; Tiberius `Numeric` | choose default: `decimal(20,0)`, checked `bigint`, or reject |
-| Float32 | `real` | `ColumnData::F32` / raw `real` | Arrow null maps to SQL `NULL` | finite values only until NaN/inf policy is defined | `supported-policy-dependent` | no special compat-100 issue | finite, null, NaN, and infinity cases | Arrow numeric types; SQL Server approximate numerics; Tiberius `ColumnData` | define NaN/inf handling |
-| Float64 | `float(53)` | `ColumnData::F64` / raw `float(53)` | Arrow null maps to SQL `NULL` | finite values only until NaN/inf policy is defined | `supported-policy-dependent` | no special compat-100 issue | finite, null, NaN, and infinity cases | Arrow numeric types; SQL Server approximate numerics; Tiberius `ColumnData` | define NaN/inf handling |
-| Utf8 | policy-selected `nvarchar(n)` or `nvarchar(max)` | `ColumnData::String` / raw Unicode string encoding | Arrow null maps to SQL `NULL` | SQL Server 2016 lacks UTF-8 collation support; target should be Unicode by default | `supported-policy-dependent` | compat-100 does not add UTF-8 collation support | short, long, Unicode, empty, and null strings | Arrow `Utf8`; SQL Server string types; Tiberius `ColumnData`; arrow-odbc mappings | choose length/default max policy |
-| LargeUtf8 | policy-selected `nvarchar(max)` by default | `ColumnData::String` / raw Unicode string encoding | Arrow null maps to SQL `NULL` | observed value length still must fit SQL Server target | `supported-policy-dependent` | compat-100 does not add UTF-8 collation support | value over 4000 UTF-16 code units and null | Arrow `LargeUtf8`; SQL Server string types; Tiberius `ColumnData`; arrow-odbc mappings | choose whether bounded `nvarchar(n)` is allowed |
-| Binary | policy-selected `varbinary(n)` or `varbinary(max)` | `ColumnData::Binary` / raw varbinary encoding | Arrow null maps to SQL `NULL` | value length must fit target length | `supported-policy-dependent` | no special compat-100 issue | empty, short, long, and null binary values | Arrow `Binary`; SQL Server binary types; Tiberius `ColumnData`; arrow-odbc mappings | choose length/default max policy |
-| LargeBinary | policy-selected `varbinary(max)` by default | `ColumnData::Binary` / raw varbinary encoding | Arrow null maps to SQL `NULL` | observed value length still must fit SQL Server target | `supported-policy-dependent` | no special compat-100 issue | value over 8000 bytes and null | Arrow `LargeBinary`; SQL Server binary types; Tiberius `ColumnData`; arrow-odbc mappings | choose whether bounded `varbinary(n)` is allowed |
-| Decimal128 | `decimal(p,s)` / `numeric(p,s)` | `ColumnData::Numeric` / raw decimal encoding | Arrow null maps to SQL `NULL` | SQL Server requires `1 <= p <= 38` and `0 <= s <= p`; Arrow negative scale is unsupported by default | `supported-policy-dependent` | no special compat-100 issue | boundary precision/scale, negative scale diagnostic, null | Arrow decimals; SQL Server decimals; Tiberius `Numeric`; arrow-odbc mappings | choose reject-vs-transform policy for negative scale |
-| Decimal256 | `decimal(p,s)` / `numeric(p,s)` only when SQL-compatible | downcast checked value to `ColumnData::Numeric` / raw decimal encoding | Arrow null maps to SQL `NULL` | reject unless `1 <= p <= 38`, `0 <= s <= p`, and value fits SQL/Tiberius decimal path | `supported-policy-dependent` | no special compat-100 issue | p=38 success, p=39 rejection, null | Arrow decimals; SQL Server decimals; Tiberius `Numeric`; arrow-odbc mappings | decide whether v0.1 supports checked downcast or rejects all `Decimal256` |
+| UInt64 | policy-selected `decimal(20,0)` or checked `bigint` | `ColumnData::Numeric` for decimal or checked `ColumnData::I64` for bigint | Arrow null maps to SQL `NULL` | values can exceed `bigint`; decimal path must keep scale 0 | `supported-policy-dependent` | no special compat-100 issue | values at `i64::MAX`, `i64::MAX + 1`, and `u64::MAX` | Arrow numeric types; SQL Server integer and decimal ranges; Tiberius `Numeric` | `UInt64Policy`, default `Reject` |
+| Float32 | `real` | `ColumnData::F32` / raw `real` | Arrow null maps to SQL `NULL` | finite values only until NaN/inf evidence proves otherwise | `supported-policy-dependent` | no special compat-100 issue | finite, null, NaN, and infinity cases | Arrow numeric types; SQL Server approximate numerics; Tiberius `ColumnData` | `FloatPolicy`, default `RejectNonFinite` |
+| Float64 | `float(53)` | `ColumnData::F64` / raw `float(53)` | Arrow null maps to SQL `NULL` | finite values only until NaN/inf evidence proves otherwise | `supported-policy-dependent` | no special compat-100 issue | finite, null, NaN, and infinity cases | Arrow numeric types; SQL Server approximate numerics; Tiberius `ColumnData` | `FloatPolicy`, default `RejectNonFinite` |
+| Utf8 | policy-selected `nvarchar(n)` or `nvarchar(max)` | `ColumnData::String` / raw Unicode string encoding | Arrow null maps to SQL `NULL` | SQL Server 2016 lacks UTF-8 collation support; target should be Unicode by default | `supported-policy-dependent` | compat-100 does not add UTF-8 collation support | short, long, Unicode, empty, and null strings | Arrow `Utf8`; SQL Server string types; Tiberius `ColumnData`; arrow-odbc mappings | `StringPolicy`, default `NVarCharMax` |
+| LargeUtf8 | policy-selected `nvarchar(max)` by default | `ColumnData::String` / raw Unicode string encoding | Arrow null maps to SQL `NULL` | observed value length still must fit SQL Server target | `supported-policy-dependent` | compat-100 does not add UTF-8 collation support | value over 4000 UTF-16 code units and null | Arrow `LargeUtf8`; SQL Server string types; Tiberius `ColumnData`; arrow-odbc mappings | `StringPolicy`, default `NVarCharMax` |
+| Binary | policy-selected `varbinary(n)` or `varbinary(max)` | `ColumnData::Binary` / raw varbinary encoding | Arrow null maps to SQL `NULL` | value length must fit target length | `supported-policy-dependent` | no special compat-100 issue | empty, short, long, and null binary values | Arrow `Binary`; SQL Server binary types; Tiberius `ColumnData`; arrow-odbc mappings | `BinaryPolicy`, default `VarBinaryMax` |
+| LargeBinary | policy-selected `varbinary(max)` by default | `ColumnData::Binary` / raw varbinary encoding | Arrow null maps to SQL `NULL` | observed value length still must fit SQL Server target | `supported-policy-dependent` | no special compat-100 issue | value over 8000 bytes and null | Arrow `LargeBinary`; SQL Server binary types; Tiberius `ColumnData`; arrow-odbc mappings | `BinaryPolicy`, default `VarBinaryMax` |
+| Decimal128 | `decimal(p,s)` / `numeric(p,s)` | `ColumnData::Numeric` / raw decimal encoding | Arrow null maps to SQL `NULL` | SQL Server requires `1 <= p <= 38` and `0 <= s <= p`; Arrow negative scale is unsupported by default | `supported-policy-dependent` | no special compat-100 issue | boundary precision/scale, negative scale diagnostic, null | Arrow decimals; SQL Server decimals; Tiberius `Numeric`; arrow-odbc mappings | `DecimalPolicy`, default `RejectNegativeScale` |
+| Decimal256 | `decimal(p,s)` / `numeric(p,s)` only when SQL-compatible | downcast checked value to `ColumnData::Numeric` / raw decimal encoding | Arrow null maps to SQL `NULL` | reject unless `1 <= p <= 38`, `0 <= s <= p`, and value fits SQL/Tiberius decimal path | `supported-policy-dependent` | no special compat-100 issue | p=38 success, p=39 rejection, null | Arrow decimals; SQL Server decimals; Tiberius `Numeric`; arrow-odbc mappings | `Decimal256Policy`, default `CheckedDowncast` |
 | Date32 | `date` | `ColumnData::Date` / raw date encoding | Arrow null maps to SQL `NULL` | date must be inside SQL Server `date` range | `supported-exact` | no special compat-100 issue | epoch, SQL min/max, out-of-range, null | Arrow `Date32`; SQL Server `date`; Tiberius `ColumnData` | none |
-| Date64 | policy-selected `date` only for whole-day values | `ColumnData::Date` / raw date encoding | Arrow null maps to SQL `NULL` | milliseconds must represent a midnight date in range; non-midnight values require rejection or timestamp policy | `supported-policy-dependent` | no special compat-100 issue | midnight success, non-midnight rejection, null | Arrow `Date64`; SQL Server `date`; Tiberius `ColumnData` | choose default rejection or timestamp remap |
-| Timestamp second | timezone-free: `datetime2(0)`; timezone-aware: policy | `ColumnData::DateTime2` or `ColumnData::DateTimeOffset` | Arrow null maps to SQL `NULL` | value must be in SQL Server date/time range; timezone handling is explicit policy | `supported-policy-dependent` | no special compat-100 issue | naive timestamp, tz timestamp, min/max-ish, null | Arrow timestamps; SQL Server `datetime2`/`datetimeoffset`; Tiberius `ColumnData` | choose timezone-aware default |
-| Timestamp millisecond | timezone-free: `datetime2(3)`; timezone-aware: policy | `ColumnData::DateTime2` or `ColumnData::DateTimeOffset` | Arrow null maps to SQL `NULL` | value must be in SQL Server date/time range; timezone handling is explicit policy | `supported-policy-dependent` | no special compat-100 issue | millisecond precision values, tz value, null | Arrow timestamps; SQL Server `datetime2`/`datetimeoffset`; Tiberius `ColumnData` | choose timezone-aware default |
-| Timestamp microsecond | timezone-free: `datetime2(6)`; timezone-aware: policy | `ColumnData::DateTime2` or `ColumnData::DateTimeOffset` | Arrow null maps to SQL `NULL` | value must be in SQL Server date/time range; timezone handling is explicit policy | `supported-policy-dependent` | no special compat-100 issue | microsecond precision values, tz value, null | Arrow timestamps; SQL Server `datetime2`/`datetimeoffset`; Tiberius `ColumnData` | choose timezone-aware default |
-| Timestamp nanosecond | timezone-free: `datetime2(7)` with 100ns policy; timezone-aware: policy | `ColumnData::DateTime2` or `ColumnData::DateTimeOffset` | Arrow null maps to SQL `NULL` | SQL Server `datetime2(7)` is 100ns precision, so nanosecond values not divisible by 100 require reject/round/truncate policy | `lossy-requires-policy` | no special compat-100 issue | divisible-by-100 success, remainder diagnostic, tz value, null | Arrow timestamps; SQL Server `datetime2`/`datetimeoffset`; Tiberius `ColumnData` | choose nanosecond remainder policy |
+| Date64 | policy-selected `date` only for whole-day values | `ColumnData::Date` / raw date encoding | Arrow null maps to SQL `NULL` | milliseconds must represent a midnight date in range; non-midnight values require rejection or timestamp policy | `supported-policy-dependent` | no special compat-100 issue | midnight success, non-midnight rejection, null | Arrow `Date64`; SQL Server `date`; Tiberius `ColumnData` | `Date64Policy`, default `RejectNonMidnight` |
+| Timestamp second | timezone-free: `datetime2(0)`; timezone-aware: policy | `ColumnData::DateTime2` or `ColumnData::DateTimeOffset` | Arrow null maps to SQL `NULL` | value must be in SQL Server date/time range; timezone handling is explicit policy | `supported-policy-dependent` | no special compat-100 issue | naive timestamp, tz timestamp, min/max-ish, null | Arrow timestamps; SQL Server `datetime2`/`datetimeoffset`; Tiberius `ColumnData` | `TimezonePolicy`, default `Reject` |
+| Timestamp millisecond | timezone-free: `datetime2(3)`; timezone-aware: policy | `ColumnData::DateTime2` or `ColumnData::DateTimeOffset` | Arrow null maps to SQL `NULL` | value must be in SQL Server date/time range; timezone handling is explicit policy | `supported-policy-dependent` | no special compat-100 issue | millisecond precision values, tz value, null | Arrow timestamps; SQL Server `datetime2`/`datetimeoffset`; Tiberius `ColumnData` | `TimezonePolicy`, default `Reject` |
+| Timestamp microsecond | timezone-free: `datetime2(6)`; timezone-aware: policy | `ColumnData::DateTime2` or `ColumnData::DateTimeOffset` | Arrow null maps to SQL `NULL` | value must be in SQL Server date/time range; timezone handling is explicit policy | `supported-policy-dependent` | no special compat-100 issue | microsecond precision values, tz value, null | Arrow timestamps; SQL Server `datetime2`/`datetimeoffset`; Tiberius `ColumnData` | `TimezonePolicy`, default `Reject` |
+| Timestamp nanosecond | timezone-free: `datetime2(7)` with 100ns policy; timezone-aware: policy | `ColumnData::DateTime2` or `ColumnData::DateTimeOffset` | Arrow null maps to SQL `NULL` | SQL Server `datetime2(7)` is 100ns precision, so nanosecond values not divisible by 100 require reject/round/truncate policy | `lossy-requires-policy` | no special compat-100 issue | divisible-by-100 success, remainder diagnostic, tz value, null | Arrow timestamps; SQL Server `datetime2`/`datetimeoffset`; Tiberius `ColumnData` | `NanosecondPolicy`, default `RejectNon100ns`; `TimezonePolicy`, default `Reject` |
 | List | none in v0.1 | none | N/A | nested arrays are outside scalar bulk insert scope | `unsupported-v0.1` | N/A | planning diagnostic fixture | Arrow nested types | none |
 | Struct | none in v0.1 | none | N/A | nested arrays are outside scalar bulk insert scope | `unsupported-v0.1` | N/A | planning diagnostic fixture | Arrow nested types | none |
 | Map | none in v0.1 | none | N/A | nested arrays are outside scalar bulk insert scope | `unsupported-v0.1` | N/A | planning diagnostic fixture | Arrow nested types | none |
 | Dictionary | none in v0.1 | none | N/A | encoded arrays are rejected before planning unless a later issue defines decoding | `unsupported-v0.1` | N/A | dictionary string diagnostic fixture | Arrow dictionary type | future issue may decode by value type |
 | Union | none in v0.1 | none | N/A | nested arrays are outside scalar bulk insert scope | `unsupported-v0.1` | N/A | planning diagnostic fixture | Arrow nested types | none |
 
-## Open Questions
+## Proposed v0.1 Policy Defaults
 
-- What should be the default SQL Server string and binary length policy:
-  bounded `nvarchar(n)` / `varbinary(n)` from observed data, explicit user
-  policy only, or `max` by default?
-- Should timezone-aware Arrow timestamps target `datetimeoffset`, fail by
-  default, or require an explicit normalization policy to timezone-free
-  `datetime2`?
-- Should nanosecond timestamps not divisible by 100 be rejected, rounded, or
-  truncated when targeting `datetime2(7)` or `datetimeoffset(7)`?
-- Should Arrow `UInt64` default to `decimal(20,0)`, a checked `bigint`, or
-  rejection unless the user chooses a policy?
-- Should Arrow `Decimal256` get checked downcast support for SQL-compatible
-  precision and scale, or be rejected entirely in v0.1?
-- Should non-finite floating-point values be rejected before SQL Server write
-  planning, or does SQL Server/TDS expose a representable behavior we should
-  support?
-- Should Arrow `Date64` non-midnight values be rejected or remapped to a
-  timestamp target under explicit policy?
-- What exact public API should the Tiberius fork expose for raw bulk row bytes?
+The v0.1 planner should expose explicit policy knobs with conservative defaults.
+Defaults should be deterministic and lossless. More permissive behavior should
+require an explicit user choice.
+
+Proposed policy surface:
+
+- `StringPolicy`: default `NVarCharMax`; options `NVarCharMax`,
+  `NVarChar(usize)`, and `ObservedNVarChar`.
+- `BinaryPolicy`: default `VarBinaryMax`; options `VarBinaryMax`,
+  `VarBinary(usize)`, and `ObservedVarBinary`.
+- `TimezonePolicy`: default `Reject`; options `Reject`, `DateTimeOffset`, and
+  `NormalizeUtcDateTime2`.
+- `NanosecondPolicy`: default `RejectNon100ns`; options `RejectNon100ns`,
+  `RoundTo100ns`, and `TruncateTo100ns`.
+- `UInt64Policy`: default `Reject`; options `Reject`, `Decimal20_0`, and
+  `CheckedBigInt`.
+- `DecimalPolicy`: default `RejectNegativeScale`; options
+  `RejectNegativeScale` and `NormalizeNegativeScale` if a later issue defines
+  exact transformation semantics.
+- `Decimal256Policy`: default `CheckedDowncast`; options `CheckedDowncast` and
+  `Reject`.
+- `FloatPolicy`: default `RejectNonFinite`; no permissive non-finite option
+  should be exposed until primary SQL Server/TDS evidence proves a supported
+  representation.
+- `Date64Policy`: default `RejectNonMidnight`; options `RejectNonMidnight` and
+  `TimestampDateTime2`.
+
+Planning implications:
+
+- Options such as `ObservedNVarChar` and `ObservedVarBinary` are batch-sensitive.
+  They should be documented as suitable for one-shot table creation, not stable
+  append workloads.
+- `NormalizeUtcDateTime2`, `RoundTo100ns`, `TruncateTo100ns`, and
+  `TimestampDateTime2` are intentionally lossy or semantic-changing policies.
+  Diagnostics should name the policy when those conversions occur.
+- `DecimalPolicy::NormalizeNegativeScale` should not be implemented until a
+  later issue specifies exact behavior for precision changes, overflow, and SQL
+  Server scale constraints.
+
+## Tiberius Fork API Recommendation
+
+The minimal fork should expose only enough public API for an Arrow-specific raw
+bulk encoder:
+
+- read-only bulk column metadata after `Client::bulk_insert`;
+- a raw row send method that accepts one already-encoded row payload;
+- existing Tiberius ownership of connection state, packet framing, auth, TLS,
+  metadata query, and `finalize`.
+
+Conceptual shape:
+
+```rust
+let mut bulk = client.bulk_insert(table).await?;
+let columns = bulk.columns();
+bulk.send_raw_row(encoded_row).await?;
+bulk.finalize().await?;
+```
+
+The fork should not expose packet ids, connection internals, or general TDS
+buffer machinery unless implementation proves that a narrower API cannot work.
