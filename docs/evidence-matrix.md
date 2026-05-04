@@ -32,6 +32,9 @@ SQL Server integration tests.
 
 Arrow Rust evidence in this document is pinned to version 58.2.0.
 
+Tiberius evidence in this document is pinned to version 0.12.3, the current
+crates.io release inspected during this issue.
+
 Later implementation issues should prefer split Arrow crates such as
 `arrow-schema = "58.2.0"` and `arrow-array = "58.2.0"` over the umbrella
 `arrow` crate unless the umbrella crate is specifically needed. Cargo caret
@@ -114,14 +117,22 @@ Facts to capture in later sections:
 
 Primary sources:
 
-- Tiberius crate docs: <https://docs.rs/tiberius/latest/tiberius/>
-- `BulkLoadRequest`: <https://docs.rs/tiberius/latest/tiberius/struct.BulkLoadRequest.html>
-- `TokenRow`: <https://docs.rs/tiberius/latest/tiberius/struct.TokenRow.html>
-- `ColumnData`: <https://docs.rs/tiberius/latest/tiberius/enum.ColumnData.html>
-- `ColumnType`: <https://docs.rs/tiberius/latest/tiberius/enum.ColumnType.html>
-- `TypeInfo` source references through docs.rs source links where public docs
-  do not expose enough detail.
+- Tiberius 0.12.3 crate page: <https://docs.rs/crate/tiberius/0.12.3>
+- Tiberius crate docs: <https://docs.rs/tiberius/0.12.3/tiberius/>
+- `Client::bulk_insert`: <https://docs.rs/tiberius/0.12.3/tiberius/struct.Client.html#method.bulk_insert>
+- `BulkLoadRequest`: <https://docs.rs/tiberius/0.12.3/tiberius/struct.BulkLoadRequest.html>
+- `TokenRow`: <https://docs.rs/tiberius/0.12.3/tiberius/struct.TokenRow.html>
+- `ColumnData`: <https://docs.rs/tiberius/0.12.3/tiberius/enum.ColumnData.html>
+- `ColumnType`: <https://docs.rs/tiberius/0.12.3/tiberius/enum.ColumnType.html>
+- `TypeLength`: <https://docs.rs/tiberius/0.12.3/tiberius/enum.TypeLength.html>
 - Tiberius GitHub repository: <https://github.com/prisma/tiberius>
+- Local source references inspected from the crates.io package:
+  - `src/client.rs`
+  - `src/tds/codec/bulk_load.rs`
+  - `src/tds/codec/token/token_row.rs`
+  - `src/tds/codec/token/token_col_metadata.rs`
+  - `src/tds/codec/type_info.rs`
+  - `src/tds/codec/column_data.rs`
 
 Facts to capture in later sections:
 
@@ -521,13 +532,241 @@ Planning implications:
 
 ## Tiberius Evidence
 
-TODO: Capture baseline bulk-load path, value/type representations, and direct
-encoder API gaps.
+Evidence is pinned to Tiberius 0.12.3.
+
+### Public Driver Boundary
+
+Sources:
+
+- Tiberius crate docs: <https://docs.rs/tiberius/0.12.3/tiberius/>
+- Tiberius crate metadata from crates.io: <https://docs.rs/crate/tiberius/0.12.3>
+
+Evidence:
+
+- Tiberius is a Rust TDS driver for Microsoft SQL Server.
+- Tiberius 0.12.3 is dual licensed MIT/Apache-2.0.
+- Tiberius exposes `Client`, `Config`, `Query`, `QueryStream`, `Row`,
+  `BulkLoadRequest`, `TokenRow`, `ColumnData`, `ColumnType`, `IntoSql`,
+  `ToSql`, `FromSql`, and related SQL Server value types.
+- The default feature set includes `tds73`, `winauth`, and `native-tls`.
+  The `tds73` feature gates newer date/time variants such as `date`,
+  `time`, `datetime2`, and `datetimeoffset`.
+
+Planning implications:
+
+- `arrow-tiberius` should not implement connection setup, authentication, TLS,
+  packet sizing, query execution, or token stream handling locally for v0.1.
+- Date/time support through Tiberius should keep `tds73` enabled unless later
+  dependency work proves a reason to disable it.
+- If `arrow-tiberius` publishes with a Tiberius fork package, it should preserve
+  upstream license and attribution.
+
+### Baseline Bulk Insert Path
+
+Sources:
+
+- `Client::bulk_insert`: <https://docs.rs/tiberius/0.12.3/tiberius/struct.Client.html#method.bulk_insert>
+- `BulkLoadRequest`: <https://docs.rs/tiberius/0.12.3/tiberius/struct.BulkLoadRequest.html>
+- Tiberius source `src/client.rs`.
+- Tiberius source `src/tds/codec/bulk_load.rs`.
+- Tiberius source `tests/bulk.rs`.
+
+Evidence:
+
+- The public baseline API is:
+
+  ```rust
+  let mut req = client.bulk_insert(table).await?;
+  req.send(row).await?;
+  let result = req.finalize().await?;
+  ```
+
+- `Client::bulk_insert` first flushes the current stream, queries destination
+  metadata with `SELECT TOP 0 * FROM {table}`, filters updateable columns, then
+  sends an `INSERT BULK {table} (...)` batch before constructing
+  `BulkLoadRequest`.
+- `BulkLoadRequest` stores the connection, packet id, internal buffer, and
+  destination metadata columns privately.
+- `BulkLoadRequest::send` accepts a `TokenRow`, encodes it with the destination
+  metadata, and writes packets only when the buffer exceeds packet size.
+- `BulkLoadRequest::finalize` appends a done token, flushes pending data,
+  writes the final end-of-message bulk-load packet, flushes the sink, and reads
+  the server `ExecuteResult`.
+- Tiberius tests cover `TokenRow` bulk inserts for several scalar SQL Server
+  types.
+
+Planning implications:
+
+- The baseline `arrow-tiberius` writer can be implemented through
+  `TokenRow` without private Tiberius APIs.
+- The writer must call `finalize` exactly once after sending rows. Dropping a
+  request without finalization is not enough to make rows available.
+- Baseline writing should use a shared `WritePlan` for conversion decisions,
+  but destination metadata still comes from Tiberius' `bulk_insert` flow.
+
+### TokenRow And ColumnData
+
+Sources:
+
+- `TokenRow`: <https://docs.rs/tiberius/0.12.3/tiberius/struct.TokenRow.html>
+- `ColumnData`: <https://docs.rs/tiberius/0.12.3/tiberius/enum.ColumnData.html>
+- Tiberius source `src/tds/codec/token/token_row.rs`.
+- Tiberius source `src/tds/codec/column_data.rs`.
+- Tiberius source `src/to_sql.rs`.
+
+Evidence:
+
+- `TokenRow` is a row-oriented container around a vector of `ColumnData`.
+- `TokenRow` validates that its value count matches destination metadata column
+  count during encoding.
+- `TokenRow::push` appends one `ColumnData` value.
+- `ColumnData` variants relevant to v0.1 include `Bit`, `U8`, `I16`, `I32`,
+  `I64`, `F32`, `F64`, `String`, `Binary`, `Numeric`, `Date`, `Time`,
+  `DateTime2`, and `DateTimeOffset`.
+- Each nullable value is represented as an `Option` inside the matching
+  `ColumnData` variant.
+- Tiberius implements `IntoSql`/`ToSql` for common Rust scalar types, but Arrow
+  arrays will need explicit extraction/conversion logic in `arrow-tiberius`.
+
+Planning implications:
+
+- Baseline conversion should produce `ColumnData` values directly or through
+  `IntoSql` only where that does not hide Arrow-specific policy decisions.
+- Null handling can use the `None` variant of the matching `ColumnData` type.
+- Baseline conversion remains row-oriented and per-cell, which is useful for
+  correctness but may be the performance ceiling that motivates direct encoding.
+
+### Metadata And Type Representation
+
+Sources:
+
+- `ColumnType`: <https://docs.rs/tiberius/0.12.3/tiberius/enum.ColumnType.html>
+- Tiberius source `src/row.rs`.
+- Tiberius source `src/tds/codec/type_info.rs`.
+- Tiberius source `src/tds/codec/token/token_col_metadata.rs`.
+- Issue #397: <https://github.com/prisma/tiberius/issues/397>
+- PR #398: <https://github.com/prisma/tiberius/pull/398>
+
+Evidence:
+
+- Public `ColumnType` is a coarse type enum exposed through query result
+  `Column` values.
+- Internal `TypeInfo`, `VarLenContext`, `MetaDataColumn`, and
+  `BaseMetaDataColumn` carry the detailed TDS metadata needed to encode values
+  against destination SQL Server columns.
+- `BulkLoadRequest` already owns `Vec<MetaDataColumn>` internally, but the
+  public API does not expose the columns or a read-only metadata view.
+- The Tiberius crate re-exports `BulkLoadRequest`, `ColumnData`, `ColumnFlag`,
+  `IntoRow`, `TokenRow`, and `TypeLength`, but not `TypeInfo`,
+  `MetaDataColumn`, or `BaseMetaDataColumn`.
+- Upstream issue #397 requests exposing `BaseMetaDataColumn` and `TypeInfo`, or
+  exposing the metadata from `BulkLoadRequest`, because user code otherwise has
+  to reimplement those types and metadata queries.
+- Upstream PR #398 proposes adding a method to query column metadata.
+
+Planning implications:
+
+- `ColumnType` alone is not enough for a direct Arrow-to-TDS encoder because it
+  loses length, precision, scale, collation, and exact TDS type details.
+- The forked Tiberius package should expose a narrow read-only metadata view
+  from `BulkLoadRequest` or a metadata query API sufficient for bulk encoding.
+- Exposing raw internal structs wholesale is not required if the fork can offer
+  a stable metadata view tailored to bulk-load encoding.
+
+### Direct Encoder API Gaps
+
+Sources:
+
+- Tiberius source `src/tds/codec/bulk_load.rs`.
+- Tiberius source `src/tds/codec/token/token_row/bytes_mut_with_data_columns.rs`.
+- Tiberius source `src/tds/codec/column_data/bytes_mut_with_type_info.rs`.
+- Issue #397: <https://github.com/prisma/tiberius/issues/397>
+
+Evidence:
+
+- `BulkLoadRequest::send` accepts only `TokenRow`.
+- The bulk-load packet buffer, packet splitting, destination metadata, and
+  connection write/flush operations are private.
+- Row encoding relies on internal wrappers that attach destination metadata to
+  the byte buffer before encoding each `ColumnData`.
+- There is no public method on `BulkLoadRequest` to append already-encoded TDS
+  row bytes.
+
+Planning implications:
+
+- A direct Arrow-to-TDS backend cannot be cleanly implemented against upstream
+  Tiberius 0.12.3 public APIs alone.
+- The minimal fork API should add:
+  - read-only access to destination bulk metadata, or an equivalent stable
+    metadata view.
+  - a method to send already-encoded bulk row bytes through the existing
+    `BulkLoadRequest` packet buffer and packet flush path.
+- The fork should keep Tiberius responsible for connection state, packet
+  splitting, finalization, server result handling, TLS, and authentication.
+
+### Upstream Bulk-Load Threads
+
+Sources:
+
+- Issue #311: <https://github.com/prisma/tiberius/issues/311>
+- PR #359: <https://github.com/prisma/tiberius/pull/359>
+- Issue #397: <https://github.com/prisma/tiberius/issues/397>
+- PR #398: <https://github.com/prisma/tiberius/pull/398>
+- Issue #410: <https://github.com/prisma/tiberius/issues/410>
+
+Evidence:
+
+- Issue #311 requests passing explicit column names to `bulk_insert`, mainly to
+  control column order.
+- PR #359 proposes a `bulk_insert_columns` API for explicit column lists and
+  subset inserts.
+- Issue #397 requests metadata and type exposure needed by external code.
+- PR #398 proposes a column metadata query method.
+- Issue #410 reports a BCP failure when a `DATE` column precedes a `TIME`
+  column, which is relevant to direct encoder parity and temporal tests.
+
+Planning implications:
+
+- `arrow-tiberius` should not assume destination column order is always safe
+  when using `SELECT TOP 0 *`; explicit write-plan column order and eventual
+  column-list support matter.
+- Direct encoder work should include temporal ordering/parity tests, especially
+  around `date`, `time`, and `datetime2`.
+- Upstream review should not block v0.1, but these threads support keeping the
+  fork patch narrow and aligned with known Tiberius API gaps.
 
 ## Cargo And crates.io Evidence
 
-TODO: Capture publication constraints that affect the forked Tiberius package
-decision.
+Sources:
+
+- Cargo dependency specification: <https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html>
+- Cargo publishing reference: <https://doc.rust-lang.org/cargo/reference/publishing.html>
+- Cargo registries reference: <https://doc.rust-lang.org/cargo/reference/registries.html>
+
+Evidence:
+
+- Cargo supports dependencies from registries, Git repositories, and local
+  paths during development.
+- Crates published to crates.io cannot depend on code outside crates.io except
+  for dev-dependencies.
+- Local `path` dependencies alone are not permitted for crates.io publication.
+- Cargo supports specifying multiple locations, such as `path` plus `version`
+  or `git` plus `version`; the local path or Git source is used locally, while
+  the registry version is used when packaged for publication.
+- A dependency package can be renamed in `Cargo.toml` using the `package` key.
+
+Planning implications:
+
+- A publishable `arrow-tiberius` crate cannot depend on an unpublished Git-only
+  Tiberius fork as a normal dependency.
+- If the direct encoder requires forked Tiberius APIs, the fork must itself be
+  published to crates.io or publication must be explicitly deferred.
+- `arrow-tiberius` should depend on one Tiberius package in its normal
+  dependency graph. Carrying both upstream Tiberius and a fork would expose two
+  incompatible `Client` types.
+- If the fork's package name differs from the Rust import name wanted by
+  downstream users, `Cargo.toml` dependency aliasing can preserve the desired
+  import path, but the public API still needs one concrete client type.
 
 ## arrow-odbc Evidence
 
