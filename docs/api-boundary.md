@@ -610,8 +610,163 @@ impl Default for WriteOptions {
 }
 ```
 
+## Diagnostics And Error API
+
+Diagnostics should represent actionable planning or execution findings that are
+useful to users even when an operation succeeds. Errors should represent failed
+operations. The API should keep these concepts separate.
+
+Candidate public diagnostic types:
+
+```rust
+pub struct Diagnostic {
+    pub severity: DiagnosticSeverity,
+    pub code: DiagnosticCode,
+    pub message: String,
+    pub field: Option<FieldRef>,
+}
+
+pub enum DiagnosticSeverity {
+    Warning,
+    Error,
+}
+
+pub struct FieldRef {
+    pub index: usize,
+    pub name: String,
+}
+```
+
+Design decisions:
+
+- Planning should return warnings through `PlanOutcome::diagnostics` when a plan
+  is still usable.
+- Planning errors may also be represented internally as diagnostics, but the
+  public failure path should be `Result::Err`.
+- Diagnostics should include field index and source field name whenever the
+  finding is column-specific.
+- Diagnostic codes should be stable enough for tests and callers to match
+  without parsing message text.
+- Message text should remain human-readable and can evolve more freely than
+  codes.
+
+Candidate diagnostic code shape:
+
+```rust
+pub enum DiagnosticCode {
+    UnsupportedArrowType,
+    LossyConversionRequiresPolicy,
+    PolicyApplied,
+    IdentifierInvalid,
+    IdentifierTooLong,
+    DecimalOutOfRange,
+    TimestampOutOfRange,
+    SchemaMismatch,
+    BackendUnavailable,
+}
+```
+
+The exact code set should be filled by implementation issues as mappings and
+writer behavior become concrete. This issue should establish that codes exist
+and are not plain strings.
+
+Candidate crate error shape:
+
+```rust
+use snafu::Snafu;
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("planning failed"))]
+    Planning {
+        diagnostics: Vec<Diagnostic>,
+    },
+    #[snafu(display("DDL rendering failed: {message}"))]
+    Ddl {
+        message: String,
+    },
+    #[snafu(display("record batch schema does not match the write plan"))]
+    SchemaMismatch {
+        diagnostics: Vec<Diagnostic>,
+    },
+    #[snafu(display("write backend {backend:?} is unavailable: {message}"))]
+    BackendUnavailable {
+        backend: WriteBackend,
+        message: String,
+    },
+    #[snafu(display("Tiberius operation failed"))]
+    Tiberius {
+        #[snafu(source)]
+        source: tiberius::error::Error,
+    },
+}
+```
+
+Design decisions:
+
+- The crate should expose one `Error` type and one `Result<T>` alias.
+- Error variants should preserve enough structured context for callers to make
+  decisions without string matching.
+- Tiberius errors should be wrapped without erasing the source error.
+- Error implementation should use `snafu` when errors are implemented. This
+  design issue should not add the dependency yet. The snippet above is intended
+  shape, not compiled code in this PR.
+- Public errors should still expose stable structured context; `snafu` context
+  selectors should be treated as construction helpers, not as the caller-facing
+  diagnostic model.
+- Errors from upstream batch streams should be convertible into `Error` only
+  once the stream API chooses exact bounds.
+
+## Write-Time Schema Compatibility
+
+`WritePlan` is created from an Arrow schema. Every batch written through a
+writer should be checked against that planned schema before rows are encoded.
+
+Candidate public shape:
+
+```rust
+#[derive(Default)]
+pub enum SchemaCheck {
+    #[default]
+    Strict,
+}
+```
+
+Recommended v0.1 behavior:
+
+- `SchemaCheck::Strict` should require exact schema equality with the planned
+  Arrow schema.
+- Strict equality should include field count, field order, field names, data
+  types, and nullability.
+- Metadata should be treated conservatively. If Arrow schema equality includes
+  metadata, v0.1 should follow that behavior rather than invent a looser rule.
+- A batch with zero rows should still be schema-checked.
+- A schema mismatch should return a structured `Error::SchemaMismatch`.
+
+Future compatibility options may be added later, for example:
+
+```rust
+pub enum SchemaCheck {
+    Strict,
+    IgnoreMetadata,
+    AllowNullableRelaxation,
+}
+```
+
+Those variants should not be included in v0.1 unless implementation issues prove
+they are needed. Starting with one strict mode keeps writer behavior predictable
+and leaves room for explicit compatibility policies later.
+
+Planning and writing should remain distinct:
+
+- `PlanOptions` controls how an Arrow schema is mapped into a SQL Server plan.
+- `WriteOptions::schema_check` controls how incoming batches are validated
+  against an already-built plan.
+- Runtime batches should not trigger implicit re-planning.
+
 ## Deferred Until Later Steps
 
-- Exact warning and error structs.
 - Exact fork package name, import name, and dependency aliasing.
 - Exact feature flags, if any.
