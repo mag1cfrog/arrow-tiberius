@@ -766,7 +766,110 @@ Planning and writing should remain distinct:
   against an already-built plan.
 - Runtime batches should not trigger implicit re-planning.
 
+## Forked Tiberius Dependency Strategy
+
+`arrow-tiberius` should expose exactly one Tiberius-compatible public client
+type. It should not support both upstream Tiberius and a forked Tiberius package
+at the same time because Rust treats those as different concrete types even when
+their APIs are similar.
+
+Preferred dependency posture after issue #13 exists:
+
+```toml
+[dependencies]
+tiberius = { package = "tiberius-arrow", version = "0.12.3-arrow.1" }
+```
+
+The package name above is illustrative. Issue #13 owns the final crates.io
+package name and versioning policy. The API requirement from this issue is that
+`arrow-tiberius` imports and exposes one crate name for the client type.
+
+Design decisions:
+
+- Alias the fork package as `tiberius` in `Cargo.toml` if crates.io naming
+  allows it. This keeps public examples and type signatures recognizable.
+- Do not expose both `upstream_tiberius::Client` and `forked_tiberius::Client`
+  in public APIs.
+- Do not make the baseline backend depend on upstream Tiberius while the direct
+  backend depends on the fork. Both backends should share the same client type.
+- If the fork package is not yet published, implementation issues should either
+  block publication of `arrow-tiberius` or use a temporary local development
+  dependency that is removed before publishing.
+- Public APIs should accept the concrete forked Tiberius client type once the
+  dependency exists, unless implementation finds a narrow trait abstraction that
+  does not hide important Tiberius behavior.
+
+Conceptual writer signature after the dependency exists:
+
+```rust
+impl<'client> BulkWriter<'client> {
+    pub async fn new(
+        client: &'client mut tiberius::Client<CompatStream>,
+        table: TableName,
+        plan: WritePlan,
+        options: WriteOptions,
+    ) -> Result<Self>;
+}
+```
+
+The exact stream type parameter should follow Tiberius' real `Client` generic
+shape. This document should not invent that bound. The key requirement is that
+there is one public Tiberius client family.
+
+## Feature Flag Posture
+
+v0.1 should keep feature flags minimal. Feature flags should not create two
+incompatible public client types or make examples compile against a different
+driver package.
+
+Recommended posture:
+
+- No feature flag for choosing upstream versus forked Tiberius.
+- No feature flag for enabling Delta, S3, CLI, pooling, or runtime behavior.
+- No feature flag for ODBC in the core write path.
+- Optional future feature flags may be acceptable for benchmarks, integration
+  tests, or runtime-specific examples if they do not alter the public client
+  type.
+
+Backend choice should be a runtime `WriteBackend` option, not a Cargo feature,
+unless direct raw-bulk support requires compile-time gating for unavoidable
+dependency reasons. Even then, the public client type must stay the same.
+
+## Future Read-Side Placement
+
+The crate name should remain `arrow-tiberius`, not `arrow-tiberius-writer`, so
+future SQL Server-to-Arrow reads fit naturally.
+
+Reserved future module:
+
+```text
+arrow_tiberius::read
+```
+
+Expected future responsibilities:
+
+- planning SQL Server query result schemas into Arrow schemas;
+- mapping Tiberius row metadata to Arrow fields;
+- building Arrow arrays or record batches from query results;
+- read-side diagnostics using the shared `diagnostic` module;
+- read-side errors using the shared `error` module.
+
+Design decisions for v0.1:
+
+- Do not expose an empty `read` module just to reserve the name.
+- Keep shared concepts such as `MssqlProfile`, identifiers, diagnostics, and
+  errors outside `write` when they are likely to apply to reads later.
+- Keep write-specific policies under `write` unless a future read issue proves
+  they should be shared.
+- Do not name crate-level types in a writer-only way if they are conceptually
+  shared. For example, prefer `MssqlProfile` over `WriteProfile`.
+
+This placement lets v0.1 ship a write path without closing the door on a future
+read API.
+
 ## Deferred Until Later Steps
 
-- Exact fork package name, import name, and dependency aliasing.
-- Exact feature flags, if any.
+- Exact fork package name and version.
+- Exact Tiberius client generic bounds.
+- Exact stream item and error bounds for the convenience stream API.
+- Exact future read API shape.
