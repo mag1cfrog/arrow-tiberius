@@ -6,8 +6,11 @@
 
 /// Error types for `arrow-tiberius`.
 pub mod error;
+/// SQL Server identifier types.
+pub mod identifier;
 /// SQL Server profile types.
 pub mod profile;
 
 pub use error::{Error, Result};
+pub use identifier::{Identifier, IdentifierPolicy, TableName};
 pub use profile::{CompatibilityLevel, MssqlProfile, MssqlVersion};
