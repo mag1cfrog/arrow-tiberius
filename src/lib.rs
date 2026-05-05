@@ -12,6 +12,8 @@ pub mod error;
 pub mod identifier;
 /// SQL Server profile types.
 pub mod profile;
+/// Write-path options and conversion policies.
+pub mod write;
 
 pub use diagnostic::{
     Diagnostic, DiagnosticCode, DiagnosticSet, DiagnosticSeverity, FieldRef, PlanOutcome,
