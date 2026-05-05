@@ -1,45 +1,6 @@
 //! Deterministic SQL Server DDL rendering helpers.
 
-use crate::{Identifier, MssqlType, TableName};
-
-/// SQL Server column definition for `CREATE TABLE` rendering.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ColumnDefinition {
-    name: Identifier,
-    ty: MssqlType,
-    nullable: bool,
-}
-
-impl ColumnDefinition {
-    /// Creates a column definition.
-    pub const fn new(name: Identifier, ty: MssqlType, nullable: bool) -> Self {
-        Self { name, ty, nullable }
-    }
-
-    /// Returns the column name.
-    pub const fn name(&self) -> &Identifier {
-        &self.name
-    }
-
-    /// Returns the SQL Server column type.
-    pub const fn ty(&self) -> &MssqlType {
-        &self.ty
-    }
-
-    /// Returns true when the column allows `NULL`.
-    pub const fn nullable(&self) -> bool {
-        self.nullable
-    }
-
-    fn to_sql(&self) -> String {
-        let nullability = if self.nullable { "NULL" } else { "NOT NULL" };
-        format!(
-            "{} {} {nullability}",
-            self.name.quoted_sql(),
-            self.ty.to_sql()
-        )
-    }
-}
+use super::{MssqlColumnPlan, TableName};
 
 /// Options for `CREATE TABLE` rendering.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -48,7 +9,7 @@ pub struct CreateTableOptions;
 /// Renders deterministic SQL Server `CREATE TABLE` DDL.
 pub fn create_table_sql(
     table: &TableName,
-    columns: &[ColumnDefinition],
+    columns: &[MssqlColumnPlan],
     _options: CreateTableOptions,
 ) -> String {
     let mut sql = format!("CREATE TABLE {} (", table.quoted_sql());
@@ -72,7 +33,7 @@ pub fn create_table_sql(
 #[cfg(test)]
 mod tests {
     use crate::{
-        ColumnDefinition, CreateTableOptions, Identifier, MssqlType, MssqlTypeLength, TableName,
+        CreateTableOptions, Identifier, MssqlColumnPlan, MssqlType, MssqlTypeLength, TableName,
         create_table_sql,
     };
 
@@ -80,8 +41,8 @@ mod tests {
     fn renders_create_table_with_deterministic_formatting() {
         let table = TableName::new("dbo", "target").unwrap();
         let columns = vec![
-            ColumnDefinition::new(Identifier::new("id").unwrap(), MssqlType::Int, false),
-            ColumnDefinition::new(
+            MssqlColumnPlan::new(Identifier::new("id").unwrap(), MssqlType::Int, false),
+            MssqlColumnPlan::new(
                 Identifier::new("name").unwrap(),
                 MssqlType::NVarChar(MssqlTypeLength::Max),
                 true,
@@ -99,7 +60,7 @@ mod tests {
     #[test]
     fn quotes_table_and_column_identifiers() {
         let table = TableName::new("dbo.part", "target]part").unwrap();
-        let columns = vec![ColumnDefinition::new(
+        let columns = vec![MssqlColumnPlan::new(
             Identifier::new("select]from").unwrap(),
             MssqlType::Bit,
             false,
