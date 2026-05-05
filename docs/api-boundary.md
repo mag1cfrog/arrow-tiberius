@@ -63,7 +63,7 @@ Relevant decisions already captured in project sources:
 
 ## Document Structure
 
-The remaining sections should be filled in small reviewed steps:
+This document is organized around these public API boundary decisions:
 
 1. Public module map.
 2. SQL Server profile API.
