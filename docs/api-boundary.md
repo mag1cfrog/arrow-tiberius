@@ -444,9 +444,174 @@ Planning implications:
 - The policy types should live in `write`, not globally, unless future read APIs
   reuse them.
 
+## Writer API
+
+The writer API should execute a previously constructed `WritePlan` against a
+caller-supplied Tiberius client. The caller remains responsible for creating,
+configuring, authenticating, pooling, and dropping the client.
+
+Candidate public shape:
+
+```rust
+pub struct BulkWriter<'client, C> {
+    // private fields
+}
+
+pub struct WriteOptions {
+    pub backend: WriteBackend,
+    pub schema_check: SchemaCheck,
+}
+```
+
+`SchemaCheck` is defined in the write-time schema compatibility section. It
+belongs in `WriteOptions` because it controls execution-time validation rather
+than schema planning.
+
+Candidate constructor and lifecycle:
+
+```rust
+impl<'client, C> BulkWriter<'client, C> {
+    pub async fn new(
+        client: &'client mut C,
+        table: TableName,
+        plan: WritePlan,
+        options: WriteOptions,
+    ) -> Result<Self>;
+
+    pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteStats>;
+    pub async fn finish(self) -> Result<WriteStats>;
+}
+```
+
+Design decisions:
+
+- `BulkWriter` should borrow the client mutably for the writer lifetime. This
+  matches Tiberius operations that need exclusive mutable access to the client.
+- `BulkWriter::new` should start the selected bulk-load path and validate that
+  the destination metadata is compatible with the plan when the backend can
+  observe metadata.
+- `write_batch` should validate the batch schema before writing rows.
+- `finish` should finalize the underlying Tiberius bulk request and consume the
+  writer so double-finalize is impossible in normal use.
+- Dropping an unfinished writer should not silently report success. The exact
+  cleanup behavior belongs to implementation, but users should be guided to call
+  `finish`.
+- Empty batches should be accepted if their schema matches the plan and should
+  not force special-case user code.
+- `WritePlan` should be owned by the writer unless implementation proves that
+  borrowing is materially better. Ownership avoids lifetime coupling between
+  planning and async writing.
+
+`WriteStats` should be a small public value object:
+
+```rust
+pub struct WriteStats {
+    pub rows_written: u64,
+    pub batches_written: u64,
+}
+```
+
+Implementation may need more internal counters, but v0.1 should keep the public
+stats stable and conservative.
+
+## Batch And Stream Writing API
+
+The primary low-level API should be `BulkWriter::write_batch`, because it gives
+callers direct control over batching, transactions, retries, and lifecycle.
+
+The convenience stream API should be layered on top of `BulkWriter`:
+
+```rust
+pub async fn write_record_batch_stream<C, S>(
+    client: &mut C,
+    table: TableName,
+    plan: WritePlan,
+    stream: S,
+    options: WriteOptions,
+) -> Result<WriteStats>
+where
+    S: Stream<Item = Result<RecordBatch>>;
+```
+
+Design decisions:
+
+- The intended stream trait is `futures_core::Stream`, but this issue should not
+  add the dependency.
+- The stream item should be `Result<RecordBatch>` so upstream stream failures can
+  be propagated through the crate error type.
+- The convenience function should call `finish` after the stream ends.
+- If a stream item errors, the function should return that error and should not
+  pretend the bulk operation finished successfully.
+- Transaction ownership should stay with the caller. v0.1 should not start,
+  commit, or roll back SQL transactions implicitly.
+- Retry behavior is out of scope. Retrying bulk writes safely is job-level
+  behavior because partial writes and transaction boundaries are application
+  decisions.
+
+The stream convenience function should be optional in implementation if it would
+force premature dependency choices. The API boundary should reserve the shape so
+the crate can add it without disturbing `BulkWriter`.
+
+## Backend Selection API
+
+The public API should let users choose the write backend without changing their
+overall write flow.
+
+Candidate public enum:
+
+```rust
+#[derive(Default)]
+pub enum WriteBackend {
+    #[default]
+    Auto,
+    BaselineTokenRow,
+    DirectRawBulk,
+}
+```
+
+The default variant should be declared on the enum instead of using a separate
+manual `Default` implementation.
+
+Backend semantics:
+
+- `Auto`: choose the best available supported backend for the build and plan.
+  Early v0.1 implementation may resolve this to `BaselineTokenRow` until direct
+  raw bulk support is available.
+- `BaselineTokenRow`: use Tiberius' existing `TokenRow` bulk path. This is the
+  compatibility backend and should be useful for correctness-first tests.
+- `DirectRawBulk`: use Arrow-aware direct TDS bulk row encoding through the
+  forked Tiberius raw-row API. If unavailable or unsupported for a plan, this
+  should return a clear error instead of silently falling back.
+
+Design decisions:
+
+- Explicit `DirectRawBulk` should fail loudly when direct encoding is unavailable
+  or unsupported. Silent fallback would make benchmarks and performance
+  expectations misleading.
+- `Auto` may fall back, but diagnostics should expose which backend was selected
+  when practical.
+- Backend selection should live in `WriteOptions`, not `PlanOptions`, because it
+  controls execution rather than schema planning.
+- The selected backend must not require a different public client type.
+
+`WriteOptions` should be execution-focused. It should not duplicate conversion
+policies already captured in `PlanOptions` and frozen into `WritePlan`.
+
+Candidate default:
+
+```rust
+impl Default for WriteOptions {
+    fn default() -> Self {
+        Self {
+            backend: WriteBackend::Auto,
+            schema_check: SchemaCheck::Strict,
+        }
+    }
+}
+```
+
 ## Deferred Until Later Steps
 
 - Exact warning and error structs.
-- Exact stream item and error bounds.
 - Exact fork package name, import name, and dependency aliasing.
 - Exact feature flags, if any.
