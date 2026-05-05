@@ -29,4 +29,5 @@ name = "arrow_tiberius"
 path = "src/lib.rs"
 
 [dependencies]
+arrow-schema = "58.2.0"
 snafu = "0.9.0"
