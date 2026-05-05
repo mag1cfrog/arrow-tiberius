@@ -4,6 +4,7 @@
 //! library primitives for writing Arrow data into SQL Server while preserving
 //! a future module boundary for SQL Server-to-Arrow reads.
 
+/// Error types for `arrow-tiberius`.
 pub mod error;
 
 pub use error::{Error, Result};
