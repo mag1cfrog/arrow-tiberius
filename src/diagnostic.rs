@@ -253,6 +253,15 @@ mod tests {
     }
 
     #[test]
+    fn empty_diagnostic_set_has_no_errors() {
+        let diagnostics = DiagnosticSet::new();
+
+        assert!(diagnostics.is_empty());
+        assert!(!diagnostics.has_errors());
+        assert_eq!(diagnostics.all(), &[]);
+    }
+
+    #[test]
     fn converts_from_vec() {
         let diagnostics = DiagnosticSet::from(vec![Diagnostic::error(
             DiagnosticCode::IdentifierInvalid,
@@ -261,6 +270,21 @@ mod tests {
 
         assert_eq!(diagnostics.len(), 1);
         assert!(!diagnostics.is_empty());
+    }
+
+    #[test]
+    fn preserves_diagnostic_order_when_consumed() {
+        let diagnostics = DiagnosticSet::from(vec![
+            Diagnostic::warning(DiagnosticCode::PolicyApplied, "first"),
+            Diagnostic::error(DiagnosticCode::SchemaMismatch, "second"),
+        ]);
+
+        let messages = diagnostics
+            .into_iter()
+            .map(|diagnostic| diagnostic.message().to_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(messages, ["first", "second"]);
     }
 
     #[test]

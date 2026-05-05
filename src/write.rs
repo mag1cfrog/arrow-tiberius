@@ -170,4 +170,32 @@ mod tests {
         assert_eq!(Date64Policy::default(), Date64Policy::RejectNonMidnight);
         assert_eq!(SchemaCheck::default(), SchemaCheck::Strict);
     }
+
+    #[test]
+    fn supports_explicit_non_default_policy_overrides() {
+        let options = PlanOptions {
+            string_policy: StringPolicy::NVarChar(128),
+            binary_policy: BinaryPolicy::VarBinary(256),
+            timezone_policy: TimezonePolicy::DateTimeOffset,
+            nanosecond_policy: NanosecondPolicy::RoundTo100ns,
+            uint64_policy: UInt64Policy::Decimal20_0,
+            decimal_policy: DecimalPolicy::NormalizeNegativeScale,
+            decimal256_policy: Decimal256Policy::Reject,
+            float_policy: FloatPolicy::RejectNonFinite,
+            date64_policy: Date64Policy::TimestampDateTime2,
+        };
+
+        assert_eq!(options.string_policy, StringPolicy::NVarChar(128));
+        assert_eq!(options.binary_policy, BinaryPolicy::VarBinary(256));
+        assert_eq!(options.timezone_policy, TimezonePolicy::DateTimeOffset);
+        assert_eq!(options.nanosecond_policy, NanosecondPolicy::RoundTo100ns);
+        assert_eq!(options.uint64_policy, UInt64Policy::Decimal20_0);
+        assert_eq!(
+            options.decimal_policy,
+            DecimalPolicy::NormalizeNegativeScale
+        );
+        assert_eq!(options.decimal256_policy, Decimal256Policy::Reject);
+        assert_eq!(options.float_policy, FloatPolicy::RejectNonFinite);
+        assert_eq!(options.date64_policy, Date64Policy::TimestampDateTime2);
+    }
 }

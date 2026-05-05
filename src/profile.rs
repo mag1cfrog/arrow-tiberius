@@ -93,9 +93,29 @@ mod tests {
     }
 
     #[test]
+    fn try_from_accepts_supported_compatibility_level() {
+        let level = CompatibilityLevel::try_from(100).unwrap();
+
+        assert_eq!(level, CompatibilityLevel::SQL_SERVER_2008);
+    }
+
+    #[test]
     fn rejects_unsupported_compatibility_level() {
         let err = CompatibilityLevel::new(90).expect_err("level should be rejected");
 
         assert!(err.to_string().contains("invalid compatibility level 90"));
+    }
+
+    #[test]
+    fn rejects_nearby_and_extreme_compatibility_levels() {
+        for level in [0, 99, 101, 150, u16::MAX] {
+            let err = CompatibilityLevel::new(level).expect_err("level should be rejected");
+
+            assert!(
+                err.to_string()
+                    .contains(&format!("invalid compatibility level {level}")),
+                "unexpected error: {err}"
+            );
+        }
     }
 }

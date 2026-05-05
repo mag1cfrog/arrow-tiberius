@@ -95,6 +95,12 @@ fn validate_identifier(value: &str, policy: IdentifierPolicy) -> Result<()> {
                 });
             }
 
+            if value.chars().any(char::is_control) {
+                return Err(crate::Error::InvalidIdentifier {
+                    reason: "identifier cannot contain control characters".to_owned(),
+                });
+            }
+
             let len = value.chars().count();
             if len > MAX_IDENTIFIER_CHARS {
                 return Err(crate::Error::InvalidIdentifier {
@@ -155,6 +161,24 @@ mod tests {
     }
 
     #[test]
+    fn quotes_injection_shaped_identifier_as_one_identifier() {
+        let ident = Identifier::new("dbo].[target]; DROP TABLE [prod];--").unwrap();
+
+        assert_eq!(
+            ident.quoted_sql(),
+            "[dbo]].[target]]; DROP TABLE [prod]];--]"
+        );
+    }
+
+    #[test]
+    fn accepts_exactly_128_unicode_scalar_values() {
+        let value = "表".repeat(128);
+        let ident = Identifier::new(value.clone()).unwrap();
+
+        assert_eq!(ident.as_str(), value);
+    }
+
+    #[test]
     fn rejects_empty_identifier() {
         let err = Identifier::new("").expect_err("empty identifiers should be rejected");
 
@@ -165,12 +189,35 @@ mod tests {
     }
 
     #[test]
+    fn rejects_control_characters() {
+        for value in ["line\nbreak", "tab\tname", "nul\0name"] {
+            let err = Identifier::new(value).expect_err("control characters should be rejected");
+
+            assert!(
+                err.to_string().contains("control characters"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_over_length_identifier() {
         let value = "x".repeat(129);
         let err = Identifier::new(value).expect_err("over-length identifiers should be rejected");
 
         assert!(
             err.to_string().contains("maximum is 128"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_over_length_unicode_identifier_by_character_count() {
+        let value = "表".repeat(129);
+        let err = Identifier::new(value).expect_err("over-length identifiers should be rejected");
+
+        assert!(
+            err.to_string().contains("identifier is 129 characters"),
             "unexpected error: {err}"
         );
     }
@@ -198,5 +245,26 @@ mod tests {
         let table = TableName::new("dbo.part", "target.part").unwrap();
 
         assert_eq!(table.quoted_sql(), "[dbo.part].[target.part]");
+    }
+
+    #[test]
+    fn rejects_invalid_schema_or_table_part() {
+        let err = TableName::new("", "target").expect_err("empty schema should be rejected");
+        assert!(
+            err.to_string().contains("identifier cannot be empty"),
+            "unexpected error: {err}"
+        );
+
+        let err = TableName::new("dbo", "").expect_err("empty table should be rejected");
+        assert!(
+            err.to_string().contains("identifier cannot be empty"),
+            "unexpected error: {err}"
+        );
+
+        let err = TableName::unqualified("").expect_err("empty table should be rejected");
+        assert!(
+            err.to_string().contains("identifier cannot be empty"),
+            "unexpected error: {err}"
+        );
     }
 }
