@@ -8,9 +8,12 @@
 
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
-use crate::write::{BinaryPolicy, PlanOptions, StringPolicy, UInt64Policy};
+use crate::write::{
+    BinaryPolicy, Date64Policy, Decimal256Policy, DecimalPolicy, NanosecondPolicy, PlanOptions,
+    StringPolicy, TimezonePolicy, UInt64Policy,
+};
 use crate::{
     ArrowFieldPlan, Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, Identifier,
     MssqlColumnPlan, MssqlProfile, MssqlType, MssqlTypeLength, PlanOutcome, Result, SchemaMapping,
@@ -113,6 +116,33 @@ fn plan_arrow_field_to_mssql_column_mapping(
         DataType::Binary | DataType::LargeBinary => {
             plan_arrow_binary_as_mssql_type(options.binary_policy, index, field)?
         }
+        DataType::Decimal32(precision, scale)
+        | DataType::Decimal64(precision, scale)
+        | DataType::Decimal128(precision, scale) => plan_arrow_decimal_as_mssql_type(
+            *precision,
+            *scale,
+            options.decimal_policy,
+            index,
+            field,
+        )?,
+        DataType::Decimal256(precision, scale) => plan_arrow_decimal256_as_mssql_type(
+            *precision,
+            *scale,
+            options.decimal_policy,
+            options.decimal256_policy,
+            index,
+            field,
+        )?,
+        DataType::Date32 => MssqlType::Date,
+        DataType::Date64 => plan_arrow_date64_as_mssql_type(options.date64_policy, index, field)?,
+        DataType::Timestamp(unit, timezone) => plan_arrow_timestamp_as_mssql_type(
+            *unit,
+            timezone.as_deref(),
+            options.timezone_policy,
+            options.nanosecond_policy,
+            index,
+            field,
+        )?,
         other => {
             return Err(Diagnostic::error(
                 DiagnosticCode::UnsupportedArrowType,
@@ -186,6 +216,156 @@ fn plan_arrow_binary_as_mssql_type(
     }
 }
 
+fn plan_arrow_decimal_as_mssql_type(
+    precision: u8,
+    scale: i8,
+    policy: DecimalPolicy,
+    index: usize,
+    field: &Field,
+) -> std::result::Result<MssqlType, Diagnostic> {
+    let (precision, scale) = normalize_arrow_decimal_shape(precision, scale, policy, index, field)?;
+    Ok(MssqlType::Decimal { precision, scale })
+}
+
+fn plan_arrow_decimal256_as_mssql_type(
+    precision: u8,
+    scale: i8,
+    decimal_policy: DecimalPolicy,
+    decimal256_policy: Decimal256Policy,
+    index: usize,
+    field: &Field,
+) -> std::result::Result<MssqlType, Diagnostic> {
+    match decimal256_policy {
+        Decimal256Policy::CheckedDowncast => {
+            plan_arrow_decimal_as_mssql_type(precision, scale, decimal_policy, index, field)
+        }
+        Decimal256Policy::Reject => Err(policy_required_for_arrow_to_mssql(
+            index,
+            field,
+            "Decimal256 requires Decimal256Policy::CheckedDowncast",
+        )),
+    }
+}
+
+fn normalize_arrow_decimal_shape(
+    precision: u8,
+    scale: i8,
+    policy: DecimalPolicy,
+    index: usize,
+    field: &Field,
+) -> std::result::Result<(u8, i8), Diagnostic> {
+    if precision == 0 {
+        return Err(decimal_out_of_range_for_arrow_to_mssql(
+            index,
+            field,
+            "decimal precision must be at least 1 for SQL Server",
+        ));
+    }
+
+    let (precision, scale) = if scale < 0 {
+        match policy {
+            DecimalPolicy::RejectNegativeScale => {
+                return Err(policy_required_for_arrow_to_mssql(
+                    index,
+                    field,
+                    "negative decimal scale requires DecimalPolicy::NormalizeNegativeScale",
+                ));
+            }
+            DecimalPolicy::NormalizeNegativeScale => {
+                let extra_digits = scale.unsigned_abs();
+                let Some(normalized_precision) = precision.checked_add(extra_digits) else {
+                    return Err(decimal_out_of_range_for_arrow_to_mssql(
+                        index,
+                        field,
+                        "normalized decimal precision overflows u8",
+                    ));
+                };
+                (normalized_precision, 0)
+            }
+        }
+    } else {
+        (precision, scale)
+    };
+
+    if precision > SQL_SERVER_MAX_DECIMAL_PRECISION {
+        return Err(decimal_out_of_range_for_arrow_to_mssql(
+            index,
+            field,
+            format!("decimal precision {precision} exceeds SQL Server maximum precision 38"),
+        ));
+    }
+
+    let scale_as_u8 = u8::try_from(scale).map_err(|_| {
+        decimal_out_of_range_for_arrow_to_mssql(
+            index,
+            field,
+            format!("decimal scale {scale} must be non-negative"),
+        )
+    })?;
+
+    if scale_as_u8 > precision {
+        return Err(decimal_out_of_range_for_arrow_to_mssql(
+            index,
+            field,
+            format!("decimal scale {scale} cannot exceed precision {precision}"),
+        ));
+    }
+
+    Ok((precision, scale))
+}
+
+fn plan_arrow_date64_as_mssql_type(
+    policy: Date64Policy,
+    index: usize,
+    field: &Field,
+) -> std::result::Result<MssqlType, Diagnostic> {
+    match policy {
+        Date64Policy::RejectNonMidnight => Err(observed_data_required_for_arrow_to_mssql(
+            index,
+            field,
+            "Date64 requires observed values to verify every value is midnight",
+        )),
+        Date64Policy::TimestampDateTime2 => Ok(MssqlType::DateTime2 { precision: 3 }),
+    }
+}
+
+fn plan_arrow_timestamp_as_mssql_type(
+    unit: TimeUnit,
+    timezone: Option<&str>,
+    timezone_policy: TimezonePolicy,
+    nanosecond_policy: NanosecondPolicy,
+    index: usize,
+    field: &Field,
+) -> std::result::Result<MssqlType, Diagnostic> {
+    let has_timezone = timezone.is_some_and(|timezone| !timezone.is_empty());
+
+    if has_timezone && matches!(timezone_policy, TimezonePolicy::Reject) {
+        return Err(policy_required_for_arrow_to_mssql(
+            index,
+            field,
+            "timezone-aware timestamps require TimezonePolicy::DateTimeOffset or TimezonePolicy::NormalizeUtcDateTime2",
+        ));
+    }
+
+    if matches!(unit, TimeUnit::Nanosecond)
+        && matches!(nanosecond_policy, NanosecondPolicy::RejectNon100ns)
+    {
+        return Err(observed_data_required_for_arrow_to_mssql(
+            index,
+            field,
+            "nanosecond timestamps require observed values to verify 100ns divisibility",
+        ));
+    }
+
+    let ty = if has_timezone && matches!(timezone_policy, TimezonePolicy::DateTimeOffset) {
+        MssqlType::DateTimeOffset { precision: 7 }
+    } else {
+        MssqlType::DateTime2 { precision: 7 }
+    };
+
+    Ok(ty)
+}
+
 fn policy_required_for_arrow_to_mssql(
     index: usize,
     field: &Field,
@@ -204,15 +384,27 @@ fn observed_data_required_for_arrow_to_mssql(
         .with_field(FieldRef::new(index, field.name()))
 }
 
+fn decimal_out_of_range_for_arrow_to_mssql(
+    index: usize,
+    field: &Field,
+    message: impl Into<String>,
+) -> Diagnostic {
+    Diagnostic::error(DiagnosticCode::DecimalOutOfRange, message)
+        .with_field(FieldRef::new(index, field.name()))
+}
+
+const SQL_SERVER_MAX_DECIMAL_PRECISION: u8 = 38;
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
     use crate::{
-        BinaryPolicy, DiagnosticCode, Error, MssqlProfile, MssqlTablePlan, MssqlType,
-        MssqlTypeLength, PlanOptions, StringPolicy, TableName, UInt64Policy,
+        BinaryPolicy, Date64Policy, Decimal256Policy, DecimalPolicy, DiagnosticCode, Error,
+        MssqlProfile, MssqlTablePlan, MssqlType, MssqlTypeLength, NanosecondPolicy, PlanOptions,
+        StringPolicy, TableName, TimezonePolicy, UInt64Policy,
     };
 
     #[test]
@@ -464,6 +656,316 @@ mod tests {
             DiagnosticCode::ObservedDataRequired
         );
         assert_eq!(diagnostics.all()[1].field().unwrap().name(), "payload");
+    }
+
+    #[test]
+    fn maps_decimal_date_and_timestamp_types() {
+        let schema = Schema::new(vec![
+            Field::new("d32_col", DataType::Decimal32(9, 2), false),
+            Field::new("d64_col", DataType::Decimal64(18, 4), false),
+            Field::new("d128_col", DataType::Decimal128(38, 9), false),
+            Field::new("d256_col", DataType::Decimal256(38, 0), false),
+            Field::new("date_col", DataType::Date32, true),
+            Field::new(
+                "ts_second_col",
+                DataType::Timestamp(TimeUnit::Second, None),
+                true,
+            ),
+            Field::new(
+                "ts_milli_col",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                true,
+            ),
+            Field::new(
+                "ts_micro_col",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new(
+                "ts_empty_timezone_col",
+                DataType::Timestamp(TimeUnit::Second, Some("".into())),
+                true,
+            ),
+        ]);
+
+        let outcome = MssqlTablePlan::from_arrow_schema(
+            Arc::new(schema),
+            MssqlProfile::sql_server_2016_compat_100(),
+            PlanOptions::default(),
+        )
+        .unwrap();
+        let columns = outcome.value().mssql_columns();
+
+        assert_eq!(
+            columns[0].ty(),
+            &MssqlType::Decimal {
+                precision: 9,
+                scale: 2
+            }
+        );
+        assert_eq!(
+            columns[1].ty(),
+            &MssqlType::Decimal {
+                precision: 18,
+                scale: 4
+            }
+        );
+        assert_eq!(
+            columns[2].ty(),
+            &MssqlType::Decimal {
+                precision: 38,
+                scale: 9
+            }
+        );
+        assert_eq!(
+            columns[3].ty(),
+            &MssqlType::Decimal {
+                precision: 38,
+                scale: 0
+            }
+        );
+        assert_eq!(columns[4].ty(), &MssqlType::Date);
+        assert_eq!(columns[5].ty(), &MssqlType::DateTime2 { precision: 7 });
+        assert_eq!(columns[6].ty(), &MssqlType::DateTime2 { precision: 7 });
+        assert_eq!(columns[7].ty(), &MssqlType::DateTime2 { precision: 7 });
+        assert_eq!(columns[8].ty(), &MssqlType::DateTime2 { precision: 7 });
+    }
+
+    #[test]
+    fn normalizes_negative_decimal_scale_when_policy_is_selected() {
+        let schema = Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(3, -2),
+            false,
+        )]);
+        let options = PlanOptions {
+            decimal_policy: DecimalPolicy::NormalizeNegativeScale,
+            ..PlanOptions::default()
+        };
+
+        let outcome = MssqlTablePlan::from_arrow_schema(
+            Arc::new(schema),
+            MssqlProfile::sql_server_2016_compat_100(),
+            options,
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.value().mssql_columns()[0].ty(),
+            &MssqlType::Decimal {
+                precision: 5,
+                scale: 0
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_decimal_shapes_that_sql_server_cannot_represent() {
+        let schema = Schema::new(vec![
+            Field::new("too_precise", DataType::Decimal256(39, 0), false),
+            Field::new("scale_too_large", DataType::Decimal128(3, 4), false),
+            Field::new("negative_scale", DataType::Decimal128(3, -2), false),
+        ]);
+
+        let err = MssqlTablePlan::from_arrow_schema(
+            Arc::new(schema),
+            MssqlProfile::sql_server_2016_compat_100(),
+            PlanOptions::default(),
+        )
+        .expect_err("invalid decimal shapes should be rejected");
+
+        let Error::Planning { diagnostics } = err else {
+            panic!("expected planning error");
+        };
+
+        assert_eq!(diagnostics.len(), 3);
+        assert_eq!(
+            diagnostics.all()[0].code(),
+            DiagnosticCode::DecimalOutOfRange
+        );
+        assert_eq!(diagnostics.all()[0].field().unwrap().name(), "too_precise");
+        assert_eq!(
+            diagnostics.all()[1].code(),
+            DiagnosticCode::DecimalOutOfRange
+        );
+        assert_eq!(
+            diagnostics.all()[1].field().unwrap().name(),
+            "scale_too_large"
+        );
+        assert_eq!(
+            diagnostics.all()[2].code(),
+            DiagnosticCode::ProfileDependentConversion
+        );
+        assert_eq!(
+            diagnostics.all()[2].field().unwrap().name(),
+            "negative_scale"
+        );
+    }
+
+    #[test]
+    fn decimal256_reject_policy_returns_structured_planning_diagnostic() {
+        let schema = Schema::new(vec![Field::new(
+            "wide_decimal",
+            DataType::Decimal256(38, 0),
+            false,
+        )]);
+        let options = PlanOptions {
+            decimal256_policy: Decimal256Policy::Reject,
+            ..PlanOptions::default()
+        };
+
+        let err = MssqlTablePlan::from_arrow_schema(
+            Arc::new(schema),
+            MssqlProfile::sql_server_2016_compat_100(),
+            options,
+        )
+        .expect_err("Decimal256 should respect explicit reject policy");
+
+        let Error::Planning { diagnostics } = err else {
+            panic!("expected planning error");
+        };
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics.all()[0].code(),
+            DiagnosticCode::ProfileDependentConversion
+        );
+        assert_eq!(diagnostics.all()[0].field().unwrap().name(), "wide_decimal");
+    }
+
+    #[test]
+    fn date64_requires_policy_or_observed_midnight_validation() {
+        let schema = Schema::new(vec![Field::new("date64_col", DataType::Date64, true)]);
+
+        let err = MssqlTablePlan::from_arrow_schema(
+            Arc::new(schema.clone()),
+            MssqlProfile::sql_server_2016_compat_100(),
+            PlanOptions::default(),
+        )
+        .expect_err("Date64 default requires observed values");
+
+        let Error::Planning { diagnostics } = err else {
+            panic!("expected planning error");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics.all()[0].code(),
+            DiagnosticCode::ObservedDataRequired
+        );
+        assert_eq!(diagnostics.all()[0].field().unwrap().name(), "date64_col");
+
+        let outcome = MssqlTablePlan::from_arrow_schema(
+            Arc::new(schema),
+            MssqlProfile::sql_server_2016_compat_100(),
+            PlanOptions {
+                date64_policy: Date64Policy::TimestampDateTime2,
+                ..PlanOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.value().mssql_columns()[0].ty(),
+            &MssqlType::DateTime2 { precision: 3 }
+        );
+    }
+
+    #[test]
+    fn timezone_timestamp_policy_controls_target_type() {
+        let schema = Schema::new(vec![Field::new(
+            "ts_col",
+            DataType::Timestamp(TimeUnit::Millisecond, Some("+00:00".into())),
+            true,
+        )]);
+
+        let err = MssqlTablePlan::from_arrow_schema(
+            Arc::new(schema.clone()),
+            MssqlProfile::sql_server_2016_compat_100(),
+            PlanOptions::default(),
+        )
+        .expect_err("timezone-aware timestamp default should be rejected");
+
+        let Error::Planning { diagnostics } = err else {
+            panic!("expected planning error");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics.all()[0].code(),
+            DiagnosticCode::ProfileDependentConversion
+        );
+
+        let offset_outcome = MssqlTablePlan::from_arrow_schema(
+            Arc::new(schema.clone()),
+            MssqlProfile::sql_server_2016_compat_100(),
+            PlanOptions {
+                timezone_policy: TimezonePolicy::DateTimeOffset,
+                ..PlanOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            offset_outcome.value().mssql_columns()[0].ty(),
+            &MssqlType::DateTimeOffset { precision: 7 }
+        );
+
+        let normalized_outcome = MssqlTablePlan::from_arrow_schema(
+            Arc::new(schema),
+            MssqlProfile::sql_server_2016_compat_100(),
+            PlanOptions {
+                timezone_policy: TimezonePolicy::NormalizeUtcDateTime2,
+                ..PlanOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            normalized_outcome.value().mssql_columns()[0].ty(),
+            &MssqlType::DateTime2 { precision: 7 }
+        );
+    }
+
+    #[test]
+    fn nanosecond_timestamps_require_precision_policy_or_observed_validation() {
+        let schema = Schema::new(vec![Field::new(
+            "ts_ns_col",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        )]);
+
+        let err = MssqlTablePlan::from_arrow_schema(
+            Arc::new(schema.clone()),
+            MssqlProfile::sql_server_2016_compat_100(),
+            PlanOptions::default(),
+        )
+        .expect_err("nanosecond default requires observed values");
+
+        let Error::Planning { diagnostics } = err else {
+            panic!("expected planning error");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics.all()[0].code(),
+            DiagnosticCode::ObservedDataRequired
+        );
+
+        for nanosecond_policy in [
+            NanosecondPolicy::RoundTo100ns,
+            NanosecondPolicy::TruncateTo100ns,
+        ] {
+            let outcome = MssqlTablePlan::from_arrow_schema(
+                Arc::new(schema.clone()),
+                MssqlProfile::sql_server_2016_compat_100(),
+                PlanOptions {
+                    nanosecond_policy,
+                    ..PlanOptions::default()
+                },
+            )
+            .unwrap();
+
+            assert_eq!(
+                outcome.value().mssql_columns()[0].ty(),
+                &MssqlType::DateTime2 { precision: 7 }
+            );
+        }
     }
 
     #[test]
