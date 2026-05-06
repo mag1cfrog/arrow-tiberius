@@ -144,11 +144,9 @@ fn plan_arrow_field_to_mssql_column_mapping(
             field,
         )?,
         other => {
-            return Err(Diagnostic::error(
-                DiagnosticCode::UnsupportedArrowType,
-                format!("unsupported Arrow type {other:?}"),
-            )
-            .with_field(FieldRef::new(index, field.name())));
+            return Err(unsupported_arrow_type_for_arrow_to_mssql(
+                index, field, other,
+            ));
         }
     };
 
@@ -393,13 +391,48 @@ fn decimal_out_of_range_for_arrow_to_mssql(
         .with_field(FieldRef::new(index, field.name()))
 }
 
+fn unsupported_arrow_type_for_arrow_to_mssql(
+    index: usize,
+    field: &Field,
+    data_type: &DataType,
+) -> Diagnostic {
+    let family = unsupported_arrow_type_family(data_type);
+    Diagnostic::error(
+        DiagnosticCode::UnsupportedArrowType,
+        format!("{family} Arrow type {data_type:?} is not supported for Arrow-to-MSSQL planning"),
+    )
+    .with_field(FieldRef::new(index, field.name()))
+}
+
+fn unsupported_arrow_type_family(data_type: &DataType) -> &'static str {
+    match data_type {
+        DataType::Null => "null",
+        DataType::Float16 => "16-bit floating-point",
+        DataType::Time32(_) | DataType::Time64(_) => "time-only",
+        DataType::Duration(_) => "duration",
+        DataType::Interval(_) => "interval",
+        DataType::FixedSizeBinary(_) => "fixed-size binary",
+        DataType::BinaryView | DataType::Utf8View => "view",
+        DataType::List(_)
+        | DataType::ListView(_)
+        | DataType::FixedSizeList(_, _)
+        | DataType::LargeList(_)
+        | DataType::LargeListView(_)
+        | DataType::Struct(_)
+        | DataType::Map(_, _)
+        | DataType::Union(_, _) => "nested",
+        DataType::Dictionary(_, _) | DataType::RunEndEncoded(_, _) => "encoded",
+        _ => "unsupported",
+    }
+}
+
 const SQL_SERVER_MAX_DECIMAL_PRECISION: u8 = 38;
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit, UnionFields, UnionMode};
 
     use crate::{
         BinaryPolicy, Date64Policy, Decimal256Policy, DecimalPolicy, DiagnosticCode, Error,
@@ -994,6 +1027,143 @@ mod tests {
         assert_eq!(diagnostic.code(), DiagnosticCode::UnsupportedArrowType);
         assert_eq!(diagnostic.field().unwrap().index(), 0);
         assert_eq!(diagnostic.field().unwrap().name(), "values");
+    }
+
+    #[test]
+    fn unsupported_type_diagnostics_name_arrow_type_family() {
+        let cases = [
+            ("null_col", DataType::Null, "null"),
+            ("f16_col", DataType::Float16, "16-bit floating-point"),
+            ("time_col", DataType::Time32(TimeUnit::Second), "time-only"),
+            (
+                "duration_col",
+                DataType::Duration(TimeUnit::Microsecond),
+                "duration",
+            ),
+            (
+                "fixed_binary_col",
+                DataType::FixedSizeBinary(16),
+                "fixed-size binary",
+            ),
+            ("binary_view_col", DataType::BinaryView, "view"),
+            ("utf8_view_col", DataType::Utf8View, "view"),
+            (
+                "dictionary_col",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                "encoded",
+            ),
+        ];
+
+        for (name, data_type, family) in cases {
+            let schema = Schema::new(vec![Field::new(name, data_type, true)]);
+
+            let err = MssqlTablePlan::from_arrow_schema(
+                Arc::new(schema),
+                MssqlProfile::sql_server_2016_compat_100(),
+                PlanOptions::default(),
+            )
+            .expect_err("unsupported type should return diagnostic");
+
+            let Error::Planning { diagnostics } = err else {
+                panic!("expected planning error");
+            };
+
+            assert_eq!(diagnostics.len(), 1);
+            let diagnostic = &diagnostics.all()[0];
+            assert_eq!(diagnostic.code(), DiagnosticCode::UnsupportedArrowType);
+            assert_eq!(diagnostic.field().unwrap().name(), name);
+            assert!(
+                diagnostic.message().contains(family),
+                "diagnostic should mention family {family:?}: {}",
+                diagnostic.message()
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_nested_and_encoded_types_collect_schema_order_diagnostics() {
+        let union_fields = UnionFields::try_new(
+            [1_i8, 2],
+            [
+                Field::new("left", DataType::Int32, true),
+                Field::new("right", DataType::Utf8, true),
+            ],
+        )
+        .unwrap();
+        let schema = Schema::new(vec![
+            Field::new("ok", DataType::Int32, false),
+            Field::new("list_col", DataType::new_list(DataType::Int64, true), true),
+            Field::new(
+                "struct_col",
+                DataType::Struct(
+                    vec![Field::new("child", DataType::Boolean, true)]
+                        .into_iter()
+                        .collect(),
+                ),
+                true,
+            ),
+            Field::new(
+                "union_col",
+                DataType::Union(union_fields, UnionMode::Sparse),
+                true,
+            ),
+            Field::new(
+                "run_end_col",
+                DataType::RunEndEncoded(
+                    Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                    Arc::new(Field::new("values", DataType::Utf8, true)),
+                ),
+                true,
+            ),
+        ]);
+
+        let err = MssqlTablePlan::from_arrow_schema(
+            Arc::new(schema),
+            MssqlProfile::sql_server_2016_compat_100(),
+            PlanOptions::default(),
+        )
+        .expect_err("unsupported fields should produce diagnostics");
+
+        let Error::Planning { diagnostics } = err else {
+            panic!("expected planning error");
+        };
+
+        assert_eq!(diagnostics.len(), 4);
+        assert!(
+            diagnostics
+                .all()
+                .iter()
+                .all(|diagnostic| diagnostic.code() == DiagnosticCode::UnsupportedArrowType)
+        );
+
+        let field_refs = diagnostics
+            .all()
+            .iter()
+            .map(|diagnostic| {
+                let field = diagnostic.field().unwrap();
+                (field.index(), field.name())
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            field_refs,
+            vec![
+                (1, "list_col"),
+                (2, "struct_col"),
+                (3, "union_col"),
+                (4, "run_end_col"),
+            ]
+        );
+
+        let messages = diagnostics
+            .all()
+            .iter()
+            .map(crate::Diagnostic::message)
+            .collect::<Vec<_>>();
+        assert!(messages[0].contains("nested"));
+        assert!(messages[1].contains("nested"));
+        assert!(messages[2].contains("nested"));
+        assert!(messages[3].contains("encoded"));
     }
 
     #[test]

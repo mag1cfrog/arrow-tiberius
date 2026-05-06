@@ -82,4 +82,41 @@ mod tests {
 
         assert_eq!(sql, "CREATE TABLE [empty] (\n);");
     }
+
+    #[test]
+    fn renders_decimal_and_temporal_columns() {
+        let table = TableName::new("dbo", "events").unwrap();
+        let columns = vec![
+            MssqlColumnPlan::new(
+                Identifier::new("amount").unwrap(),
+                MssqlType::Decimal {
+                    precision: 38,
+                    scale: 9,
+                },
+                false,
+            ),
+            MssqlColumnPlan::new(
+                Identifier::new("event_date").unwrap(),
+                MssqlType::Date,
+                true,
+            ),
+            MssqlColumnPlan::new(
+                Identifier::new("created_at").unwrap(),
+                MssqlType::DateTime2 { precision: 7 },
+                false,
+            ),
+            MssqlColumnPlan::new(
+                Identifier::new("source_offset").unwrap(),
+                MssqlType::DateTimeOffset { precision: 7 },
+                true,
+            ),
+        ];
+
+        let sql = create_table_sql(&table, &columns, CreateTableOptions);
+
+        assert_eq!(
+            sql,
+            "CREATE TABLE [dbo].[events] (\n    [amount] decimal(38,9) NOT NULL,\n    [event_date] date NULL,\n    [created_at] datetime2(7) NOT NULL,\n    [source_offset] datetimeoffset(7) NULL\n);"
+        );
+    }
 }
