@@ -10,11 +10,11 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
 
-use crate::write::PlanOptions;
+use crate::write::{BinaryPolicy, PlanOptions, StringPolicy, UInt64Policy};
 use crate::{
     ArrowFieldPlan, Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, Identifier,
-    MssqlColumnPlan, MssqlProfile, MssqlType, PlanOutcome, Result, SchemaMapping, TableName,
-    create_table_sql,
+    MssqlColumnPlan, MssqlProfile, MssqlType, MssqlTypeLength, PlanOutcome, Result, SchemaMapping,
+    TableName, create_table_sql,
 };
 
 /// Immutable Arrow/MSSQL table schema plan.
@@ -30,14 +30,14 @@ impl MssqlTablePlan {
     pub fn from_arrow_schema(
         schema: impl Into<Arc<Schema>>,
         profile: MssqlProfile,
-        _options: PlanOptions,
+        options: PlanOptions,
     ) -> Result<PlanOutcome<Self>> {
         let schema = schema.into();
         let mut mappings = Vec::with_capacity(schema.fields().len());
         let mut diagnostics = DiagnosticSet::new();
 
         for (index, field) in schema.fields().iter().enumerate() {
-            match plan_mapping(index, field) {
+            match plan_arrow_field_to_mssql_column_mapping(index, field, &options) {
                 Ok(mapping) => mappings.push(mapping),
                 Err(diagnostic) => diagnostics.push(diagnostic),
             }
@@ -86,7 +86,11 @@ impl MssqlTablePlan {
     }
 }
 
-fn plan_mapping(index: usize, field: &Field) -> std::result::Result<SchemaMapping, Diagnostic> {
+fn plan_arrow_field_to_mssql_column_mapping(
+    index: usize,
+    field: &Field,
+    options: &PlanOptions,
+) -> std::result::Result<SchemaMapping, Diagnostic> {
     let name = Identifier::new(field.name()).map_err(|err| {
         Diagnostic::error(DiagnosticCode::IdentifierInvalid, err.to_string())
             .with_field(FieldRef::new(index, field.name()))
@@ -94,7 +98,21 @@ fn plan_mapping(index: usize, field: &Field) -> std::result::Result<SchemaMappin
 
     let ty = match field.data_type() {
         DataType::Boolean => MssqlType::Bit,
+        DataType::Int8 | DataType::Int16 => MssqlType::SmallInt,
         DataType::Int32 => MssqlType::Int,
+        DataType::Int64 => MssqlType::BigInt,
+        DataType::UInt8 => MssqlType::TinyInt,
+        DataType::UInt16 => MssqlType::Int,
+        DataType::UInt32 => MssqlType::BigInt,
+        DataType::UInt64 => plan_arrow_uint64_as_mssql_type(options.uint64_policy, index, field)?,
+        DataType::Float32 => MssqlType::Real,
+        DataType::Float64 => MssqlType::Float { precision: 53 },
+        DataType::Utf8 | DataType::LargeUtf8 => {
+            plan_arrow_string_as_mssql_type(options.string_policy, index, field)?
+        }
+        DataType::Binary | DataType::LargeBinary => {
+            plan_arrow_binary_as_mssql_type(options.binary_policy, index, field)?
+        }
         other => {
             return Err(Diagnostic::error(
                 DiagnosticCode::UnsupportedArrowType,
@@ -115,6 +133,77 @@ fn plan_mapping(index: usize, field: &Field) -> std::result::Result<SchemaMappin
     Ok(SchemaMapping::new(arrow, mssql))
 }
 
+fn plan_arrow_uint64_as_mssql_type(
+    policy: UInt64Policy,
+    index: usize,
+    field: &Field,
+) -> std::result::Result<MssqlType, Diagnostic> {
+    match policy {
+        UInt64Policy::Reject => Err(policy_required_for_arrow_to_mssql(
+            index,
+            field,
+            "UInt64 requires UInt64Policy::Decimal20_0 or UInt64Policy::CheckedBigInt",
+        )),
+        UInt64Policy::Decimal20_0 => Ok(MssqlType::Decimal {
+            precision: 20,
+            scale: 0,
+        }),
+        UInt64Policy::CheckedBigInt => Ok(MssqlType::BigInt),
+    }
+}
+
+fn plan_arrow_string_as_mssql_type(
+    policy: StringPolicy,
+    index: usize,
+    field: &Field,
+) -> std::result::Result<MssqlType, Diagnostic> {
+    match policy {
+        StringPolicy::NVarCharMax => Ok(MssqlType::NVarChar(MssqlTypeLength::Max)),
+        StringPolicy::NVarChar(length) => Ok(MssqlType::NVarChar(MssqlTypeLength::Bounded(length))),
+        StringPolicy::ObservedNVarChar => Err(observed_data_required_for_arrow_to_mssql(
+            index,
+            field,
+            "ObservedNVarChar requires observed values or statistics",
+        )),
+    }
+}
+
+fn plan_arrow_binary_as_mssql_type(
+    policy: BinaryPolicy,
+    index: usize,
+    field: &Field,
+) -> std::result::Result<MssqlType, Diagnostic> {
+    match policy {
+        BinaryPolicy::VarBinaryMax => Ok(MssqlType::VarBinary(MssqlTypeLength::Max)),
+        BinaryPolicy::VarBinary(length) => {
+            Ok(MssqlType::VarBinary(MssqlTypeLength::Bounded(length)))
+        }
+        BinaryPolicy::ObservedVarBinary => Err(observed_data_required_for_arrow_to_mssql(
+            index,
+            field,
+            "ObservedVarBinary requires observed values or statistics",
+        )),
+    }
+}
+
+fn policy_required_for_arrow_to_mssql(
+    index: usize,
+    field: &Field,
+    message: impl Into<String>,
+) -> Diagnostic {
+    Diagnostic::error(DiagnosticCode::ProfileDependentConversion, message)
+        .with_field(FieldRef::new(index, field.name()))
+}
+
+fn observed_data_required_for_arrow_to_mssql(
+    index: usize,
+    field: &Field,
+    message: impl Into<String>,
+) -> Diagnostic {
+    Diagnostic::error(DiagnosticCode::ObservedDataRequired, message)
+        .with_field(FieldRef::new(index, field.name()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -122,7 +211,8 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use crate::{
-        DiagnosticCode, Error, MssqlProfile, MssqlTablePlan, MssqlType, PlanOptions, TableName,
+        BinaryPolicy, DiagnosticCode, Error, MssqlProfile, MssqlTablePlan, MssqlType,
+        MssqlTypeLength, PlanOptions, StringPolicy, TableName, UInt64Policy,
     };
 
     #[test]
@@ -204,15 +294,192 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_type_returns_structured_planning_diagnostic() {
-        let schema = Schema::new(vec![Field::new("name", DataType::Utf8, true)]);
+    fn maps_integer_float_string_and_binary_types() {
+        let schema = Schema::new(vec![
+            Field::new("i8_col", DataType::Int8, false),
+            Field::new("i16_col", DataType::Int16, false),
+            Field::new("i64_col", DataType::Int64, false),
+            Field::new("u8_col", DataType::UInt8, false),
+            Field::new("u16_col", DataType::UInt16, false),
+            Field::new("u32_col", DataType::UInt32, false),
+            Field::new("f32_col", DataType::Float32, false),
+            Field::new("f64_col", DataType::Float64, false),
+            Field::new("utf8_col", DataType::Utf8, true),
+            Field::new("large_utf8_col", DataType::LargeUtf8, true),
+            Field::new("binary_col", DataType::Binary, true),
+            Field::new("large_binary_col", DataType::LargeBinary, true),
+        ]);
+        let outcome = MssqlTablePlan::from_arrow_schema(
+            Arc::new(schema),
+            MssqlProfile::sql_server_2016_compat_100(),
+            PlanOptions::default(),
+        )
+        .unwrap();
+        let columns = outcome.value().mssql_columns();
+
+        assert_eq!(columns[0].ty(), &MssqlType::SmallInt);
+        assert_eq!(columns[1].ty(), &MssqlType::SmallInt);
+        assert_eq!(columns[2].ty(), &MssqlType::BigInt);
+        assert_eq!(columns[3].ty(), &MssqlType::TinyInt);
+        assert_eq!(columns[4].ty(), &MssqlType::Int);
+        assert_eq!(columns[5].ty(), &MssqlType::BigInt);
+        assert_eq!(columns[6].ty(), &MssqlType::Real);
+        assert_eq!(columns[7].ty(), &MssqlType::Float { precision: 53 });
+        assert_eq!(columns[8].ty(), &MssqlType::NVarChar(MssqlTypeLength::Max));
+        assert_eq!(columns[9].ty(), &MssqlType::NVarChar(MssqlTypeLength::Max));
+        assert_eq!(
+            columns[10].ty(),
+            &MssqlType::VarBinary(MssqlTypeLength::Max)
+        );
+        assert_eq!(
+            columns[11].ty(),
+            &MssqlType::VarBinary(MssqlTypeLength::Max)
+        );
+    }
+
+    #[test]
+    fn applies_bounded_string_and_binary_policies() {
+        let schema = Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("payload", DataType::Binary, true),
+        ]);
+        let options = PlanOptions {
+            string_policy: StringPolicy::NVarChar(128),
+            binary_policy: BinaryPolicy::VarBinary(256),
+            ..PlanOptions::default()
+        };
+        let outcome = MssqlTablePlan::from_arrow_schema(
+            Arc::new(schema),
+            MssqlProfile::sql_server_2016_compat_100(),
+            options,
+        )
+        .unwrap();
+        let columns = outcome.value().mssql_columns();
+
+        assert_eq!(
+            columns[0].ty(),
+            &MssqlType::NVarChar(MssqlTypeLength::Bounded(128))
+        );
+        assert_eq!(
+            columns[1].ty(),
+            &MssqlType::VarBinary(MssqlTypeLength::Bounded(256))
+        );
+    }
+
+    #[test]
+    fn maps_uint64_when_explicit_policy_is_selected() {
+        let schema = Schema::new(vec![Field::new("u64_col", DataType::UInt64, false)]);
+
+        let decimal_outcome = MssqlTablePlan::from_arrow_schema(
+            Arc::new(schema.clone()),
+            MssqlProfile::sql_server_2016_compat_100(),
+            PlanOptions {
+                uint64_policy: UInt64Policy::Decimal20_0,
+                ..PlanOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            decimal_outcome.value().mssql_columns()[0].ty(),
+            &MssqlType::Decimal {
+                precision: 20,
+                scale: 0
+            }
+        );
+
+        let bigint_outcome = MssqlTablePlan::from_arrow_schema(
+            Arc::new(schema),
+            MssqlProfile::sql_server_2016_compat_100(),
+            PlanOptions {
+                uint64_policy: UInt64Policy::CheckedBigInt,
+                ..PlanOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            bigint_outcome.value().mssql_columns()[0].ty(),
+            &MssqlType::BigInt
+        );
+    }
+
+    #[test]
+    fn default_uint64_policy_returns_structured_planning_diagnostic() {
+        let schema = Schema::new(vec![Field::new("u64_col", DataType::UInt64, false)]);
 
         let err = MssqlTablePlan::from_arrow_schema(
             Arc::new(schema),
             MssqlProfile::sql_server_2016_compat_100(),
             PlanOptions::default(),
         )
-        .expect_err("Utf8 mapping is added in a later step");
+        .expect_err("UInt64 should require explicit policy by default");
+
+        let Error::Planning { diagnostics } = err else {
+            panic!("expected planning error");
+        };
+
+        assert!(diagnostics.has_errors());
+        assert_eq!(diagnostics.len(), 1);
+
+        let diagnostic = &diagnostics.all()[0];
+        assert_eq!(
+            diagnostic.code(),
+            DiagnosticCode::ProfileDependentConversion
+        );
+        assert_eq!(diagnostic.field().unwrap().index(), 0);
+        assert_eq!(diagnostic.field().unwrap().name(), "u64_col");
+    }
+
+    #[test]
+    fn observed_length_policies_return_structured_planning_diagnostics() {
+        let schema = Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("payload", DataType::Binary, true),
+        ]);
+        let options = PlanOptions {
+            string_policy: StringPolicy::ObservedNVarChar,
+            binary_policy: BinaryPolicy::ObservedVarBinary,
+            ..PlanOptions::default()
+        };
+
+        let err = MssqlTablePlan::from_arrow_schema(
+            Arc::new(schema),
+            MssqlProfile::sql_server_2016_compat_100(),
+            options,
+        )
+        .expect_err("observed policies need data, not just schema");
+
+        let Error::Planning { diagnostics } = err else {
+            panic!("expected planning error");
+        };
+
+        assert_eq!(diagnostics.len(), 2);
+        assert!(diagnostics.has_errors());
+        assert_eq!(
+            diagnostics.all()[0].code(),
+            DiagnosticCode::ObservedDataRequired
+        );
+        assert_eq!(diagnostics.all()[0].field().unwrap().name(), "name");
+        assert_eq!(
+            diagnostics.all()[1].code(),
+            DiagnosticCode::ObservedDataRequired
+        );
+        assert_eq!(diagnostics.all()[1].field().unwrap().name(), "payload");
+    }
+
+    #[test]
+    fn unsupported_type_returns_structured_planning_diagnostic() {
+        let schema = Schema::new(vec![Field::new(
+            "values",
+            DataType::new_list(DataType::Int32, true),
+            true,
+        )]);
+
+        let err = MssqlTablePlan::from_arrow_schema(
+            Arc::new(schema),
+            MssqlProfile::sql_server_2016_compat_100(),
+            PlanOptions::default(),
+        )
+        .expect_err("nested mappings are unsupported in v0.1");
 
         let Error::Planning { diagnostics } = err else {
             panic!("expected planning error");
@@ -224,7 +491,7 @@ mod tests {
         let diagnostic = &diagnostics.all()[0];
         assert_eq!(diagnostic.code(), DiagnosticCode::UnsupportedArrowType);
         assert_eq!(diagnostic.field().unwrap().index(), 0);
-        assert_eq!(diagnostic.field().unwrap().name(), "name");
+        assert_eq!(diagnostic.field().unwrap().name(), "values");
     }
 
     #[test]
