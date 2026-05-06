@@ -28,6 +28,9 @@ workspace = true
 name = "arrow_tiberius"
 path = "src/lib.rs"
 
+[features]
+integration-tests = []
+
 [dependencies]
 arrow-schema = "58.2.0"
 snafu = "0.9.0"
