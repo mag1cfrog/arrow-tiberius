@@ -33,6 +33,8 @@ pub enum DiagnosticCode {
     BackendUnavailable,
     /// A mapping depends on explicit user policy.
     ProfileDependentConversion,
+    /// A selected policy needs observed values or statistics, not just schema.
+    ObservedDataRequired,
 }
 
 /// Field location for a diagnostic.

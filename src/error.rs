@@ -2,6 +2,8 @@
 
 use snafu::Snafu;
 
+use crate::DiagnosticSet;
+
 /// Crate-local result type.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -22,4 +24,30 @@ pub enum Error {
         /// Human-readable reason the identifier is invalid.
         reason: String,
     },
+
+    /// Arrow schema planning failed.
+    #[snafu(display("write planning failed with {} diagnostic(s)", diagnostics.len()))]
+    Planning {
+        /// Structured planning diagnostics.
+        diagnostics: DiagnosticSet,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Diagnostic, DiagnosticCode, DiagnosticSet, Error};
+
+    #[test]
+    fn planning_error_display_includes_diagnostic_count() {
+        let diagnostics = DiagnosticSet::from(vec![Diagnostic::error(
+            DiagnosticCode::UnsupportedArrowType,
+            "unsupported",
+        )]);
+        let err = Error::Planning { diagnostics };
+
+        assert_eq!(
+            err.to_string(),
+            "write planning failed with 1 diagnostic(s)"
+        );
+    }
 }
