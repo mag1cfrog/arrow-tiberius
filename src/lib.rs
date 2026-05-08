@@ -28,6 +28,7 @@ pub use mssql::{
 };
 pub use schema::{MssqlTablePlan, SchemaMapping};
 pub use write::{
-    BinaryPolicy, Date64Policy, Decimal256Policy, DecimalPolicy, FloatPolicy, NanosecondPolicy,
-    PlanOptions, SchemaCheck, StringPolicy, TimezonePolicy, UInt64Policy,
+    BinaryPolicy, BulkWriter, Date64Policy, Decimal256Policy, DecimalPolicy, FloatPolicy,
+    NanosecondPolicy, PlanOptions, SchemaCheck, StringPolicy, TimezonePolicy, UInt64Policy,
+    WriteBackend, WriteOptions, WriteStats,
 };

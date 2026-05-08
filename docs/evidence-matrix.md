@@ -211,7 +211,7 @@ Evidence:
 
 Planning implications:
 
-- `WritePlan` should hold enough source-field identity to report diagnostics by
+- `MssqlTablePlan` should hold enough source-field identity to report diagnostics by
   field name and column index.
 - Schema metadata should not silently affect SQL Server DDL in v0.1. If later
   issues want metadata-driven overrides, they should define an explicit policy.
@@ -276,7 +276,7 @@ Evidence:
 
 Planning implications:
 
-- The writer should validate each incoming batch schema against the `WritePlan`.
+- The writer should validate each incoming batch schema against the `MssqlTablePlan`.
 - The writer should process batches incrementally rather than requiring the full
   source table in memory.
 - Unit tests should include schema mismatch cases even before SQL Server
@@ -610,7 +610,7 @@ Planning implications:
   `TokenRow` without private Tiberius APIs.
 - The writer must call `finalize` exactly once after sending rows. Dropping a
   request without finalization is not enough to make rows available.
-- Baseline writing should use a shared `WritePlan` for conversion decisions,
+- Baseline writing should use a shared `MssqlTablePlan` for conversion decisions,
   but destination metadata still comes from Tiberius' `bulk_insert` flow.
 
 ### TokenRow And ColumnData

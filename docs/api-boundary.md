@@ -86,7 +86,7 @@ The final design should support a flow equivalent to:
 
 ```rust
 let profile = MssqlProfile::sql_server_2016_compat_100();
-let plan = WritePlan::from_arrow_schema(schema, profile, PlanOptions::default())?;
+let plan = MssqlTablePlan::from_arrow_schema(schema, profile, PlanOptions::default())?;
 let ddl = plan.create_table_sql(TableName::new("dbo", "target_table"))?;
 
 let mut writer = BulkWriter::new(
@@ -163,7 +163,8 @@ ownership clear:
 pub use error::{Error, Result};
 pub use identifier::TableName;
 pub use profile::MssqlProfile;
-pub use write::{BulkWriter, PlanOptions, WriteOptions, WritePlan};
+pub use schema::MssqlTablePlan;
+pub use write::{BulkWriter, PlanOptions, WriteOptions};
 ```
 
 Implementation-only code should stay under private modules inside `write` or
@@ -202,7 +203,7 @@ The initial profile should capture:
 
 Planning implications:
 
-- `MssqlProfile` should be copied into or referenced by `WritePlan` so the plan
+- `MssqlProfile` should be copied into or referenced by `MssqlTablePlan` so the plan
   remains stable after construction.
 - Profiles should be value objects with no network access.
 - Future profiles may add newer SQL Server behavior, but v0.1 should not require
@@ -264,13 +265,13 @@ identifier is the target identity after policy is applied.
 ## Planning And DDL API
 
 Planning converts an Arrow schema plus SQL Server profile and policy options
-into an immutable `WritePlan`. The plan should be reusable across batches with
+into an immutable `MssqlTablePlan`. The plan should be reusable across batches with
 the same expected schema.
 
 Candidate public shape:
 
 ```rust
-pub struct WritePlan {
+pub struct MssqlTablePlan {
     // private fields
 }
 
@@ -283,7 +284,7 @@ pub struct PlanOptions {
 }
 
 pub struct PlanOutcome {
-    pub plan: WritePlan,
+    pub plan: MssqlTablePlan,
     pub diagnostics: Vec<Diagnostic>,
 }
 ```
@@ -291,7 +292,7 @@ pub struct PlanOutcome {
 Candidate constructors and accessors:
 
 ```rust
-impl WritePlan {
+impl MssqlTablePlan {
     pub fn from_arrow_schema(
         schema: impl Into<Arc<Schema>>,
         profile: MssqlProfile,
@@ -307,15 +308,15 @@ impl WritePlan {
 
 Design decisions:
 
-- `WritePlan` should be immutable after construction.
+- `MssqlTablePlan` should be immutable after construction.
 - Planning should preserve Arrow field order as SQL column order unless a future
   issue adds explicit reordering.
 - Planning should preserve source Arrow field identity for diagnostics.
 - `PlanOutcome` should allow a usable plan with warnings.
 - Unsupported Arrow types, invalid identifiers, incompatible precision/scale,
   and lossy conversions without explicit policy should be planning errors.
-- DDL rendering should be a method on `WritePlan` or a small `DdlRenderer`
-  wrapper over `WritePlan`; v0.1 can start with `WritePlan::create_table_sql`.
+- DDL rendering should be a method on `MssqlTablePlan` or a small `DdlRenderer`
+  wrapper over `MssqlTablePlan`; v0.1 can start with `MssqlTablePlan::create_table_sql`.
 - DDL rendering should produce deterministic SQL text for reviewable tests.
 - v0.1 should only design `CREATE TABLE` rendering. `DROP`, `MERGE`, `TRUNCATE`,
   migration, and schema-diff APIs are out of scope.
@@ -446,7 +447,7 @@ Planning implications:
 
 ## Writer API
 
-The writer API should execute a previously constructed `WritePlan` against a
+The writer API should execute a previously constructed `MssqlTablePlan` against a
 caller-supplied Tiberius client. The caller remains responsible for creating,
 configuring, authenticating, pooling, and dropping the client.
 
@@ -474,7 +475,7 @@ impl<'client, C> BulkWriter<'client, C> {
     pub async fn new(
         client: &'client mut C,
         table: TableName,
-        plan: WritePlan,
+        plan: MssqlTablePlan,
         options: WriteOptions,
     ) -> Result<Self>;
 
@@ -498,7 +499,7 @@ Design decisions:
   `finish`.
 - Empty batches should be accepted if their schema matches the plan and should
   not force special-case user code.
-- `WritePlan` should be owned by the writer unless implementation proves that
+- `MssqlTablePlan` should be owned by the writer unless implementation proves that
   borrowing is materially better. Ownership avoids lifetime coupling between
   planning and async writing.
 
@@ -525,7 +526,7 @@ The convenience stream API should be layered on top of `BulkWriter`:
 pub async fn write_record_batch_stream<C, S>(
     client: &mut C,
     table: TableName,
-    plan: WritePlan,
+    plan: MssqlTablePlan,
     stream: S,
     options: WriteOptions,
 ) -> Result<WriteStats>
@@ -595,7 +596,7 @@ Design decisions:
 - The selected backend must not require a different public client type.
 
 `WriteOptions` should be execution-focused. It should not duplicate conversion
-policies already captured in `PlanOptions` and frozen into `WritePlan`.
+policies already captured in `PlanOptions` and frozen into `MssqlTablePlan`.
 
 Candidate default:
 
@@ -721,7 +722,7 @@ Design decisions:
 
 ## Write-Time Schema Compatibility
 
-`WritePlan` is created from an Arrow schema. Every batch written through a
+`MssqlTablePlan` is created from an Arrow schema. Every batch written through a
 writer should be checked against that planned schema before rows are encoded.
 
 Candidate public shape:
@@ -773,16 +774,16 @@ type. It should not support both upstream Tiberius and a forked Tiberius package
 at the same time because Rust treats those as different concrete types even when
 their APIs are similar.
 
-Preferred dependency posture after issue #13 exists:
+Published dependency posture from issue #13:
 
 ```toml
 [dependencies]
-tiberius = { package = "tiberius-arrow", version = "0.12.3-arrow.1" }
+tiberius = { package = "tiberius-raw-bulk", version = "0.12.3-raw-bulk.1" }
 ```
 
-The package name above is illustrative. Issue #13 owns the final crates.io
-package name and versioning policy. The API requirement from this issue is that
-`arrow-tiberius` imports and exposes one crate name for the client type.
+This is the published fork package from issue #13. The API requirement from
+this issue is that `arrow-tiberius` imports and exposes one crate name for the
+client type.
 
 Design decisions:
 
@@ -806,7 +807,7 @@ impl<'client> BulkWriter<'client> {
     pub async fn new(
         client: &'client mut tiberius::Client<CompatStream>,
         table: TableName,
-        plan: WritePlan,
+        plan: MssqlTablePlan,
         options: WriteOptions,
     ) -> Result<Self>;
 }
