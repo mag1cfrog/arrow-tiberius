@@ -1,12 +1,10 @@
 //! Bidirectional Arrow/MSSQL schema mapping.
 //!
-//! The plan is built from an Arrow schema in v0.1 because the first operation is
-//! Arrow-to-SQL Server writing. The resulting model keeps Arrow field metadata
-//! and MSSQL column metadata as peer concepts so future SQL Server-to-Arrow read
-//! planning can reuse the shared representation instead of inheriting a
-//! write-only column model.
-
-use std::sync::Arc;
+//! The initial mapping function starts from an Arrow schema because the first
+//! operation is Arrow-to-SQL Server writing. The resulting `SchemaMapping`
+//! values keep Arrow field metadata and MSSQL column metadata as peer concepts
+//! so future SQL Server-to-Arrow read planning can reuse the shared
+//! representation instead of inheriting a write-only column model.
 
 use arrow_schema::{Field, Schema};
 
@@ -17,73 +15,45 @@ use crate::{
     MssqlProfile, PlanOutcome, Result, SchemaMapping, TableName, create_table_sql,
 };
 
-/// Immutable Arrow/MSSQL table schema plan.
-#[derive(Debug, Clone)]
-pub struct MssqlTablePlan {
-    arrow_schema: Arc<Schema>,
-    profile: MssqlProfile,
-    mappings: Vec<SchemaMapping>,
+/// Plans Arrow/MSSQL column mappings from an Arrow schema.
+pub fn plan_arrow_schema_to_mssql_mappings(
+    schema: impl AsRef<Schema>,
+    _profile: MssqlProfile,
+    options: PlanOptions,
+) -> Result<PlanOutcome<Vec<SchemaMapping>>> {
+    let schema = schema.as_ref();
+    let mut mappings = Vec::with_capacity(schema.fields().len());
+    let mut diagnostics = DiagnosticSet::new();
+
+    for (index, field) in schema.fields().iter().enumerate() {
+        match plan_arrow_field_to_mssql_column_mapping(index, field, &options) {
+            Ok(mapping) => mappings.push(mapping),
+            Err(diagnostic) => diagnostics.push(diagnostic),
+        }
+    }
+
+    if diagnostics.has_errors() {
+        return Err(crate::Error::Planning { diagnostics });
+    }
+
+    Ok(PlanOutcome::new(mappings, diagnostics))
 }
 
-impl MssqlTablePlan {
-    /// Creates an Arrow/MSSQL table plan from an Arrow schema.
-    pub fn from_arrow_schema(
-        schema: impl Into<Arc<Schema>>,
-        profile: MssqlProfile,
-        options: PlanOptions,
-    ) -> Result<PlanOutcome<Self>> {
-        let schema = schema.into();
-        let mut mappings = Vec::with_capacity(schema.fields().len());
-        let mut diagnostics = DiagnosticSet::new();
+/// Returns the planned MSSQL columns in mapping order.
+pub fn mssql_columns_from_mappings(mappings: &[SchemaMapping]) -> Vec<MssqlColumn> {
+    mappings
+        .iter()
+        .map(|mapping| mapping.mssql().clone())
+        .collect()
+}
 
-        for (index, field) in schema.fields().iter().enumerate() {
-            match plan_arrow_field_to_mssql_column_mapping(index, field, &options) {
-                Ok(mapping) => mappings.push(mapping),
-                Err(diagnostic) => diagnostics.push(diagnostic),
-            }
-        }
-
-        if diagnostics.has_errors() {
-            return Err(crate::Error::Planning { diagnostics });
-        }
-
-        Ok(PlanOutcome::new(
-            Self {
-                arrow_schema: schema,
-                profile,
-                mappings,
-            },
-            diagnostics,
-        ))
-    }
-
-    /// Returns the source Arrow schema used to build this plan.
-    pub fn arrow_schema(&self) -> &Schema {
-        &self.arrow_schema
-    }
-
-    /// Returns the SQL Server planning profile.
-    pub const fn profile(&self) -> MssqlProfile {
-        self.profile
-    }
-
-    /// Returns the planned Arrow/MSSQL mappings in schema order.
-    pub fn mappings(&self) -> &[SchemaMapping] {
-        &self.mappings
-    }
-
-    /// Returns the planned MSSQL columns in schema order.
-    pub fn mssql_columns(&self) -> Vec<MssqlColumn> {
-        self.mappings
-            .iter()
-            .map(|mapping| mapping.mssql().clone())
-            .collect()
-    }
-
-    /// Renders deterministic `CREATE TABLE` SQL from the MSSQL side.
-    pub fn create_table_sql(&self, table: &TableName) -> String {
-        create_table_sql(table, &self.mssql_columns(), crate::CreateTableOptions)
-    }
+/// Renders deterministic `CREATE TABLE` SQL from mapping metadata.
+pub fn create_table_sql_from_mappings(table: &TableName, mappings: &[SchemaMapping]) -> String {
+    create_table_sql(
+        table,
+        &mssql_columns_from_mappings(mappings),
+        crate::CreateTableOptions,
+    )
 }
 
 fn plan_arrow_field_to_mssql_column_mapping(
@@ -116,7 +86,9 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema, UnionFields, UnionMode};
 
     use crate::{
-        DiagnosticCode, Error, MssqlProfile, MssqlTablePlan, MssqlType, PlanOptions, TableName,
+        DiagnosticCode, Error, MssqlProfile, MssqlType, PlanOptions, TableName,
+        create_table_sql_from_mappings, mssql_columns_from_mappings,
+        plan_arrow_schema_to_mssql_mappings,
     };
 
     #[test]
@@ -126,19 +98,17 @@ mod tests {
             Field::new("quantity", DataType::Int32, true),
         ]));
 
-        let outcome = MssqlTablePlan::from_arrow_schema(
+        let outcome = plan_arrow_schema_to_mssql_mappings(
             Arc::clone(&schema),
             MssqlProfile::sql_server_2016_compat_100(),
             PlanOptions::default(),
         )
         .unwrap();
-        let plan = outcome.value();
+        let mappings = outcome.value();
 
-        assert_eq!(plan.arrow_schema(), schema.as_ref());
-        assert_eq!(plan.profile(), MssqlProfile::sql_server_2016_compat_100());
-        assert_eq!(plan.mappings().len(), 2);
+        assert_eq!(mappings.len(), 2);
 
-        let is_active = &plan.mappings()[0];
+        let is_active = &mappings[0];
         assert_eq!(is_active.arrow().index(), 0);
         assert_eq!(is_active.arrow().name(), "is_active");
         assert_eq!(is_active.arrow().data_type(), &DataType::Boolean);
@@ -147,7 +117,7 @@ mod tests {
         assert!(!is_active.mssql().nullable());
         assert_eq!(is_active.mssql().ty(), &MssqlType::Bit);
 
-        let quantity = &plan.mappings()[1];
+        let quantity = &mappings[1];
         assert_eq!(quantity.arrow().index(), 1);
         assert_eq!(quantity.arrow().name(), "quantity");
         assert_eq!(quantity.arrow().data_type(), &DataType::Int32);
@@ -163,7 +133,7 @@ mod tests {
             Field::new("is_active", DataType::Boolean, false),
             Field::new("quantity", DataType::Int32, true),
         ]);
-        let outcome = MssqlTablePlan::from_arrow_schema(
+        let outcome = plan_arrow_schema_to_mssql_mappings(
             Arc::new(schema),
             MssqlProfile::sql_server_2016_compat_100(),
             PlanOptions::default(),
@@ -171,7 +141,7 @@ mod tests {
         .unwrap();
         let table = TableName::new("dbo", "target").unwrap();
 
-        let sql = outcome.value().create_table_sql(&table);
+        let sql = create_table_sql_from_mappings(&table, outcome.value());
 
         assert_eq!(
             sql,
@@ -182,14 +152,14 @@ mod tests {
     #[test]
     fn exposes_mssql_columns_without_arrow_identity() {
         let schema = Schema::new(vec![Field::new("is_active", DataType::Boolean, false)]);
-        let outcome = MssqlTablePlan::from_arrow_schema(
+        let outcome = plan_arrow_schema_to_mssql_mappings(
             Arc::new(schema),
             MssqlProfile::sql_server_2016_compat_100(),
             PlanOptions::default(),
         )
         .unwrap();
 
-        let columns = outcome.value().mssql_columns();
+        let columns = mssql_columns_from_mappings(outcome.value());
 
         assert_eq!(columns.len(), 1);
         assert_eq!(columns[0].name().as_str(), "is_active");
@@ -234,7 +204,7 @@ mod tests {
             ),
         ]);
 
-        let err = MssqlTablePlan::from_arrow_schema(
+        let err = plan_arrow_schema_to_mssql_mappings(
             Arc::new(schema),
             MssqlProfile::sql_server_2016_compat_100(),
             PlanOptions::default(),
@@ -287,7 +257,7 @@ mod tests {
     fn invalid_identifier_returns_structured_planning_diagnostic() {
         let schema = Schema::new(vec![Field::new("", DataType::Boolean, false)]);
 
-        let err = MssqlTablePlan::from_arrow_schema(
+        let err = plan_arrow_schema_to_mssql_mappings(
             Arc::new(schema),
             MssqlProfile::sql_server_2016_compat_100(),
             PlanOptions::default(),

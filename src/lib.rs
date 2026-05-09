@@ -26,7 +26,10 @@ pub use mssql::{
     CompatibilityLevel, CreateTableOptions, Identifier, IdentifierPolicy, MssqlColumn,
     MssqlProfile, MssqlType, MssqlTypeLength, MssqlVersion, TableName, create_table_sql,
 };
-pub use schema::{MssqlTablePlan, SchemaMapping};
+pub use schema::{
+    SchemaMapping, create_table_sql_from_mappings, mssql_columns_from_mappings,
+    plan_arrow_schema_to_mssql_mappings,
+};
 pub use write::{
     BinaryPolicy, BulkWriter, Date64Policy, Decimal256Policy, DecimalPolicy, FloatPolicy,
     NanosecondPolicy, PlanOptions, SchemaCheck, StringPolicy, TimezonePolicy, UInt64Policy,
