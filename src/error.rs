@@ -32,6 +32,16 @@ pub enum Error {
         diagnostics: DiagnosticSet,
     },
 
+    /// Runtime value conversion failed.
+    #[snafu(display(
+        "value conversion failed with {} diagnostic(s)",
+        diagnostics.len()
+    ))]
+    ValueConversion {
+        /// Structured value conversion diagnostics.
+        diagnostics: DiagnosticSet,
+    },
+
     /// A requested write backend is not available.
     #[snafu(display("write backend {backend:?} is unavailable: {reason}"))]
     BackendUnavailable {
@@ -57,6 +67,20 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "write planning failed with 1 diagnostic(s)"
+        );
+    }
+
+    #[test]
+    fn value_conversion_error_display_includes_diagnostic_count() {
+        let diagnostics = DiagnosticSet::from(vec![Diagnostic::error(
+            DiagnosticCode::ValueConversionUnsupported,
+            "unsupported conversion",
+        )]);
+        let err = Error::ValueConversion { diagnostics };
+
+        assert_eq!(
+            err.to_string(),
+            "value conversion failed with 1 diagnostic(s)"
         );
     }
 
