@@ -2,17 +2,20 @@
 
 use arrow_schema::DataType;
 
-/// Planned Arrow field metadata.
+/// Reference to an Arrow source field used by a schema mapping.
+///
+/// This is this crate's mapped source-field metadata. It is not a replacement
+/// for `arrow_schema::Field`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ArrowFieldPlan {
+pub struct ArrowFieldRef {
     index: usize,
     name: String,
     nullable: bool,
     data_type: DataType,
 }
 
-impl ArrowFieldPlan {
-    /// Creates planned Arrow field metadata.
+impl ArrowFieldRef {
+    /// Creates an Arrow source field reference.
     pub const fn new(index: usize, name: String, nullable: bool, data_type: DataType) -> Self {
         Self {
             index,

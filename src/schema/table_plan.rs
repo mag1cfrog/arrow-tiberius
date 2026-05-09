@@ -15,9 +15,9 @@ use crate::write::{
     StringPolicy, TimezonePolicy, UInt64Policy,
 };
 use crate::{
-    ArrowFieldPlan, Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, Identifier,
-    MssqlColumnPlan, MssqlProfile, MssqlType, MssqlTypeLength, PlanOutcome, Result, SchemaMapping,
-    TableName, create_table_sql,
+    ArrowFieldRef, Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, Identifier, MssqlColumn,
+    MssqlProfile, MssqlType, MssqlTypeLength, PlanOutcome, Result, SchemaMapping, TableName,
+    create_table_sql,
 };
 
 /// Immutable Arrow/MSSQL table schema plan.
@@ -76,7 +76,7 @@ impl MssqlTablePlan {
     }
 
     /// Returns the planned MSSQL columns in schema order.
-    pub fn mssql_columns(&self) -> Vec<MssqlColumnPlan> {
+    pub fn mssql_columns(&self) -> Vec<MssqlColumn> {
         self.mappings
             .iter()
             .map(|mapping| mapping.mssql().clone())
@@ -150,13 +150,13 @@ fn plan_arrow_field_to_mssql_column_mapping(
         }
     };
 
-    let arrow = ArrowFieldPlan::new(
+    let arrow = ArrowFieldRef::new(
         index,
         field.name().clone(),
         field.is_nullable(),
         field.data_type().clone(),
     );
-    let mssql = MssqlColumnPlan::new(name, ty, field.is_nullable());
+    let mssql = MssqlColumn::new(name, ty, field.is_nullable());
 
     Ok(SchemaMapping::new(arrow, mssql))
 }

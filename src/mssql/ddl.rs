@@ -1,6 +1,6 @@
 //! Deterministic SQL Server DDL rendering helpers.
 
-use super::{MssqlColumnPlan, TableName};
+use super::{MssqlColumn, TableName};
 
 /// Options for `CREATE TABLE` rendering.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -9,7 +9,7 @@ pub struct CreateTableOptions;
 /// Renders deterministic SQL Server `CREATE TABLE` DDL.
 pub fn create_table_sql(
     table: &TableName,
-    columns: &[MssqlColumnPlan],
+    columns: &[MssqlColumn],
     _options: CreateTableOptions,
 ) -> String {
     let mut sql = format!("CREATE TABLE {} (", table.quoted_sql());
@@ -33,7 +33,7 @@ pub fn create_table_sql(
 #[cfg(test)]
 mod tests {
     use crate::{
-        CreateTableOptions, Identifier, MssqlColumnPlan, MssqlType, MssqlTypeLength, TableName,
+        CreateTableOptions, Identifier, MssqlColumn, MssqlType, MssqlTypeLength, TableName,
         create_table_sql,
     };
 
@@ -41,8 +41,8 @@ mod tests {
     fn renders_create_table_with_deterministic_formatting() {
         let table = TableName::new("dbo", "target").unwrap();
         let columns = vec![
-            MssqlColumnPlan::new(Identifier::new("id").unwrap(), MssqlType::Int, false),
-            MssqlColumnPlan::new(
+            MssqlColumn::new(Identifier::new("id").unwrap(), MssqlType::Int, false),
+            MssqlColumn::new(
                 Identifier::new("name").unwrap(),
                 MssqlType::NVarChar(MssqlTypeLength::Max),
                 true,
@@ -60,7 +60,7 @@ mod tests {
     #[test]
     fn quotes_table_and_column_identifiers() {
         let table = TableName::new("dbo.part", "target]part").unwrap();
-        let columns = vec![MssqlColumnPlan::new(
+        let columns = vec![MssqlColumn::new(
             Identifier::new("select]from").unwrap(),
             MssqlType::Bit,
             false,
@@ -87,7 +87,7 @@ mod tests {
     fn renders_decimal_and_temporal_columns() {
         let table = TableName::new("dbo", "events").unwrap();
         let columns = vec![
-            MssqlColumnPlan::new(
+            MssqlColumn::new(
                 Identifier::new("amount").unwrap(),
                 MssqlType::Decimal {
                     precision: 38,
@@ -95,17 +95,17 @@ mod tests {
                 },
                 false,
             ),
-            MssqlColumnPlan::new(
+            MssqlColumn::new(
                 Identifier::new("event_date").unwrap(),
                 MssqlType::Date,
                 true,
             ),
-            MssqlColumnPlan::new(
+            MssqlColumn::new(
                 Identifier::new("created_at").unwrap(),
                 MssqlType::DateTime2 { precision: 7 },
                 false,
             ),
-            MssqlColumnPlan::new(
+            MssqlColumn::new(
                 Identifier::new("source_offset").unwrap(),
                 MssqlType::DateTimeOffset { precision: 7 },
                 true,
