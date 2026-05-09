@@ -45,6 +45,7 @@ pub struct BulkWriter<'client, S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    backend: WriteBackend,
     _client: PhantomData<&'client mut tiberius::Client<S>>,
 }
 
@@ -68,7 +69,7 @@ where
     /// Writes one Arrow record batch.
     pub async fn write_batch(&mut self, _batch: &RecordBatch) -> Result<WriteStats> {
         Err(crate::Error::BackendUnavailable {
-            backend: WriteBackend::Auto,
+            backend: self.backend,
             reason: "bulk writer execution is not implemented yet".to_owned(),
         })
     }
@@ -76,7 +77,7 @@ where
     /// Finalizes the bulk writer and returns cumulative write statistics.
     pub async fn finish(self) -> Result<WriteStats> {
         Err(crate::Error::BackendUnavailable {
-            backend: WriteBackend::Auto,
+            backend: self.backend,
             reason: "bulk writer execution is not implemented yet".to_owned(),
         })
     }
@@ -85,14 +86,19 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
+        future::Future,
+        marker::PhantomData,
         pin::Pin,
-        task::{Context, Poll},
+        sync::Arc,
+        task::{Context, Poll, Wake, Waker},
     };
 
+    use arrow_array::RecordBatch;
+    use arrow_schema::Schema;
     use futures_util::io::{AsyncRead, AsyncWrite};
 
-    use super::{WriteBackend, WriteOptions, WriteStats};
-    use crate::{BulkWriter, SchemaCheck};
+    use super::{BulkWriter, WriteBackend, WriteOptions, WriteStats};
+    use crate::SchemaCheck;
 
     #[test]
     fn write_backend_defaults_to_auto() {
@@ -108,6 +114,23 @@ mod tests {
     }
 
     #[test]
+    fn write_options_preserve_explicit_backend_selection() {
+        for backend in [
+            WriteBackend::Auto,
+            WriteBackend::BaselineTokenRow,
+            WriteBackend::DirectRawBulk,
+        ] {
+            let options = WriteOptions {
+                backend,
+                schema_check: SchemaCheck::Strict,
+            };
+
+            assert_eq!(options.backend, backend);
+            assert_eq!(options.schema_check, SchemaCheck::Strict);
+        }
+    }
+
+    #[test]
     fn write_stats_default_to_zero() {
         let stats = WriteStats::default();
 
@@ -120,7 +143,7 @@ mod tests {
         assert_eq!(crate::WriteBackend::default(), WriteBackend::Auto);
         assert_eq!(crate::WriteOptions::default(), WriteOptions::default());
         assert_eq!(crate::WriteStats::default(), WriteStats::default());
-        let _ = std::any::type_name::<BulkWriter<'static, DummyStream>>();
+        let _ = std::any::type_name::<crate::BulkWriter<'static, DummyStream>>();
     }
 
     #[test]
@@ -128,6 +151,77 @@ mod tests {
         let name = std::any::type_name::<tiberius::Client<DummyStream>>();
 
         assert!(name.contains("tiberius"));
+    }
+
+    #[test]
+    fn write_batch_rejects_all_backends_until_execution_is_implemented() {
+        let batch = empty_batch();
+
+        for backend in [
+            WriteBackend::Auto,
+            WriteBackend::BaselineTokenRow,
+            WriteBackend::DirectRawBulk,
+        ] {
+            let mut writer = skeleton_writer(backend);
+            let result = poll_ready(writer.write_batch(&batch));
+
+            assert_backend_unavailable(result, backend);
+        }
+    }
+
+    #[test]
+    fn finish_rejects_all_backends_until_execution_is_implemented() {
+        for backend in [
+            WriteBackend::Auto,
+            WriteBackend::BaselineTokenRow,
+            WriteBackend::DirectRawBulk,
+        ] {
+            let writer = skeleton_writer(backend);
+            let result = poll_ready(writer.finish());
+
+            assert_backend_unavailable(result, backend);
+        }
+    }
+
+    fn skeleton_writer(backend: WriteBackend) -> BulkWriter<'static, DummyStream> {
+        BulkWriter {
+            backend,
+            _client: PhantomData,
+        }
+    }
+
+    fn empty_batch() -> RecordBatch {
+        RecordBatch::new_empty(Arc::new(Schema::empty()))
+    }
+
+    fn assert_backend_unavailable(result: crate::Result<WriteStats>, expected: WriteBackend) {
+        match result {
+            Err(crate::Error::BackendUnavailable { backend, reason }) => {
+                assert_eq!(backend, expected);
+                assert_eq!(reason, "bulk writer execution is not implemented yet");
+            }
+            other => panic!("expected backend-unavailable error, got {other:?}"),
+        }
+    }
+
+    fn poll_ready<F>(future: F) -> F::Output
+    where
+        F: Future,
+    {
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut context = Context::from_waker(&waker);
+        let mut future = Box::pin(future);
+
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("future unexpectedly returned pending"),
+        }
+    }
+
+    struct NoopWake;
+
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
     }
 
     #[derive(Debug)]
