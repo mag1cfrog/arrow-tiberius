@@ -35,6 +35,18 @@ pub enum DiagnosticCode {
     ProfileDependentConversion,
     /// A selected policy needs observed values or statistics, not just schema.
     ObservedDataRequired,
+    /// A planned value conversion is not supported by the current converter.
+    ValueConversionUnsupported,
+    /// A runtime value or array type does not match the planned conversion.
+    ValueTypeMismatch,
+    /// A runtime null value was found for a non-nullable target column.
+    NullInNonNullableColumn,
+    /// A floating-point value is not finite.
+    NonFiniteFloat,
+    /// A runtime value exceeds the planned target type length.
+    ValueTooLong,
+    /// A requested row index is outside the runtime batch.
+    RowIndexOutOfBounds,
 }
 
 /// Field location for a diagnostic.
@@ -71,6 +83,7 @@ pub struct Diagnostic {
     code: DiagnosticCode,
     message: String,
     field: Option<FieldRef>,
+    row: Option<usize>,
 }
 
 impl Diagnostic {
@@ -85,6 +98,7 @@ impl Diagnostic {
             code,
             message: message.into(),
             field: None,
+            row: None,
         }
     }
 
@@ -102,6 +116,13 @@ impl Diagnostic {
     #[must_use]
     pub fn with_field(mut self, field: FieldRef) -> Self {
         self.field = Some(field);
+        self
+    }
+
+    /// Attaches row location to this diagnostic.
+    #[must_use]
+    pub const fn with_row(mut self, row: usize) -> Self {
+        self.row = Some(row);
         self
     }
 
@@ -123,6 +144,11 @@ impl Diagnostic {
     /// Returns the optional field location.
     pub fn field(&self) -> Option<&FieldRef> {
         self.field.as_ref()
+    }
+
+    /// Returns the optional row location.
+    pub const fn row(&self) -> Option<usize> {
+        self.row
     }
 
     /// Returns true if this diagnostic is an error.
@@ -233,6 +259,25 @@ mod tests {
         let field = diagnostic.field().unwrap();
         assert_eq!(field.index(), 2);
         assert_eq!(field.name(), "amount");
+        assert_eq!(diagnostic.row(), None);
+    }
+
+    #[test]
+    fn creates_row_and_field_diagnostic() {
+        let diagnostic = Diagnostic::error(
+            DiagnosticCode::NullInNonNullableColumn,
+            "null value cannot be written",
+        )
+        .with_field(FieldRef::new(3, "name"))
+        .with_row(42);
+
+        assert_eq!(diagnostic.severity(), DiagnosticSeverity::Error);
+        assert_eq!(diagnostic.code(), DiagnosticCode::NullInNonNullableColumn);
+        assert_eq!(diagnostic.row(), Some(42));
+
+        let field = diagnostic.field().unwrap();
+        assert_eq!(field.index(), 3);
+        assert_eq!(field.name(), "name");
     }
 
     #[test]
