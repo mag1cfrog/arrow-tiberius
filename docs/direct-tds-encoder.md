@@ -135,19 +135,19 @@ The fork package should:
 - remain close to upstream Tiberius;
 - document its upstream base version and patch set;
 - expose one Tiberius client family used by both baseline and direct backends;
-- support dependency aliasing so `arrow-tiberius` can import it as `tiberius`
-  if the final package name differs.
+- support dependency aliasing so `arrow-tiberius` can import the published fork
+  as `tiberius`.
 
-Illustrative dependency shape:
+Published dependency shape:
 
 ```toml
 [dependencies]
-tiberius = { package = "tiberius-arrow", version = "0.12.3-arrow.1" }
+tiberius = { package = "tiberius-raw-bulk", version = "0.12.3-raw-bulk.1" }
 ```
 
-The package name and version above are placeholders. The important requirement
-is that `arrow-tiberius` does not expose both upstream and forked Tiberius
-client types.
+The package name and version above are the published fork dependency. The
+important requirement is that `arrow-tiberius` does not expose both upstream and
+forked Tiberius client types.
 
 ## Direct Encoder Inputs
 

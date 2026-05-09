@@ -2,7 +2,7 @@
 
 use snafu::Snafu;
 
-use crate::DiagnosticSet;
+use crate::{DiagnosticSet, WriteBackend};
 
 /// Crate-local result type.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -31,6 +31,15 @@ pub enum Error {
         /// Structured planning diagnostics.
         diagnostics: DiagnosticSet,
     },
+
+    /// A requested write backend is not available.
+    #[snafu(display("write backend {backend:?} is unavailable: {reason}"))]
+    BackendUnavailable {
+        /// Requested write backend.
+        backend: WriteBackend,
+        /// Human-readable reason the backend is unavailable.
+        reason: String,
+    },
 }
 
 #[cfg(test)]
@@ -48,6 +57,19 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "write planning failed with 1 diagnostic(s)"
+        );
+    }
+
+    #[test]
+    fn backend_unavailable_error_display_includes_backend() {
+        let err = Error::BackendUnavailable {
+            backend: crate::WriteBackend::DirectRawBulk,
+            reason: "not implemented".to_owned(),
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "write backend DirectRawBulk is unavailable: not implemented"
         );
     }
 }
