@@ -3,4 +3,4 @@
 /// Arrow field metadata model.
 pub mod field;
 
-pub use field::ArrowFieldPlan;
+pub use field::ArrowFieldRef;

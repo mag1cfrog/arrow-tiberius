@@ -2,16 +2,16 @@
 
 use super::{Identifier, MssqlType};
 
-/// Planned MSSQL column metadata.
+/// MSSQL column metadata used by a schema mapping.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MssqlColumnPlan {
+pub struct MssqlColumn {
     name: Identifier,
     ty: MssqlType,
     nullable: bool,
 }
 
-impl MssqlColumnPlan {
-    /// Creates planned MSSQL column metadata.
+impl MssqlColumn {
+    /// Creates MSSQL column metadata.
     pub const fn new(name: Identifier, ty: MssqlType, nullable: bool) -> Self {
         Self { name, ty, nullable }
     }

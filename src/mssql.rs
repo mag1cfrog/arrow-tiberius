@@ -11,7 +11,7 @@ pub mod profile;
 /// MSSQL type model.
 pub mod ty;
 
-pub use column::MssqlColumnPlan;
+pub use column::MssqlColumn;
 pub use ddl::{CreateTableOptions, create_table_sql};
 pub use identifier::{Identifier, IdentifierPolicy, TableName};
 pub use profile::{CompatibilityLevel, MssqlProfile, MssqlVersion};

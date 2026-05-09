@@ -17,13 +17,13 @@ pub mod schema;
 /// Write-path options and conversion policies.
 pub mod write;
 
-pub use arrow::ArrowFieldPlan;
+pub use arrow::ArrowFieldRef;
 pub use diagnostic::{
     Diagnostic, DiagnosticCode, DiagnosticSet, DiagnosticSeverity, FieldRef, PlanOutcome,
 };
 pub use error::{Error, Result};
 pub use mssql::{
-    CompatibilityLevel, CreateTableOptions, Identifier, IdentifierPolicy, MssqlColumnPlan,
+    CompatibilityLevel, CreateTableOptions, Identifier, IdentifierPolicy, MssqlColumn,
     MssqlProfile, MssqlType, MssqlTypeLength, MssqlVersion, TableName, create_table_sql,
 };
 pub use schema::{MssqlTablePlan, SchemaMapping};
