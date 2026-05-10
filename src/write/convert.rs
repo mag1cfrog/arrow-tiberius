@@ -573,7 +573,7 @@ fn validate_runtime_columns(batch: &RecordBatch, mappings: &[SchemaMapping]) -> 
         let mapping = &mappings[batch.num_columns()];
         return Err(value_conversion_error(mapping_diagnostic(
             mapping,
-            DiagnosticCode::ValueTypeMismatch,
+            DiagnosticCode::SchemaMismatch,
             format!(
                 "planned column index {} is outside runtime batch with {} column(s)",
                 mapping.arrow().index(),
@@ -584,7 +584,7 @@ fn validate_runtime_columns(batch: &RecordBatch, mappings: &[SchemaMapping]) -> 
 
     if batch.num_columns() > mappings.len() {
         return Err(value_conversion_error(Diagnostic::error(
-            DiagnosticCode::ValueTypeMismatch,
+            DiagnosticCode::SchemaMismatch,
             format!(
                 "runtime batch has {} column(s) but mappings contain {} column(s)",
                 batch.num_columns(),
@@ -593,14 +593,32 @@ fn validate_runtime_columns(batch: &RecordBatch, mappings: &[SchemaMapping]) -> 
         )));
     }
 
-    for (position, (array, mapping)) in batch.columns().iter().zip(mappings).enumerate() {
+    for (position, (field, (array, mapping))) in batch
+        .schema()
+        .fields()
+        .iter()
+        .zip(batch.columns().iter().zip(mappings))
+        .enumerate()
+    {
         if mapping.arrow().index() != position {
             return Err(value_conversion_error(mapping_diagnostic(
                 mapping,
-                DiagnosticCode::ValueTypeMismatch,
+                DiagnosticCode::SchemaMismatch,
                 format!(
                     "mapping position {position} does not match planned Arrow field index {}",
                     mapping.arrow().index()
+                ),
+            )));
+        }
+
+        if field.name() != mapping.arrow().name() {
+            return Err(value_conversion_error(mapping_diagnostic(
+                mapping,
+                DiagnosticCode::SchemaMismatch,
+                format!(
+                    "runtime Arrow field name {} does not match planned Arrow field name {}",
+                    field.name(),
+                    mapping.arrow().name()
                 ),
             )));
         }
@@ -615,7 +633,7 @@ fn validate_runtime_column(array: &dyn Array, mapping: &SchemaMapping) -> Result
     if array.data_type() != mapping.arrow().data_type() {
         return Err(value_conversion_error(mapping_diagnostic(
             mapping,
-            DiagnosticCode::ValueTypeMismatch,
+            DiagnosticCode::SchemaMismatch,
             format!(
                 "runtime Arrow type {} does not match planned Arrow type {}",
                 array.data_type(),
@@ -1707,7 +1725,7 @@ mod tests {
 
         assert_single_diagnostic(
             err,
-            DiagnosticCode::ValueTypeMismatch,
+            DiagnosticCode::SchemaMismatch,
             None,
             Some((1, "active")),
         );
@@ -1731,7 +1749,7 @@ mod tests {
 
         let err = RecordBatchView::new(&batch, &mappings).unwrap_err();
 
-        assert_single_diagnostic(err, DiagnosticCode::ValueTypeMismatch, None, None);
+        assert_single_diagnostic(err, DiagnosticCode::SchemaMismatch, None, None);
     }
 
     #[test]
@@ -1748,12 +1766,49 @@ mod tests {
 
         let err = RecordBatchView::new(&batch, &mappings).unwrap_err();
 
-        assert_single_diagnostic(
-            err,
-            DiagnosticCode::ValueTypeMismatch,
-            None,
-            Some((1, "id")),
-        );
+        assert_single_diagnostic(err, DiagnosticCode::SchemaMismatch, None, Some((1, "id")));
+    }
+
+    #[test]
+    fn rejects_runtime_field_name_mismatch_even_when_type_matches() {
+        let mappings = mappings_for_schema(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("amount", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("amount", DataType::Int32, false),
+                Field::new("id", DataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![100_i32])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![1_i32])),
+            ],
+        )
+        .unwrap();
+
+        let err = RecordBatchView::new(&batch, &mappings).unwrap_err();
+
+        assert_single_diagnostic(err, DiagnosticCode::SchemaMismatch, None, Some((0, "id")));
+    }
+
+    #[test]
+    fn rejects_runtime_field_rename_even_when_position_and_type_match() {
+        let mappings =
+            mappings_for_schema(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "renamed_id",
+                DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![1_i32]))],
+        )
+        .unwrap();
+
+        let err = RecordBatchView::new(&batch, &mappings).unwrap_err();
+
+        assert_single_diagnostic(err, DiagnosticCode::SchemaMismatch, None, Some((0, "id")));
     }
 
     #[test]
@@ -1774,7 +1829,7 @@ mod tests {
 
         assert_single_diagnostic(
             err,
-            DiagnosticCode::ValueTypeMismatch,
+            DiagnosticCode::SchemaMismatch,
             None,
             Some((0, "number")),
         );
