@@ -5,7 +5,7 @@ use std::marker::PhantomData;
 use arrow_array::RecordBatch;
 use futures_util::io::{AsyncRead, AsyncWrite};
 
-use crate::{MssqlTablePlan, Result, TableName};
+use crate::{Result, SchemaMapping, TableName};
 
 use super::SchemaCheck;
 
@@ -57,7 +57,7 @@ where
     pub async fn new(
         _client: &'client mut tiberius::Client<S>,
         _table: TableName,
-        _plan: MssqlTablePlan,
+        _mappings: Vec<SchemaMapping>,
         options: WriteOptions,
     ) -> Result<Self> {
         Err(crate::Error::BackendUnavailable {
