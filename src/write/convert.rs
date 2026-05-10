@@ -3,13 +3,15 @@
 #![allow(dead_code)]
 
 use arrow_array::{
-    Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    RecordBatch, UInt8Array, UInt16Array, UInt32Array,
+    Array, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
+    UInt8Array, UInt16Array, UInt32Array,
 };
 use arrow_schema::DataType;
 
 use crate::{
-    Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, MssqlType, Result, SchemaMapping,
+    Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, MssqlType, MssqlTypeLength, Result,
+    SchemaMapping,
 };
 
 /// Borrowed value extracted from one Arrow array cell.
@@ -43,7 +45,7 @@ pub(crate) enum ArrowCell<'a> {
     Binary(&'a [u8]),
 }
 
-impl ArrowCell<'_> {
+impl<'a> ArrowCell<'a> {
     fn try_bool(self, mapping: &SchemaMapping, row_index: usize) -> Result<bool> {
         match self {
             Self::Boolean(value) => Ok(value),
@@ -129,6 +131,30 @@ impl ArrowCell<'_> {
                 row_index,
                 DiagnosticCode::ValueTypeMismatch,
                 format!("expected Arrow Float64 payload, got {other:?}"),
+            ))),
+        }
+    }
+
+    fn try_str(self, mapping: &SchemaMapping, row_index: usize) -> Result<&'a str> {
+        match self {
+            Self::Utf8(value) => Ok(value),
+            other => Err(value_conversion_error(row_mapping_diagnostic(
+                mapping,
+                row_index,
+                DiagnosticCode::ValueTypeMismatch,
+                format!("expected Arrow UTF-8 payload, got {other:?}"),
+            ))),
+        }
+    }
+
+    fn try_bytes(self, mapping: &SchemaMapping, row_index: usize) -> Result<&'a [u8]> {
+        match self {
+            Self::Binary(value) => Ok(value),
+            other => Err(value_conversion_error(row_mapping_diagnostic(
+                mapping,
+                row_index,
+                DiagnosticCode::ValueTypeMismatch,
+                format!("expected Arrow binary payload, got {other:?}"),
             ))),
         }
     }
@@ -283,6 +309,22 @@ fn extract_arrow_cell<'a>(
             let array = downcast_array::<Float64Array>(array, mapping, row_index)?;
             Ok(ArrowCell::Float64(array.value(row_index)))
         }
+        DataType::Utf8 => {
+            let array = downcast_array::<StringArray>(array, mapping, row_index)?;
+            Ok(ArrowCell::Utf8(array.value(row_index)))
+        }
+        DataType::LargeUtf8 => {
+            let array = downcast_array::<LargeStringArray>(array, mapping, row_index)?;
+            Ok(ArrowCell::Utf8(array.value(row_index)))
+        }
+        DataType::Binary => {
+            let array = downcast_array::<BinaryArray>(array, mapping, row_index)?;
+            Ok(ArrowCell::Binary(array.value(row_index)))
+        }
+        DataType::LargeBinary => {
+            let array = downcast_array::<LargeBinaryArray>(array, mapping, row_index)?;
+            Ok(ArrowCell::Binary(array.value(row_index)))
+        }
         other => Err(unsupported_value_conversion(
             mapping,
             row_index,
@@ -317,6 +359,8 @@ fn mssql_cell_from_arrow_cell<'a>(
         MssqlType::BigInt => Ok(MssqlCell::BigInt(Some(cell.try_i64(mapping, row_index)?))),
         MssqlType::Real => Ok(MssqlCell::Real(Some(cell.try_f32(mapping, row_index)?))),
         MssqlType::Float { .. } => Ok(MssqlCell::Float(Some(cell.try_f64(mapping, row_index)?))),
+        MssqlType::NVarChar(length) => nvar_char_cell(mapping, row_index, *length, cell),
+        MssqlType::VarBinary(length) => var_binary_cell(mapping, row_index, *length, cell),
         ty => Err(unsupported_value_conversion(
             mapping,
             row_index,
@@ -337,6 +381,8 @@ fn null_mssql_cell<'a>(mapping: &SchemaMapping, row_index: usize) -> Result<Mssq
         MssqlType::BigInt => Ok(MssqlCell::BigInt(None)),
         MssqlType::Real => Ok(MssqlCell::Real(None)),
         MssqlType::Float { .. } => Ok(MssqlCell::Float(None)),
+        MssqlType::NVarChar(_) => Ok(MssqlCell::NVarChar(None)),
+        MssqlType::VarBinary(_) => Ok(MssqlCell::VarBinary(None)),
         ty => Err(unsupported_value_conversion(
             mapping,
             row_index,
@@ -345,6 +391,59 @@ fn null_mssql_cell<'a>(mapping: &SchemaMapping, row_index: usize) -> Result<Mssq
                 ty.to_sql()
             ),
         )),
+    }
+}
+
+fn nvar_char_cell<'a>(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    length: MssqlTypeLength,
+    cell: ArrowCell<'a>,
+) -> Result<MssqlCell<'a>> {
+    let value = cell.try_str(mapping, row_index)?;
+    let code_units = value.encode_utf16().count();
+
+    if exceeds_length(length, code_units) {
+        return Err(value_too_long_error(
+            mapping,
+            row_index,
+            format!(
+                "string value has {code_units} UTF-16 code unit(s), exceeding planned {}",
+                mapping.mssql().ty().to_sql()
+            ),
+        ));
+    }
+
+    Ok(MssqlCell::NVarChar(Some(value)))
+}
+
+fn var_binary_cell<'a>(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    length: MssqlTypeLength,
+    cell: ArrowCell<'a>,
+) -> Result<MssqlCell<'a>> {
+    let value = cell.try_bytes(mapping, row_index)?;
+    let bytes = value.len();
+
+    if exceeds_length(length, bytes) {
+        return Err(value_too_long_error(
+            mapping,
+            row_index,
+            format!(
+                "binary value has {bytes} byte(s), exceeding planned {}",
+                mapping.mssql().ty().to_sql()
+            ),
+        ));
+    }
+
+    Ok(MssqlCell::VarBinary(Some(value)))
+}
+
+fn exceeds_length(length: MssqlTypeLength, actual: usize) -> bool {
+    match length {
+        MssqlTypeLength::Bounded(limit) => actual > limit,
+        MssqlTypeLength::Max => false,
     }
 }
 
@@ -390,6 +489,19 @@ fn non_finite_float_error(
         row_index,
         DiagnosticCode::NonFiniteFloat,
         format!("non-finite floating point value {value} is not supported"),
+    ))
+}
+
+fn value_too_long_error(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    message: impl Into<String>,
+) -> crate::Error {
+    value_conversion_error(row_mapping_diagnostic(
+        mapping,
+        row_index,
+        DiagnosticCode::ValueTooLong,
+        message,
     ))
 }
 
@@ -483,15 +595,16 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-        Int64Array, RecordBatch, UInt8Array, UInt16Array, UInt32Array,
+        ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
+        Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
+        UInt8Array, UInt16Array, UInt32Array,
     };
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{ArrowCell, MssqlCell, RecordBatchView};
     use crate::{
-        ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlProfile, MssqlType,
-        PlanOptions, SchemaMapping, plan_arrow_schema_to_mssql_mappings,
+        ArrowFieldRef, BinaryPolicy, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlProfile,
+        MssqlType, PlanOptions, SchemaMapping, StringPolicy, plan_arrow_schema_to_mssql_mappings,
     };
 
     #[test]
@@ -532,6 +645,10 @@ mod tests {
             Field::new("unsigned_large", DataType::UInt32, true),
             Field::new("real_value", DataType::Float32, true),
             Field::new("float_value", DataType::Float64, true),
+            Field::new("text", DataType::Utf8, true),
+            Field::new("large_text", DataType::LargeUtf8, true),
+            Field::new("bytes", DataType::Binary, true),
+            Field::new("large_bytes", DataType::LargeBinary, true),
         ]));
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
@@ -545,6 +662,10 @@ mod tests {
                 Field::new("unsigned_large", DataType::UInt32, true),
                 Field::new("real_value", DataType::Float32, true),
                 Field::new("float_value", DataType::Float64, true),
+                Field::new("text", DataType::Utf8, true),
+                Field::new("large_text", DataType::LargeUtf8, true),
+                Field::new("bytes", DataType::Binary, true),
+                Field::new("large_bytes", DataType::LargeBinary, true),
             ])),
             vec![
                 Arc::new(BooleanArray::from(vec![Some(true), None])) as ArrayRef,
@@ -557,6 +678,10 @@ mod tests {
                 Arc::new(UInt32Array::from(vec![Some(32_u32), None])),
                 Arc::new(Float32Array::from(vec![Some(1.25_f32), None])),
                 Arc::new(Float64Array::from(vec![Some(2.5_f64), None])),
+                Arc::new(StringArray::from(vec![Some("hello"), None])),
+                Arc::new(LargeStringArray::from(vec![Some("東京"), None])),
+                Arc::new(BinaryArray::from(vec![Some(&b"abc"[..]), None])),
+                Arc::new(LargeBinaryArray::from(vec![Some(&b"large"[..]), None])),
             ],
         )
         .unwrap();
@@ -612,6 +737,26 @@ mod tests {
             ArrowCell::Float64(2.5)
         );
         assert_eq!(view.arrow_cell(&mappings[9], 1).unwrap(), ArrowCell::Null);
+        assert_eq!(
+            view.arrow_cell(&mappings[10], 0).unwrap(),
+            ArrowCell::Utf8("hello")
+        );
+        assert_eq!(view.arrow_cell(&mappings[10], 1).unwrap(), ArrowCell::Null);
+        assert_eq!(
+            view.arrow_cell(&mappings[11], 0).unwrap(),
+            ArrowCell::Utf8("東京")
+        );
+        assert_eq!(view.arrow_cell(&mappings[11], 1).unwrap(), ArrowCell::Null);
+        assert_eq!(
+            view.arrow_cell(&mappings[12], 0).unwrap(),
+            ArrowCell::Binary(b"abc")
+        );
+        assert_eq!(view.arrow_cell(&mappings[12], 1).unwrap(), ArrowCell::Null);
+        assert_eq!(
+            view.arrow_cell(&mappings[13], 0).unwrap(),
+            ArrowCell::Binary(b"large")
+        );
+        assert_eq!(view.arrow_cell(&mappings[13], 1).unwrap(), ArrowCell::Null);
     }
 
     #[test]
@@ -627,6 +772,10 @@ mod tests {
             Field::new("unsigned_large", DataType::UInt32, true),
             Field::new("real_value", DataType::Float32, true),
             Field::new("float_value", DataType::Float64, true),
+            Field::new("text", DataType::Utf8, true),
+            Field::new("large_text", DataType::LargeUtf8, true),
+            Field::new("bytes", DataType::Binary, true),
+            Field::new("large_bytes", DataType::LargeBinary, true),
         ]));
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
@@ -640,6 +789,10 @@ mod tests {
                 Field::new("unsigned_large", DataType::UInt32, true),
                 Field::new("real_value", DataType::Float32, true),
                 Field::new("float_value", DataType::Float64, true),
+                Field::new("text", DataType::Utf8, true),
+                Field::new("large_text", DataType::LargeUtf8, true),
+                Field::new("bytes", DataType::Binary, true),
+                Field::new("large_bytes", DataType::LargeBinary, true),
             ])),
             vec![
                 Arc::new(BooleanArray::from(vec![Some(true), None])) as ArrayRef,
@@ -652,6 +805,10 @@ mod tests {
                 Arc::new(UInt32Array::from(vec![Some(32_u32), None])),
                 Arc::new(Float32Array::from(vec![Some(1.25_f32), None])),
                 Arc::new(Float64Array::from(vec![Some(2.5_f64), None])),
+                Arc::new(StringArray::from(vec![Some("hello"), None])),
+                Arc::new(LargeStringArray::from(vec![Some("東京"), None])),
+                Arc::new(BinaryArray::from(vec![Some(&b"abc"[..]), None])),
+                Arc::new(LargeBinaryArray::from(vec![Some(&b"large"[..]), None])),
             ],
         )
         .unwrap();
@@ -736,6 +893,199 @@ mod tests {
         assert_eq!(
             view.mssql_cell(&mappings[9], 1).unwrap(),
             MssqlCell::Float(None)
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[10], 0).unwrap(),
+            MssqlCell::NVarChar(Some("hello"))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[10], 1).unwrap(),
+            MssqlCell::NVarChar(None)
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[11], 0).unwrap(),
+            MssqlCell::NVarChar(Some("東京"))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[11], 1).unwrap(),
+            MssqlCell::NVarChar(None)
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[12], 0).unwrap(),
+            MssqlCell::VarBinary(Some(b"abc"))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[12], 1).unwrap(),
+            MssqlCell::VarBinary(None)
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[13], 0).unwrap(),
+            MssqlCell::VarBinary(Some(b"large"))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[13], 1).unwrap(),
+            MssqlCell::VarBinary(None)
+        );
+    }
+
+    #[test]
+    fn converts_empty_ascii_and_non_ascii_strings() {
+        let mappings = mappings_for_schema(Schema::new(vec![
+            Field::new("text", DataType::Utf8, true),
+            Field::new("large_text", DataType::LargeUtf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("text", DataType::Utf8, true),
+                Field::new("large_text", DataType::LargeUtf8, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["", "ascii", "東京"])) as ArrayRef,
+                Arc::new(LargeStringArray::from(vec!["", "ascii", "🙂"])),
+            ],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 0).unwrap(),
+            MssqlCell::NVarChar(Some(""))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 1).unwrap(),
+            MssqlCell::NVarChar(Some("ascii"))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 2).unwrap(),
+            MssqlCell::NVarChar(Some("東京"))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[1], 0).unwrap(),
+            MssqlCell::NVarChar(Some(""))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[1], 1).unwrap(),
+            MssqlCell::NVarChar(Some("ascii"))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[1], 2).unwrap(),
+            MssqlCell::NVarChar(Some("🙂"))
+        );
+    }
+
+    #[test]
+    fn converts_empty_and_non_empty_binary_values() {
+        let mappings = mappings_for_schema(Schema::new(vec![
+            Field::new("bytes", DataType::Binary, true),
+            Field::new("large_bytes", DataType::LargeBinary, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("bytes", DataType::Binary, true),
+                Field::new("large_bytes", DataType::LargeBinary, true),
+            ])),
+            vec![
+                Arc::new(BinaryArray::from(vec![Some(&b""[..]), Some(&b"abc"[..])])) as ArrayRef,
+                Arc::new(LargeBinaryArray::from(vec![
+                    Some(&b""[..]),
+                    Some(&b"large"[..]),
+                ])),
+            ],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 0).unwrap(),
+            MssqlCell::VarBinary(Some(b""))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 1).unwrap(),
+            MssqlCell::VarBinary(Some(b"abc"))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[1], 0).unwrap(),
+            MssqlCell::VarBinary(Some(b""))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[1], 1).unwrap(),
+            MssqlCell::VarBinary(Some(b"large"))
+        );
+    }
+
+    #[test]
+    fn rejects_bounded_nvarchar_by_utf16_code_units() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new("text", DataType::Utf8, true)]),
+            PlanOptions {
+                string_policy: StringPolicy::NVarChar(2),
+                ..PlanOptions::default()
+            },
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, true)])),
+            vec![Arc::new(StringArray::from(vec!["ab", "🙂", "abc"]))],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 0).unwrap(),
+            MssqlCell::NVarChar(Some("ab"))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 1).unwrap(),
+            MssqlCell::NVarChar(Some("🙂"))
+        );
+        let err = view.mssql_cell(&mappings[0], 2).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::ValueTooLong,
+            Some(2),
+            Some((0, "text")),
+        );
+    }
+
+    #[test]
+    fn rejects_bounded_varbinary_by_byte_count() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new("bytes", DataType::Binary, true)]),
+            PlanOptions {
+                binary_policy: BinaryPolicy::VarBinary(2),
+                ..PlanOptions::default()
+            },
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "bytes",
+                DataType::Binary,
+                true,
+            )])),
+            vec![Arc::new(BinaryArray::from(vec![
+                Some(&b""[..]),
+                Some(&b"ab"[..]),
+                Some(&b"abc"[..]),
+            ]))],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 0).unwrap(),
+            MssqlCell::VarBinary(Some(b""))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 1).unwrap(),
+            MssqlCell::VarBinary(Some(b"ab"))
+        );
+        let err = view.mssql_cell(&mappings[0], 2).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::ValueTooLong,
+            Some(2),
+            Some((0, "bytes")),
         );
     }
 
@@ -1038,10 +1388,17 @@ mod tests {
     }
 
     fn mappings_for_schema(schema: Schema) -> Vec<SchemaMapping> {
+        mappings_for_schema_with_options(schema, PlanOptions::default())
+    }
+
+    fn mappings_for_schema_with_options(
+        schema: Schema,
+        options: PlanOptions,
+    ) -> Vec<SchemaMapping> {
         plan_arrow_schema_to_mssql_mappings(
             Arc::new(schema),
             MssqlProfile::sql_server_2016_compat_100(),
-            PlanOptions::default(),
+            options,
         )
         .unwrap()
         .into_parts()
