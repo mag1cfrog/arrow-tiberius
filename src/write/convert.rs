@@ -2,7 +2,10 @@
 
 #![allow(dead_code)]
 
-use arrow_array::{Array, BooleanArray, Int32Array, Int64Array, RecordBatch};
+use arrow_array::{
+    Array, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, UInt8Array,
+    UInt16Array, UInt32Array,
+};
 use arrow_schema::DataType;
 
 use crate::{
@@ -16,10 +19,20 @@ pub(crate) enum ArrowCell<'a> {
     Null,
     /// Arrow boolean value.
     Boolean(bool),
+    /// Arrow signed 8-bit integer value.
+    Int8(i8),
+    /// Arrow signed 16-bit integer value.
+    Int16(i16),
     /// Arrow signed 32-bit integer value.
     Int32(i32),
     /// Arrow signed 64-bit integer value.
     Int64(i64),
+    /// Arrow unsigned 8-bit integer value.
+    UInt8(u8),
+    /// Arrow unsigned 16-bit integer value.
+    UInt16(u16),
+    /// Arrow unsigned 32-bit integer value.
+    UInt32(u32),
     /// Arrow UTF-8 string value.
     Utf8(&'a str),
     /// Arrow binary value.
@@ -39,14 +52,40 @@ impl ArrowCell<'_> {
         }
     }
 
-    fn try_i32(self, mapping: &SchemaMapping, row_index: usize) -> Result<i32> {
+    fn try_u8(self, mapping: &SchemaMapping, row_index: usize) -> Result<u8> {
         match self {
-            Self::Int32(value) => Ok(value),
+            Self::UInt8(value) => Ok(value),
             other => Err(value_conversion_error(row_mapping_diagnostic(
                 mapping,
                 row_index,
                 DiagnosticCode::ValueTypeMismatch,
-                format!("expected Arrow Int32 payload, got {other:?}"),
+                format!("expected Arrow UInt8 payload, got {other:?}"),
+            ))),
+        }
+    }
+
+    fn try_i16(self, mapping: &SchemaMapping, row_index: usize) -> Result<i16> {
+        match self {
+            Self::Int8(value) => Ok(i16::from(value)),
+            Self::Int16(value) => Ok(value),
+            other => Err(value_conversion_error(row_mapping_diagnostic(
+                mapping,
+                row_index,
+                DiagnosticCode::ValueTypeMismatch,
+                format!("expected Arrow Int8 or Int16 payload, got {other:?}"),
+            ))),
+        }
+    }
+
+    fn try_i32(self, mapping: &SchemaMapping, row_index: usize) -> Result<i32> {
+        match self {
+            Self::Int32(value) => Ok(value),
+            Self::UInt16(value) => Ok(i32::from(value)),
+            other => Err(value_conversion_error(row_mapping_diagnostic(
+                mapping,
+                row_index,
+                DiagnosticCode::ValueTypeMismatch,
+                format!("expected Arrow Int32 or UInt16 payload, got {other:?}"),
             ))),
         }
     }
@@ -54,11 +93,12 @@ impl ArrowCell<'_> {
     fn try_i64(self, mapping: &SchemaMapping, row_index: usize) -> Result<i64> {
         match self {
             Self::Int64(value) => Ok(value),
+            Self::UInt32(value) => Ok(i64::from(value)),
             other => Err(value_conversion_error(row_mapping_diagnostic(
                 mapping,
                 row_index,
                 DiagnosticCode::ValueTypeMismatch,
-                format!("expected Arrow Int64 payload, got {other:?}"),
+                format!("expected Arrow Int64 or UInt32 payload, got {other:?}"),
             ))),
         }
     }
@@ -69,6 +109,10 @@ impl ArrowCell<'_> {
 pub(crate) enum MssqlCell<'a> {
     /// SQL Server `bit` cell.
     Bit(Option<bool>),
+    /// SQL Server `tinyint` cell.
+    TinyInt(Option<u8>),
+    /// SQL Server `smallint` cell.
+    SmallInt(Option<i16>),
     /// SQL Server `int` cell.
     Int(Option<i32>),
     /// SQL Server `bigint` cell.
@@ -169,6 +213,14 @@ fn extract_arrow_cell<'a>(
             let array = downcast_array::<BooleanArray>(array, mapping, row_index)?;
             Ok(ArrowCell::Boolean(array.value(row_index)))
         }
+        DataType::Int8 => {
+            let array = downcast_array::<Int8Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Int8(array.value(row_index)))
+        }
+        DataType::Int16 => {
+            let array = downcast_array::<Int16Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Int16(array.value(row_index)))
+        }
         DataType::Int32 => {
             let array = downcast_array::<Int32Array>(array, mapping, row_index)?;
             Ok(ArrowCell::Int32(array.value(row_index)))
@@ -176,6 +228,18 @@ fn extract_arrow_cell<'a>(
         DataType::Int64 => {
             let array = downcast_array::<Int64Array>(array, mapping, row_index)?;
             Ok(ArrowCell::Int64(array.value(row_index)))
+        }
+        DataType::UInt8 => {
+            let array = downcast_array::<UInt8Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::UInt8(array.value(row_index)))
+        }
+        DataType::UInt16 => {
+            let array = downcast_array::<UInt16Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::UInt16(array.value(row_index)))
+        }
+        DataType::UInt32 => {
+            let array = downcast_array::<UInt32Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::UInt32(array.value(row_index)))
         }
         other => Err(unsupported_value_conversion(
             mapping,
@@ -205,6 +269,8 @@ fn mssql_cell_from_arrow_cell<'a>(
 
     match mapping.mssql().ty() {
         MssqlType::Bit => Ok(MssqlCell::Bit(Some(cell.try_bool(mapping, row_index)?))),
+        MssqlType::TinyInt => Ok(MssqlCell::TinyInt(Some(cell.try_u8(mapping, row_index)?))),
+        MssqlType::SmallInt => Ok(MssqlCell::SmallInt(Some(cell.try_i16(mapping, row_index)?))),
         MssqlType::Int => Ok(MssqlCell::Int(Some(cell.try_i32(mapping, row_index)?))),
         MssqlType::BigInt => Ok(MssqlCell::BigInt(Some(cell.try_i64(mapping, row_index)?))),
         ty => Err(unsupported_value_conversion(
@@ -221,6 +287,8 @@ fn mssql_cell_from_arrow_cell<'a>(
 fn null_mssql_cell<'a>(mapping: &SchemaMapping, row_index: usize) -> Result<MssqlCell<'a>> {
     match mapping.mssql().ty() {
         MssqlType::Bit => Ok(MssqlCell::Bit(None)),
+        MssqlType::TinyInt => Ok(MssqlCell::TinyInt(None)),
+        MssqlType::SmallInt => Ok(MssqlCell::SmallInt(None)),
         MssqlType::Int => Ok(MssqlCell::Int(None)),
         MssqlType::BigInt => Ok(MssqlCell::BigInt(None)),
         ty => Err(unsupported_value_conversion(
@@ -355,7 +423,10 @@ fn value_conversion_error(diagnostic: Diagnostic) -> crate::Error {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, BooleanArray, Float32Array, Int32Array, Int64Array, RecordBatch};
+    use arrow_array::{
+        ArrayRef, BooleanArray, Float32Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        RecordBatch, UInt8Array, UInt16Array, UInt32Array,
+    };
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{ArrowCell, MssqlCell, RecordBatchView};
@@ -393,19 +464,34 @@ mod tests {
     fn extracts_arrow_cells_for_supported_initial_primitives() {
         let mappings = mappings_for_schema(Schema::new(vec![
             Field::new("active", DataType::Boolean, true),
+            Field::new("tiny", DataType::Int8, true),
+            Field::new("small", DataType::Int16, true),
             Field::new("quantity", DataType::Int32, true),
             Field::new("total", DataType::Int64, true),
+            Field::new("unsigned_tiny", DataType::UInt8, true),
+            Field::new("unsigned_medium", DataType::UInt16, true),
+            Field::new("unsigned_large", DataType::UInt32, true),
         ]));
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("active", DataType::Boolean, true),
+                Field::new("tiny", DataType::Int8, true),
+                Field::new("small", DataType::Int16, true),
                 Field::new("quantity", DataType::Int32, true),
                 Field::new("total", DataType::Int64, true),
+                Field::new("unsigned_tiny", DataType::UInt8, true),
+                Field::new("unsigned_medium", DataType::UInt16, true),
+                Field::new("unsigned_large", DataType::UInt32, true),
             ])),
             vec![
                 Arc::new(BooleanArray::from(vec![Some(true), None])) as ArrayRef,
+                Arc::new(Int8Array::from(vec![Some(-8_i8), None])),
+                Arc::new(Int16Array::from(vec![Some(-16_i16), None])),
                 Arc::new(Int32Array::from(vec![Some(12_i32), None])),
                 Arc::new(Int64Array::from(vec![Some(34_i64), None])),
+                Arc::new(UInt8Array::from(vec![Some(8_u8), None])),
+                Arc::new(UInt16Array::from(vec![Some(16_u16), None])),
+                Arc::new(UInt32Array::from(vec![Some(32_u32), None])),
             ],
         )
         .unwrap();
@@ -418,33 +504,73 @@ mod tests {
         assert_eq!(view.arrow_cell(&mappings[0], 1).unwrap(), ArrowCell::Null);
         assert_eq!(
             view.arrow_cell(&mappings[1], 0).unwrap(),
-            ArrowCell::Int32(12)
+            ArrowCell::Int8(-8)
         );
         assert_eq!(view.arrow_cell(&mappings[1], 1).unwrap(), ArrowCell::Null);
         assert_eq!(
             view.arrow_cell(&mappings[2], 0).unwrap(),
-            ArrowCell::Int64(34)
+            ArrowCell::Int16(-16)
         );
         assert_eq!(view.arrow_cell(&mappings[2], 1).unwrap(), ArrowCell::Null);
+        assert_eq!(
+            view.arrow_cell(&mappings[3], 0).unwrap(),
+            ArrowCell::Int32(12)
+        );
+        assert_eq!(view.arrow_cell(&mappings[3], 1).unwrap(), ArrowCell::Null);
+        assert_eq!(
+            view.arrow_cell(&mappings[4], 0).unwrap(),
+            ArrowCell::Int64(34)
+        );
+        assert_eq!(view.arrow_cell(&mappings[4], 1).unwrap(), ArrowCell::Null);
+        assert_eq!(
+            view.arrow_cell(&mappings[5], 0).unwrap(),
+            ArrowCell::UInt8(8)
+        );
+        assert_eq!(view.arrow_cell(&mappings[5], 1).unwrap(), ArrowCell::Null);
+        assert_eq!(
+            view.arrow_cell(&mappings[6], 0).unwrap(),
+            ArrowCell::UInt16(16)
+        );
+        assert_eq!(view.arrow_cell(&mappings[6], 1).unwrap(), ArrowCell::Null);
+        assert_eq!(
+            view.arrow_cell(&mappings[7], 0).unwrap(),
+            ArrowCell::UInt32(32)
+        );
+        assert_eq!(view.arrow_cell(&mappings[7], 1).unwrap(), ArrowCell::Null);
     }
 
     #[test]
     fn converts_supported_initial_primitives_to_mssql_cells() {
         let mappings = mappings_for_schema(Schema::new(vec![
             Field::new("active", DataType::Boolean, true),
+            Field::new("tiny", DataType::Int8, true),
+            Field::new("small", DataType::Int16, true),
             Field::new("quantity", DataType::Int32, true),
             Field::new("total", DataType::Int64, true),
+            Field::new("unsigned_tiny", DataType::UInt8, true),
+            Field::new("unsigned_medium", DataType::UInt16, true),
+            Field::new("unsigned_large", DataType::UInt32, true),
         ]));
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("active", DataType::Boolean, true),
+                Field::new("tiny", DataType::Int8, true),
+                Field::new("small", DataType::Int16, true),
                 Field::new("quantity", DataType::Int32, true),
                 Field::new("total", DataType::Int64, true),
+                Field::new("unsigned_tiny", DataType::UInt8, true),
+                Field::new("unsigned_medium", DataType::UInt16, true),
+                Field::new("unsigned_large", DataType::UInt32, true),
             ])),
             vec![
                 Arc::new(BooleanArray::from(vec![Some(true), None])) as ArrayRef,
+                Arc::new(Int8Array::from(vec![Some(-8_i8), None])),
+                Arc::new(Int16Array::from(vec![Some(-16_i16), None])),
                 Arc::new(Int32Array::from(vec![Some(12_i32), None])),
                 Arc::new(Int64Array::from(vec![Some(34_i64), None])),
+                Arc::new(UInt8Array::from(vec![Some(8_u8), None])),
+                Arc::new(UInt16Array::from(vec![Some(16_u16), None])),
+                Arc::new(UInt32Array::from(vec![Some(32_u32), None])),
             ],
         )
         .unwrap();
@@ -460,19 +586,129 @@ mod tests {
         );
         assert_eq!(
             view.mssql_cell(&mappings[1], 0).unwrap(),
-            MssqlCell::Int(Some(12))
+            MssqlCell::SmallInt(Some(-8))
         );
         assert_eq!(
             view.mssql_cell(&mappings[1], 1).unwrap(),
-            MssqlCell::Int(None)
+            MssqlCell::SmallInt(None)
         );
         assert_eq!(
             view.mssql_cell(&mappings[2], 0).unwrap(),
-            MssqlCell::BigInt(Some(34))
+            MssqlCell::SmallInt(Some(-16))
         );
         assert_eq!(
             view.mssql_cell(&mappings[2], 1).unwrap(),
+            MssqlCell::SmallInt(None)
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[3], 0).unwrap(),
+            MssqlCell::Int(Some(12))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[3], 1).unwrap(),
+            MssqlCell::Int(None)
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[4], 0).unwrap(),
+            MssqlCell::BigInt(Some(34))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[4], 1).unwrap(),
             MssqlCell::BigInt(None)
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[5], 0).unwrap(),
+            MssqlCell::TinyInt(Some(8))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[5], 1).unwrap(),
+            MssqlCell::TinyInt(None)
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[6], 0).unwrap(),
+            MssqlCell::Int(Some(16))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[6], 1).unwrap(),
+            MssqlCell::Int(None)
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[7], 0).unwrap(),
+            MssqlCell::BigInt(Some(32))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[7], 1).unwrap(),
+            MssqlCell::BigInt(None)
+        );
+    }
+
+    #[test]
+    fn preserves_integer_boundaries_during_widening() {
+        let mappings = mappings_for_schema(Schema::new(vec![
+            Field::new("tiny", DataType::Int8, false),
+            Field::new("small", DataType::Int16, false),
+            Field::new("unsigned_tiny", DataType::UInt8, false),
+            Field::new("unsigned_medium", DataType::UInt16, false),
+            Field::new("unsigned_large", DataType::UInt32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("tiny", DataType::Int8, false),
+                Field::new("small", DataType::Int16, false),
+                Field::new("unsigned_tiny", DataType::UInt8, false),
+                Field::new("unsigned_medium", DataType::UInt16, false),
+                Field::new("unsigned_large", DataType::UInt32, false),
+            ])),
+            vec![
+                Arc::new(Int8Array::from(vec![i8::MIN, i8::MAX])) as ArrayRef,
+                Arc::new(Int16Array::from(vec![i16::MIN, i16::MAX])),
+                Arc::new(UInt8Array::from(vec![u8::MIN, u8::MAX])),
+                Arc::new(UInt16Array::from(vec![u16::MIN, u16::MAX])),
+                Arc::new(UInt32Array::from(vec![u32::MIN, u32::MAX])),
+            ],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 0).unwrap(),
+            MssqlCell::SmallInt(Some(i16::from(i8::MIN)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 1).unwrap(),
+            MssqlCell::SmallInt(Some(i16::from(i8::MAX)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[1], 0).unwrap(),
+            MssqlCell::SmallInt(Some(i16::MIN))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[1], 1).unwrap(),
+            MssqlCell::SmallInt(Some(i16::MAX))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[2], 0).unwrap(),
+            MssqlCell::TinyInt(Some(u8::MIN))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[2], 1).unwrap(),
+            MssqlCell::TinyInt(Some(u8::MAX))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[3], 0).unwrap(),
+            MssqlCell::Int(Some(i32::from(u16::MIN)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[3], 1).unwrap(),
+            MssqlCell::Int(Some(i32::from(u16::MAX)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[4], 0).unwrap(),
+            MssqlCell::BigInt(Some(i64::from(u32::MIN)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[4], 1).unwrap(),
+            MssqlCell::BigInt(Some(i64::from(u32::MAX)))
         );
     }
 
