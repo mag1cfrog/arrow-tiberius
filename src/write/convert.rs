@@ -597,14 +597,15 @@ mod tests {
     use arrow_array::{
         ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
         Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
-        UInt8Array, UInt16Array, UInt32Array,
+        UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_null_array,
     };
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
     use super::{ArrowCell, MssqlCell, RecordBatchView};
     use crate::{
-        ArrowFieldRef, BinaryPolicy, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlProfile,
-        MssqlType, PlanOptions, SchemaMapping, StringPolicy, plan_arrow_schema_to_mssql_mappings,
+        ArrowFieldRef, BinaryPolicy, Date64Policy, DiagnosticCode, Error, Identifier, MssqlColumn,
+        MssqlProfile, MssqlType, PlanOptions, SchemaMapping, StringPolicy, UInt64Policy,
+        plan_arrow_schema_to_mssql_mappings,
     };
 
     #[test]
@@ -1090,6 +1091,72 @@ mod tests {
     }
 
     #[test]
+    fn rejects_policy_planned_uint64_runtime_conversion_until_implemented() {
+        for (policy, name) in [
+            (UInt64Policy::Decimal20_0, "unsigned_as_decimal"),
+            (UInt64Policy::CheckedBigInt, "unsigned_as_bigint"),
+        ] {
+            let mappings = mappings_for_schema_with_options(
+                Schema::new(vec![Field::new(name, DataType::UInt64, true)]),
+                PlanOptions {
+                    uint64_policy: policy,
+                    ..PlanOptions::default()
+                },
+            );
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(name, DataType::UInt64, true)])),
+                vec![Arc::new(UInt64Array::from(vec![1_u64]))],
+            )
+            .unwrap();
+            let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+            let err = view.mssql_cell(&mappings[0], 0).unwrap_err();
+
+            assert_single_diagnostic(
+                err,
+                DiagnosticCode::ValueConversionUnsupported,
+                Some(0),
+                Some((0, name)),
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_policy_planned_decimal_runtime_conversion_until_implemented() {
+        assert_policy_planned_null_runtime_unsupported(
+            "amount",
+            DataType::Decimal128(10, 2),
+            PlanOptions::default(),
+        );
+    }
+
+    #[test]
+    fn rejects_policy_planned_date_runtime_conversion_until_implemented() {
+        assert_policy_planned_null_runtime_unsupported(
+            "date_value",
+            DataType::Date32,
+            PlanOptions::default(),
+        );
+        assert_policy_planned_null_runtime_unsupported(
+            "date64_value",
+            DataType::Date64,
+            PlanOptions {
+                date64_policy: Date64Policy::TimestampDateTime2,
+                ..PlanOptions::default()
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_policy_planned_timestamp_runtime_conversion_until_implemented() {
+        assert_policy_planned_null_runtime_unsupported(
+            "created_at",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            PlanOptions::default(),
+        );
+    }
+
+    #[test]
     fn preserves_integer_boundaries_during_widening() {
         let mappings = mappings_for_schema(Schema::new(vec![
             Field::new("tiny", DataType::Int8, false),
@@ -1403,6 +1470,32 @@ mod tests {
         .unwrap()
         .into_parts()
         .0
+    }
+
+    fn assert_policy_planned_null_runtime_unsupported(
+        name: &str,
+        data_type: DataType,
+        options: PlanOptions,
+    ) {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(name, data_type.clone(), true)]),
+            options,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(name, data_type.clone(), true)])),
+            vec![new_null_array(&data_type, 1)],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let err = view.mssql_cell(&mappings[0], 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::ValueConversionUnsupported,
+            Some(0),
+            Some((0, name)),
+        );
     }
 
     fn unsafe_batch_for_field(
