@@ -2,6 +2,8 @@
 
 #![allow(dead_code)]
 
+use std::borrow::Cow;
+
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
     Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
@@ -256,6 +258,40 @@ impl<'a> RecordBatchView<'a> {
     ) -> Result<MssqlCell<'_>> {
         let cell = self.arrow_cell(mapping, row_index)?;
         mssql_cell_from_arrow_cell(mapping, cell, row_index)
+    }
+}
+
+/// Converts a semantic SQL Server cell into borrowed Tiberius column data.
+pub(crate) fn mssql_cell_to_tiberius_borrowed(cell: MssqlCell<'_>) -> tiberius::ColumnData<'_> {
+    match cell {
+        MssqlCell::Bit(value) => tiberius::ColumnData::Bit(value),
+        MssqlCell::TinyInt(value) => tiberius::ColumnData::U8(value),
+        MssqlCell::SmallInt(value) => tiberius::ColumnData::I16(value),
+        MssqlCell::Int(value) => tiberius::ColumnData::I32(value),
+        MssqlCell::BigInt(value) => tiberius::ColumnData::I64(value),
+        MssqlCell::Real(value) => tiberius::ColumnData::F32(value),
+        MssqlCell::Float(value) => tiberius::ColumnData::F64(value),
+        MssqlCell::NVarChar(value) => tiberius::ColumnData::String(value.map(Cow::Borrowed)),
+        MssqlCell::VarBinary(value) => tiberius::ColumnData::Binary(value.map(Cow::Borrowed)),
+    }
+}
+
+/// Converts a semantic SQL Server cell into owned Tiberius column data.
+pub(crate) fn mssql_cell_to_tiberius_owned(cell: MssqlCell<'_>) -> tiberius::ColumnData<'static> {
+    match cell {
+        MssqlCell::Bit(value) => tiberius::ColumnData::Bit(value),
+        MssqlCell::TinyInt(value) => tiberius::ColumnData::U8(value),
+        MssqlCell::SmallInt(value) => tiberius::ColumnData::I16(value),
+        MssqlCell::Int(value) => tiberius::ColumnData::I32(value),
+        MssqlCell::BigInt(value) => tiberius::ColumnData::I64(value),
+        MssqlCell::Real(value) => tiberius::ColumnData::F32(value),
+        MssqlCell::Float(value) => tiberius::ColumnData::F64(value),
+        MssqlCell::NVarChar(value) => {
+            tiberius::ColumnData::String(value.map(|value| Cow::Owned(value.to_owned())))
+        }
+        MssqlCell::VarBinary(value) => {
+            tiberius::ColumnData::Binary(value.map(|value| Cow::Owned(value.to_vec())))
+        }
     }
 }
 
@@ -592,6 +628,7 @@ fn value_conversion_error(diagnostic: Diagnostic) -> crate::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::sync::Arc;
 
     use arrow_array::{
@@ -601,7 +638,10 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
-    use super::{ArrowCell, MssqlCell, RecordBatchView};
+    use super::{
+        ArrowCell, MssqlCell, RecordBatchView, mssql_cell_to_tiberius_borrowed,
+        mssql_cell_to_tiberius_owned,
+    };
     use crate::{
         ArrowFieldRef, BinaryPolicy, Date64Policy, DiagnosticCode, Error, Identifier, MssqlColumn,
         MssqlProfile, MssqlType, PlanOptions, SchemaMapping, StringPolicy, UInt64Policy,
@@ -926,6 +966,145 @@ mod tests {
         assert_eq!(
             view.mssql_cell(&mappings[13], 1).unwrap(),
             MssqlCell::VarBinary(None)
+        );
+    }
+
+    #[test]
+    fn converts_mssql_cells_to_borrowed_tiberius_column_data() {
+        assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::Bit(Some(true))),
+            tiberius::ColumnData::Bit(Some(true))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::Bit(None)),
+            tiberius::ColumnData::Bit(None)
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::TinyInt(Some(8))),
+            tiberius::ColumnData::U8(Some(8))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::TinyInt(None)),
+            tiberius::ColumnData::U8(None)
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::SmallInt(Some(-16))),
+            tiberius::ColumnData::I16(Some(-16))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::SmallInt(None)),
+            tiberius::ColumnData::I16(None)
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::Int(Some(32))),
+            tiberius::ColumnData::I32(Some(32))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::Int(None)),
+            tiberius::ColumnData::I32(None)
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::BigInt(Some(64))),
+            tiberius::ColumnData::I64(Some(64))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::BigInt(None)),
+            tiberius::ColumnData::I64(None)
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::Real(Some(1.25))),
+            tiberius::ColumnData::F32(Some(1.25))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::Real(None)),
+            tiberius::ColumnData::F32(None)
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::Float(Some(2.5))),
+            tiberius::ColumnData::F64(Some(2.5))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::Float(None)),
+            tiberius::ColumnData::F64(None)
+        );
+
+        let text = "hello";
+        let bytes = b"abc".as_slice();
+
+        let text_data = mssql_cell_to_tiberius_borrowed(MssqlCell::NVarChar(Some(text)));
+        let tiberius::ColumnData::String(Some(Cow::Borrowed(value))) = text_data else {
+            panic!("expected borrowed string column data");
+        };
+        assert_eq!(value, text);
+
+        assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::NVarChar(None)),
+            tiberius::ColumnData::String(None)
+        );
+
+        let binary_data = mssql_cell_to_tiberius_borrowed(MssqlCell::VarBinary(Some(bytes)));
+        let tiberius::ColumnData::Binary(Some(Cow::Borrowed(value))) = binary_data else {
+            panic!("expected borrowed binary column data");
+        };
+        assert_eq!(value, bytes);
+
+        assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::VarBinary(None)),
+            tiberius::ColumnData::Binary(None)
+        );
+    }
+
+    #[test]
+    fn converts_mssql_cells_to_owned_tiberius_column_data() {
+        assert_eq!(
+            mssql_cell_to_tiberius_owned(MssqlCell::Bit(Some(true))),
+            tiberius::ColumnData::Bit(Some(true))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_owned(MssqlCell::TinyInt(Some(8))),
+            tiberius::ColumnData::U8(Some(8))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_owned(MssqlCell::SmallInt(Some(-16))),
+            tiberius::ColumnData::I16(Some(-16))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_owned(MssqlCell::Int(Some(32))),
+            tiberius::ColumnData::I32(Some(32))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_owned(MssqlCell::BigInt(Some(64))),
+            tiberius::ColumnData::I64(Some(64))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_owned(MssqlCell::Real(Some(1.25))),
+            tiberius::ColumnData::F32(Some(1.25))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_owned(MssqlCell::Float(Some(2.5))),
+            tiberius::ColumnData::F64(Some(2.5))
+        );
+
+        let text_data = mssql_cell_to_tiberius_owned(MssqlCell::NVarChar(Some("hello")));
+        let tiberius::ColumnData::String(Some(Cow::Owned(value))) = text_data else {
+            panic!("expected owned string column data");
+        };
+        assert_eq!(value, "hello");
+
+        assert_eq!(
+            mssql_cell_to_tiberius_owned(MssqlCell::NVarChar(None)),
+            tiberius::ColumnData::String(None)
+        );
+
+        let binary_data = mssql_cell_to_tiberius_owned(MssqlCell::VarBinary(Some(b"abc")));
+        let tiberius::ColumnData::Binary(Some(Cow::Owned(value))) = binary_data else {
+            panic!("expected owned binary column data");
+        };
+        assert_eq!(value, b"abc");
+
+        assert_eq!(
+            mssql_cell_to_tiberius_owned(MssqlCell::VarBinary(None)),
+            tiberius::ColumnData::Binary(None)
         );
     }
 
