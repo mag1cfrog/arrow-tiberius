@@ -3,8 +3,8 @@
 #![allow(dead_code)]
 
 use arrow_array::{
-    Array, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, UInt8Array,
-    UInt16Array, UInt32Array,
+    Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    RecordBatch, UInt8Array, UInt16Array, UInt32Array,
 };
 use arrow_schema::DataType;
 
@@ -33,6 +33,10 @@ pub(crate) enum ArrowCell<'a> {
     UInt16(u16),
     /// Arrow unsigned 32-bit integer value.
     UInt32(u32),
+    /// Arrow 32-bit floating point value.
+    Float32(f32),
+    /// Arrow 64-bit floating point value.
+    Float64(f64),
     /// Arrow UTF-8 string value.
     Utf8(&'a str),
     /// Arrow binary value.
@@ -102,6 +106,32 @@ impl ArrowCell<'_> {
             ))),
         }
     }
+
+    fn try_f32(self, mapping: &SchemaMapping, row_index: usize) -> Result<f32> {
+        match self {
+            Self::Float32(value) if value.is_finite() => Ok(value),
+            Self::Float32(value) => Err(non_finite_float_error(mapping, row_index, value)),
+            other => Err(value_conversion_error(row_mapping_diagnostic(
+                mapping,
+                row_index,
+                DiagnosticCode::ValueTypeMismatch,
+                format!("expected Arrow Float32 payload, got {other:?}"),
+            ))),
+        }
+    }
+
+    fn try_f64(self, mapping: &SchemaMapping, row_index: usize) -> Result<f64> {
+        match self {
+            Self::Float64(value) if value.is_finite() => Ok(value),
+            Self::Float64(value) => Err(non_finite_float_error(mapping, row_index, value)),
+            other => Err(value_conversion_error(row_mapping_diagnostic(
+                mapping,
+                row_index,
+                DiagnosticCode::ValueTypeMismatch,
+                format!("expected Arrow Float64 payload, got {other:?}"),
+            ))),
+        }
+    }
 }
 
 /// Semantic SQL Server value for one planned cell.
@@ -117,6 +147,10 @@ pub(crate) enum MssqlCell<'a> {
     Int(Option<i32>),
     /// SQL Server `bigint` cell.
     BigInt(Option<i64>),
+    /// SQL Server `real` cell.
+    Real(Option<f32>),
+    /// SQL Server `float` cell.
+    Float(Option<f64>),
     /// SQL Server `nvarchar` cell.
     NVarChar(Option<&'a str>),
     /// SQL Server `varbinary` cell.
@@ -241,6 +275,14 @@ fn extract_arrow_cell<'a>(
             let array = downcast_array::<UInt32Array>(array, mapping, row_index)?;
             Ok(ArrowCell::UInt32(array.value(row_index)))
         }
+        DataType::Float32 => {
+            let array = downcast_array::<Float32Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Float32(array.value(row_index)))
+        }
+        DataType::Float64 => {
+            let array = downcast_array::<Float64Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Float64(array.value(row_index)))
+        }
         other => Err(unsupported_value_conversion(
             mapping,
             row_index,
@@ -273,6 +315,8 @@ fn mssql_cell_from_arrow_cell<'a>(
         MssqlType::SmallInt => Ok(MssqlCell::SmallInt(Some(cell.try_i16(mapping, row_index)?))),
         MssqlType::Int => Ok(MssqlCell::Int(Some(cell.try_i32(mapping, row_index)?))),
         MssqlType::BigInt => Ok(MssqlCell::BigInt(Some(cell.try_i64(mapping, row_index)?))),
+        MssqlType::Real => Ok(MssqlCell::Real(Some(cell.try_f32(mapping, row_index)?))),
+        MssqlType::Float { .. } => Ok(MssqlCell::Float(Some(cell.try_f64(mapping, row_index)?))),
         ty => Err(unsupported_value_conversion(
             mapping,
             row_index,
@@ -291,6 +335,8 @@ fn null_mssql_cell<'a>(mapping: &SchemaMapping, row_index: usize) -> Result<Mssq
         MssqlType::SmallInt => Ok(MssqlCell::SmallInt(None)),
         MssqlType::Int => Ok(MssqlCell::Int(None)),
         MssqlType::BigInt => Ok(MssqlCell::BigInt(None)),
+        MssqlType::Real => Ok(MssqlCell::Real(None)),
+        MssqlType::Float { .. } => Ok(MssqlCell::Float(None)),
         ty => Err(unsupported_value_conversion(
             mapping,
             row_index,
@@ -331,6 +377,19 @@ fn unsupported_value_conversion(
         row_index,
         DiagnosticCode::ValueConversionUnsupported,
         message,
+    ))
+}
+
+fn non_finite_float_error(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    value: impl std::fmt::Display,
+) -> crate::Error {
+    value_conversion_error(row_mapping_diagnostic(
+        mapping,
+        row_index,
+        DiagnosticCode::NonFiniteFloat,
+        format!("non-finite floating point value {value} is not supported"),
     ))
 }
 
@@ -424,8 +483,8 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        ArrayRef, BooleanArray, Float32Array, Int8Array, Int16Array, Int32Array, Int64Array,
-        RecordBatch, UInt8Array, UInt16Array, UInt32Array,
+        ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+        Int64Array, RecordBatch, UInt8Array, UInt16Array, UInt32Array,
     };
     use arrow_schema::{DataType, Field, Schema};
 
@@ -471,6 +530,8 @@ mod tests {
             Field::new("unsigned_tiny", DataType::UInt8, true),
             Field::new("unsigned_medium", DataType::UInt16, true),
             Field::new("unsigned_large", DataType::UInt32, true),
+            Field::new("real_value", DataType::Float32, true),
+            Field::new("float_value", DataType::Float64, true),
         ]));
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
@@ -482,6 +543,8 @@ mod tests {
                 Field::new("unsigned_tiny", DataType::UInt8, true),
                 Field::new("unsigned_medium", DataType::UInt16, true),
                 Field::new("unsigned_large", DataType::UInt32, true),
+                Field::new("real_value", DataType::Float32, true),
+                Field::new("float_value", DataType::Float64, true),
             ])),
             vec![
                 Arc::new(BooleanArray::from(vec![Some(true), None])) as ArrayRef,
@@ -492,6 +555,8 @@ mod tests {
                 Arc::new(UInt8Array::from(vec![Some(8_u8), None])),
                 Arc::new(UInt16Array::from(vec![Some(16_u16), None])),
                 Arc::new(UInt32Array::from(vec![Some(32_u32), None])),
+                Arc::new(Float32Array::from(vec![Some(1.25_f32), None])),
+                Arc::new(Float64Array::from(vec![Some(2.5_f64), None])),
             ],
         )
         .unwrap();
@@ -537,6 +602,16 @@ mod tests {
             ArrowCell::UInt32(32)
         );
         assert_eq!(view.arrow_cell(&mappings[7], 1).unwrap(), ArrowCell::Null);
+        assert_eq!(
+            view.arrow_cell(&mappings[8], 0).unwrap(),
+            ArrowCell::Float32(1.25)
+        );
+        assert_eq!(view.arrow_cell(&mappings[8], 1).unwrap(), ArrowCell::Null);
+        assert_eq!(
+            view.arrow_cell(&mappings[9], 0).unwrap(),
+            ArrowCell::Float64(2.5)
+        );
+        assert_eq!(view.arrow_cell(&mappings[9], 1).unwrap(), ArrowCell::Null);
     }
 
     #[test]
@@ -550,6 +625,8 @@ mod tests {
             Field::new("unsigned_tiny", DataType::UInt8, true),
             Field::new("unsigned_medium", DataType::UInt16, true),
             Field::new("unsigned_large", DataType::UInt32, true),
+            Field::new("real_value", DataType::Float32, true),
+            Field::new("float_value", DataType::Float64, true),
         ]));
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
@@ -561,6 +638,8 @@ mod tests {
                 Field::new("unsigned_tiny", DataType::UInt8, true),
                 Field::new("unsigned_medium", DataType::UInt16, true),
                 Field::new("unsigned_large", DataType::UInt32, true),
+                Field::new("real_value", DataType::Float32, true),
+                Field::new("float_value", DataType::Float64, true),
             ])),
             vec![
                 Arc::new(BooleanArray::from(vec![Some(true), None])) as ArrayRef,
@@ -571,6 +650,8 @@ mod tests {
                 Arc::new(UInt8Array::from(vec![Some(8_u8), None])),
                 Arc::new(UInt16Array::from(vec![Some(16_u16), None])),
                 Arc::new(UInt32Array::from(vec![Some(32_u32), None])),
+                Arc::new(Float32Array::from(vec![Some(1.25_f32), None])),
+                Arc::new(Float64Array::from(vec![Some(2.5_f64), None])),
             ],
         )
         .unwrap();
@@ -639,6 +720,22 @@ mod tests {
         assert_eq!(
             view.mssql_cell(&mappings[7], 1).unwrap(),
             MssqlCell::BigInt(None)
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[8], 0).unwrap(),
+            MssqlCell::Real(Some(1.25))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[8], 1).unwrap(),
+            MssqlCell::Real(None)
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[9], 0).unwrap(),
+            MssqlCell::Float(Some(2.5))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[9], 1).unwrap(),
+            MssqlCell::Float(None)
         );
     }
 
@@ -738,7 +835,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_runtime_extraction_for_now() {
+    fn rejects_non_finite_float32_values() {
         let mappings = mappings_for_schema(Schema::new(vec![Field::new(
             "ratio",
             DataType::Float32,
@@ -750,19 +847,59 @@ mod tests {
                 DataType::Float32,
                 true,
             )])),
-            vec![Arc::new(Float32Array::from(vec![1.25_f32]))],
+            vec![Arc::new(Float32Array::from(vec![
+                f32::NAN,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+            ]))],
         )
         .unwrap();
         let view = RecordBatchView::new(&batch, &mappings).unwrap();
 
-        let err = view.mssql_cell(&mappings[0], 0).unwrap_err();
+        for row_index in 0..3 {
+            let err = view.mssql_cell(&mappings[0], row_index).unwrap_err();
 
-        assert_single_diagnostic(
-            err,
-            DiagnosticCode::ValueConversionUnsupported,
-            Some(0),
-            Some((0, "ratio")),
-        );
+            assert_single_diagnostic(
+                err,
+                DiagnosticCode::NonFiniteFloat,
+                Some(row_index),
+                Some((0, "ratio")),
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_finite_float64_values() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "ratio",
+            DataType::Float64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "ratio",
+                DataType::Float64,
+                true,
+            )])),
+            vec![Arc::new(Float64Array::from(vec![
+                f64::NAN,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+            ]))],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        for row_index in 0..3 {
+            let err = view.mssql_cell(&mappings[0], row_index).unwrap_err();
+
+            assert_single_diagnostic(
+                err,
+                DiagnosticCode::NonFiniteFloat,
+                Some(row_index),
+                Some((0, "ratio")),
+            );
+        }
     }
 
     #[test]
