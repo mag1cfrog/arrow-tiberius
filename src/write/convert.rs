@@ -259,6 +259,33 @@ impl<'a> RecordBatchView<'a> {
         let cell = self.arrow_cell(mapping, row_index)?;
         mssql_cell_from_arrow_cell(mapping, cell, row_index)
     }
+
+    /// Converts one runtime row into semantic SQL Server cells in mapping order.
+    pub(crate) fn mssql_row(&self, row_index: usize) -> Result<Vec<MssqlCell<'_>>> {
+        self.check_row_index(row_index)?;
+
+        let mut cells = Vec::with_capacity(self.mappings.len());
+        for mapping in self.mappings {
+            cells.push(self.mssql_cell(mapping, row_index)?);
+        }
+
+        Ok(cells)
+    }
+
+    /// Converts one runtime row into an owned Tiberius token row.
+    pub(crate) fn tiberius_row_owned(
+        &self,
+        row_index: usize,
+    ) -> Result<tiberius::TokenRow<'static>> {
+        let cells = self.mssql_row(row_index)?;
+        let mut row = tiberius::TokenRow::with_capacity(cells.len());
+
+        for cell in cells {
+            row.push(mssql_cell_to_tiberius_owned(cell));
+        }
+
+        Ok(row)
+    }
 }
 
 /// Converts a semantic SQL Server cell into borrowed Tiberius column data.
@@ -966,6 +993,149 @@ mod tests {
         assert_eq!(
             view.mssql_cell(&mappings[13], 1).unwrap(),
             MssqlCell::VarBinary(None)
+        );
+    }
+
+    #[test]
+    fn converts_runtime_row_to_mssql_cells_in_mapping_order() {
+        let mappings = mappings_for_schema(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("active", DataType::Boolean, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("payload", DataType::Binary, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("active", DataType::Boolean, true),
+                Field::new("name", DataType::Utf8, true),
+                Field::new("payload", DataType::Binary, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1_i32, 2])) as ArrayRef,
+                Arc::new(BooleanArray::from(vec![Some(true), None])),
+                Arc::new(StringArray::from(vec![Some("first"), Some("second")])),
+                Arc::new(BinaryArray::from(vec![Some(&b"abc"[..]), None])),
+            ],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let first_row = view.mssql_row(0).unwrap();
+        assert_eq!(
+            first_row,
+            vec![
+                MssqlCell::Int(Some(1)),
+                MssqlCell::Bit(Some(true)),
+                MssqlCell::NVarChar(Some("first")),
+                MssqlCell::VarBinary(Some(b"abc")),
+            ]
+        );
+
+        let second_row = view.mssql_row(1).unwrap();
+        assert_eq!(
+            second_row,
+            vec![
+                MssqlCell::Int(Some(2)),
+                MssqlCell::Bit(None),
+                MssqlCell::NVarChar(Some("second")),
+                MssqlCell::VarBinary(None),
+            ]
+        );
+    }
+
+    #[test]
+    fn converts_runtime_row_to_owned_tiberius_token_row() {
+        let mappings = mappings_for_schema(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("active", DataType::Boolean, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("payload", DataType::Binary, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("active", DataType::Boolean, true),
+                Field::new("name", DataType::Utf8, true),
+                Field::new("payload", DataType::Binary, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1_i32])) as ArrayRef,
+                Arc::new(BooleanArray::from(vec![Some(true)])),
+                Arc::new(StringArray::from(vec![Some("first")])),
+                Arc::new(BinaryArray::from(vec![Some(&b"abc"[..])])),
+            ],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let row = view.tiberius_row_owned(0).unwrap();
+
+        assert_eq!(row.len(), 4);
+        assert_eq!(row.get(0), Some(&tiberius::ColumnData::I32(Some(1))));
+        assert_eq!(row.get(1), Some(&tiberius::ColumnData::Bit(Some(true))));
+
+        let Some(tiberius::ColumnData::String(Some(Cow::Owned(value)))) = row.get(2) else {
+            panic!("expected owned string column data");
+        };
+        assert_eq!(value, "first");
+
+        let Some(tiberius::ColumnData::Binary(Some(Cow::Owned(value)))) = row.get(3) else {
+            panic!("expected owned binary column data");
+        };
+        assert_eq!(value, b"abc");
+    }
+
+    #[test]
+    fn row_helpers_reject_row_index_out_of_bounds() {
+        let mappings =
+            mappings_for_schema(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![1_i32]))],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let err = view.mssql_row(1).unwrap_err();
+        assert_single_diagnostic(err, DiagnosticCode::RowIndexOutOfBounds, Some(1), None);
+
+        let err = view.tiberius_row_owned(1).unwrap_err();
+        assert_single_diagnostic(err, DiagnosticCode::RowIndexOutOfBounds, Some(1), None);
+    }
+
+    #[test]
+    fn row_helpers_preserve_conversion_diagnostics() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "ratio",
+            DataType::Float64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "ratio",
+                DataType::Float64,
+                true,
+            )])),
+            vec![Arc::new(Float64Array::from(vec![f64::NAN]))],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let err = view.mssql_row(0).unwrap_err();
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::NonFiniteFloat,
+            Some(0),
+            Some((0, "ratio")),
+        );
+
+        let err = view.tiberius_row_owned(0).unwrap_err();
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::NonFiniteFloat,
+            Some(0),
+            Some((0, "ratio")),
         );
     }
 
