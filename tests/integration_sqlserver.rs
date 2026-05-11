@@ -12,8 +12,8 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use arrow_tiberius::{
-    BulkWriter, MssqlProfile, PlanOptions, TableName, WriteBackend, WriteOptions,
-    create_table_sql_from_mappings, plan_arrow_schema_to_mssql_mappings,
+    BulkWriter, DiagnosticCode, Error, MssqlProfile, PlanOptions, TableName, WriteBackend,
+    WriteOptions, create_table_sql_from_mappings, plan_arrow_schema_to_mssql_mappings,
 };
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -293,6 +293,112 @@ async fn baseline_writer_round_trips_supported_value_matrix() -> TestResult<()> 
     Ok(())
 }
 
+#[tokio::test]
+async fn baseline_writer_rejects_target_table_schema_drift() -> TestResult<()> {
+    let Some((connection_string, database)) = integration_config() else {
+        eprintln!(
+            "skipping SQL Server baseline writer schema-drift integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+        );
+        return Ok(());
+    };
+
+    let mut client = connect(&connection_string, &database).await?;
+    let table = unique_table_name()?;
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
+        Arc::clone(&schema),
+        MssqlProfile::sql_server_2016_compat_100(),
+        PlanOptions::default(),
+    )?
+    .into_parts();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int32Array::from(vec![1_i32, 2])) as ArrayRef],
+    )?;
+
+    execute_sql(
+        &mut client,
+        format!(
+            "CREATE TABLE {} ([renamed_id] int NOT NULL)",
+            table.quoted_sql()
+        ),
+    )
+    .await?;
+
+    let result = async {
+        let err = BulkWriter::new(
+            &mut client,
+            table.clone(),
+            mappings,
+            WriteOptions {
+                backend: WriteBackend::BaselineTokenRow,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        .expect_err("target-table schema drift should be rejected");
+
+        let Error::ValueConversion { diagnostics } = err else {
+            panic!("expected value conversion error");
+        };
+
+        assert!(diagnostics.all().iter().any(|diagnostic| diagnostic.code()
+            == DiagnosticCode::SchemaMismatch
+            && diagnostic.message().contains("renamed_id")
+            && diagnostic.message().contains("id")));
+
+        let row_count = select_count(&mut client, &table).await?;
+        assert_eq!(row_count, 0);
+
+        let mut writer = BulkWriter::new(
+            &mut client,
+            table.clone(),
+            vec![arrow_tiberius::SchemaMapping::new(
+                arrow_tiberius::ArrowFieldRef::new(
+                    0,
+                    "renamed_id".to_owned(),
+                    false,
+                    DataType::Int32,
+                ),
+                arrow_tiberius::MssqlColumn::new(
+                    arrow_tiberius::Identifier::new("renamed_id")?,
+                    arrow_tiberius::MssqlType::Int,
+                    false,
+                ),
+            )],
+            WriteOptions {
+                backend: WriteBackend::BaselineTokenRow,
+                ..WriteOptions::default()
+            },
+        )
+        .await?;
+        let err = writer.write_batch(&batch).await.expect_err(
+            "runtime Arrow field drift should still be rejected after failed writer construction",
+        );
+
+        let Error::ValueConversion { diagnostics } = err else {
+            panic!("expected value conversion error");
+        };
+        assert!(diagnostics.all().iter().any(|diagnostic| {
+            diagnostic.code() == DiagnosticCode::SchemaMismatch
+                && diagnostic.message().contains("runtime Arrow field name id")
+                && diagnostic
+                    .message()
+                    .contains("planned Arrow field name renamed_id")
+        }));
+        assert_eq!(writer.finish().await?.rows_written, 0);
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    let drop_result = drop_table(&mut client, &table).await;
+    result?;
+    drop_result?;
+
+    Ok(())
+}
+
 type TestClient = tiberius::Client<Compat<TcpStream>>;
 type TestResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -316,6 +422,19 @@ async fn drop_table(client: &mut TestClient, table: &TableName) -> tiberius::Res
         format!("DROP TABLE IF EXISTS {}", table.quoted_sql()),
     )
     .await
+}
+
+async fn select_count(client: &mut TestClient, table: &TableName) -> tiberius::Result<i32> {
+    let row = client
+        .simple_query(format!("SELECT COUNT(*) FROM {}", table.quoted_sql()))
+        .await?
+        .into_row()
+        .await?
+        .expect("SELECT COUNT(*) should return one row");
+
+    Ok(row
+        .get::<i32, _>(0)
+        .expect("SELECT COUNT(*) should return an int"))
 }
 
 fn unique_table_name() -> arrow_tiberius::Result<TableName> {
