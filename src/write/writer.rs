@@ -1,7 +1,5 @@
 //! Baseline bulk writer public API skeleton.
 
-use std::{future::Future, pin::Pin};
-
 use arrow_array::RecordBatch;
 use futures_util::io::{AsyncRead, AsyncWrite};
 
@@ -292,25 +290,17 @@ where
 }
 
 trait TokenRowSink {
-    fn send_token_row<'a>(
-        &'a mut self,
-        row: tiberius::TokenRow<'static>,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
+    async fn send_token_row(&mut self, row: tiberius::TokenRow<'static>) -> Result<()>;
 }
 
 impl<S> TokenRowSink for tiberius::BulkLoadRequest<'_, S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    fn send_token_row<'a>(
-        &'a mut self,
-        row: tiberius::TokenRow<'static>,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
-        Box::pin(async move {
-            self.send(row)
-                .await
-                .map_err(|source| crate::Error::Tiberius { source })
-        })
+    async fn send_token_row(&mut self, row: tiberius::TokenRow<'static>) -> Result<()> {
+        self.send(row)
+            .await
+            .map_err(|source| crate::Error::Tiberius { source })
     }
 }
 
@@ -817,22 +807,15 @@ mod tests {
     }
 
     impl TokenRowSink for RecordingSink {
-        fn send_token_row<'a>(
-            &'a mut self,
-            row: tiberius::TokenRow<'static>,
-        ) -> Pin<Box<dyn Future<Output = crate::Result<()>> + 'a>> {
-            Box::pin(async move {
-                if self.fail_on_send == Some(self.rows.len()) {
-                    return Err(Error::Tiberius {
-                        source: tiberius::error::Error::BulkInput(Cow::Borrowed(
-                            "fake send failure",
-                        )),
-                    });
-                }
+        async fn send_token_row(&mut self, row: tiberius::TokenRow<'static>) -> crate::Result<()> {
+            if self.fail_on_send == Some(self.rows.len()) {
+                return Err(Error::Tiberius {
+                    source: tiberius::error::Error::BulkInput(Cow::Borrowed("fake send failure")),
+                });
+            }
 
-                self.rows.push(row);
-                Ok(())
-            })
+            self.rows.push(row);
+            Ok(())
         }
     }
 
