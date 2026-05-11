@@ -115,7 +115,15 @@ where
                     .bulk_insert(&table_sql)
                     .await
                     .map_err(|source| crate::Error::Tiberius { source })?;
-                validate_bulk_target_columns(request.columns(), state.mappings())?;
+                if let Err(validation_error) =
+                    validate_bulk_target_columns(request.columns(), state.mappings())
+                {
+                    request
+                        .finalize()
+                        .await
+                        .map_err(|source| crate::Error::Tiberius { source })?;
+                    return Err(validation_error);
+                }
                 request
             }
             WriteBackend::Auto | WriteBackend::DirectRawBulk => {
