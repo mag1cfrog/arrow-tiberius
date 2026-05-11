@@ -424,17 +424,17 @@ async fn drop_table(client: &mut TestClient, table: &TableName) -> tiberius::Res
     .await
 }
 
-async fn select_count(client: &mut TestClient, table: &TableName) -> tiberius::Result<i32> {
+async fn select_count(client: &mut TestClient, table: &TableName) -> TestResult<i32> {
     let row = client
         .simple_query(format!("SELECT COUNT(*) FROM {}", table.quoted_sql()))
         .await?
         .into_row()
         .await?
-        .expect("SELECT COUNT(*) should return one row");
+        .ok_or_else(|| std::io::Error::other("SELECT COUNT(*) returned no rows"))?;
 
     Ok(row
         .get::<i32, _>(0)
-        .expect("SELECT COUNT(*) should return an int"))
+        .ok_or_else(|| std::io::Error::other("SELECT COUNT(*) did not return an int"))?)
 }
 
 fn unique_table_name() -> arrow_tiberius::Result<TableName> {
