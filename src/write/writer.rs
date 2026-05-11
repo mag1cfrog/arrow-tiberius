@@ -5,7 +5,9 @@ use std::{future::Future, pin::Pin};
 use arrow_array::RecordBatch;
 use futures_util::io::{AsyncRead, AsyncWrite};
 
-use crate::{Result, SchemaMapping, TableName};
+use crate::{
+    Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, Result, SchemaMapping, TableName,
+};
 
 use super::{SchemaCheck, convert::RecordBatchView};
 
@@ -111,10 +113,12 @@ where
         let request = match state.backend() {
             WriteBackend::BaselineTokenRow => {
                 let table_sql = bulk_insert_table_sql(&table);
-                client
+                let request = client
                     .bulk_insert(&table_sql)
                     .await
-                    .map_err(|source| crate::Error::Tiberius { source })?
+                    .map_err(|source| crate::Error::Tiberius { source })?;
+                validate_bulk_target_columns(request.columns(), state.mappings())?;
+                request
             }
             WriteBackend::Auto | WriteBackend::DirectRawBulk => {
                 return Err(execution_unavailable(state.backend()));
@@ -163,6 +167,108 @@ fn validate_batch_rows(view: &RecordBatchView<'_>) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn validate_bulk_target_columns<Column>(
+    columns: impl ExactSizeIterator<Item = Column>,
+    mappings: &[SchemaMapping],
+) -> Result<()>
+where
+    Column: BulkTargetColumnMetadata,
+{
+    let column_count = columns.len();
+    let mut diagnostics = DiagnosticSet::new();
+
+    if column_count != mappings.len() {
+        diagnostics.push(Diagnostic::error(
+            DiagnosticCode::SchemaMismatch,
+            format!(
+                "bulk target has {column_count} updateable column(s) but mappings contain {} column(s)",
+                mappings.len()
+            ),
+        ));
+    }
+
+    for (position, (column, mapping)) in columns.zip(mappings).enumerate() {
+        validate_bulk_target_column(position, column, mapping, &mut diagnostics);
+    }
+
+    if diagnostics.has_errors() {
+        return Err(crate::Error::ValueConversion { diagnostics });
+    }
+
+    Ok(())
+}
+
+fn validate_bulk_target_column(
+    position: usize,
+    column: impl BulkTargetColumnMetadata,
+    mapping: &SchemaMapping,
+    diagnostics: &mut DiagnosticSet,
+) {
+    if column.ordinal() != position {
+        diagnostics.push(bulk_target_column_diagnostic(
+            mapping,
+            format!(
+                "bulk target column ordinal {} does not match mapping position {position}",
+                column.ordinal()
+            ),
+        ));
+    }
+
+    if column.name() != mapping.mssql().name().as_str() {
+        diagnostics.push(bulk_target_column_diagnostic(
+            mapping,
+            format!(
+                "bulk target column name {} does not match planned MSSQL column name {}",
+                column.name(),
+                mapping.mssql().name().as_str()
+            ),
+        ));
+    }
+
+    if column.is_nullable() != mapping.mssql().nullable() {
+        diagnostics.push(bulk_target_column_diagnostic(
+            mapping,
+            format!(
+                "bulk target column nullability {} does not match planned MSSQL column nullability {}",
+                column.is_nullable(),
+                mapping.mssql().nullable()
+            ),
+        ));
+    }
+}
+
+fn bulk_target_column_diagnostic(
+    mapping: &SchemaMapping,
+    message: impl Into<String>,
+) -> Diagnostic {
+    Diagnostic::error(DiagnosticCode::SchemaMismatch, message).with_field(FieldRef::new(
+        mapping.arrow().index(),
+        mapping.arrow().name(),
+    ))
+}
+
+trait BulkTargetColumnMetadata {
+    fn ordinal(&self) -> usize;
+
+    fn name(&self) -> &str;
+
+    fn is_nullable(&self) -> bool;
+}
+
+impl BulkTargetColumnMetadata for tiberius::BulkLoadColumn<'_> {
+    fn ordinal(&self) -> usize {
+        self.ordinal()
+    }
+
+    fn name(&self) -> &str {
+        self.name()
+    }
+
+    fn is_nullable(&self) -> bool {
+        self.is_nullable()
+    }
 }
 
 async fn write_batch_to_sink<Sink>(
@@ -244,8 +350,9 @@ mod tests {
     use futures_util::io::{AsyncRead, AsyncWrite};
 
     use super::{
-        TokenRowSink, WriteBackend, WriteOptions, WriteStats, WriterState, bulk_insert_table_sql,
-        record_batch_view, resolve_backend, validate_batch_rows, write_batch_to_sink,
+        BulkTargetColumnMetadata, TokenRowSink, WriteBackend, WriteOptions, WriteStats,
+        WriterState, bulk_insert_table_sql, record_batch_view, resolve_backend,
+        validate_batch_rows, validate_bulk_target_columns, write_batch_to_sink,
     };
     use crate::{
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, SchemaCheck,
@@ -428,6 +535,75 @@ mod tests {
     }
 
     #[test]
+    fn bulk_target_column_validation_accepts_matching_metadata() {
+        let mappings = vec![mapping("id")];
+        let columns = vec![bulk_target_column(0, "id", false)];
+
+        validate_bulk_target_columns(columns.into_iter(), &mappings).unwrap();
+    }
+
+    #[test]
+    fn bulk_target_column_validation_rejects_missing_target_columns() {
+        let mappings = vec![mapping("id")];
+        let columns = Vec::<FakeBulkTargetColumn>::new();
+
+        let err = validate_bulk_target_columns(columns.into_iter(), &mappings).unwrap_err();
+
+        let Error::ValueConversion { diagnostics } = err else {
+            panic!("expected value conversion error");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics.all()[0].code(), DiagnosticCode::SchemaMismatch);
+        assert_eq!(
+            diagnostics.all()[0].message(),
+            "bulk target has 0 updateable column(s) but mappings contain 1 column(s)"
+        );
+    }
+
+    #[test]
+    fn bulk_target_column_validation_rejects_ordinal_name_and_nullability_drift() {
+        let mappings = vec![mapping("id")];
+        let columns = vec![bulk_target_column(7, "id]; DROP TABLE target;--", true)];
+
+        let err = validate_bulk_target_columns(columns.into_iter(), &mappings).unwrap_err();
+
+        let Error::ValueConversion { diagnostics } = err else {
+            panic!("expected value conversion error");
+        };
+        assert_eq!(diagnostics.len(), 3);
+        assert!(
+            diagnostics
+                .all()
+                .iter()
+                .all(|diagnostic| diagnostic.code() == DiagnosticCode::SchemaMismatch)
+        );
+        assert!(
+            diagnostics
+                .all()
+                .iter()
+                .all(|diagnostic| diagnostic.field().map(|field| field.name()) == Some("id"))
+        );
+        assert!(
+            diagnostics
+                .all()
+                .iter()
+                .any(|diagnostic| diagnostic.message().contains("ordinal 7"))
+        );
+        assert!(
+            diagnostics
+                .all()
+                .iter()
+                .any(|diagnostic| diagnostic.message().contains("DROP TABLE"))
+        );
+        assert!(
+            diagnostics
+                .all()
+                .iter()
+                .any(|diagnostic| diagnostic.message().contains("nullability true"))
+        );
+    }
+
+    #[test]
     fn write_batch_to_sink_accepts_empty_matching_batch() {
         let mappings = vec![mapping("id")];
         let mut state = WriterState::new(
@@ -587,6 +763,14 @@ mod tests {
         RecordBatch::try_new(schema, vec![array]).unwrap()
     }
 
+    fn bulk_target_column(ordinal: usize, name: &str, nullable: bool) -> FakeBulkTargetColumn {
+        FakeBulkTargetColumn {
+            ordinal,
+            name: name.to_owned(),
+            nullable,
+        }
+    }
+
     fn float64_batch(name: &str, values: &[Option<f64>]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new(
             name,
@@ -649,6 +833,27 @@ mod tests {
                 self.rows.push(row);
                 Ok(())
             })
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeBulkTargetColumn {
+        ordinal: usize,
+        name: String,
+        nullable: bool,
+    }
+
+    impl BulkTargetColumnMetadata for FakeBulkTargetColumn {
+        fn ordinal(&self) -> usize {
+            self.ordinal
+        }
+
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn is_nullable(&self) -> bool {
+            self.nullable
         }
     }
 
