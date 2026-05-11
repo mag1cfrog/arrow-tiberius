@@ -1,7 +1,5 @@
 //! Baseline bulk writer public API skeleton.
 
-use std::marker::PhantomData;
-
 use arrow_array::RecordBatch;
 use futures_util::io::{AsyncRead, AsyncWrite};
 
@@ -84,7 +82,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     state: WriterState,
-    _client: PhantomData<&'client mut tiberius::Client<S>>,
+    request: tiberius::BulkLoadRequest<'client, S>,
 }
 
 impl<'client, S> BulkWriter<'client, S>
@@ -93,29 +91,50 @@ where
 {
     /// Starts a bulk writer for a planned SQL Server table target.
     pub async fn new(
-        _client: &'client mut tiberius::Client<S>,
-        _table: TableName,
+        client: &'client mut tiberius::Client<S>,
+        table: TableName,
         mappings: Vec<SchemaMapping>,
         options: WriteOptions,
     ) -> Result<Self> {
         let state = WriterState::new(options.backend, mappings)?;
+        let request = match state.backend() {
+            WriteBackend::BaselineTokenRow => {
+                let table_sql = bulk_insert_table_sql(&table);
+                client
+                    .bulk_insert(&table_sql)
+                    .await
+                    .map_err(|source| crate::Error::Tiberius { source })?
+            }
+            WriteBackend::Auto | WriteBackend::DirectRawBulk => {
+                return Err(execution_unavailable(state.backend()));
+            }
+        };
 
-        Err(execution_unavailable(state.backend()))
+        Ok(Self { state, request })
     }
 
     /// Writes one Arrow record batch.
     pub async fn write_batch(&mut self, _batch: &RecordBatch) -> Result<WriteStats> {
         let _planned_column_count = self.state.mappings().len();
+        let _request = &mut self.request;
 
         Err(execution_unavailable(self.state.backend()))
     }
 
     /// Finalizes the bulk writer and returns cumulative write statistics.
     pub async fn finish(self) -> Result<WriteStats> {
-        let _stats = self.state.stats();
+        let Self {
+            state,
+            request: _request,
+        } = self;
+        let _stats = state.stats();
 
-        Err(execution_unavailable(self.state.backend()))
+        Err(execution_unavailable(state.backend()))
     }
+}
+
+fn bulk_insert_table_sql(table: &TableName) -> String {
+    table.quoted_sql()
 }
 
 fn resolve_backend(requested_backend: WriteBackend) -> Result<WriteBackend> {
@@ -138,19 +157,19 @@ fn execution_unavailable(backend: WriteBackend) -> crate::Error {
 #[cfg(test)]
 mod tests {
     use std::{
-        future::Future,
-        marker::PhantomData,
         pin::Pin,
-        sync::Arc,
-        task::{Context, Poll, Wake, Waker},
+        task::{Context, Poll},
     };
 
-    use arrow_array::RecordBatch;
-    use arrow_schema::{DataType, Schema};
+    use arrow_schema::DataType;
     use futures_util::io::{AsyncRead, AsyncWrite};
 
-    use super::{BulkWriter, WriteBackend, WriteOptions, WriteStats, WriterState, resolve_backend};
-    use crate::{ArrowFieldRef, Identifier, MssqlColumn, MssqlType, SchemaCheck, SchemaMapping};
+    use super::{
+        WriteBackend, WriteOptions, WriteStats, WriterState, bulk_insert_table_sql, resolve_backend,
+    };
+    use crate::{
+        ArrowFieldRef, Identifier, MssqlColumn, MssqlType, SchemaCheck, SchemaMapping, TableName,
+    };
 
     #[test]
     fn write_backend_defaults_to_auto() {
@@ -252,6 +271,13 @@ mod tests {
     }
 
     #[test]
+    fn bulk_insert_table_sql_uses_quoted_table_name() {
+        let table = TableName::new("dbo]x", "target.table").unwrap();
+
+        assert_eq!(bulk_insert_table_sql(&table), "[dbo]]x].[target.table]");
+    }
+
+    #[test]
     fn writer_types_are_exported_from_crate_root() {
         assert_eq!(crate::WriteBackend::default(), WriteBackend::Auto);
         assert_eq!(crate::WriteOptions::default(), WriteOptions::default());
@@ -266,51 +292,11 @@ mod tests {
         assert!(name.contains("tiberius"));
     }
 
-    #[test]
-    fn write_batch_rejects_baseline_until_execution_is_implemented() {
-        let batch = empty_batch();
-        let mut writer = skeleton_writer(WriteBackend::BaselineTokenRow);
-        let result = poll_ready(writer.write_batch(&batch));
-
-        assert_execution_unavailable(result, WriteBackend::BaselineTokenRow);
-    }
-
-    #[test]
-    fn finish_rejects_baseline_until_execution_is_implemented() {
-        let writer = skeleton_writer(WriteBackend::BaselineTokenRow);
-        let result = poll_ready(writer.finish());
-
-        assert_execution_unavailable(result, WriteBackend::BaselineTokenRow);
-    }
-
-    fn skeleton_writer(backend: WriteBackend) -> BulkWriter<'static, DummyStream> {
-        BulkWriter {
-            state: WriterState {
-                backend,
-                mappings: Vec::new(),
-                stats: WriteStats::default(),
-            },
-            _client: PhantomData,
-        }
-    }
-
-    fn empty_batch() -> RecordBatch {
-        RecordBatch::new_empty(Arc::new(Schema::empty()))
-    }
-
     fn mapping(name: &str) -> SchemaMapping {
         SchemaMapping::new(
             ArrowFieldRef::new(0, name.to_owned(), false, DataType::Int32),
             MssqlColumn::new(Identifier::new(name).unwrap(), MssqlType::Int, false),
         )
-    }
-
-    fn assert_execution_unavailable(result: crate::Result<WriteStats>, expected: WriteBackend) {
-        assert_backend_unavailable_reason(
-            result,
-            expected,
-            "bulk writer execution is not implemented yet",
-        );
     }
 
     fn assert_backend_unavailable_reason<T: std::fmt::Debug>(
@@ -325,26 +311,6 @@ mod tests {
             }
             other => panic!("expected backend-unavailable error, got {other:?}"),
         }
-    }
-
-    fn poll_ready<F>(future: F) -> F::Output
-    where
-        F: Future,
-    {
-        let waker = Waker::from(Arc::new(NoopWake));
-        let mut context = Context::from_waker(&waker);
-        let mut future = Box::pin(future);
-
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(output) => output,
-            Poll::Pending => panic!("future unexpectedly returned pending"),
-        }
-    }
-
-    struct NoopWake;
-
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
     }
 
     #[derive(Debug)]
