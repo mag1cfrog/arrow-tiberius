@@ -121,6 +121,29 @@ impl<'a> ArrowCell<'a> {
         }
     }
 
+    fn try_decimal(self, mapping: &SchemaMapping, row_index: usize) -> Result<MssqlDecimal> {
+        if !is_uint64_decimal20_0_mapping(mapping) {
+            return Err(unsupported_value_conversion(
+                mapping,
+                row_index,
+                format!(
+                    "planned SQL Server type {} is not supported yet",
+                    mapping.mssql().ty().to_sql()
+                ),
+            ));
+        }
+
+        match self {
+            Self::UInt64(value) => Ok(MssqlDecimal::new(i128::from(value), 0)),
+            other => Err(value_conversion_error(row_mapping_diagnostic(
+                mapping,
+                row_index,
+                DiagnosticCode::ValueTypeMismatch,
+                format!("expected Arrow UInt64 payload, got {other:?}"),
+            ))),
+        }
+    }
+
     fn try_f32(self, mapping: &SchemaMapping, row_index: usize) -> Result<f32> {
         match self {
             Self::Float32(value) if value.is_finite() => Ok(value),
@@ -462,6 +485,9 @@ fn mssql_cell_from_arrow_cell<'a>(
         MssqlType::SmallInt => Ok(MssqlCell::SmallInt(Some(cell.try_i16(mapping, row_index)?))),
         MssqlType::Int => Ok(MssqlCell::Int(Some(cell.try_i32(mapping, row_index)?))),
         MssqlType::BigInt => Ok(MssqlCell::BigInt(Some(cell.try_i64(mapping, row_index)?))),
+        MssqlType::Decimal { .. } => Ok(MssqlCell::Decimal(Some(
+            cell.try_decimal(mapping, row_index)?,
+        ))),
         MssqlType::Real => Ok(MssqlCell::Real(Some(cell.try_f32(mapping, row_index)?))),
         MssqlType::Float { .. } => Ok(MssqlCell::Float(Some(cell.try_f64(mapping, row_index)?))),
         MssqlType::NVarChar(length) => nvar_char_cell(mapping, row_index, *length, cell),
@@ -484,6 +510,9 @@ fn null_mssql_cell<'a>(mapping: &SchemaMapping, row_index: usize) -> Result<Mssq
         MssqlType::SmallInt => Ok(MssqlCell::SmallInt(None)),
         MssqlType::Int => Ok(MssqlCell::Int(None)),
         MssqlType::BigInt => Ok(MssqlCell::BigInt(None)),
+        MssqlType::Decimal { .. } if is_uint64_decimal20_0_mapping(mapping) => {
+            Ok(MssqlCell::Decimal(None))
+        }
         MssqlType::Real => Ok(MssqlCell::Real(None)),
         MssqlType::Float { .. } => Ok(MssqlCell::Float(None)),
         MssqlType::NVarChar(_) => Ok(MssqlCell::NVarChar(None)),
@@ -497,6 +526,19 @@ fn null_mssql_cell<'a>(mapping: &SchemaMapping, row_index: usize) -> Result<Mssq
             ),
         )),
     }
+}
+
+fn is_uint64_decimal20_0_mapping(mapping: &SchemaMapping) -> bool {
+    matches!(
+        (mapping.arrow().data_type(), mapping.mssql().ty()),
+        (
+            DataType::UInt64,
+            MssqlType::Decimal {
+                precision: 20,
+                scale: 0
+            }
+        )
+    )
 }
 
 fn nvar_char_cell<'a>(
@@ -1565,7 +1607,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_decimal_policy_planned_uint64_runtime_conversion_until_implemented() {
+    fn converts_uint64_decimal20_0_boundary_values() {
         let mappings = mappings_for_schema_with_options(
             Schema::new(vec![Field::new(
                 "unsigned_as_decimal",
@@ -1583,18 +1625,70 @@ mod tests {
                 DataType::UInt64,
                 true,
             )])),
-            vec![Arc::new(UInt64Array::from(vec![1_u64]))],
+            vec![Arc::new(UInt64Array::from(vec![
+                Some(0_u64),
+                Some(i64::MAX as u64),
+                Some((i64::MAX as u64) + 1),
+                Some(u64::MAX),
+                None,
+            ]))],
         )
         .unwrap();
         let view = RecordBatchView::new(&batch, &mappings).unwrap();
 
-        let err = view.mssql_cell(&mappings[0], 0).unwrap_err();
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 0).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(0, 0)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 1).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(i128::from(i64::MAX), 0)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 2).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(i128::from(i64::MAX) + 1, 0)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 3).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(i128::from(u64::MAX), 0)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 4).unwrap(),
+            MssqlCell::Decimal(None)
+        );
+    }
 
-        assert_single_diagnostic(
-            err,
-            DiagnosticCode::ValueConversionUnsupported,
-            Some(0),
-            Some((0, "unsigned_as_decimal")),
+    #[test]
+    fn converts_uint64_decimal20_0_to_owned_tiberius_numeric() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "unsigned_as_decimal",
+                DataType::UInt64,
+                true,
+            )]),
+            PlanOptions {
+                uint64_policy: UInt64Policy::Decimal20_0,
+                ..PlanOptions::default()
+            },
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "unsigned_as_decimal",
+                DataType::UInt64,
+                true,
+            )])),
+            vec![Arc::new(UInt64Array::from(vec![Some(u64::MAX)]))],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let row = view.tiberius_row_owned(0).unwrap();
+
+        assert_eq!(
+            row.get(0),
+            Some(&tiberius::ColumnData::Numeric(Some(
+                tiberius::numeric::Numeric::new_with_scale(i128::from(u64::MAX), 0)
+            )))
         );
     }
 
