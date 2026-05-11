@@ -1,5 +1,6 @@
 //! Write-path options and policies.
 
+pub(crate) mod convert;
 /// Write-path planning and conversion policies.
 pub mod policy;
 /// Baseline bulk writer public API skeleton.
