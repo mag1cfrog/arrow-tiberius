@@ -6,7 +6,10 @@ use std::env;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+use arrow_array::{
+    ArrayRef, BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch,
+    StringArray,
+};
 use arrow_schema::{DataType, Field, Schema};
 use arrow_tiberius::{
     BulkWriter, MssqlProfile, PlanOptions, TableName, WriteBackend, WriteOptions,
@@ -132,6 +135,152 @@ async fn baseline_writer_inserts_int32_and_utf8_batch() -> TestResult<()> {
         assert_eq!(rows[1].get::<&str, _>(1), Some("東京"));
         assert_eq!(rows[2].get::<i32, _>(0), Some(3));
         assert_eq!(rows[2].get::<&str, _>(1), None);
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    let drop_result = drop_table(&mut client, &table).await;
+    result?;
+    drop_result?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn baseline_writer_round_trips_supported_value_matrix() -> TestResult<()> {
+    let Some((connection_string, database)) = integration_config() else {
+        eprintln!(
+            "skipping SQL Server baseline writer matrix integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+        );
+        return Ok(());
+    };
+
+    let mut client = connect(&connection_string, &database).await?;
+    let table = unique_table_name()?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::Int32, false),
+        Field::new("flag", DataType::Boolean, true),
+        Field::new("i32_value", DataType::Int32, true),
+        Field::new("i64_value", DataType::Int64, true),
+        Field::new("f64_value", DataType::Float64, true),
+        Field::new("text_value", DataType::Utf8, true),
+        Field::new("bytes_value", DataType::Binary, true),
+    ]));
+    let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
+        Arc::clone(&schema),
+        MssqlProfile::sql_server_2016_compat_100(),
+        PlanOptions::default(),
+    )?
+    .into_parts();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1_i32, 2, 3, 4])) as ArrayRef,
+            Arc::new(BooleanArray::from(vec![
+                Some(true),
+                Some(false),
+                None,
+                Some(true),
+            ])),
+            Arc::new(Int32Array::from(vec![
+                Some(i32::MIN),
+                Some(0),
+                Some(i32::MAX),
+                None,
+            ])),
+            Arc::new(Int64Array::from(vec![
+                Some(i64::MIN),
+                Some(0),
+                Some(i64::MAX),
+                None,
+            ])),
+            Arc::new(Float64Array::from(vec![
+                Some(-123.5),
+                Some(0.0),
+                Some(42.25),
+                None,
+            ])),
+            Arc::new(StringArray::from(vec![
+                Some(""),
+                Some("ascii"),
+                Some("東京"),
+                None,
+            ])),
+            Arc::new(BinaryArray::from_iter(vec![
+                Some(&b""[..]),
+                Some(&b"\x00\x01\xfe\xff"[..]),
+                Some(&b"abc"[..]),
+                None,
+            ])),
+        ],
+    )?;
+
+    execute_sql(
+        &mut client,
+        create_table_sql_from_mappings(&table, &mappings),
+    )
+    .await?;
+
+    let result = async {
+        let mut writer = BulkWriter::new(
+            &mut client,
+            table.clone(),
+            mappings,
+            WriteOptions {
+                backend: WriteBackend::BaselineTokenRow,
+                ..WriteOptions::default()
+            },
+        )
+        .await?;
+        let stats = writer.write_batch(&batch).await?;
+
+        assert_eq!(stats.rows_written, 4);
+        assert_eq!(stats.batches_written, 1);
+        assert_eq!(writer.finish().await?, stats);
+
+        let rows = client
+            .simple_query(format!(
+                "SELECT [row_id], [flag], [i32_value], [i64_value], [f64_value], [text_value], [bytes_value] FROM {} ORDER BY [row_id]",
+                table.quoted_sql()
+            ))
+            .await?
+            .into_first_result()
+            .await?;
+
+        assert_eq!(rows.len(), 4);
+
+        assert_eq!(rows[0].get::<i32, _>(0), Some(1));
+        assert_eq!(rows[0].get::<bool, _>(1), Some(true));
+        assert_eq!(rows[0].get::<i32, _>(2), Some(i32::MIN));
+        assert_eq!(rows[0].get::<i64, _>(3), Some(i64::MIN));
+        assert_eq!(rows[0].get::<f64, _>(4), Some(-123.5));
+        assert_eq!(rows[0].get::<&str, _>(5), Some(""));
+        assert_eq!(rows[0].get::<&[u8], _>(6), Some(&b""[..]));
+
+        assert_eq!(rows[1].get::<i32, _>(0), Some(2));
+        assert_eq!(rows[1].get::<bool, _>(1), Some(false));
+        assert_eq!(rows[1].get::<i32, _>(2), Some(0));
+        assert_eq!(rows[1].get::<i64, _>(3), Some(0));
+        assert_eq!(rows[1].get::<f64, _>(4), Some(0.0));
+        assert_eq!(rows[1].get::<&str, _>(5), Some("ascii"));
+        assert_eq!(rows[1].get::<&[u8], _>(6), Some(&b"\x00\x01\xfe\xff"[..]));
+
+        assert_eq!(rows[2].get::<i32, _>(0), Some(3));
+        assert_eq!(rows[2].get::<bool, _>(1), None);
+        assert_eq!(rows[2].get::<i32, _>(2), Some(i32::MAX));
+        assert_eq!(rows[2].get::<i64, _>(3), Some(i64::MAX));
+        assert_eq!(rows[2].get::<f64, _>(4), Some(42.25));
+        assert_eq!(rows[2].get::<&str, _>(5), Some("東京"));
+        assert_eq!(rows[2].get::<&[u8], _>(6), Some(&b"abc"[..]));
+
+        assert_eq!(rows[3].get::<i32, _>(0), Some(4));
+        assert_eq!(rows[3].get::<bool, _>(1), Some(true));
+        assert_eq!(rows[3].get::<i32, _>(2), None);
+        assert_eq!(rows[3].get::<i64, _>(3), None);
+        assert_eq!(rows[3].get::<f64, _>(4), None);
+        assert_eq!(rows[3].get::<&str, _>(5), None);
+        assert_eq!(rows[3].get::<&[u8], _>(6), None);
 
         Ok::<(), Box<dyn std::error::Error>>(())
     }
