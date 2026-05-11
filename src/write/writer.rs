@@ -124,10 +124,12 @@ where
 
     /// Writes one Arrow record batch.
     pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteStats> {
-        let rows = convert_batch_rows(batch, self.state.mappings(), self.state.schema_check())?;
-        let rows_written = usize_to_u64_saturating(rows.len());
+        let view = record_batch_view(batch, self.state.mappings(), self.state.schema_check())?;
+        validate_batch_rows(&view)?;
+        let rows_written = usize_to_u64_saturating(view.row_count());
 
-        for row in rows {
+        for row_index in 0..view.row_count() {
+            let row = view.tiberius_row_owned(row_index)?;
             self.request
                 .send(row)
                 .await
@@ -155,23 +157,22 @@ fn bulk_insert_table_sql(table: &TableName) -> String {
     table.quoted_sql()
 }
 
-fn convert_batch_rows(
-    batch: &RecordBatch,
-    mappings: &[SchemaMapping],
+fn record_batch_view<'a>(
+    batch: &'a RecordBatch,
+    mappings: &'a [SchemaMapping],
     schema_check: SchemaCheck,
-) -> Result<Vec<tiberius::TokenRow<'static>>> {
+) -> Result<RecordBatchView<'a>> {
     match schema_check {
-        SchemaCheck::Strict => {
-            let view = RecordBatchView::new(batch, mappings)?;
-            let mut rows = Vec::with_capacity(view.row_count());
-
-            for row_index in 0..view.row_count() {
-                rows.push(view.tiberius_row_owned(row_index)?);
-            }
-
-            Ok(rows)
-        }
+        SchemaCheck::Strict => RecordBatchView::new(batch, mappings),
     }
+}
+
+fn validate_batch_rows(view: &RecordBatchView<'_>) -> Result<()> {
+    for row_index in 0..view.row_count() {
+        let _cells = view.mssql_row(row_index)?;
+    }
+
+    Ok(())
 }
 
 fn usize_to_u64_saturating(value: usize) -> u64 {
@@ -209,7 +210,7 @@ mod tests {
 
     use super::{
         WriteBackend, WriteOptions, WriteStats, WriterState, bulk_insert_table_sql,
-        convert_batch_rows, resolve_backend,
+        record_batch_view, resolve_backend, validate_batch_rows,
     };
     use crate::{
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, SchemaCheck,
@@ -330,19 +331,21 @@ mod tests {
     }
 
     #[test]
-    fn strict_batch_conversion_prepares_token_rows_before_send() {
+    fn strict_batch_validation_accepts_supported_rows_without_owning_payloads() {
         let batch = int32_batch("id", &[1, 2]);
-        let rows = convert_batch_rows(&batch, &[mapping("id")], SchemaCheck::Strict).unwrap();
+        let mappings = [mapping("id")];
+        let view = record_batch_view(&batch, &mappings, SchemaCheck::Strict).unwrap();
 
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].get(0), Some(&tiberius::ColumnData::I32(Some(1))));
-        assert_eq!(rows[1].get(0), Some(&tiberius::ColumnData::I32(Some(2))));
+        validate_batch_rows(&view).unwrap();
+
+        let row = view.tiberius_row_owned(1).unwrap();
+        assert_eq!(row.get(0), Some(&tiberius::ColumnData::I32(Some(2))));
     }
 
     #[test]
-    fn strict_batch_conversion_rejects_runtime_schema_mismatch_before_send() {
+    fn strict_batch_view_rejects_runtime_schema_mismatch_before_send() {
         let batch = int32_batch("renamed_id", &[1]);
-        let err = convert_batch_rows(&batch, &[mapping("id")], SchemaCheck::Strict).unwrap_err();
+        let err = record_batch_view(&batch, &[mapping("id")], SchemaCheck::Strict).unwrap_err();
 
         let Error::ValueConversion { diagnostics } = err else {
             panic!("expected value conversion error");
@@ -354,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_batch_conversion_rejects_bad_later_row_before_any_send() {
+    fn strict_batch_validation_rejects_bad_later_row_before_any_send() {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "amount",
             DataType::Float64,
@@ -377,7 +380,8 @@ mod tests {
             ),
         )];
 
-        let err = convert_batch_rows(&batch, &mappings, SchemaCheck::Strict).unwrap_err();
+        let view = record_batch_view(&batch, &mappings, SchemaCheck::Strict).unwrap();
+        let err = validate_batch_rows(&view).unwrap_err();
 
         let Error::ValueConversion { diagnostics } = err else {
             panic!("expected value conversion error");
