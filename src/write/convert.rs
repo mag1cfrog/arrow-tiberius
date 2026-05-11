@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
     Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
-    UInt8Array, UInt16Array, UInt32Array,
+    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::DataType;
 
@@ -37,6 +37,8 @@ pub(crate) enum ArrowCell<'a> {
     UInt16(u16),
     /// Arrow unsigned 32-bit integer value.
     UInt32(u32),
+    /// Arrow unsigned 64-bit integer value.
+    UInt64(u64),
     /// Arrow 32-bit floating point value.
     Float32(f32),
     /// Arrow 64-bit floating point value.
@@ -391,6 +393,10 @@ fn extract_arrow_cell<'a>(
         DataType::UInt32 => {
             let array = downcast_array::<UInt32Array>(array, mapping, row_index)?;
             Ok(ArrowCell::UInt32(array.value(row_index)))
+        }
+        DataType::UInt64 => {
+            let array = downcast_array::<UInt64Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::UInt64(array.value(row_index)))
         }
         DataType::Float32 => {
             let array = downcast_array::<Float32Array>(array, mapping, row_index)?;
@@ -871,6 +877,51 @@ mod tests {
             ArrowCell::Binary(b"large")
         );
         assert_eq!(view.arrow_cell(&mappings[13], 1).unwrap(), ArrowCell::Null);
+    }
+
+    #[test]
+    fn extracts_uint64_arrow_cells_at_policy_boundaries() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new("unsigned_huge", DataType::UInt64, true)]),
+            PlanOptions {
+                uint64_policy: UInt64Policy::Decimal20_0,
+                ..PlanOptions::default()
+            },
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "unsigned_huge",
+                DataType::UInt64,
+                true,
+            )])),
+            vec![Arc::new(UInt64Array::from(vec![
+                Some(0_u64),
+                Some(i64::MAX as u64),
+                Some((i64::MAX as u64) + 1),
+                Some(u64::MAX),
+                None,
+            ]))],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        assert_eq!(
+            view.arrow_cell(&mappings[0], 0).unwrap(),
+            ArrowCell::UInt64(0)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[0], 1).unwrap(),
+            ArrowCell::UInt64(i64::MAX as u64)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[0], 2).unwrap(),
+            ArrowCell::UInt64((i64::MAX as u64) + 1)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[0], 3).unwrap(),
+            ArrowCell::UInt64(u64::MAX)
+        );
+        assert_eq!(view.arrow_cell(&mappings[0], 4).unwrap(), ArrowCell::Null);
     }
 
     #[test]
@@ -1507,9 +1558,17 @@ mod tests {
 
     #[test]
     fn rejects_policy_planned_uint64_runtime_conversion_until_implemented() {
-        for (policy, name) in [
-            (UInt64Policy::Decimal20_0, "unsigned_as_decimal"),
-            (UInt64Policy::CheckedBigInt, "unsigned_as_bigint"),
+        for (policy, name, expected_code) in [
+            (
+                UInt64Policy::Decimal20_0,
+                "unsigned_as_decimal",
+                DiagnosticCode::ValueConversionUnsupported,
+            ),
+            (
+                UInt64Policy::CheckedBigInt,
+                "unsigned_as_bigint",
+                DiagnosticCode::ValueTypeMismatch,
+            ),
         ] {
             let mappings = mappings_for_schema_with_options(
                 Schema::new(vec![Field::new(name, DataType::UInt64, true)]),
@@ -1527,12 +1586,7 @@ mod tests {
 
             let err = view.mssql_cell(&mappings[0], 0).unwrap_err();
 
-            assert_single_diagnostic(
-                err,
-                DiagnosticCode::ValueConversionUnsupported,
-                Some(0),
-                Some((0, name)),
-            );
+            assert_single_diagnostic(err, expected_code, Some(0), Some((0, name)));
         }
     }
 
