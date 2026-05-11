@@ -39,13 +39,51 @@ pub struct WriteStats {
     pub batches_written: u64,
 }
 
+#[derive(Debug)]
+struct WriterState {
+    backend: WriteBackend,
+    mappings: Vec<SchemaMapping>,
+    stats: WriteStats,
+}
+
+impl WriterState {
+    fn new(requested_backend: WriteBackend, mappings: Vec<SchemaMapping>) -> Result<Self> {
+        let backend = resolve_backend(requested_backend)?;
+
+        Ok(Self {
+            backend,
+            mappings,
+            stats: WriteStats::default(),
+        })
+    }
+
+    fn backend(&self) -> WriteBackend {
+        self.backend
+    }
+
+    fn mappings(&self) -> &[SchemaMapping] {
+        &self.mappings
+    }
+
+    fn stats(&self) -> WriteStats {
+        self.stats
+    }
+
+    #[cfg(test)]
+    fn record_accepted_batch(&mut self, rows: u64) -> WriteStats {
+        self.stats.rows_written = self.stats.rows_written.saturating_add(rows);
+        self.stats.batches_written = self.stats.batches_written.saturating_add(1);
+        self.stats
+    }
+}
+
 /// SQL Server bulk writer for Arrow record batches.
 #[derive(Debug)]
 pub struct BulkWriter<'client, S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    backend: WriteBackend,
+    state: WriterState,
     _client: PhantomData<&'client mut tiberius::Client<S>>,
 }
 
@@ -57,29 +95,43 @@ where
     pub async fn new(
         _client: &'client mut tiberius::Client<S>,
         _table: TableName,
-        _mappings: Vec<SchemaMapping>,
+        mappings: Vec<SchemaMapping>,
         options: WriteOptions,
     ) -> Result<Self> {
-        Err(crate::Error::BackendUnavailable {
-            backend: options.backend,
-            reason: "bulk writer execution is not implemented yet".to_owned(),
-        })
+        let state = WriterState::new(options.backend, mappings)?;
+
+        Err(execution_unavailable(state.backend()))
     }
 
     /// Writes one Arrow record batch.
     pub async fn write_batch(&mut self, _batch: &RecordBatch) -> Result<WriteStats> {
-        Err(crate::Error::BackendUnavailable {
-            backend: self.backend,
-            reason: "bulk writer execution is not implemented yet".to_owned(),
-        })
+        let _planned_column_count = self.state.mappings().len();
+
+        Err(execution_unavailable(self.state.backend()))
     }
 
     /// Finalizes the bulk writer and returns cumulative write statistics.
     pub async fn finish(self) -> Result<WriteStats> {
-        Err(crate::Error::BackendUnavailable {
-            backend: self.backend,
-            reason: "bulk writer execution is not implemented yet".to_owned(),
-        })
+        let _stats = self.state.stats();
+
+        Err(execution_unavailable(self.state.backend()))
+    }
+}
+
+fn resolve_backend(requested_backend: WriteBackend) -> Result<WriteBackend> {
+    match requested_backend {
+        WriteBackend::Auto | WriteBackend::BaselineTokenRow => Ok(WriteBackend::BaselineTokenRow),
+        WriteBackend::DirectRawBulk => Err(crate::Error::BackendUnavailable {
+            backend: WriteBackend::DirectRawBulk,
+            reason: "direct raw bulk backend is not implemented yet".to_owned(),
+        }),
+    }
+}
+
+fn execution_unavailable(backend: WriteBackend) -> crate::Error {
+    crate::Error::BackendUnavailable {
+        backend,
+        reason: "bulk writer execution is not implemented yet".to_owned(),
     }
 }
 
@@ -94,11 +146,11 @@ mod tests {
     };
 
     use arrow_array::RecordBatch;
-    use arrow_schema::Schema;
+    use arrow_schema::{DataType, Schema};
     use futures_util::io::{AsyncRead, AsyncWrite};
 
-    use super::{BulkWriter, WriteBackend, WriteOptions, WriteStats};
-    use crate::SchemaCheck;
+    use super::{BulkWriter, WriteBackend, WriteOptions, WriteStats, WriterState, resolve_backend};
+    use crate::{ArrowFieldRef, Identifier, MssqlColumn, MssqlType, SchemaCheck, SchemaMapping};
 
     #[test]
     fn write_backend_defaults_to_auto() {
@@ -139,6 +191,67 @@ mod tests {
     }
 
     #[test]
+    fn auto_backend_resolves_to_baseline_token_row() {
+        assert_eq!(
+            resolve_backend(WriteBackend::Auto).unwrap(),
+            WriteBackend::BaselineTokenRow
+        );
+        assert_eq!(
+            resolve_backend(WriteBackend::BaselineTokenRow).unwrap(),
+            WriteBackend::BaselineTokenRow
+        );
+    }
+
+    #[test]
+    fn direct_raw_bulk_resolution_fails_until_direct_backend_exists() {
+        let result = resolve_backend(WriteBackend::DirectRawBulk);
+
+        assert_backend_unavailable_reason(
+            result,
+            WriteBackend::DirectRawBulk,
+            "direct raw bulk backend is not implemented yet",
+        );
+    }
+
+    #[test]
+    fn writer_state_starts_with_resolved_backend_mappings_and_zero_stats() {
+        let mappings = vec![mapping("id")];
+
+        let state = WriterState::new(WriteBackend::Auto, mappings.clone()).unwrap();
+
+        assert_eq!(state.backend(), WriteBackend::BaselineTokenRow);
+        assert_eq!(state.mappings(), mappings.as_slice());
+        assert_eq!(state.stats(), WriteStats::default());
+    }
+
+    #[test]
+    fn writer_state_accumulates_accepted_batch_stats() {
+        let mut state = WriterState::new(WriteBackend::BaselineTokenRow, Vec::new()).unwrap();
+
+        assert_eq!(
+            state.record_accepted_batch(0),
+            WriteStats {
+                rows_written: 0,
+                batches_written: 1
+            }
+        );
+        assert_eq!(
+            state.record_accepted_batch(3),
+            WriteStats {
+                rows_written: 3,
+                batches_written: 2
+            }
+        );
+        assert_eq!(
+            state.record_accepted_batch(5),
+            WriteStats {
+                rows_written: 8,
+                batches_written: 3
+            }
+        );
+    }
+
+    #[test]
     fn writer_types_are_exported_from_crate_root() {
         assert_eq!(crate::WriteBackend::default(), WriteBackend::Auto);
         assert_eq!(crate::WriteOptions::default(), WriteOptions::default());
@@ -154,38 +267,29 @@ mod tests {
     }
 
     #[test]
-    fn write_batch_rejects_all_backends_until_execution_is_implemented() {
+    fn write_batch_rejects_baseline_until_execution_is_implemented() {
         let batch = empty_batch();
+        let mut writer = skeleton_writer(WriteBackend::BaselineTokenRow);
+        let result = poll_ready(writer.write_batch(&batch));
 
-        for backend in [
-            WriteBackend::Auto,
-            WriteBackend::BaselineTokenRow,
-            WriteBackend::DirectRawBulk,
-        ] {
-            let mut writer = skeleton_writer(backend);
-            let result = poll_ready(writer.write_batch(&batch));
-
-            assert_backend_unavailable(result, backend);
-        }
+        assert_execution_unavailable(result, WriteBackend::BaselineTokenRow);
     }
 
     #[test]
-    fn finish_rejects_all_backends_until_execution_is_implemented() {
-        for backend in [
-            WriteBackend::Auto,
-            WriteBackend::BaselineTokenRow,
-            WriteBackend::DirectRawBulk,
-        ] {
-            let writer = skeleton_writer(backend);
-            let result = poll_ready(writer.finish());
+    fn finish_rejects_baseline_until_execution_is_implemented() {
+        let writer = skeleton_writer(WriteBackend::BaselineTokenRow);
+        let result = poll_ready(writer.finish());
 
-            assert_backend_unavailable(result, backend);
-        }
+        assert_execution_unavailable(result, WriteBackend::BaselineTokenRow);
     }
 
     fn skeleton_writer(backend: WriteBackend) -> BulkWriter<'static, DummyStream> {
         BulkWriter {
-            backend,
+            state: WriterState {
+                backend,
+                mappings: Vec::new(),
+                stats: WriteStats::default(),
+            },
             _client: PhantomData,
         }
     }
@@ -194,11 +298,30 @@ mod tests {
         RecordBatch::new_empty(Arc::new(Schema::empty()))
     }
 
-    fn assert_backend_unavailable(result: crate::Result<WriteStats>, expected: WriteBackend) {
+    fn mapping(name: &str) -> SchemaMapping {
+        SchemaMapping::new(
+            ArrowFieldRef::new(0, name.to_owned(), false, DataType::Int32),
+            MssqlColumn::new(Identifier::new(name).unwrap(), MssqlType::Int, false),
+        )
+    }
+
+    fn assert_execution_unavailable(result: crate::Result<WriteStats>, expected: WriteBackend) {
+        assert_backend_unavailable_reason(
+            result,
+            expected,
+            "bulk writer execution is not implemented yet",
+        );
+    }
+
+    fn assert_backend_unavailable_reason<T: std::fmt::Debug>(
+        result: crate::Result<T>,
+        expected: WriteBackend,
+        expected_reason: &str,
+    ) {
         match result {
             Err(crate::Error::BackendUnavailable { backend, reason }) => {
                 assert_eq!(backend, expected);
-                assert_eq!(reason, "bulk writer execution is not implemented yet");
+                assert_eq!(reason, expected_reason);
             }
             other => panic!("expected backend-unavailable error, got {other:?}"),
         }
