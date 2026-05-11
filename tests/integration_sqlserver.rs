@@ -8,12 +8,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch,
-    StringArray,
+    StringArray, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use arrow_tiberius::{
-    BulkWriter, DiagnosticCode, Error, MssqlProfile, PlanOptions, TableName, WriteBackend,
-    WriteOptions, create_table_sql_from_mappings, plan_arrow_schema_to_mssql_mappings,
+    BulkWriter, DiagnosticCode, Error, MssqlProfile, PlanOptions, TableName, UInt64Policy,
+    WriteBackend, WriteOptions, create_table_sql_from_mappings,
+    plan_arrow_schema_to_mssql_mappings,
 };
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -325,6 +326,303 @@ async fn baseline_writer_round_trips_supported_value_matrix() -> TestResult<()> 
         ensure_eq(rows[3].get::<f64, _>(4), None, "row 3 f64_value")?;
         ensure_eq(rows[3].get::<&str, _>(5), None, "row 3 text_value")?;
         ensure_eq(rows[3].get::<&[u8], _>(6), None, "row 3 bytes_value")?;
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    let drop_result = drop_table(&mut client, &table).await;
+    result?;
+    drop_result?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn baseline_writer_round_trips_uint64_policy_values() -> TestResult<()> {
+    let Some((connection_string, database)) = integration_config() else {
+        eprintln!(
+            "skipping SQL Server UInt64 policy integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+        );
+        return Ok(());
+    };
+
+    let mut client = connect(&connection_string, &database).await?;
+    let decimal_table = unique_table_name()?;
+    let bigint_table = unique_table_name()?;
+    let decimal_schema = Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::Int32, false),
+        Field::new("u64_value", DataType::UInt64, true),
+    ]));
+    let bigint_schema = Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::Int32, false),
+        Field::new("u64_value", DataType::UInt64, true),
+    ]));
+    let (decimal_mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
+        Arc::clone(&decimal_schema),
+        MssqlProfile::sql_server_2016_compat_100(),
+        PlanOptions {
+            uint64_policy: UInt64Policy::Decimal20_0,
+            ..PlanOptions::default()
+        },
+    )?
+    .into_parts();
+    let (bigint_mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
+        Arc::clone(&bigint_schema),
+        MssqlProfile::sql_server_2016_compat_100(),
+        PlanOptions {
+            uint64_policy: UInt64Policy::CheckedBigInt,
+            ..PlanOptions::default()
+        },
+    )?
+    .into_parts();
+    let decimal_batch = RecordBatch::try_new(
+        decimal_schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1_i32, 2, 3, 4])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![
+                Some(0_u64),
+                Some((i64::MAX as u64) + 1),
+                Some(u64::MAX),
+                None,
+            ])),
+        ],
+    )?;
+    let bigint_batch = RecordBatch::try_new(
+        bigint_schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1_i32, 2, 3])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![
+                Some(0_u64),
+                Some(i64::MAX as u64),
+                None,
+            ])),
+        ],
+    )?;
+
+    execute_sql(
+        &mut client,
+        create_table_sql_from_mappings(&decimal_table, &decimal_mappings),
+    )
+    .await?;
+    execute_sql(
+        &mut client,
+        create_table_sql_from_mappings(&bigint_table, &bigint_mappings),
+    )
+    .await?;
+
+    let result = async {
+        let mut decimal_writer = BulkWriter::new(
+            &mut client,
+            decimal_table.clone(),
+            decimal_mappings,
+            WriteOptions {
+                backend: WriteBackend::BaselineTokenRow,
+                ..WriteOptions::default()
+            },
+        )
+        .await?;
+        let decimal_stats = decimal_writer.write_batch(&decimal_batch).await?;
+        ensure_eq(decimal_stats.rows_written, 4, "decimal rows_written")?;
+        ensure_eq(
+            decimal_writer.finish().await?,
+            decimal_stats,
+            "decimal finish stats",
+        )?;
+
+        let mut bigint_writer = BulkWriter::new(
+            &mut client,
+            bigint_table.clone(),
+            bigint_mappings,
+            WriteOptions {
+                backend: WriteBackend::BaselineTokenRow,
+                ..WriteOptions::default()
+            },
+        )
+        .await?;
+        let bigint_stats = bigint_writer.write_batch(&bigint_batch).await?;
+        ensure_eq(bigint_stats.rows_written, 3, "bigint rows_written")?;
+        ensure_eq(
+            bigint_writer.finish().await?,
+            bigint_stats,
+            "bigint finish stats",
+        )?;
+
+        let decimal_rows = client
+            .simple_query(format!(
+                "SELECT [row_id], CONVERT(varchar(40), [u64_value]) FROM {} ORDER BY [row_id]",
+                decimal_table.quoted_sql()
+            ))
+            .await?
+            .into_first_result()
+            .await?;
+
+        ensure_eq(decimal_rows.len(), 4, "decimal row count")?;
+        ensure_eq(
+            decimal_rows[0].get::<i32, _>(0),
+            Some(1),
+            "decimal row 0 id",
+        )?;
+        ensure_eq(
+            decimal_rows[0].get::<&str, _>(1),
+            Some("0"),
+            "decimal row 0 value",
+        )?;
+        ensure_eq(
+            decimal_rows[1].get::<i32, _>(0),
+            Some(2),
+            "decimal row 1 id",
+        )?;
+        ensure_eq(
+            decimal_rows[1].get::<&str, _>(1),
+            Some("9223372036854775808"),
+            "decimal row 1 value",
+        )?;
+        ensure_eq(
+            decimal_rows[2].get::<i32, _>(0),
+            Some(3),
+            "decimal row 2 id",
+        )?;
+        ensure_eq(
+            decimal_rows[2].get::<&str, _>(1),
+            Some("18446744073709551615"),
+            "decimal row 2 value",
+        )?;
+        ensure_eq(
+            decimal_rows[3].get::<i32, _>(0),
+            Some(4),
+            "decimal row 3 id",
+        )?;
+        ensure_eq(
+            decimal_rows[3].get::<&str, _>(1),
+            None,
+            "decimal row 3 value",
+        )?;
+
+        let bigint_rows = client
+            .simple_query(format!(
+                "SELECT [row_id], [u64_value] FROM {} ORDER BY [row_id]",
+                bigint_table.quoted_sql()
+            ))
+            .await?
+            .into_first_result()
+            .await?;
+
+        ensure_eq(bigint_rows.len(), 3, "bigint row count")?;
+        ensure_eq(bigint_rows[0].get::<i32, _>(0), Some(1), "bigint row 0 id")?;
+        ensure_eq(
+            bigint_rows[0].get::<i64, _>(1),
+            Some(0),
+            "bigint row 0 value",
+        )?;
+        ensure_eq(bigint_rows[1].get::<i32, _>(0), Some(2), "bigint row 1 id")?;
+        ensure_eq(
+            bigint_rows[1].get::<i64, _>(1),
+            Some(i64::MAX),
+            "bigint row 1 value",
+        )?;
+        ensure_eq(bigint_rows[2].get::<i32, _>(0), Some(3), "bigint row 2 id")?;
+        ensure_eq(bigint_rows[2].get::<i64, _>(1), None, "bigint row 2 value")?;
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    let decimal_drop_result = drop_table(&mut client, &decimal_table).await;
+    let bigint_drop_result = drop_table(&mut client, &bigint_table).await;
+    result?;
+    decimal_drop_result?;
+    bigint_drop_result?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn baseline_writer_rejects_uint64_checked_bigint_overflow_without_partial_insert()
+-> TestResult<()> {
+    let Some((connection_string, database)) = integration_config() else {
+        eprintln!(
+            "skipping SQL Server UInt64 overflow integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+        );
+        return Ok(());
+    };
+
+    let mut client = connect(&connection_string, &database).await?;
+    let table = unique_table_name()?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::Int32, false),
+        Field::new("u64_value", DataType::UInt64, false),
+    ]));
+    let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
+        Arc::clone(&schema),
+        MssqlProfile::sql_server_2016_compat_100(),
+        PlanOptions {
+            uint64_policy: UInt64Policy::CheckedBigInt,
+            ..PlanOptions::default()
+        },
+    )?
+    .into_parts();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1_i32, 2])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![0_u64, (i64::MAX as u64) + 1])),
+        ],
+    )?;
+
+    execute_sql(
+        &mut client,
+        create_table_sql_from_mappings(&table, &mappings),
+    )
+    .await?;
+
+    let result = async {
+        let mut writer = BulkWriter::new(
+            &mut client,
+            table.clone(),
+            mappings,
+            WriteOptions {
+                backend: WriteBackend::BaselineTokenRow,
+                ..WriteOptions::default()
+            },
+        )
+        .await?;
+        let err = match writer.write_batch(&batch).await {
+            Ok(_stats) => {
+                let _stats = writer.finish().await?;
+                return Err(test_error("UInt64 bigint overflow was accepted"));
+            }
+            Err(err) => err,
+        };
+
+        let diagnostics = match err {
+            Error::ValueConversion { diagnostics } => diagnostics,
+            other => {
+                return Err(test_error(format!(
+                    "expected value conversion error, got {other}"
+                )));
+            }
+        };
+        ensure(
+            diagnostics.all().iter().any(|diagnostic| {
+                diagnostic.code() == DiagnosticCode::IntegerOutOfRange
+                    && diagnostic.row() == Some(1)
+                    && diagnostic
+                        .field()
+                        .is_some_and(|field| field.name() == "u64_value")
+            }),
+            "UInt64 bigint overflow diagnostic should include row and field",
+        )?;
+        ensure_eq(
+            writer.finish().await?.rows_written,
+            0,
+            "finish rows_written",
+        )?;
+        ensure_eq(
+            select_count(&mut client, &table).await?,
+            0,
+            "row count after overflow rejection",
+        )?;
 
         Ok::<(), Box<dyn std::error::Error>>(())
     }

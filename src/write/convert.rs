@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
     Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
-    UInt8Array, UInt16Array, UInt32Array,
+    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::DataType;
 
@@ -37,6 +37,8 @@ pub(crate) enum ArrowCell<'a> {
     UInt16(u16),
     /// Arrow unsigned 32-bit integer value.
     UInt32(u32),
+    /// Arrow unsigned 64-bit integer value.
+    UInt64(u64),
     /// Arrow 32-bit floating point value.
     Float32(f32),
     /// Arrow 64-bit floating point value.
@@ -102,11 +104,42 @@ impl<'a> ArrowCell<'a> {
         match self {
             Self::Int64(value) => Ok(value),
             Self::UInt32(value) => Ok(i64::from(value)),
+            Self::UInt64(value) => i64::try_from(value).map_err(|_| {
+                value_conversion_error(row_mapping_diagnostic(
+                    mapping,
+                    row_index,
+                    DiagnosticCode::IntegerOutOfRange,
+                    format!("Arrow UInt64 value {value} does not fit planned SQL Server bigint"),
+                ))
+            }),
             other => Err(value_conversion_error(row_mapping_diagnostic(
                 mapping,
                 row_index,
                 DiagnosticCode::ValueTypeMismatch,
-                format!("expected Arrow Int64 or UInt32 payload, got {other:?}"),
+                format!("expected Arrow Int64, UInt32, or UInt64 payload, got {other:?}"),
+            ))),
+        }
+    }
+
+    fn try_decimal(self, mapping: &SchemaMapping, row_index: usize) -> Result<MssqlDecimal> {
+        if !is_uint64_decimal20_0_mapping(mapping) {
+            return Err(unsupported_value_conversion(
+                mapping,
+                row_index,
+                format!(
+                    "planned SQL Server type {} is not supported yet",
+                    mapping.mssql().ty().to_sql()
+                ),
+            ));
+        }
+
+        match self {
+            Self::UInt64(value) => Ok(MssqlDecimal::new(i128::from(value), 0)),
+            other => Err(value_conversion_error(row_mapping_diagnostic(
+                mapping,
+                row_index,
+                DiagnosticCode::ValueTypeMismatch,
+                format!("expected Arrow UInt64 payload, got {other:?}"),
             ))),
         }
     }
@@ -175,6 +208,8 @@ pub(crate) enum MssqlCell<'a> {
     Int(Option<i32>),
     /// SQL Server `bigint` cell.
     BigInt(Option<i64>),
+    /// SQL Server `decimal` cell.
+    Decimal(Option<MssqlDecimal>),
     /// SQL Server `real` cell.
     Real(Option<f32>),
     /// SQL Server `float` cell.
@@ -183,6 +218,34 @@ pub(crate) enum MssqlCell<'a> {
     NVarChar(Option<&'a str>),
     /// SQL Server `varbinary` cell.
     VarBinary(Option<&'a [u8]>),
+}
+
+/// Semantic SQL Server decimal value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MssqlDecimal {
+    unscaled: i128,
+    scale: u8,
+}
+
+impl MssqlDecimal {
+    /// Creates a semantic decimal value from its unscaled integer and scale.
+    const fn new(unscaled: i128, scale: u8) -> Self {
+        Self { unscaled, scale }
+    }
+
+    /// Returns the unscaled integer value.
+    pub(crate) const fn unscaled(self) -> i128 {
+        self.unscaled
+    }
+
+    /// Returns the decimal scale.
+    pub(crate) const fn scale(self) -> u8 {
+        self.scale
+    }
+
+    fn to_tiberius_numeric(self) -> tiberius::numeric::Numeric {
+        tiberius::numeric::Numeric::new_with_scale(self.unscaled, self.scale)
+    }
 }
 
 /// Borrowed conversion view over one Arrow record batch and schema mappings.
@@ -288,6 +351,9 @@ pub(crate) fn mssql_cell_to_tiberius_borrowed(cell: MssqlCell<'_>) -> tiberius::
         MssqlCell::SmallInt(value) => tiberius::ColumnData::I16(value),
         MssqlCell::Int(value) => tiberius::ColumnData::I32(value),
         MssqlCell::BigInt(value) => tiberius::ColumnData::I64(value),
+        MssqlCell::Decimal(value) => {
+            tiberius::ColumnData::Numeric(value.map(MssqlDecimal::to_tiberius_numeric))
+        }
         MssqlCell::Real(value) => tiberius::ColumnData::F32(value),
         MssqlCell::Float(value) => tiberius::ColumnData::F64(value),
         MssqlCell::NVarChar(value) => tiberius::ColumnData::String(value.map(Cow::Borrowed)),
@@ -303,6 +369,9 @@ pub(crate) fn mssql_cell_to_tiberius_owned(cell: MssqlCell<'_>) -> tiberius::Col
         MssqlCell::SmallInt(value) => tiberius::ColumnData::I16(value),
         MssqlCell::Int(value) => tiberius::ColumnData::I32(value),
         MssqlCell::BigInt(value) => tiberius::ColumnData::I64(value),
+        MssqlCell::Decimal(value) => {
+            tiberius::ColumnData::Numeric(value.map(MssqlDecimal::to_tiberius_numeric))
+        }
         MssqlCell::Real(value) => tiberius::ColumnData::F32(value),
         MssqlCell::Float(value) => tiberius::ColumnData::F64(value),
         MssqlCell::NVarChar(value) => {
@@ -355,6 +424,10 @@ fn extract_arrow_cell<'a>(
         DataType::UInt32 => {
             let array = downcast_array::<UInt32Array>(array, mapping, row_index)?;
             Ok(ArrowCell::UInt32(array.value(row_index)))
+        }
+        DataType::UInt64 => {
+            let array = downcast_array::<UInt64Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::UInt64(array.value(row_index)))
         }
         DataType::Float32 => {
             let array = downcast_array::<Float32Array>(array, mapping, row_index)?;
@@ -412,6 +485,9 @@ fn mssql_cell_from_arrow_cell<'a>(
         MssqlType::SmallInt => Ok(MssqlCell::SmallInt(Some(cell.try_i16(mapping, row_index)?))),
         MssqlType::Int => Ok(MssqlCell::Int(Some(cell.try_i32(mapping, row_index)?))),
         MssqlType::BigInt => Ok(MssqlCell::BigInt(Some(cell.try_i64(mapping, row_index)?))),
+        MssqlType::Decimal { .. } => Ok(MssqlCell::Decimal(Some(
+            cell.try_decimal(mapping, row_index)?,
+        ))),
         MssqlType::Real => Ok(MssqlCell::Real(Some(cell.try_f32(mapping, row_index)?))),
         MssqlType::Float { .. } => Ok(MssqlCell::Float(Some(cell.try_f64(mapping, row_index)?))),
         MssqlType::NVarChar(length) => nvar_char_cell(mapping, row_index, *length, cell),
@@ -434,6 +510,9 @@ fn null_mssql_cell<'a>(mapping: &SchemaMapping, row_index: usize) -> Result<Mssq
         MssqlType::SmallInt => Ok(MssqlCell::SmallInt(None)),
         MssqlType::Int => Ok(MssqlCell::Int(None)),
         MssqlType::BigInt => Ok(MssqlCell::BigInt(None)),
+        MssqlType::Decimal { .. } if is_uint64_decimal20_0_mapping(mapping) => {
+            Ok(MssqlCell::Decimal(None))
+        }
         MssqlType::Real => Ok(MssqlCell::Real(None)),
         MssqlType::Float { .. } => Ok(MssqlCell::Float(None)),
         MssqlType::NVarChar(_) => Ok(MssqlCell::NVarChar(None)),
@@ -447,6 +526,19 @@ fn null_mssql_cell<'a>(mapping: &SchemaMapping, row_index: usize) -> Result<Mssq
             ),
         )),
     }
+}
+
+fn is_uint64_decimal20_0_mapping(mapping: &SchemaMapping) -> bool {
+    matches!(
+        (mapping.arrow().data_type(), mapping.mssql().ty()),
+        (
+            DataType::UInt64,
+            MssqlType::Decimal {
+                precision: 20,
+                scale: 0
+            }
+        )
+    )
 }
 
 fn nvar_char_cell<'a>(
@@ -676,7 +768,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
     use super::{
-        ArrowCell, MssqlCell, RecordBatchView, mssql_cell_to_tiberius_borrowed,
+        ArrowCell, MssqlCell, MssqlDecimal, RecordBatchView, mssql_cell_to_tiberius_borrowed,
         mssql_cell_to_tiberius_owned,
     };
     use crate::{
@@ -835,6 +927,51 @@ mod tests {
             ArrowCell::Binary(b"large")
         );
         assert_eq!(view.arrow_cell(&mappings[13], 1).unwrap(), ArrowCell::Null);
+    }
+
+    #[test]
+    fn extracts_uint64_arrow_cells_at_policy_boundaries() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new("unsigned_huge", DataType::UInt64, true)]),
+            PlanOptions {
+                uint64_policy: UInt64Policy::Decimal20_0,
+                ..PlanOptions::default()
+            },
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "unsigned_huge",
+                DataType::UInt64,
+                true,
+            )])),
+            vec![Arc::new(UInt64Array::from(vec![
+                Some(0_u64),
+                Some(i64::MAX as u64),
+                Some((i64::MAX as u64) + 1),
+                Some(u64::MAX),
+                None,
+            ]))],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        assert_eq!(
+            view.arrow_cell(&mappings[0], 0).unwrap(),
+            ArrowCell::UInt64(0)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[0], 1).unwrap(),
+            ArrowCell::UInt64(i64::MAX as u64)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[0], 2).unwrap(),
+            ArrowCell::UInt64((i64::MAX as u64) + 1)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[0], 3).unwrap(),
+            ArrowCell::UInt64(u64::MAX)
+        );
+        assert_eq!(view.arrow_cell(&mappings[0], 4).unwrap(), ArrowCell::Null);
     }
 
     #[test]
@@ -1192,6 +1329,16 @@ mod tests {
             tiberius::ColumnData::I64(None)
         );
         assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::Decimal(Some(MssqlDecimal::new(12345, 2)))),
+            tiberius::ColumnData::Numeric(Some(tiberius::numeric::Numeric::new_with_scale(
+                12345, 2
+            )))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::Decimal(None)),
+            tiberius::ColumnData::Numeric(None)
+        );
+        assert_eq!(
             mssql_cell_to_tiberius_borrowed(MssqlCell::Real(Some(1.25))),
             tiberius::ColumnData::F32(Some(1.25))
         );
@@ -1255,6 +1402,16 @@ mod tests {
         assert_eq!(
             mssql_cell_to_tiberius_owned(MssqlCell::BigInt(Some(64))),
             tiberius::ColumnData::I64(Some(64))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_owned(MssqlCell::Decimal(Some(MssqlDecimal::new(12345, 2)))),
+            tiberius::ColumnData::Numeric(Some(tiberius::numeric::Numeric::new_with_scale(
+                12345, 2
+            )))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_owned(MssqlCell::Decimal(None)),
+            tiberius::ColumnData::Numeric(None)
         );
         assert_eq!(
             mssql_cell_to_tiberius_owned(MssqlCell::Real(Some(1.25))),
@@ -1450,34 +1607,175 @@ mod tests {
     }
 
     #[test]
-    fn rejects_policy_planned_uint64_runtime_conversion_until_implemented() {
-        for (policy, name) in [
-            (UInt64Policy::Decimal20_0, "unsigned_as_decimal"),
-            (UInt64Policy::CheckedBigInt, "unsigned_as_bigint"),
-        ] {
-            let mappings = mappings_for_schema_with_options(
-                Schema::new(vec![Field::new(name, DataType::UInt64, true)]),
-                PlanOptions {
-                    uint64_policy: policy,
-                    ..PlanOptions::default()
-                },
-            );
-            let batch = RecordBatch::try_new(
-                Arc::new(Schema::new(vec![Field::new(name, DataType::UInt64, true)])),
-                vec![Arc::new(UInt64Array::from(vec![1_u64]))],
-            )
-            .unwrap();
-            let view = RecordBatchView::new(&batch, &mappings).unwrap();
+    fn converts_uint64_decimal20_0_boundary_values() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "unsigned_as_decimal",
+                DataType::UInt64,
+                true,
+            )]),
+            PlanOptions {
+                uint64_policy: UInt64Policy::Decimal20_0,
+                ..PlanOptions::default()
+            },
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "unsigned_as_decimal",
+                DataType::UInt64,
+                true,
+            )])),
+            vec![Arc::new(UInt64Array::from(vec![
+                Some(0_u64),
+                Some(i64::MAX as u64),
+                Some((i64::MAX as u64) + 1),
+                Some(u64::MAX),
+                None,
+            ]))],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
 
-            let err = view.mssql_cell(&mappings[0], 0).unwrap_err();
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 0).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(0, 0)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 1).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(i128::from(i64::MAX), 0)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 2).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(i128::from(i64::MAX) + 1, 0)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 3).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(i128::from(u64::MAX), 0)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 4).unwrap(),
+            MssqlCell::Decimal(None)
+        );
+    }
 
-            assert_single_diagnostic(
-                err,
-                DiagnosticCode::ValueConversionUnsupported,
-                Some(0),
-                Some((0, name)),
-            );
-        }
+    #[test]
+    fn converts_uint64_decimal20_0_to_owned_tiberius_numeric() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "unsigned_as_decimal",
+                DataType::UInt64,
+                true,
+            )]),
+            PlanOptions {
+                uint64_policy: UInt64Policy::Decimal20_0,
+                ..PlanOptions::default()
+            },
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "unsigned_as_decimal",
+                DataType::UInt64,
+                true,
+            )])),
+            vec![Arc::new(UInt64Array::from(vec![Some(u64::MAX)]))],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let row = view.tiberius_row_owned(0).unwrap();
+
+        assert_eq!(
+            row.get(0),
+            Some(&tiberius::ColumnData::Numeric(Some(
+                tiberius::numeric::Numeric::new_with_scale(i128::from(u64::MAX), 0)
+            )))
+        );
+    }
+
+    #[test]
+    fn converts_uint64_checked_bigint_boundary_values() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "unsigned_as_bigint",
+                DataType::UInt64,
+                true,
+            )]),
+            PlanOptions {
+                uint64_policy: UInt64Policy::CheckedBigInt,
+                ..PlanOptions::default()
+            },
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "unsigned_as_bigint",
+                DataType::UInt64,
+                true,
+            )])),
+            vec![Arc::new(UInt64Array::from(vec![
+                Some(0_u64),
+                Some(i64::MAX as u64),
+                None,
+            ]))],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 0).unwrap(),
+            MssqlCell::BigInt(Some(0))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 1).unwrap(),
+            MssqlCell::BigInt(Some(i64::MAX))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 2).unwrap(),
+            MssqlCell::BigInt(None)
+        );
+    }
+
+    #[test]
+    fn rejects_uint64_checked_bigint_overflow_without_wrapping() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "unsigned_as_bigint",
+                DataType::UInt64,
+                false,
+            )]),
+            PlanOptions {
+                uint64_policy: UInt64Policy::CheckedBigInt,
+                ..PlanOptions::default()
+            },
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "unsigned_as_bigint",
+                DataType::UInt64,
+                false,
+            )])),
+            vec![Arc::new(UInt64Array::from(vec![
+                (i64::MAX as u64) + 1,
+                u64::MAX,
+            ]))],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let just_over = view.mssql_cell(&mappings[0], 0).unwrap_err();
+        assert_single_diagnostic(
+            just_over,
+            DiagnosticCode::IntegerOutOfRange,
+            Some(0),
+            Some((0, "unsigned_as_bigint")),
+        );
+
+        let max = view.mssql_cell(&mappings[0], 1).unwrap_err();
+        assert_single_diagnostic(
+            max,
+            DiagnosticCode::IntegerOutOfRange,
+            Some(1),
+            Some((0, "unsigned_as_bigint")),
+        );
     }
 
     #[test]
