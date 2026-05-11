@@ -50,10 +50,19 @@ pub enum Error {
         /// Human-readable reason the backend is unavailable.
         reason: String,
     },
+
+    /// Tiberius returned an error while executing a SQL Server operation.
+    #[snafu(display("tiberius operation failed: {source}"))]
+    Tiberius {
+        /// Source error returned by Tiberius.
+        source: tiberius::error::Error,
+    },
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{borrow::Cow, error::Error as StdError};
+
     use crate::{Diagnostic, DiagnosticCode, DiagnosticSet, Error};
 
     #[test]
@@ -94,6 +103,31 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "write backend DirectRawBulk is unavailable: not implemented"
+        );
+    }
+
+    #[test]
+    fn tiberius_error_display_includes_source_error() {
+        let err = Error::Tiberius {
+            source: tiberius::error::Error::Protocol(Cow::Borrowed("invalid token")),
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "tiberius operation failed: Protocol error: invalid token"
+        );
+    }
+
+    #[test]
+    fn tiberius_error_preserves_source_error() {
+        let err = Error::Tiberius {
+            source: tiberius::error::Error::BulkInput(Cow::Borrowed("row payload is malformed")),
+        };
+
+        let source = StdError::source(&err).expect("tiberius source should be preserved");
+        assert_eq!(
+            source.to_string(),
+            "BULK UPLOAD input failure: row payload is malformed"
         );
     }
 }
