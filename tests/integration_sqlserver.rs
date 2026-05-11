@@ -7,13 +7,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow_array::{
-    ArrayRef, BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch,
-    StringArray, UInt64Array,
+    ArrayRef, BinaryArray, BooleanArray, Decimal32Array, Decimal64Array, Decimal128Array,
+    Decimal256Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray, UInt64Array,
 };
+use arrow_buffer::i256;
+use arrow_data::ArrayData;
 use arrow_schema::{DataType, Field, Schema};
 use arrow_tiberius::{
-    BulkWriter, DiagnosticCode, Error, MssqlProfile, PlanOptions, TableName, UInt64Policy,
-    WriteBackend, WriteOptions, create_table_sql_from_mappings,
+    BulkWriter, DecimalPolicy, DiagnosticCode, Error, MssqlProfile, PlanOptions, TableName,
+    UInt64Policy, WriteBackend, WriteOptions, create_table_sql_from_mappings,
     plan_arrow_schema_to_mssql_mappings,
 };
 use tokio::net::TcpStream;
@@ -636,6 +638,287 @@ async fn baseline_writer_rejects_uint64_checked_bigint_overflow_without_partial_
 }
 
 #[tokio::test]
+async fn baseline_writer_round_trips_decimal_policy_values() -> TestResult<()> {
+    let Some((connection_string, database)) = integration_config() else {
+        eprintln!(
+            "skipping SQL Server decimal policy integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+        );
+        return Ok(());
+    };
+
+    let mut client = connect(&connection_string, &database).await?;
+    let table = unique_table_name()?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::Int32, false),
+        Field::new("d32_value", DataType::Decimal32(9, 2), true),
+        Field::new("d64_value", DataType::Decimal64(18, 4), true),
+        Field::new("d128_value", DataType::Decimal128(30, 6), true),
+        Field::new("d256_value", DataType::Decimal256(30, 0), true),
+        Field::new("negative_scale_value", DataType::Decimal128(3, -2), true),
+    ]));
+    let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
+        Arc::clone(&schema),
+        MssqlProfile::sql_server_2016_compat_100(),
+        PlanOptions {
+            decimal_policy: DecimalPolicy::NormalizeNegativeScale,
+            ..PlanOptions::default()
+        },
+    )?
+    .into_parts();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1_i32, 2, 3, 4])) as ArrayRef,
+            Arc::new(
+                Decimal32Array::from(vec![Some(12_345_i32), Some(-12_345), Some(0), None])
+                    .with_precision_and_scale(9, 2)?,
+            ),
+            Arc::new(
+                Decimal64Array::from(vec![
+                    Some(1_234_567_890_i64),
+                    Some(-1_234_567_890),
+                    Some(0),
+                    None,
+                ])
+                .with_precision_and_scale(18, 4)?,
+            ),
+            Arc::new(
+                Decimal128Array::from(vec![
+                    Some(123_456_789_012_345_678_901_234_567_890_i128),
+                    Some(-123_456_789_012_345_678_901_234_567_890_i128),
+                    Some(0),
+                    None,
+                ])
+                .with_precision_and_scale(30, 6)?,
+            ),
+            Arc::new(
+                Decimal256Array::from(vec![
+                    Some(i256::from_i128(
+                        123_456_789_012_345_678_901_234_567_890_i128,
+                    )),
+                    Some(i256::from_i128(
+                        -123_456_789_012_345_678_901_234_567_890_i128,
+                    )),
+                    Some(i256::ZERO),
+                    None,
+                ])
+                .with_precision_and_scale(30, 0)?,
+            ),
+            Arc::new(
+                Decimal128Array::from(vec![Some(123_i128), Some(-123), Some(0), None])
+                    .with_precision_and_scale(3, -2)?,
+            ),
+        ],
+    )?;
+
+    execute_sql(
+        &mut client,
+        create_table_sql_from_mappings(&table, &mappings),
+    )
+    .await?;
+
+    let result = async {
+        let mut writer = BulkWriter::new(
+            &mut client,
+            table.clone(),
+            mappings,
+            WriteOptions {
+                backend: WriteBackend::BaselineTokenRow,
+                ..WriteOptions::default()
+            },
+        )
+        .await?;
+        let stats = writer.write_batch(&batch).await?;
+        ensure_eq(stats.rows_written, 4, "decimal rows_written")?;
+        ensure_eq(stats.batches_written, 1, "decimal batches_written")?;
+        ensure_eq(writer.finish().await?, stats, "decimal finish stats")?;
+
+        let rows = client
+            .simple_query(format!(
+                "SELECT [row_id], CONVERT(varchar(80), [d32_value]), CONVERT(varchar(80), [d64_value]), CONVERT(varchar(80), [d128_value]), CONVERT(varchar(80), [d256_value]), CONVERT(varchar(80), [negative_scale_value]) FROM {} ORDER BY [row_id]",
+                table.quoted_sql()
+            ))
+            .await?
+            .into_first_result()
+            .await?;
+
+        ensure_eq(rows.len(), 4, "decimal row count")?;
+
+        ensure_eq(rows[0].get::<i32, _>(0), Some(1), "row 0 row_id")?;
+        ensure_eq(rows[0].get::<&str, _>(1), Some("123.45"), "row 0 d32")?;
+        ensure_eq(
+            rows[0].get::<&str, _>(2),
+            Some("123456.7890"),
+            "row 0 d64",
+        )?;
+        ensure_eq(
+            rows[0].get::<&str, _>(3),
+            Some("123456789012345678901234.567890"),
+            "row 0 d128",
+        )?;
+        ensure_eq(
+            rows[0].get::<&str, _>(4),
+            Some("123456789012345678901234567890"),
+            "row 0 d256",
+        )?;
+        ensure_eq(
+            rows[0].get::<&str, _>(5),
+            Some("12300"),
+            "row 0 negative scale",
+        )?;
+
+        ensure_eq(rows[1].get::<i32, _>(0), Some(2), "row 1 row_id")?;
+        ensure_eq(rows[1].get::<&str, _>(1), Some("-123.45"), "row 1 d32")?;
+        ensure_eq(
+            rows[1].get::<&str, _>(2),
+            Some("-123456.7890"),
+            "row 1 d64",
+        )?;
+        ensure_eq(
+            rows[1].get::<&str, _>(3),
+            Some("-123456789012345678901234.567890"),
+            "row 1 d128",
+        )?;
+        ensure_eq(
+            rows[1].get::<&str, _>(4),
+            Some("-123456789012345678901234567890"),
+            "row 1 d256",
+        )?;
+        ensure_eq(
+            rows[1].get::<&str, _>(5),
+            Some("-12300"),
+            "row 1 negative scale",
+        )?;
+
+        ensure_eq(rows[2].get::<i32, _>(0), Some(3), "row 2 row_id")?;
+        ensure_eq(rows[2].get::<&str, _>(1), Some("0.00"), "row 2 d32")?;
+        ensure_eq(rows[2].get::<&str, _>(2), Some("0.0000"), "row 2 d64")?;
+        ensure_eq(
+            rows[2].get::<&str, _>(3),
+            Some("0.000000"),
+            "row 2 d128",
+        )?;
+        ensure_eq(rows[2].get::<&str, _>(4), Some("0"), "row 2 d256")?;
+        ensure_eq(
+            rows[2].get::<&str, _>(5),
+            Some("0"),
+            "row 2 negative scale",
+        )?;
+
+        ensure_eq(rows[3].get::<i32, _>(0), Some(4), "row 3 row_id")?;
+        ensure_eq(rows[3].get::<&str, _>(1), None, "row 3 d32")?;
+        ensure_eq(rows[3].get::<&str, _>(2), None, "row 3 d64")?;
+        ensure_eq(rows[3].get::<&str, _>(3), None, "row 3 d128")?;
+        ensure_eq(rows[3].get::<&str, _>(4), None, "row 3 d256")?;
+        ensure_eq(rows[3].get::<&str, _>(5), None, "row 3 negative scale")?;
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    let drop_result = drop_table(&mut client, &table).await;
+    result?;
+    drop_result?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn baseline_writer_rejects_decimal_precision_overflow_without_partial_insert()
+-> TestResult<()> {
+    let Some((connection_string, database)) = integration_config() else {
+        eprintln!(
+            "skipping SQL Server decimal overflow integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+        );
+        return Ok(());
+    };
+
+    let mut client = connect(&connection_string, &database).await?;
+    let table = unique_table_name()?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::Int32, false),
+        Field::new("amount", DataType::Decimal128(5, 2), false),
+    ]));
+    let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
+        Arc::clone(&schema),
+        MssqlProfile::sql_server_2016_compat_100(),
+        PlanOptions::default(),
+    )?
+    .into_parts();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1_i32, 2])) as ArrayRef,
+            malicious_decimal128_array(DataType::Decimal128(5, 2), &[12_345, 100_000])?,
+        ],
+    )?;
+
+    execute_sql(
+        &mut client,
+        create_table_sql_from_mappings(&table, &mappings),
+    )
+    .await?;
+
+    let result = async {
+        let mut writer = BulkWriter::new(
+            &mut client,
+            table.clone(),
+            mappings,
+            WriteOptions {
+                backend: WriteBackend::BaselineTokenRow,
+                ..WriteOptions::default()
+            },
+        )
+        .await?;
+        let err = match writer.write_batch(&batch).await {
+            Ok(_stats) => {
+                let _stats = writer.finish().await?;
+                return Err(test_error("decimal precision overflow was accepted"));
+            }
+            Err(err) => err,
+        };
+
+        let diagnostics = match err {
+            Error::ValueConversion { diagnostics } => diagnostics,
+            other => {
+                return Err(test_error(format!(
+                    "expected value conversion error, got {other}"
+                )));
+            }
+        };
+        ensure(
+            diagnostics.all().iter().any(|diagnostic| {
+                diagnostic.code() == DiagnosticCode::DecimalOutOfRange
+                    && diagnostic.row() == Some(1)
+                    && diagnostic
+                        .field()
+                        .is_some_and(|field| field.name() == "amount")
+            }),
+            "decimal overflow diagnostic should include row and field",
+        )?;
+        ensure_eq(
+            writer.finish().await?.rows_written,
+            0,
+            "finish rows_written",
+        )?;
+        ensure_eq(
+            select_count(&mut client, &table).await?,
+            0,
+            "row count after decimal overflow rejection",
+        )?;
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    let drop_result = drop_table(&mut client, &table).await;
+    result?;
+    drop_result?;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn baseline_writer_rejects_target_table_schema_drift() -> TestResult<()> {
     let Some((connection_string, database)) = integration_config() else {
         eprintln!(
@@ -830,6 +1113,15 @@ async fn select_count(client: &mut TestClient, table: &TableName) -> TestResult<
     Ok(row
         .get::<i32, _>(0)
         .ok_or_else(|| std::io::Error::other("SELECT COUNT(*) did not return an int"))?)
+}
+
+fn malicious_decimal128_array(data_type: DataType, values: &[i128]) -> TestResult<ArrayRef> {
+    let data = ArrayData::builder(data_type)
+        .len(values.len())
+        .add_buffer(values.to_vec().into())
+        .build()?;
+
+    Ok(Arc::new(Decimal128Array::from(data)))
 }
 
 fn unique_table_name() -> arrow_tiberius::Result<TableName> {

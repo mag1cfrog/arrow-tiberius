@@ -133,6 +133,7 @@ impl<'a> ArrowCell<'a> {
 
     fn to_mssql_decimal(self, mapping: &SchemaMapping, row_index: usize) -> Result<MssqlDecimal> {
         let scale = decimal_scale(mapping, row_index)?;
+        validate_decimal_scale_compatibility(mapping, row_index, scale)?;
 
         match (self, mapping.arrow().data_type()) {
             (Self::UInt64(value), DataType::UInt64) if is_uint64_decimal20_0_mapping(mapping) => {
@@ -192,7 +193,7 @@ impl<'a> ArrowCell<'a> {
                 mapping,
                 row_index,
                 DiagnosticCode::ValueTypeMismatch,
-                format!("expected Arrow UInt64 payload, got {other:?}"),
+                format!("expected Arrow decimal-compatible payload, got {other:?}"),
             ))),
         }
     }
@@ -664,6 +665,49 @@ fn decimal_scale(mapping: &SchemaMapping, row_index: usize) -> Result<u8> {
     }
 
     Ok(scale)
+}
+
+fn validate_decimal_scale_compatibility(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    planned_scale: u8,
+) -> Result<()> {
+    let expected_scale = match mapping.arrow().data_type() {
+        DataType::UInt64 if is_uint64_decimal20_0_mapping(mapping) => 0,
+        DataType::Decimal32(_, arrow_scale)
+        | DataType::Decimal64(_, arrow_scale)
+        | DataType::Decimal128(_, arrow_scale)
+        | DataType::Decimal256(_, arrow_scale)
+            if *arrow_scale < 0 =>
+        {
+            0
+        }
+        DataType::Decimal32(_, arrow_scale)
+        | DataType::Decimal64(_, arrow_scale)
+        | DataType::Decimal128(_, arrow_scale)
+        | DataType::Decimal256(_, arrow_scale) => u8::try_from(*arrow_scale).map_err(|_| {
+            value_conversion_error(row_mapping_diagnostic(
+                mapping,
+                row_index,
+                DiagnosticCode::DecimalOutOfRange,
+                format!("Arrow decimal scale {arrow_scale} cannot be represented at runtime"),
+            ))
+        })?,
+        _ => return Ok(()),
+    };
+
+    if planned_scale == expected_scale {
+        return Ok(());
+    }
+
+    Err(value_conversion_error(row_mapping_diagnostic(
+        mapping,
+        row_index,
+        DiagnosticCode::SchemaMismatch,
+        format!(
+            "planned SQL Server decimal scale {planned_scale} is incompatible with Arrow decimal scale {expected_scale}"
+        ),
+    )))
 }
 
 fn mssql_decimal(
@@ -2745,6 +2789,44 @@ mod tests {
             DiagnosticCode::ValueTypeMismatch,
             Some(0),
             Some((0, "id")),
+        );
+    }
+
+    #[test]
+    fn rejects_decimal_mapping_scale_mismatch_before_value_corruption() {
+        let mappings = vec![SchemaMapping::new(
+            ArrowFieldRef::new(0, "amount".to_owned(), false, DataType::Decimal128(5, 2)),
+            MssqlColumn::new(
+                Identifier::new("amount").unwrap(),
+                MssqlType::Decimal {
+                    precision: 5,
+                    scale: 0,
+                },
+                false,
+            ),
+        )];
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal128(5, 2),
+                false,
+            )])),
+            vec![Arc::new(
+                Decimal128Array::from(vec![123_i128])
+                    .with_precision_and_scale(5, 2)
+                    .unwrap(),
+            )],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let err = view.mssql_cell(&mappings[0], 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::SchemaMismatch,
+            Some(0),
+            Some((0, "amount")),
         );
     }
 
