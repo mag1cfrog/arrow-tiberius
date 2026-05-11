@@ -5,10 +5,12 @@
 use std::borrow::Cow;
 
 use arrow_array::{
-    Array, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, BinaryArray, BooleanArray, Decimal32Array, Decimal64Array, Decimal128Array,
+    Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    LargeBinaryArray, LargeStringArray, RecordBatch, StringArray, UInt8Array, UInt16Array,
+    UInt32Array, UInt64Array,
 };
+use arrow_buffer::i256;
 use arrow_schema::DataType;
 
 use crate::{
@@ -39,6 +41,14 @@ pub(crate) enum ArrowCell<'a> {
     UInt32(u32),
     /// Arrow unsigned 64-bit integer value.
     UInt64(u64),
+    /// Arrow 32-bit decimal value.
+    Decimal32(i32),
+    /// Arrow 64-bit decimal value.
+    Decimal64(i64),
+    /// Arrow 128-bit decimal value.
+    Decimal128(i128),
+    /// Arrow 256-bit decimal value.
+    Decimal256(i256),
     /// Arrow 32-bit floating point value.
     Float32(f32),
     /// Arrow 64-bit floating point value.
@@ -429,6 +439,22 @@ fn extract_arrow_cell<'a>(
             let array = downcast_array::<UInt64Array>(array, mapping, row_index)?;
             Ok(ArrowCell::UInt64(array.value(row_index)))
         }
+        DataType::Decimal32(_, _) => {
+            let array = downcast_array::<Decimal32Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Decimal32(array.value(row_index)))
+        }
+        DataType::Decimal64(_, _) => {
+            let array = downcast_array::<Decimal64Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Decimal64(array.value(row_index)))
+        }
+        DataType::Decimal128(_, _) => {
+            let array = downcast_array::<Decimal128Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Decimal128(array.value(row_index)))
+        }
+        DataType::Decimal256(_, _) => {
+            let array = downcast_array::<Decimal256Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Decimal256(array.value(row_index)))
+        }
         DataType::Float32 => {
             let array = downcast_array::<Float32Array>(array, mapping, row_index)?;
             Ok(ArrowCell::Float32(array.value(row_index)))
@@ -761,10 +787,12 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
-        Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
-        UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_null_array,
+        ArrayRef, BinaryArray, BooleanArray, Decimal32Array, Decimal64Array, Decimal128Array,
+        Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        LargeBinaryArray, LargeStringArray, RecordBatch, StringArray, UInt8Array, UInt16Array,
+        UInt32Array, UInt64Array, new_null_array,
     };
+    use arrow_buffer::i256;
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
     use super::{
@@ -972,6 +1000,125 @@ mod tests {
             ArrowCell::UInt64(u64::MAX)
         );
         assert_eq!(view.arrow_cell(&mappings[0], 4).unwrap(), ArrowCell::Null);
+    }
+
+    #[test]
+    fn extracts_decimal_arrow_cells_for_all_widths() {
+        let fields = vec![
+            Field::new("decimal32", DataType::Decimal32(9, 2), true),
+            Field::new("decimal64", DataType::Decimal64(18, 4), true),
+            Field::new("decimal128", DataType::Decimal128(38, 9), true),
+            Field::new("decimal256", DataType::Decimal256(38, 0), true),
+        ];
+        let mappings = mappings_for_schema(Schema::new(fields.clone()));
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(
+                    Decimal32Array::from(vec![
+                        Some(12_345_i32),
+                        Some(-12_345_i32),
+                        Some(0_i32),
+                        None,
+                    ])
+                    .with_precision_and_scale(9, 2)
+                    .unwrap(),
+                ) as ArrayRef,
+                Arc::new(
+                    Decimal64Array::from(vec![
+                        Some(1_234_567_890_i64),
+                        Some(-1_234_567_890_i64),
+                        Some(0_i64),
+                        None,
+                    ])
+                    .with_precision_and_scale(18, 4)
+                    .unwrap(),
+                ),
+                Arc::new(
+                    Decimal128Array::from(vec![
+                        Some(123_456_789_012_345_678_901_234_567_890_i128),
+                        Some(-123_456_789_012_345_678_901_234_567_890_i128),
+                        Some(0_i128),
+                        None,
+                    ])
+                    .with_precision_and_scale(38, 9)
+                    .unwrap(),
+                ),
+                Arc::new(
+                    Decimal256Array::from(vec![
+                        Some(i256::from_i128(
+                            123_456_789_012_345_678_901_234_567_890_i128,
+                        )),
+                        Some(i256::from_i128(
+                            -123_456_789_012_345_678_901_234_567_890_i128,
+                        )),
+                        Some(i256::ZERO),
+                        None,
+                    ])
+                    .with_precision_and_scale(38, 0)
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        assert_eq!(
+            view.arrow_cell(&mappings[0], 0).unwrap(),
+            ArrowCell::Decimal32(12_345)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[0], 1).unwrap(),
+            ArrowCell::Decimal32(-12_345)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[0], 2).unwrap(),
+            ArrowCell::Decimal32(0)
+        );
+        assert_eq!(view.arrow_cell(&mappings[0], 3).unwrap(), ArrowCell::Null);
+
+        assert_eq!(
+            view.arrow_cell(&mappings[1], 0).unwrap(),
+            ArrowCell::Decimal64(1_234_567_890)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[1], 1).unwrap(),
+            ArrowCell::Decimal64(-1_234_567_890)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[1], 2).unwrap(),
+            ArrowCell::Decimal64(0)
+        );
+        assert_eq!(view.arrow_cell(&mappings[1], 3).unwrap(), ArrowCell::Null);
+
+        assert_eq!(
+            view.arrow_cell(&mappings[2], 0).unwrap(),
+            ArrowCell::Decimal128(123_456_789_012_345_678_901_234_567_890)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[2], 1).unwrap(),
+            ArrowCell::Decimal128(-123_456_789_012_345_678_901_234_567_890)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[2], 2).unwrap(),
+            ArrowCell::Decimal128(0)
+        );
+        assert_eq!(view.arrow_cell(&mappings[2], 3).unwrap(), ArrowCell::Null);
+
+        assert_eq!(
+            view.arrow_cell(&mappings[3], 0).unwrap(),
+            ArrowCell::Decimal256(i256::from_i128(123_456_789_012_345_678_901_234_567_890))
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[3], 1).unwrap(),
+            ArrowCell::Decimal256(i256::from_i128(-123_456_789_012_345_678_901_234_567_890))
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[3], 2).unwrap(),
+            ArrowCell::Decimal256(i256::ZERO)
+        );
+        assert_eq!(view.arrow_cell(&mappings[3], 3).unwrap(), ArrowCell::Null);
     }
 
     #[test]
