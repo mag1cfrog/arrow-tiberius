@@ -5,7 +5,7 @@ use futures_util::io::{AsyncRead, AsyncWrite};
 
 use crate::{Result, SchemaMapping, TableName};
 
-use super::SchemaCheck;
+use super::{SchemaCheck, convert::RecordBatchView};
 
 /// Write backend selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -40,16 +40,22 @@ pub struct WriteStats {
 #[derive(Debug)]
 struct WriterState {
     backend: WriteBackend,
+    schema_check: SchemaCheck,
     mappings: Vec<SchemaMapping>,
     stats: WriteStats,
 }
 
 impl WriterState {
-    fn new(requested_backend: WriteBackend, mappings: Vec<SchemaMapping>) -> Result<Self> {
+    fn new(
+        requested_backend: WriteBackend,
+        schema_check: SchemaCheck,
+        mappings: Vec<SchemaMapping>,
+    ) -> Result<Self> {
         let backend = resolve_backend(requested_backend)?;
 
         Ok(Self {
             backend,
+            schema_check,
             mappings,
             stats: WriteStats::default(),
         })
@@ -63,11 +69,14 @@ impl WriterState {
         &self.mappings
     }
 
+    fn schema_check(&self) -> SchemaCheck {
+        self.schema_check
+    }
+
     fn stats(&self) -> WriteStats {
         self.stats
     }
 
-    #[cfg(test)]
     fn record_accepted_batch(&mut self, rows: u64) -> WriteStats {
         self.stats.rows_written = self.stats.rows_written.saturating_add(rows);
         self.stats.batches_written = self.stats.batches_written.saturating_add(1);
@@ -96,7 +105,7 @@ where
         mappings: Vec<SchemaMapping>,
         options: WriteOptions,
     ) -> Result<Self> {
-        let state = WriterState::new(options.backend, mappings)?;
+        let state = WriterState::new(options.backend, options.schema_check, mappings)?;
         let request = match state.backend() {
             WriteBackend::BaselineTokenRow => {
                 let table_sql = bulk_insert_table_sql(&table);
@@ -114,11 +123,18 @@ where
     }
 
     /// Writes one Arrow record batch.
-    pub async fn write_batch(&mut self, _batch: &RecordBatch) -> Result<WriteStats> {
-        let _planned_column_count = self.state.mappings().len();
-        let _request = &mut self.request;
+    pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteStats> {
+        let rows = convert_batch_rows(batch, self.state.mappings(), self.state.schema_check())?;
+        let rows_written = usize_to_u64_saturating(rows.len());
 
-        Err(execution_unavailable(self.state.backend()))
+        for row in rows {
+            self.request
+                .send(row)
+                .await
+                .map_err(|source| crate::Error::Tiberius { source })?;
+        }
+
+        Ok(self.state.record_accepted_batch(rows_written))
     }
 
     /// Finalizes the bulk writer and returns cumulative write statistics.
@@ -135,6 +151,29 @@ where
 
 fn bulk_insert_table_sql(table: &TableName) -> String {
     table.quoted_sql()
+}
+
+fn convert_batch_rows(
+    batch: &RecordBatch,
+    mappings: &[SchemaMapping],
+    schema_check: SchemaCheck,
+) -> Result<Vec<tiberius::TokenRow<'static>>> {
+    match schema_check {
+        SchemaCheck::Strict => {
+            let view = RecordBatchView::new(batch, mappings)?;
+            let mut rows = Vec::with_capacity(view.row_count());
+
+            for row_index in 0..view.row_count() {
+                rows.push(view.tiberius_row_owned(row_index)?);
+            }
+
+            Ok(rows)
+        }
+    }
+}
+
+fn usize_to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn resolve_backend(requested_backend: WriteBackend) -> Result<WriteBackend> {
@@ -158,17 +197,21 @@ fn execution_unavailable(backend: WriteBackend) -> crate::Error {
 mod tests {
     use std::{
         pin::Pin,
+        sync::Arc,
         task::{Context, Poll},
     };
 
-    use arrow_schema::DataType;
+    use arrow_array::{Float64Array, Int32Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
     use futures_util::io::{AsyncRead, AsyncWrite};
 
     use super::{
-        WriteBackend, WriteOptions, WriteStats, WriterState, bulk_insert_table_sql, resolve_backend,
+        WriteBackend, WriteOptions, WriteStats, WriterState, bulk_insert_table_sql,
+        convert_batch_rows, resolve_backend,
     };
     use crate::{
-        ArrowFieldRef, Identifier, MssqlColumn, MssqlType, SchemaCheck, SchemaMapping, TableName,
+        ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, SchemaCheck,
+        SchemaMapping, TableName,
     };
 
     #[test]
@@ -236,16 +279,23 @@ mod tests {
     fn writer_state_starts_with_resolved_backend_mappings_and_zero_stats() {
         let mappings = vec![mapping("id")];
 
-        let state = WriterState::new(WriteBackend::Auto, mappings.clone()).unwrap();
+        let state =
+            WriterState::new(WriteBackend::Auto, SchemaCheck::Strict, mappings.clone()).unwrap();
 
         assert_eq!(state.backend(), WriteBackend::BaselineTokenRow);
+        assert_eq!(state.schema_check(), SchemaCheck::Strict);
         assert_eq!(state.mappings(), mappings.as_slice());
         assert_eq!(state.stats(), WriteStats::default());
     }
 
     #[test]
     fn writer_state_accumulates_accepted_batch_stats() {
-        let mut state = WriterState::new(WriteBackend::BaselineTokenRow, Vec::new()).unwrap();
+        let mut state = WriterState::new(
+            WriteBackend::BaselineTokenRow,
+            SchemaCheck::Strict,
+            Vec::new(),
+        )
+        .unwrap();
 
         assert_eq!(
             state.record_accepted_batch(0),
@@ -278,6 +328,65 @@ mod tests {
     }
 
     #[test]
+    fn strict_batch_conversion_prepares_token_rows_before_send() {
+        let batch = int32_batch("id", &[1, 2]);
+        let rows = convert_batch_rows(&batch, &[mapping("id")], SchemaCheck::Strict).unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get(0), Some(&tiberius::ColumnData::I32(Some(1))));
+        assert_eq!(rows[1].get(0), Some(&tiberius::ColumnData::I32(Some(2))));
+    }
+
+    #[test]
+    fn strict_batch_conversion_rejects_runtime_schema_mismatch_before_send() {
+        let batch = int32_batch("renamed_id", &[1]);
+        let err = convert_batch_rows(&batch, &[mapping("id")], SchemaCheck::Strict).unwrap_err();
+
+        let Error::ValueConversion { diagnostics } = err else {
+            panic!("expected value conversion error");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics.all()[0];
+        assert_eq!(diagnostic.code(), DiagnosticCode::SchemaMismatch);
+        assert_eq!(diagnostic.field().map(|field| field.name()), Some("id"));
+    }
+
+    #[test]
+    fn strict_batch_conversion_rejects_bad_later_row_before_any_send() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Float64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Float64Array::from(vec![
+                Some(1.0),
+                Some(f64::NAN),
+            ]))],
+        )
+        .unwrap();
+        let mappings = [SchemaMapping::new(
+            ArrowFieldRef::new(0, "amount".to_owned(), false, DataType::Float64),
+            MssqlColumn::new(
+                Identifier::new("amount").unwrap(),
+                MssqlType::Float { precision: 53 },
+                false,
+            ),
+        )];
+
+        let err = convert_batch_rows(&batch, &mappings, SchemaCheck::Strict).unwrap_err();
+
+        let Error::ValueConversion { diagnostics } = err else {
+            panic!("expected value conversion error");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics.all()[0];
+        assert_eq!(diagnostic.code(), DiagnosticCode::NonFiniteFloat);
+        assert_eq!(diagnostic.row(), Some(1));
+    }
+
+    #[test]
     fn writer_types_are_exported_from_crate_root() {
         assert_eq!(crate::WriteBackend::default(), WriteBackend::Auto);
         assert_eq!(crate::WriteOptions::default(), WriteOptions::default());
@@ -297,6 +406,13 @@ mod tests {
             ArrowFieldRef::new(0, name.to_owned(), false, DataType::Int32),
             MssqlColumn::new(Identifier::new(name).unwrap(), MssqlType::Int, false),
         )
+    }
+
+    fn int32_batch(name: &str, values: &[i32]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, false)]));
+        let array = Arc::new(Int32Array::from(values.to_vec()));
+
+        RecordBatch::try_new(schema, vec![array]).unwrap()
     }
 
     fn assert_backend_unavailable_reason<T: std::fmt::Debug>(
