@@ -226,11 +226,7 @@ impl<'a> RecordBatchView<'a> {
     }
 
     /// Extracts one borrowed Arrow cell from a planned mapping and row index.
-    pub(crate) fn arrow_cell(
-        &self,
-        mapping: &SchemaMapping,
-        row_index: usize,
-    ) -> Result<ArrowCell<'_>> {
+    fn arrow_cell(&self, mapping: &SchemaMapping, row_index: usize) -> Result<ArrowCell<'_>> {
         self.check_row_index(row_index)?;
 
         let Some(array) = self
@@ -251,11 +247,7 @@ impl<'a> RecordBatchView<'a> {
     }
 
     /// Converts one planned cell into a semantic SQL Server cell.
-    pub(crate) fn mssql_cell(
-        &self,
-        mapping: &SchemaMapping,
-        row_index: usize,
-    ) -> Result<MssqlCell<'_>> {
+    fn mssql_cell(&self, mapping: &SchemaMapping, row_index: usize) -> Result<MssqlCell<'_>> {
         let cell = self.arrow_cell(mapping, row_index)?;
         mssql_cell_from_arrow_cell(mapping, cell, row_index)
     }
