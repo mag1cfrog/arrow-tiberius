@@ -139,13 +139,15 @@ where
 
     /// Finalizes the bulk writer and returns cumulative write statistics.
     pub async fn finish(self) -> Result<WriteStats> {
-        let Self {
-            state,
-            request: _request,
-        } = self;
-        let _stats = state.stats();
+        let Self { state, request } = self;
+        let stats = state.stats();
 
-        Err(execution_unavailable(state.backend()))
+        request
+            .finalize()
+            .await
+            .map_err(|source| crate::Error::Tiberius { source })?;
+
+        Ok(stats)
     }
 }
 
