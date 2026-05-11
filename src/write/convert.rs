@@ -149,6 +149,19 @@ impl<'a> ArrowCell<'a> {
             {
                 mssql_decimal(mapping, row_index, value, scale)
             }
+            (Self::Decimal256(value), DataType::Decimal256(_, arrow_scale))
+                if *arrow_scale >= 0 =>
+            {
+                let value = value.to_i128().ok_or_else(|| {
+                    value_conversion_error(row_mapping_diagnostic(
+                        mapping,
+                        row_index,
+                        DiagnosticCode::DecimalOutOfRange,
+                        "Arrow Decimal256 value does not fit runtime i128 decimal representation",
+                    ))
+                })?;
+                mssql_decimal(mapping, row_index, value, scale)
+            }
             other => Err(value_conversion_error(row_mapping_diagnostic(
                 mapping,
                 row_index,
@@ -588,6 +601,7 @@ fn supports_null_decimal_cell(mapping: &SchemaMapping) -> bool {
             | DataType::Decimal32(_, _)
             | DataType::Decimal64(_, _)
             | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
     ) && matches!(mapping.mssql().ty(), MssqlType::Decimal { .. })
 }
 
@@ -2268,11 +2282,117 @@ mod tests {
     }
 
     #[test]
-    fn rejects_decimal256_runtime_conversion_until_implemented() {
-        assert_policy_planned_null_runtime_unsupported(
+    fn converts_decimal256_checked_downcast_values() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
             "amount",
-            DataType::Decimal256(10, 2),
-            PlanOptions::default(),
+            DataType::Decimal256(38, 4),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal256(38, 4),
+                true,
+            )])),
+            vec![Arc::new(
+                Decimal256Array::from(vec![
+                    Some(i256::from_i128(123_456_789_012_345_678_901_234_567_890)),
+                    Some(i256::from_i128(-123_456_789_012_345_678_901_234_567_890)),
+                    Some(i256::ZERO),
+                    None,
+                ])
+                .with_precision_and_scale(38, 4)
+                .unwrap(),
+            )],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 0).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(
+                123_456_789_012_345_678_901_234_567_890,
+                4,
+            )))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 1).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(
+                -123_456_789_012_345_678_901_234_567_890,
+                4,
+            )))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 2).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(0, 4)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 3).unwrap(),
+            MssqlCell::Decimal(None)
+        );
+    }
+
+    #[test]
+    fn rejects_decimal256_values_that_do_not_fit_i128_runtime_representation() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal256(38, 0),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal256(38, 0),
+                false,
+            )])),
+            vec![Arc::new(
+                Decimal256Array::from(vec![i256::from_i128(i128::MAX) + i256::ONE])
+                    .with_precision_and_scale(38, 0)
+                    .unwrap(),
+            )],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let err = view.mssql_cell(&mappings[0], 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::DecimalOutOfRange,
+            Some(0),
+            Some((0, "amount")),
+        );
+    }
+
+    #[test]
+    fn rejects_decimal256_checked_downcast_values_outside_planned_precision() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal256(5, 2),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal256(5, 2),
+                false,
+            )])),
+            vec![Arc::new(
+                Decimal256Array::from(vec![i256::from_i128(100_000)])
+                    .with_precision_and_scale(5, 2)
+                    .unwrap(),
+            )],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let err = view.mssql_cell(&mappings[0], 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::DecimalOutOfRange,
+            Some(0),
+            Some((0, "amount")),
         );
     }
 
