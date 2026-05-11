@@ -1,5 +1,7 @@
 //! Baseline bulk writer public API skeleton.
 
+use std::{future::Future, pin::Pin};
+
 use arrow_array::RecordBatch;
 use futures_util::io::{AsyncRead, AsyncWrite};
 
@@ -124,19 +126,7 @@ where
 
     /// Writes one Arrow record batch.
     pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteStats> {
-        let view = record_batch_view(batch, self.state.mappings(), self.state.schema_check())?;
-        validate_batch_rows(&view)?;
-        let rows_written = usize_to_u64_saturating(view.row_count());
-
-        for row_index in 0..view.row_count() {
-            let row = view.tiberius_row_owned(row_index)?;
-            self.request
-                .send(row)
-                .await
-                .map_err(|source| crate::Error::Tiberius { source })?;
-        }
-
-        Ok(self.state.record_accepted_batch(rows_written))
+        write_batch_to_sink(&mut self.state, &mut self.request, batch).await
     }
 
     /// Finalizes the bulk writer and returns cumulative write statistics.
@@ -175,6 +165,49 @@ fn validate_batch_rows(view: &RecordBatchView<'_>) -> Result<()> {
     Ok(())
 }
 
+async fn write_batch_to_sink<Sink>(
+    state: &mut WriterState,
+    sink: &mut Sink,
+    batch: &RecordBatch,
+) -> Result<WriteStats>
+where
+    Sink: TokenRowSink,
+{
+    let view = record_batch_view(batch, state.mappings(), state.schema_check())?;
+    validate_batch_rows(&view)?;
+    let rows_written = usize_to_u64_saturating(view.row_count());
+
+    for row_index in 0..view.row_count() {
+        let row = view.tiberius_row_owned(row_index)?;
+        sink.send_token_row(row).await?;
+    }
+
+    Ok(state.record_accepted_batch(rows_written))
+}
+
+trait TokenRowSink {
+    fn send_token_row<'a>(
+        &'a mut self,
+        row: tiberius::TokenRow<'static>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
+}
+
+impl<S> TokenRowSink for tiberius::BulkLoadRequest<'_, S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    fn send_token_row<'a>(
+        &'a mut self,
+        row: tiberius::TokenRow<'static>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        Box::pin(async move {
+            self.send(row)
+                .await
+                .map_err(|source| crate::Error::Tiberius { source })
+        })
+    }
+}
+
 fn usize_to_u64_saturating(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
@@ -199,9 +232,11 @@ fn execution_unavailable(backend: WriteBackend) -> crate::Error {
 #[cfg(test)]
 mod tests {
     use std::{
+        borrow::Cow,
+        future::Future,
         pin::Pin,
         sync::Arc,
-        task::{Context, Poll},
+        task::{Context, Poll, Wake, Waker},
     };
 
     use arrow_array::{Float64Array, Int32Array, RecordBatch};
@@ -209,8 +244,8 @@ mod tests {
     use futures_util::io::{AsyncRead, AsyncWrite};
 
     use super::{
-        WriteBackend, WriteOptions, WriteStats, WriterState, bulk_insert_table_sql,
-        record_batch_view, resolve_backend, validate_batch_rows,
+        TokenRowSink, WriteBackend, WriteOptions, WriteStats, WriterState, bulk_insert_table_sql,
+        record_batch_view, resolve_backend, validate_batch_rows, write_batch_to_sink,
     };
     use crate::{
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, SchemaCheck,
@@ -393,6 +428,126 @@ mod tests {
     }
 
     #[test]
+    fn write_batch_to_sink_accepts_empty_matching_batch() {
+        let mappings = vec![mapping("id")];
+        let mut state = WriterState::new(
+            WriteBackend::BaselineTokenRow,
+            SchemaCheck::Strict,
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingSink::default();
+        let batch = int32_batch("id", &[]);
+
+        let stats = poll_ready(write_batch_to_sink(&mut state, &mut sink, &batch)).unwrap();
+
+        assert_eq!(
+            stats,
+            WriteStats {
+                rows_written: 0,
+                batches_written: 1
+            }
+        );
+        assert!(sink.rows.is_empty());
+    }
+
+    #[test]
+    fn write_batch_to_sink_accumulates_multi_batch_stats() {
+        let mappings = vec![mapping("id")];
+        let mut state = WriterState::new(
+            WriteBackend::BaselineTokenRow,
+            SchemaCheck::Strict,
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingSink::default();
+
+        let first = poll_ready(write_batch_to_sink(
+            &mut state,
+            &mut sink,
+            &int32_batch("id", &[10, 20]),
+        ))
+        .unwrap();
+        let second = poll_ready(write_batch_to_sink(
+            &mut state,
+            &mut sink,
+            &int32_batch("id", &[30]),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            first,
+            WriteStats {
+                rows_written: 2,
+                batches_written: 1
+            }
+        );
+        assert_eq!(
+            second,
+            WriteStats {
+                rows_written: 3,
+                batches_written: 2
+            }
+        );
+        assert_eq!(sink.rows.len(), 3);
+        assert_eq!(
+            sink.rows[2].get(0),
+            Some(&tiberius::ColumnData::I32(Some(30)))
+        );
+    }
+
+    #[test]
+    fn write_batch_to_sink_conversion_failure_sends_nothing_and_keeps_stats() {
+        let mappings = vec![float_mapping("amount")];
+        let mut state = WriterState::new(
+            WriteBackend::BaselineTokenRow,
+            SchemaCheck::Strict,
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingSink::default();
+        let batch = float64_batch("amount", &[Some(1.0), Some(f64::NAN)]);
+
+        let err = poll_ready(write_batch_to_sink(&mut state, &mut sink, &batch)).unwrap_err();
+
+        let Error::ValueConversion { diagnostics } = err else {
+            panic!("expected value conversion error");
+        };
+        assert_eq!(diagnostics.all()[0].code(), DiagnosticCode::NonFiniteFloat);
+        assert_eq!(diagnostics.all()[0].row(), Some(1));
+        assert!(sink.rows.is_empty());
+        assert_eq!(state.stats(), WriteStats::default());
+    }
+
+    #[test]
+    fn write_batch_to_sink_send_failure_preserves_error_and_keeps_stats() {
+        let mappings = vec![mapping("id")];
+        let mut state = WriterState::new(
+            WriteBackend::BaselineTokenRow,
+            SchemaCheck::Strict,
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingSink {
+            fail_on_send: Some(1),
+            rows: Vec::new(),
+        };
+        let batch = int32_batch("id", &[1, 2, 3]);
+
+        let err = poll_ready(write_batch_to_sink(&mut state, &mut sink, &batch)).unwrap_err();
+
+        let Error::Tiberius { source } = err else {
+            panic!("expected tiberius error");
+        };
+        assert_eq!(
+            source.to_string(),
+            "BULK UPLOAD input failure: fake send failure"
+        );
+        assert_eq!(sink.rows.len(), 1);
+        assert_eq!(state.stats(), WriteStats::default());
+    }
+
+    #[test]
     fn writer_types_are_exported_from_crate_root() {
         assert_eq!(crate::WriteBackend::default(), WriteBackend::Auto);
         assert_eq!(crate::WriteOptions::default(), WriteOptions::default());
@@ -414,9 +569,31 @@ mod tests {
         )
     }
 
+    fn float_mapping(name: &str) -> SchemaMapping {
+        SchemaMapping::new(
+            ArrowFieldRef::new(0, name.to_owned(), false, DataType::Float64),
+            MssqlColumn::new(
+                Identifier::new(name).unwrap(),
+                MssqlType::Float { precision: 53 },
+                false,
+            ),
+        )
+    }
+
     fn int32_batch(name: &str, values: &[i32]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, false)]));
         let array = Arc::new(Int32Array::from(values.to_vec()));
+
+        RecordBatch::try_new(schema, vec![array]).unwrap()
+    }
+
+    fn float64_batch(name: &str, values: &[Option<f64>]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            name,
+            DataType::Float64,
+            false,
+        )]));
+        let array = Arc::new(Float64Array::from(values.to_vec()));
 
         RecordBatch::try_new(schema, vec![array]).unwrap()
     }
@@ -433,6 +610,52 @@ mod tests {
             }
             other => panic!("expected backend-unavailable error, got {other:?}"),
         }
+    }
+
+    fn poll_ready<F>(future: F) -> F::Output
+    where
+        F: Future,
+    {
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut context = Context::from_waker(&waker);
+        let mut future = Box::pin(future);
+
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("future unexpectedly returned pending"),
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingSink {
+        fail_on_send: Option<usize>,
+        rows: Vec<tiberius::TokenRow<'static>>,
+    }
+
+    impl TokenRowSink for RecordingSink {
+        fn send_token_row<'a>(
+            &'a mut self,
+            row: tiberius::TokenRow<'static>,
+        ) -> Pin<Box<dyn Future<Output = crate::Result<()>> + 'a>> {
+            Box::pin(async move {
+                if self.fail_on_send == Some(self.rows.len()) {
+                    return Err(Error::Tiberius {
+                        source: tiberius::error::Error::BulkInput(Cow::Borrowed(
+                            "fake send failure",
+                        )),
+                    });
+                }
+
+                self.rows.push(row);
+                Ok(())
+            })
+        }
+    }
+
+    struct NoopWake;
+
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
     }
 
     #[derive(Debug)]
