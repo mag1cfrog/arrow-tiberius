@@ -115,9 +115,9 @@ async fn baseline_writer_inserts_int32_and_utf8_batch() -> TestResult<()> {
         .await?;
         let stats = writer.write_batch(&batch).await?;
 
-        assert_eq!(stats.rows_written, 3);
-        assert_eq!(stats.batches_written, 1);
-        assert_eq!(writer.finish().await?, stats);
+        ensure_eq(stats.rows_written, 3, "rows_written")?;
+        ensure_eq(stats.batches_written, 1, "batches_written")?;
+        ensure_eq(writer.finish().await?, stats, "finish stats")?;
 
         let rows = client
             .simple_query(format!(
@@ -128,13 +128,13 @@ async fn baseline_writer_inserts_int32_and_utf8_batch() -> TestResult<()> {
             .into_first_result()
             .await?;
 
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].get::<i32, _>(0), Some(1));
-        assert_eq!(rows[0].get::<&str, _>(1), Some("alpha"));
-        assert_eq!(rows[1].get::<i32, _>(0), Some(2));
-        assert_eq!(rows[1].get::<&str, _>(1), Some("東京"));
-        assert_eq!(rows[2].get::<i32, _>(0), Some(3));
-        assert_eq!(rows[2].get::<&str, _>(1), None);
+        ensure_eq(rows.len(), 3, "row count")?;
+        ensure_eq(rows[0].get::<i32, _>(0), Some(1), "row 0 id")?;
+        ensure_eq(rows[0].get::<&str, _>(1), Some("alpha"), "row 0 label")?;
+        ensure_eq(rows[1].get::<i32, _>(0), Some(2), "row 1 id")?;
+        ensure_eq(rows[1].get::<&str, _>(1), Some("東京"), "row 1 label")?;
+        ensure_eq(rows[2].get::<i32, _>(0), Some(3), "row 2 id")?;
+        ensure_eq(rows[2].get::<&str, _>(1), None, "row 2 label")?;
 
         Ok::<(), Box<dyn std::error::Error>>(())
     }
@@ -235,9 +235,9 @@ async fn baseline_writer_round_trips_supported_value_matrix() -> TestResult<()> 
         .await?;
         let stats = writer.write_batch(&batch).await?;
 
-        assert_eq!(stats.rows_written, 4);
-        assert_eq!(stats.batches_written, 1);
-        assert_eq!(writer.finish().await?, stats);
+        ensure_eq(stats.rows_written, 4, "rows_written")?;
+        ensure_eq(stats.batches_written, 1, "batches_written")?;
+        ensure_eq(writer.finish().await?, stats, "finish stats")?;
 
         let rows = client
             .simple_query(format!(
@@ -248,39 +248,83 @@ async fn baseline_writer_round_trips_supported_value_matrix() -> TestResult<()> 
             .into_first_result()
             .await?;
 
-        assert_eq!(rows.len(), 4);
+        ensure_eq(rows.len(), 4, "row count")?;
 
-        assert_eq!(rows[0].get::<i32, _>(0), Some(1));
-        assert_eq!(rows[0].get::<bool, _>(1), Some(true));
-        assert_eq!(rows[0].get::<i32, _>(2), Some(i32::MIN));
-        assert_eq!(rows[0].get::<i64, _>(3), Some(i64::MIN));
-        assert_eq!(rows[0].get::<f64, _>(4), Some(-123.5));
-        assert_eq!(rows[0].get::<&str, _>(5), Some(""));
-        assert_eq!(rows[0].get::<&[u8], _>(6), Some(&b""[..]));
+        ensure_eq(rows[0].get::<i32, _>(0), Some(1), "row 0 row_id")?;
+        ensure_eq(rows[0].get::<bool, _>(1), Some(true), "row 0 flag")?;
+        ensure_eq(
+            rows[0].get::<i32, _>(2),
+            Some(i32::MIN),
+            "row 0 i32_value",
+        )?;
+        ensure_eq(
+            rows[0].get::<i64, _>(3),
+            Some(i64::MIN),
+            "row 0 i64_value",
+        )?;
+        ensure_eq(
+            rows[0].get::<f64, _>(4),
+            Some(-123.5),
+            "row 0 f64_value",
+        )?;
+        ensure_eq(rows[0].get::<&str, _>(5), Some(""), "row 0 text_value")?;
+        ensure_eq(
+            rows[0].get::<&[u8], _>(6),
+            Some(&b""[..]),
+            "row 0 bytes_value",
+        )?;
 
-        assert_eq!(rows[1].get::<i32, _>(0), Some(2));
-        assert_eq!(rows[1].get::<bool, _>(1), Some(false));
-        assert_eq!(rows[1].get::<i32, _>(2), Some(0));
-        assert_eq!(rows[1].get::<i64, _>(3), Some(0));
-        assert_eq!(rows[1].get::<f64, _>(4), Some(0.0));
-        assert_eq!(rows[1].get::<&str, _>(5), Some("ascii"));
-        assert_eq!(rows[1].get::<&[u8], _>(6), Some(&b"\x00\x01\xfe\xff"[..]));
+        ensure_eq(rows[1].get::<i32, _>(0), Some(2), "row 1 row_id")?;
+        ensure_eq(rows[1].get::<bool, _>(1), Some(false), "row 1 flag")?;
+        ensure_eq(rows[1].get::<i32, _>(2), Some(0), "row 1 i32_value")?;
+        ensure_eq(rows[1].get::<i64, _>(3), Some(0), "row 1 i64_value")?;
+        ensure_eq(rows[1].get::<f64, _>(4), Some(0.0), "row 1 f64_value")?;
+        ensure_eq(
+            rows[1].get::<&str, _>(5),
+            Some("ascii"),
+            "row 1 text_value",
+        )?;
+        ensure_eq(
+            rows[1].get::<&[u8], _>(6),
+            Some(&b"\x00\x01\xfe\xff"[..]),
+            "row 1 bytes_value",
+        )?;
 
-        assert_eq!(rows[2].get::<i32, _>(0), Some(3));
-        assert_eq!(rows[2].get::<bool, _>(1), None);
-        assert_eq!(rows[2].get::<i32, _>(2), Some(i32::MAX));
-        assert_eq!(rows[2].get::<i64, _>(3), Some(i64::MAX));
-        assert_eq!(rows[2].get::<f64, _>(4), Some(42.25));
-        assert_eq!(rows[2].get::<&str, _>(5), Some("東京"));
-        assert_eq!(rows[2].get::<&[u8], _>(6), Some(&b"abc"[..]));
+        ensure_eq(rows[2].get::<i32, _>(0), Some(3), "row 2 row_id")?;
+        ensure_eq(rows[2].get::<bool, _>(1), None, "row 2 flag")?;
+        ensure_eq(
+            rows[2].get::<i32, _>(2),
+            Some(i32::MAX),
+            "row 2 i32_value",
+        )?;
+        ensure_eq(
+            rows[2].get::<i64, _>(3),
+            Some(i64::MAX),
+            "row 2 i64_value",
+        )?;
+        ensure_eq(
+            rows[2].get::<f64, _>(4),
+            Some(42.25),
+            "row 2 f64_value",
+        )?;
+        ensure_eq(
+            rows[2].get::<&str, _>(5),
+            Some("東京"),
+            "row 2 text_value",
+        )?;
+        ensure_eq(
+            rows[2].get::<&[u8], _>(6),
+            Some(&b"abc"[..]),
+            "row 2 bytes_value",
+        )?;
 
-        assert_eq!(rows[3].get::<i32, _>(0), Some(4));
-        assert_eq!(rows[3].get::<bool, _>(1), Some(true));
-        assert_eq!(rows[3].get::<i32, _>(2), None);
-        assert_eq!(rows[3].get::<i64, _>(3), None);
-        assert_eq!(rows[3].get::<f64, _>(4), None);
-        assert_eq!(rows[3].get::<&str, _>(5), None);
-        assert_eq!(rows[3].get::<&[u8], _>(6), None);
+        ensure_eq(rows[3].get::<i32, _>(0), Some(4), "row 3 row_id")?;
+        ensure_eq(rows[3].get::<bool, _>(1), Some(true), "row 3 flag")?;
+        ensure_eq(rows[3].get::<i32, _>(2), None, "row 3 i32_value")?;
+        ensure_eq(rows[3].get::<i64, _>(3), None, "row 3 i64_value")?;
+        ensure_eq(rows[3].get::<f64, _>(4), None, "row 3 f64_value")?;
+        ensure_eq(rows[3].get::<&str, _>(5), None, "row 3 text_value")?;
+        ensure_eq(rows[3].get::<&[u8], _>(6), None, "row 3 bytes_value")?;
 
         Ok::<(), Box<dyn std::error::Error>>(())
     }
@@ -326,7 +370,7 @@ async fn baseline_writer_rejects_target_table_schema_drift() -> TestResult<()> {
     .await?;
 
     let result = async {
-        let err = BulkWriter::new(
+        let err = match BulkWriter::new(
             &mut client,
             table.clone(),
             mappings,
@@ -336,19 +380,34 @@ async fn baseline_writer_rejects_target_table_schema_drift() -> TestResult<()> {
             },
         )
         .await
-        .expect_err("target-table schema drift should be rejected");
-
-        let Error::ValueConversion { diagnostics } = err else {
-            panic!("expected value conversion error");
+        {
+            Ok(writer) => {
+                let _stats = writer.finish().await?;
+                return Err(test_error("target-table schema drift was accepted"));
+            }
+            Err(err) => err,
         };
 
-        assert!(diagnostics.all().iter().any(|diagnostic| diagnostic.code()
-            == DiagnosticCode::SchemaMismatch
-            && diagnostic.message().contains("renamed_id")
-            && diagnostic.message().contains("id")));
+        let diagnostics = match err {
+            Error::ValueConversion { diagnostics } => diagnostics,
+            other => {
+                return Err(test_error(format!(
+                    "expected value conversion error, got {other}"
+                )));
+            }
+        };
+
+        ensure(
+            diagnostics.all().iter().any(|diagnostic| {
+                diagnostic.code() == DiagnosticCode::SchemaMismatch
+                    && diagnostic.message().contains("renamed_id")
+                    && diagnostic.message().contains("id")
+            }),
+            "target schema drift diagnostic should mention renamed_id and id",
+        )?;
 
         let row_count = select_count(&mut client, &table).await?;
-        assert_eq!(row_count, 0);
+        ensure_eq(row_count, 0, "row count after rejected writer creation")?;
 
         let mut writer = BulkWriter::new(
             &mut client,
@@ -372,21 +431,37 @@ async fn baseline_writer_rejects_target_table_schema_drift() -> TestResult<()> {
             },
         )
         .await?;
-        let err = writer.write_batch(&batch).await.expect_err(
-            "runtime Arrow field drift should still be rejected after failed writer construction",
-        );
-
-        let Error::ValueConversion { diagnostics } = err else {
-            panic!("expected value conversion error");
+        let err = match writer.write_batch(&batch).await {
+            Ok(_stats) => {
+                let _stats = writer.finish().await?;
+                return Err(test_error("runtime Arrow field drift was accepted"));
+            }
+            Err(err) => err,
         };
-        assert!(diagnostics.all().iter().any(|diagnostic| {
-            diagnostic.code() == DiagnosticCode::SchemaMismatch
-                && diagnostic.message().contains("runtime Arrow field name id")
-                && diagnostic
-                    .message()
-                    .contains("planned Arrow field name renamed_id")
-        }));
-        assert_eq!(writer.finish().await?.rows_written, 0);
+
+        let diagnostics = match err {
+            Error::ValueConversion { diagnostics } => diagnostics,
+            other => {
+                return Err(test_error(format!(
+                    "expected value conversion error, got {other}"
+                )));
+            }
+        };
+        ensure(
+            diagnostics.all().iter().any(|diagnostic| {
+                diagnostic.code() == DiagnosticCode::SchemaMismatch
+                    && diagnostic.message().contains("runtime Arrow field name id")
+                    && diagnostic
+                        .message()
+                        .contains("planned Arrow field name renamed_id")
+            }),
+            "runtime schema drift diagnostic should mention id and renamed_id",
+        )?;
+        ensure_eq(
+            writer.finish().await?.rows_written,
+            0,
+            "finish rows_written",
+        )?;
 
         Ok::<(), Box<dyn std::error::Error>>(())
     }
@@ -401,6 +476,28 @@ async fn baseline_writer_rejects_target_table_schema_drift() -> TestResult<()> {
 
 type TestClient = tiberius::Client<Compat<TcpStream>>;
 type TestResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+fn ensure(condition: bool, message: impl Into<String>) -> TestResult<()> {
+    if condition {
+        return Ok(());
+    }
+
+    Err(test_error(message))
+}
+
+fn ensure_eq<T>(actual: T, expected: T, context: &str) -> TestResult<()>
+where
+    T: std::fmt::Debug + PartialEq,
+{
+    ensure(
+        actual == expected,
+        format!("{context}: expected {expected:?}, got {actual:?}"),
+    )
+}
+
+fn test_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
+    Box::new(std::io::Error::other(message.into()))
+}
 
 async fn connect(connection_string: &str, database: &str) -> tiberius::Result<TestClient> {
     let connection_string = format!("{connection_string};database={database}");
