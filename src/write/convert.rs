@@ -141,12 +141,26 @@ impl<'a> ArrowCell<'a> {
             (Self::Decimal32(value), DataType::Decimal32(_, arrow_scale)) if *arrow_scale >= 0 => {
                 mssql_decimal(mapping, row_index, i128::from(value), scale)
             }
+            (Self::Decimal32(value), DataType::Decimal32(_, arrow_scale)) => {
+                let value =
+                    normalize_negative_scale(mapping, row_index, i128::from(value), *arrow_scale)?;
+                mssql_decimal(mapping, row_index, value, scale)
+            }
             (Self::Decimal64(value), DataType::Decimal64(_, arrow_scale)) if *arrow_scale >= 0 => {
                 mssql_decimal(mapping, row_index, i128::from(value), scale)
+            }
+            (Self::Decimal64(value), DataType::Decimal64(_, arrow_scale)) => {
+                let value =
+                    normalize_negative_scale(mapping, row_index, i128::from(value), *arrow_scale)?;
+                mssql_decimal(mapping, row_index, value, scale)
             }
             (Self::Decimal128(value), DataType::Decimal128(_, arrow_scale))
                 if *arrow_scale >= 0 =>
             {
+                mssql_decimal(mapping, row_index, value, scale)
+            }
+            (Self::Decimal128(value), DataType::Decimal128(_, arrow_scale)) => {
+                let value = normalize_negative_scale(mapping, row_index, value, *arrow_scale)?;
                 mssql_decimal(mapping, row_index, value, scale)
             }
             (Self::Decimal256(value), DataType::Decimal256(_, arrow_scale))
@@ -160,6 +174,18 @@ impl<'a> ArrowCell<'a> {
                         "Arrow Decimal256 value does not fit runtime i128 decimal representation",
                     ))
                 })?;
+                mssql_decimal(mapping, row_index, value, scale)
+            }
+            (Self::Decimal256(value), DataType::Decimal256(_, arrow_scale)) => {
+                let value = value.to_i128().ok_or_else(|| {
+                    value_conversion_error(row_mapping_diagnostic(
+                        mapping,
+                        row_index,
+                        DiagnosticCode::DecimalOutOfRange,
+                        "Arrow Decimal256 value does not fit runtime i128 decimal representation",
+                    ))
+                })?;
+                let value = normalize_negative_scale(mapping, row_index, value, *arrow_scale)?;
                 mssql_decimal(mapping, row_index, value, scale)
             }
             other => Err(value_conversion_error(row_mapping_diagnostic(
@@ -667,6 +693,37 @@ fn mssql_decimal(
     )))
 }
 
+fn normalize_negative_scale(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    unscaled: i128,
+    arrow_scale: i8,
+) -> Result<i128> {
+    if arrow_scale >= 0 {
+        return Ok(unscaled);
+    }
+
+    let factor = 10_i128
+        .checked_pow(u32::from(arrow_scale.unsigned_abs()))
+        .ok_or_else(|| {
+            value_conversion_error(row_mapping_diagnostic(
+                mapping,
+                row_index,
+                DiagnosticCode::DecimalOutOfRange,
+                format!("negative decimal scale {arrow_scale} normalization factor overflows"),
+            ))
+        })?;
+
+    unscaled.checked_mul(factor).ok_or_else(|| {
+        value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::DecimalOutOfRange,
+            format!("decimal value {unscaled} overflows while normalizing scale {arrow_scale}"),
+        ))
+    })
+}
+
 fn decimal_unscaled_fits_precision(value: i128, precision: u8) -> bool {
     if precision == 0 {
         return false;
@@ -917,9 +974,9 @@ mod tests {
         mssql_cell_to_tiberius_owned,
     };
     use crate::{
-        ArrowFieldRef, BinaryPolicy, Date64Policy, DiagnosticCode, Error, Identifier, MssqlColumn,
-        MssqlProfile, MssqlType, PlanOptions, SchemaMapping, StringPolicy, UInt64Policy,
-        plan_arrow_schema_to_mssql_mappings,
+        ArrowFieldRef, BinaryPolicy, Date64Policy, DecimalPolicy, DiagnosticCode, Error,
+        Identifier, MssqlColumn, MssqlProfile, MssqlType, PlanOptions, SchemaMapping, StringPolicy,
+        UInt64Policy, plan_arrow_schema_to_mssql_mappings,
     };
 
     #[test]
@@ -2058,6 +2115,89 @@ mod tests {
         assert_eq!(
             view.mssql_cell(&mappings[2], 3).unwrap(),
             MssqlCell::Decimal(None)
+        );
+    }
+
+    #[test]
+    fn normalizes_negative_decimal_scale_at_runtime() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal128(3, -2),
+                true,
+            )]),
+            PlanOptions {
+                decimal_policy: DecimalPolicy::NormalizeNegativeScale,
+                ..PlanOptions::default()
+            },
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal128(3, -2),
+                true,
+            )])),
+            vec![Arc::new(
+                Decimal128Array::from(vec![Some(123_i128), Some(-123_i128), Some(0), None])
+                    .with_precision_and_scale(3, -2)
+                    .unwrap(),
+            )],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 0).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(12_300, 0)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 1).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(-12_300, 0)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 2).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(0, 0)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 3).unwrap(),
+            MssqlCell::Decimal(None)
+        );
+    }
+
+    #[test]
+    fn rejects_negative_decimal_scale_normalization_overflow() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal128(37, -1),
+                false,
+            )]),
+            PlanOptions {
+                decimal_policy: DecimalPolicy::NormalizeNegativeScale,
+                ..PlanOptions::default()
+            },
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal128(37, -1),
+                false,
+            )])),
+            vec![malicious_decimal128_array(
+                DataType::Decimal128(37, -1),
+                &[i128::MAX],
+            )],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let err = view.mssql_cell(&mappings[0], 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::DecimalOutOfRange,
+            Some(0),
+            Some((0, "amount")),
         );
     }
 
