@@ -25,6 +25,8 @@ pub enum DiagnosticCode {
     IdentifierTooLong,
     /// A decimal value, precision, or scale is outside the supported range.
     DecimalOutOfRange,
+    /// An integer value is outside the supported range.
+    IntegerOutOfRange,
     /// A timestamp value is outside the supported range.
     TimestampOutOfRange,
     /// A runtime batch schema does not match the planned schema.

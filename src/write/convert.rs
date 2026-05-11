@@ -104,11 +104,19 @@ impl<'a> ArrowCell<'a> {
         match self {
             Self::Int64(value) => Ok(value),
             Self::UInt32(value) => Ok(i64::from(value)),
+            Self::UInt64(value) => i64::try_from(value).map_err(|_| {
+                value_conversion_error(row_mapping_diagnostic(
+                    mapping,
+                    row_index,
+                    DiagnosticCode::IntegerOutOfRange,
+                    format!("Arrow UInt64 value {value} does not fit planned SQL Server bigint"),
+                ))
+            }),
             other => Err(value_conversion_error(row_mapping_diagnostic(
                 mapping,
                 row_index,
                 DiagnosticCode::ValueTypeMismatch,
-                format!("expected Arrow Int64 or UInt32 payload, got {other:?}"),
+                format!("expected Arrow Int64, UInt32, or UInt64 payload, got {other:?}"),
             ))),
         }
     }
@@ -1557,37 +1565,123 @@ mod tests {
     }
 
     #[test]
-    fn rejects_policy_planned_uint64_runtime_conversion_until_implemented() {
-        for (policy, name, expected_code) in [
-            (
-                UInt64Policy::Decimal20_0,
+    fn rejects_decimal_policy_planned_uint64_runtime_conversion_until_implemented() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
                 "unsigned_as_decimal",
-                DiagnosticCode::ValueConversionUnsupported,
-            ),
-            (
-                UInt64Policy::CheckedBigInt,
+                DataType::UInt64,
+                true,
+            )]),
+            PlanOptions {
+                uint64_policy: UInt64Policy::Decimal20_0,
+                ..PlanOptions::default()
+            },
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "unsigned_as_decimal",
+                DataType::UInt64,
+                true,
+            )])),
+            vec![Arc::new(UInt64Array::from(vec![1_u64]))],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let err = view.mssql_cell(&mappings[0], 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::ValueConversionUnsupported,
+            Some(0),
+            Some((0, "unsigned_as_decimal")),
+        );
+    }
+
+    #[test]
+    fn converts_uint64_checked_bigint_boundary_values() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
                 "unsigned_as_bigint",
-                DiagnosticCode::ValueTypeMismatch,
-            ),
-        ] {
-            let mappings = mappings_for_schema_with_options(
-                Schema::new(vec![Field::new(name, DataType::UInt64, true)]),
-                PlanOptions {
-                    uint64_policy: policy,
-                    ..PlanOptions::default()
-                },
-            );
-            let batch = RecordBatch::try_new(
-                Arc::new(Schema::new(vec![Field::new(name, DataType::UInt64, true)])),
-                vec![Arc::new(UInt64Array::from(vec![1_u64]))],
-            )
-            .unwrap();
-            let view = RecordBatchView::new(&batch, &mappings).unwrap();
+                DataType::UInt64,
+                true,
+            )]),
+            PlanOptions {
+                uint64_policy: UInt64Policy::CheckedBigInt,
+                ..PlanOptions::default()
+            },
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "unsigned_as_bigint",
+                DataType::UInt64,
+                true,
+            )])),
+            vec![Arc::new(UInt64Array::from(vec![
+                Some(0_u64),
+                Some(i64::MAX as u64),
+                None,
+            ]))],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
 
-            let err = view.mssql_cell(&mappings[0], 0).unwrap_err();
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 0).unwrap(),
+            MssqlCell::BigInt(Some(0))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 1).unwrap(),
+            MssqlCell::BigInt(Some(i64::MAX))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 2).unwrap(),
+            MssqlCell::BigInt(None)
+        );
+    }
 
-            assert_single_diagnostic(err, expected_code, Some(0), Some((0, name)));
-        }
+    #[test]
+    fn rejects_uint64_checked_bigint_overflow_without_wrapping() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "unsigned_as_bigint",
+                DataType::UInt64,
+                false,
+            )]),
+            PlanOptions {
+                uint64_policy: UInt64Policy::CheckedBigInt,
+                ..PlanOptions::default()
+            },
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "unsigned_as_bigint",
+                DataType::UInt64,
+                false,
+            )])),
+            vec![Arc::new(UInt64Array::from(vec![
+                (i64::MAX as u64) + 1,
+                u64::MAX,
+            ]))],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let just_over = view.mssql_cell(&mappings[0], 0).unwrap_err();
+        assert_single_diagnostic(
+            just_over,
+            DiagnosticCode::IntegerOutOfRange,
+            Some(0),
+            Some((0, "unsigned_as_bigint")),
+        );
+
+        let max = view.mssql_cell(&mappings[0], 1).unwrap_err();
+        assert_single_diagnostic(
+            max,
+            DiagnosticCode::IntegerOutOfRange,
+            Some(1),
+            Some((0, "unsigned_as_bigint")),
+        );
     }
 
     #[test]
