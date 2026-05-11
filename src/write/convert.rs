@@ -229,7 +229,7 @@ pub(crate) struct MssqlDecimal {
 
 impl MssqlDecimal {
     /// Creates a semantic decimal value from its unscaled integer and scale.
-    pub(crate) const fn new(unscaled: i128, scale: u8) -> Self {
+    const fn new(unscaled: i128, scale: u8) -> Self {
         Self { unscaled, scale }
     }
 
