@@ -175,6 +175,8 @@ pub(crate) enum MssqlCell<'a> {
     Int(Option<i32>),
     /// SQL Server `bigint` cell.
     BigInt(Option<i64>),
+    /// SQL Server `decimal` cell.
+    Decimal(Option<MssqlDecimal>),
     /// SQL Server `real` cell.
     Real(Option<f32>),
     /// SQL Server `float` cell.
@@ -183,6 +185,34 @@ pub(crate) enum MssqlCell<'a> {
     NVarChar(Option<&'a str>),
     /// SQL Server `varbinary` cell.
     VarBinary(Option<&'a [u8]>),
+}
+
+/// Semantic SQL Server decimal value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MssqlDecimal {
+    unscaled: i128,
+    scale: u8,
+}
+
+impl MssqlDecimal {
+    /// Creates a semantic decimal value from its unscaled integer and scale.
+    pub(crate) const fn new(unscaled: i128, scale: u8) -> Self {
+        Self { unscaled, scale }
+    }
+
+    /// Returns the unscaled integer value.
+    pub(crate) const fn unscaled(self) -> i128 {
+        self.unscaled
+    }
+
+    /// Returns the decimal scale.
+    pub(crate) const fn scale(self) -> u8 {
+        self.scale
+    }
+
+    fn to_tiberius_numeric(self) -> tiberius::numeric::Numeric {
+        tiberius::numeric::Numeric::new_with_scale(self.unscaled, self.scale)
+    }
 }
 
 /// Borrowed conversion view over one Arrow record batch and schema mappings.
@@ -288,6 +318,9 @@ pub(crate) fn mssql_cell_to_tiberius_borrowed(cell: MssqlCell<'_>) -> tiberius::
         MssqlCell::SmallInt(value) => tiberius::ColumnData::I16(value),
         MssqlCell::Int(value) => tiberius::ColumnData::I32(value),
         MssqlCell::BigInt(value) => tiberius::ColumnData::I64(value),
+        MssqlCell::Decimal(value) => {
+            tiberius::ColumnData::Numeric(value.map(MssqlDecimal::to_tiberius_numeric))
+        }
         MssqlCell::Real(value) => tiberius::ColumnData::F32(value),
         MssqlCell::Float(value) => tiberius::ColumnData::F64(value),
         MssqlCell::NVarChar(value) => tiberius::ColumnData::String(value.map(Cow::Borrowed)),
@@ -303,6 +336,9 @@ pub(crate) fn mssql_cell_to_tiberius_owned(cell: MssqlCell<'_>) -> tiberius::Col
         MssqlCell::SmallInt(value) => tiberius::ColumnData::I16(value),
         MssqlCell::Int(value) => tiberius::ColumnData::I32(value),
         MssqlCell::BigInt(value) => tiberius::ColumnData::I64(value),
+        MssqlCell::Decimal(value) => {
+            tiberius::ColumnData::Numeric(value.map(MssqlDecimal::to_tiberius_numeric))
+        }
         MssqlCell::Real(value) => tiberius::ColumnData::F32(value),
         MssqlCell::Float(value) => tiberius::ColumnData::F64(value),
         MssqlCell::NVarChar(value) => {
@@ -676,7 +712,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
     use super::{
-        ArrowCell, MssqlCell, RecordBatchView, mssql_cell_to_tiberius_borrowed,
+        ArrowCell, MssqlCell, MssqlDecimal, RecordBatchView, mssql_cell_to_tiberius_borrowed,
         mssql_cell_to_tiberius_owned,
     };
     use crate::{
@@ -1192,6 +1228,16 @@ mod tests {
             tiberius::ColumnData::I64(None)
         );
         assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::Decimal(Some(MssqlDecimal::new(12345, 2)))),
+            tiberius::ColumnData::Numeric(Some(tiberius::numeric::Numeric::new_with_scale(
+                12345, 2
+            )))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::Decimal(None)),
+            tiberius::ColumnData::Numeric(None)
+        );
+        assert_eq!(
             mssql_cell_to_tiberius_borrowed(MssqlCell::Real(Some(1.25))),
             tiberius::ColumnData::F32(Some(1.25))
         );
@@ -1255,6 +1301,16 @@ mod tests {
         assert_eq!(
             mssql_cell_to_tiberius_owned(MssqlCell::BigInt(Some(64))),
             tiberius::ColumnData::I64(Some(64))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_owned(MssqlCell::Decimal(Some(MssqlDecimal::new(12345, 2)))),
+            tiberius::ColumnData::Numeric(Some(tiberius::numeric::Numeric::new_with_scale(
+                12345, 2
+            )))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_owned(MssqlCell::Decimal(None)),
+            tiberius::ColumnData::Numeric(None)
         );
         assert_eq!(
             mssql_cell_to_tiberius_owned(MssqlCell::Real(Some(1.25))),
