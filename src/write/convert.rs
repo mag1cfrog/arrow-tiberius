@@ -5,10 +5,12 @@
 use std::borrow::Cow;
 
 use arrow_array::{
-    Array, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, BinaryArray, BooleanArray, Decimal32Array, Decimal64Array, Decimal128Array,
+    Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    LargeBinaryArray, LargeStringArray, RecordBatch, StringArray, UInt8Array, UInt16Array,
+    UInt32Array, UInt64Array,
 };
+use arrow_buffer::i256;
 use arrow_schema::DataType;
 
 use crate::{
@@ -39,6 +41,14 @@ pub(crate) enum ArrowCell<'a> {
     UInt32(u32),
     /// Arrow unsigned 64-bit integer value.
     UInt64(u64),
+    /// Arrow 32-bit decimal value.
+    Decimal32(i32),
+    /// Arrow 64-bit decimal value.
+    Decimal64(i64),
+    /// Arrow 128-bit decimal value.
+    Decimal128(i128),
+    /// Arrow 256-bit decimal value.
+    Decimal256(i256),
     /// Arrow 32-bit floating point value.
     Float32(f32),
     /// Arrow 64-bit floating point value.
@@ -50,7 +60,7 @@ pub(crate) enum ArrowCell<'a> {
 }
 
 impl<'a> ArrowCell<'a> {
-    fn try_bool(self, mapping: &SchemaMapping, row_index: usize) -> Result<bool> {
+    fn to_mssql_bit(self, mapping: &SchemaMapping, row_index: usize) -> Result<bool> {
         match self {
             Self::Boolean(value) => Ok(value),
             other => Err(value_conversion_error(row_mapping_diagnostic(
@@ -62,7 +72,7 @@ impl<'a> ArrowCell<'a> {
         }
     }
 
-    fn try_u8(self, mapping: &SchemaMapping, row_index: usize) -> Result<u8> {
+    fn to_mssql_tinyint(self, mapping: &SchemaMapping, row_index: usize) -> Result<u8> {
         match self {
             Self::UInt8(value) => Ok(value),
             other => Err(value_conversion_error(row_mapping_diagnostic(
@@ -74,7 +84,7 @@ impl<'a> ArrowCell<'a> {
         }
     }
 
-    fn try_i16(self, mapping: &SchemaMapping, row_index: usize) -> Result<i16> {
+    fn to_mssql_smallint(self, mapping: &SchemaMapping, row_index: usize) -> Result<i16> {
         match self {
             Self::Int8(value) => Ok(i16::from(value)),
             Self::Int16(value) => Ok(value),
@@ -87,7 +97,7 @@ impl<'a> ArrowCell<'a> {
         }
     }
 
-    fn try_i32(self, mapping: &SchemaMapping, row_index: usize) -> Result<i32> {
+    fn to_mssql_int(self, mapping: &SchemaMapping, row_index: usize) -> Result<i32> {
         match self {
             Self::Int32(value) => Ok(value),
             Self::UInt16(value) => Ok(i32::from(value)),
@@ -100,7 +110,7 @@ impl<'a> ArrowCell<'a> {
         }
     }
 
-    fn try_i64(self, mapping: &SchemaMapping, row_index: usize) -> Result<i64> {
+    fn to_mssql_bigint(self, mapping: &SchemaMapping, row_index: usize) -> Result<i64> {
         match self {
             Self::Int64(value) => Ok(value),
             Self::UInt32(value) => Ok(i64::from(value)),
@@ -121,30 +131,74 @@ impl<'a> ArrowCell<'a> {
         }
     }
 
-    fn try_decimal(self, mapping: &SchemaMapping, row_index: usize) -> Result<MssqlDecimal> {
-        if !is_uint64_decimal20_0_mapping(mapping) {
-            return Err(unsupported_value_conversion(
-                mapping,
-                row_index,
-                format!(
-                    "planned SQL Server type {} is not supported yet",
-                    mapping.mssql().ty().to_sql()
-                ),
-            ));
-        }
+    fn to_mssql_decimal(self, mapping: &SchemaMapping, row_index: usize) -> Result<MssqlDecimal> {
+        let scale = decimal_scale(mapping, row_index)?;
+        validate_decimal_scale_compatibility(mapping, row_index, scale)?;
 
-        match self {
-            Self::UInt64(value) => Ok(MssqlDecimal::new(i128::from(value), 0)),
+        match (self, mapping.arrow().data_type()) {
+            (Self::UInt64(value), DataType::UInt64) if is_uint64_decimal20_0_mapping(mapping) => {
+                mssql_decimal(mapping, row_index, i128::from(value), scale)
+            }
+            (Self::Decimal32(value), DataType::Decimal32(_, arrow_scale)) if *arrow_scale >= 0 => {
+                mssql_decimal(mapping, row_index, i128::from(value), scale)
+            }
+            (Self::Decimal32(value), DataType::Decimal32(_, arrow_scale)) => {
+                let value =
+                    normalize_negative_scale(mapping, row_index, i128::from(value), *arrow_scale)?;
+                mssql_decimal(mapping, row_index, value, scale)
+            }
+            (Self::Decimal64(value), DataType::Decimal64(_, arrow_scale)) if *arrow_scale >= 0 => {
+                mssql_decimal(mapping, row_index, i128::from(value), scale)
+            }
+            (Self::Decimal64(value), DataType::Decimal64(_, arrow_scale)) => {
+                let value =
+                    normalize_negative_scale(mapping, row_index, i128::from(value), *arrow_scale)?;
+                mssql_decimal(mapping, row_index, value, scale)
+            }
+            (Self::Decimal128(value), DataType::Decimal128(_, arrow_scale))
+                if *arrow_scale >= 0 =>
+            {
+                mssql_decimal(mapping, row_index, value, scale)
+            }
+            (Self::Decimal128(value), DataType::Decimal128(_, arrow_scale)) => {
+                let value = normalize_negative_scale(mapping, row_index, value, *arrow_scale)?;
+                mssql_decimal(mapping, row_index, value, scale)
+            }
+            (Self::Decimal256(value), DataType::Decimal256(_, arrow_scale))
+                if *arrow_scale >= 0 =>
+            {
+                let value = value.to_i128().ok_or_else(|| {
+                    value_conversion_error(row_mapping_diagnostic(
+                        mapping,
+                        row_index,
+                        DiagnosticCode::DecimalOutOfRange,
+                        "Arrow Decimal256 value does not fit runtime i128 decimal representation",
+                    ))
+                })?;
+                mssql_decimal(mapping, row_index, value, scale)
+            }
+            (Self::Decimal256(value), DataType::Decimal256(_, arrow_scale)) => {
+                let value = value.to_i128().ok_or_else(|| {
+                    value_conversion_error(row_mapping_diagnostic(
+                        mapping,
+                        row_index,
+                        DiagnosticCode::DecimalOutOfRange,
+                        "Arrow Decimal256 value does not fit runtime i128 decimal representation",
+                    ))
+                })?;
+                let value = normalize_negative_scale(mapping, row_index, value, *arrow_scale)?;
+                mssql_decimal(mapping, row_index, value, scale)
+            }
             other => Err(value_conversion_error(row_mapping_diagnostic(
                 mapping,
                 row_index,
                 DiagnosticCode::ValueTypeMismatch,
-                format!("expected Arrow UInt64 payload, got {other:?}"),
+                format!("expected Arrow decimal-compatible payload, got {other:?}"),
             ))),
         }
     }
 
-    fn try_f32(self, mapping: &SchemaMapping, row_index: usize) -> Result<f32> {
+    fn to_mssql_real(self, mapping: &SchemaMapping, row_index: usize) -> Result<f32> {
         match self {
             Self::Float32(value) if value.is_finite() => Ok(value),
             Self::Float32(value) => Err(non_finite_float_error(mapping, row_index, value)),
@@ -157,7 +211,7 @@ impl<'a> ArrowCell<'a> {
         }
     }
 
-    fn try_f64(self, mapping: &SchemaMapping, row_index: usize) -> Result<f64> {
+    fn to_mssql_float(self, mapping: &SchemaMapping, row_index: usize) -> Result<f64> {
         match self {
             Self::Float64(value) if value.is_finite() => Ok(value),
             Self::Float64(value) => Err(non_finite_float_error(mapping, row_index, value)),
@@ -170,7 +224,7 @@ impl<'a> ArrowCell<'a> {
         }
     }
 
-    fn try_str(self, mapping: &SchemaMapping, row_index: usize) -> Result<&'a str> {
+    fn to_mssql_nvarchar(self, mapping: &SchemaMapping, row_index: usize) -> Result<&'a str> {
         match self {
             Self::Utf8(value) => Ok(value),
             other => Err(value_conversion_error(row_mapping_diagnostic(
@@ -182,7 +236,7 @@ impl<'a> ArrowCell<'a> {
         }
     }
 
-    fn try_bytes(self, mapping: &SchemaMapping, row_index: usize) -> Result<&'a [u8]> {
+    fn to_mssql_varbinary(self, mapping: &SchemaMapping, row_index: usize) -> Result<&'a [u8]> {
         match self {
             Self::Binary(value) => Ok(value),
             other => Err(value_conversion_error(row_mapping_diagnostic(
@@ -429,6 +483,22 @@ fn extract_arrow_cell<'a>(
             let array = downcast_array::<UInt64Array>(array, mapping, row_index)?;
             Ok(ArrowCell::UInt64(array.value(row_index)))
         }
+        DataType::Decimal32(_, _) => {
+            let array = downcast_array::<Decimal32Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Decimal32(array.value(row_index)))
+        }
+        DataType::Decimal64(_, _) => {
+            let array = downcast_array::<Decimal64Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Decimal64(array.value(row_index)))
+        }
+        DataType::Decimal128(_, _) => {
+            let array = downcast_array::<Decimal128Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Decimal128(array.value(row_index)))
+        }
+        DataType::Decimal256(_, _) => {
+            let array = downcast_array::<Decimal256Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Decimal256(array.value(row_index)))
+        }
         DataType::Float32 => {
             let array = downcast_array::<Float32Array>(array, mapping, row_index)?;
             Ok(ArrowCell::Float32(array.value(row_index)))
@@ -480,16 +550,26 @@ fn mssql_cell_from_arrow_cell<'a>(
     }
 
     match mapping.mssql().ty() {
-        MssqlType::Bit => Ok(MssqlCell::Bit(Some(cell.try_bool(mapping, row_index)?))),
-        MssqlType::TinyInt => Ok(MssqlCell::TinyInt(Some(cell.try_u8(mapping, row_index)?))),
-        MssqlType::SmallInt => Ok(MssqlCell::SmallInt(Some(cell.try_i16(mapping, row_index)?))),
-        MssqlType::Int => Ok(MssqlCell::Int(Some(cell.try_i32(mapping, row_index)?))),
-        MssqlType::BigInt => Ok(MssqlCell::BigInt(Some(cell.try_i64(mapping, row_index)?))),
-        MssqlType::Decimal { .. } => Ok(MssqlCell::Decimal(Some(
-            cell.try_decimal(mapping, row_index)?,
+        MssqlType::Bit => Ok(MssqlCell::Bit(Some(cell.to_mssql_bit(mapping, row_index)?))),
+        MssqlType::TinyInt => Ok(MssqlCell::TinyInt(Some(
+            cell.to_mssql_tinyint(mapping, row_index)?,
         ))),
-        MssqlType::Real => Ok(MssqlCell::Real(Some(cell.try_f32(mapping, row_index)?))),
-        MssqlType::Float { .. } => Ok(MssqlCell::Float(Some(cell.try_f64(mapping, row_index)?))),
+        MssqlType::SmallInt => Ok(MssqlCell::SmallInt(Some(
+            cell.to_mssql_smallint(mapping, row_index)?,
+        ))),
+        MssqlType::Int => Ok(MssqlCell::Int(Some(cell.to_mssql_int(mapping, row_index)?))),
+        MssqlType::BigInt => Ok(MssqlCell::BigInt(Some(
+            cell.to_mssql_bigint(mapping, row_index)?,
+        ))),
+        MssqlType::Decimal { .. } => Ok(MssqlCell::Decimal(Some(
+            cell.to_mssql_decimal(mapping, row_index)?,
+        ))),
+        MssqlType::Real => Ok(MssqlCell::Real(Some(
+            cell.to_mssql_real(mapping, row_index)?,
+        ))),
+        MssqlType::Float { .. } => Ok(MssqlCell::Float(Some(
+            cell.to_mssql_float(mapping, row_index)?,
+        ))),
         MssqlType::NVarChar(length) => nvar_char_cell(mapping, row_index, *length, cell),
         MssqlType::VarBinary(length) => var_binary_cell(mapping, row_index, *length, cell),
         ty => Err(unsupported_value_conversion(
@@ -510,7 +590,7 @@ fn null_mssql_cell<'a>(mapping: &SchemaMapping, row_index: usize) -> Result<Mssq
         MssqlType::SmallInt => Ok(MssqlCell::SmallInt(None)),
         MssqlType::Int => Ok(MssqlCell::Int(None)),
         MssqlType::BigInt => Ok(MssqlCell::BigInt(None)),
-        MssqlType::Decimal { .. } if is_uint64_decimal20_0_mapping(mapping) => {
+        MssqlType::Decimal { .. } if supports_null_decimal_cell(mapping) => {
             Ok(MssqlCell::Decimal(None))
         }
         MssqlType::Real => Ok(MssqlCell::Real(None)),
@@ -541,13 +621,176 @@ fn is_uint64_decimal20_0_mapping(mapping: &SchemaMapping) -> bool {
     )
 }
 
+fn supports_null_decimal_cell(mapping: &SchemaMapping) -> bool {
+    matches!(
+        mapping.arrow().data_type(),
+        DataType::UInt64
+            | DataType::Decimal32(_, _)
+            | DataType::Decimal64(_, _)
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+    ) && matches!(mapping.mssql().ty(), MssqlType::Decimal { .. })
+}
+
+fn decimal_scale(mapping: &SchemaMapping, row_index: usize) -> Result<u8> {
+    let MssqlType::Decimal { scale, .. } = mapping.mssql().ty() else {
+        return Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            "planned SQL Server type is not decimal",
+        )));
+    };
+
+    let scale = u8::try_from(*scale).map_err(|_| {
+        value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::DecimalOutOfRange,
+            format!(
+                "planned SQL Server decimal scale {scale} cannot be represented by Tiberius Numeric"
+            ),
+        ))
+    })?;
+
+    if scale >= 38 {
+        return Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::DecimalOutOfRange,
+            format!(
+                "planned SQL Server decimal scale {scale} cannot be represented by Tiberius Numeric"
+            ),
+        )));
+    }
+
+    Ok(scale)
+}
+
+fn validate_decimal_scale_compatibility(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    planned_scale: u8,
+) -> Result<()> {
+    let expected_scale = match mapping.arrow().data_type() {
+        DataType::UInt64 if is_uint64_decimal20_0_mapping(mapping) => 0,
+        DataType::Decimal32(_, arrow_scale)
+        | DataType::Decimal64(_, arrow_scale)
+        | DataType::Decimal128(_, arrow_scale)
+        | DataType::Decimal256(_, arrow_scale)
+            if *arrow_scale < 0 =>
+        {
+            0
+        }
+        DataType::Decimal32(_, arrow_scale)
+        | DataType::Decimal64(_, arrow_scale)
+        | DataType::Decimal128(_, arrow_scale)
+        | DataType::Decimal256(_, arrow_scale) => u8::try_from(*arrow_scale).map_err(|_| {
+            value_conversion_error(row_mapping_diagnostic(
+                mapping,
+                row_index,
+                DiagnosticCode::DecimalOutOfRange,
+                format!("Arrow decimal scale {arrow_scale} cannot be represented at runtime"),
+            ))
+        })?,
+        _ => return Ok(()),
+    };
+
+    if planned_scale == expected_scale {
+        return Ok(());
+    }
+
+    Err(value_conversion_error(row_mapping_diagnostic(
+        mapping,
+        row_index,
+        DiagnosticCode::SchemaMismatch,
+        format!(
+            "planned SQL Server decimal scale {planned_scale} is incompatible with Arrow decimal scale {expected_scale}"
+        ),
+    )))
+}
+
+fn mssql_decimal(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    unscaled: i128,
+    scale: u8,
+) -> Result<MssqlDecimal> {
+    let MssqlType::Decimal { precision, .. } = mapping.mssql().ty() else {
+        return Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            "planned SQL Server type is not decimal",
+        )));
+    };
+
+    if decimal_unscaled_fits_precision(unscaled, *precision) {
+        return Ok(MssqlDecimal::new(unscaled, scale));
+    }
+
+    Err(value_conversion_error(row_mapping_diagnostic(
+        mapping,
+        row_index,
+        DiagnosticCode::DecimalOutOfRange,
+        format!("decimal value {unscaled} does not fit planned precision {precision}"),
+    )))
+}
+
+fn normalize_negative_scale(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    unscaled: i128,
+    arrow_scale: i8,
+) -> Result<i128> {
+    if arrow_scale >= 0 {
+        return Ok(unscaled);
+    }
+
+    let factor = 10_i128
+        .checked_pow(u32::from(arrow_scale.unsigned_abs()))
+        .ok_or_else(|| {
+            value_conversion_error(row_mapping_diagnostic(
+                mapping,
+                row_index,
+                DiagnosticCode::DecimalOutOfRange,
+                format!("negative decimal scale {arrow_scale} normalization factor overflows"),
+            ))
+        })?;
+
+    unscaled.checked_mul(factor).ok_or_else(|| {
+        value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::DecimalOutOfRange,
+            format!("decimal value {unscaled} overflows while normalizing scale {arrow_scale}"),
+        ))
+    })
+}
+
+fn decimal_unscaled_fits_precision(value: i128, precision: u8) -> bool {
+    if precision == 0 {
+        return false;
+    }
+
+    let Some(max) = decimal_max_unscaled(precision) else {
+        return false;
+    };
+
+    value <= max && value >= -max
+}
+
+fn decimal_max_unscaled(precision: u8) -> Option<i128> {
+    10_i128.checked_pow(u32::from(precision))?.checked_sub(1)
+}
+
 fn nvar_char_cell<'a>(
     mapping: &SchemaMapping,
     row_index: usize,
     length: MssqlTypeLength,
     cell: ArrowCell<'a>,
 ) -> Result<MssqlCell<'a>> {
-    let value = cell.try_str(mapping, row_index)?;
+    let value = cell.to_mssql_nvarchar(mapping, row_index)?;
     let code_units = value.encode_utf16().count();
 
     if exceeds_length(length, code_units) {
@@ -570,7 +813,7 @@ fn var_binary_cell<'a>(
     length: MssqlTypeLength,
     cell: ArrowCell<'a>,
 ) -> Result<MssqlCell<'a>> {
-    let value = cell.try_bytes(mapping, row_index)?;
+    let value = cell.to_mssql_varbinary(mapping, row_index)?;
     let bytes = value.len();
 
     if exceeds_length(length, bytes) {
@@ -761,10 +1004,13 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
-        Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
-        UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_null_array,
+        ArrayRef, BinaryArray, BooleanArray, Decimal32Array, Decimal64Array, Decimal128Array,
+        Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        LargeBinaryArray, LargeStringArray, RecordBatch, StringArray, UInt8Array, UInt16Array,
+        UInt32Array, UInt64Array, new_null_array,
     };
+    use arrow_buffer::i256;
+    use arrow_data::ArrayData;
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
     use super::{
@@ -772,9 +1018,9 @@ mod tests {
         mssql_cell_to_tiberius_owned,
     };
     use crate::{
-        ArrowFieldRef, BinaryPolicy, Date64Policy, DiagnosticCode, Error, Identifier, MssqlColumn,
-        MssqlProfile, MssqlType, PlanOptions, SchemaMapping, StringPolicy, UInt64Policy,
-        plan_arrow_schema_to_mssql_mappings,
+        ArrowFieldRef, BinaryPolicy, Date64Policy, DecimalPolicy, DiagnosticCode, Error,
+        Identifier, MssqlColumn, MssqlProfile, MssqlType, PlanOptions, SchemaMapping, StringPolicy,
+        UInt64Policy, plan_arrow_schema_to_mssql_mappings,
     };
 
     #[test]
@@ -972,6 +1218,125 @@ mod tests {
             ArrowCell::UInt64(u64::MAX)
         );
         assert_eq!(view.arrow_cell(&mappings[0], 4).unwrap(), ArrowCell::Null);
+    }
+
+    #[test]
+    fn extracts_decimal_arrow_cells_for_all_widths() {
+        let fields = vec![
+            Field::new("decimal32", DataType::Decimal32(9, 2), true),
+            Field::new("decimal64", DataType::Decimal64(18, 4), true),
+            Field::new("decimal128", DataType::Decimal128(38, 9), true),
+            Field::new("decimal256", DataType::Decimal256(38, 0), true),
+        ];
+        let mappings = mappings_for_schema(Schema::new(fields.clone()));
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(
+                    Decimal32Array::from(vec![
+                        Some(12_345_i32),
+                        Some(-12_345_i32),
+                        Some(0_i32),
+                        None,
+                    ])
+                    .with_precision_and_scale(9, 2)
+                    .unwrap(),
+                ) as ArrayRef,
+                Arc::new(
+                    Decimal64Array::from(vec![
+                        Some(1_234_567_890_i64),
+                        Some(-1_234_567_890_i64),
+                        Some(0_i64),
+                        None,
+                    ])
+                    .with_precision_and_scale(18, 4)
+                    .unwrap(),
+                ),
+                Arc::new(
+                    Decimal128Array::from(vec![
+                        Some(123_456_789_012_345_678_901_234_567_890_i128),
+                        Some(-123_456_789_012_345_678_901_234_567_890_i128),
+                        Some(0_i128),
+                        None,
+                    ])
+                    .with_precision_and_scale(38, 9)
+                    .unwrap(),
+                ),
+                Arc::new(
+                    Decimal256Array::from(vec![
+                        Some(i256::from_i128(
+                            123_456_789_012_345_678_901_234_567_890_i128,
+                        )),
+                        Some(i256::from_i128(
+                            -123_456_789_012_345_678_901_234_567_890_i128,
+                        )),
+                        Some(i256::ZERO),
+                        None,
+                    ])
+                    .with_precision_and_scale(38, 0)
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        assert_eq!(
+            view.arrow_cell(&mappings[0], 0).unwrap(),
+            ArrowCell::Decimal32(12_345)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[0], 1).unwrap(),
+            ArrowCell::Decimal32(-12_345)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[0], 2).unwrap(),
+            ArrowCell::Decimal32(0)
+        );
+        assert_eq!(view.arrow_cell(&mappings[0], 3).unwrap(), ArrowCell::Null);
+
+        assert_eq!(
+            view.arrow_cell(&mappings[1], 0).unwrap(),
+            ArrowCell::Decimal64(1_234_567_890)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[1], 1).unwrap(),
+            ArrowCell::Decimal64(-1_234_567_890)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[1], 2).unwrap(),
+            ArrowCell::Decimal64(0)
+        );
+        assert_eq!(view.arrow_cell(&mappings[1], 3).unwrap(), ArrowCell::Null);
+
+        assert_eq!(
+            view.arrow_cell(&mappings[2], 0).unwrap(),
+            ArrowCell::Decimal128(123_456_789_012_345_678_901_234_567_890)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[2], 1).unwrap(),
+            ArrowCell::Decimal128(-123_456_789_012_345_678_901_234_567_890)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[2], 2).unwrap(),
+            ArrowCell::Decimal128(0)
+        );
+        assert_eq!(view.arrow_cell(&mappings[2], 3).unwrap(), ArrowCell::Null);
+
+        assert_eq!(
+            view.arrow_cell(&mappings[3], 0).unwrap(),
+            ArrowCell::Decimal256(i256::from_i128(123_456_789_012_345_678_901_234_567_890))
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[3], 1).unwrap(),
+            ArrowCell::Decimal256(i256::from_i128(-123_456_789_012_345_678_901_234_567_890))
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[3], 2).unwrap(),
+            ArrowCell::Decimal256(i256::ZERO)
+        );
+        assert_eq!(view.arrow_cell(&mappings[3], 3).unwrap(), ArrowCell::Null);
     }
 
     #[test]
@@ -1693,6 +2058,328 @@ mod tests {
     }
 
     #[test]
+    fn converts_decimal32_64_128_cells_with_sign_zero_scale_and_null() {
+        let fields = vec![
+            Field::new("decimal32", DataType::Decimal32(9, 2), true),
+            Field::new("decimal64", DataType::Decimal64(18, 4), true),
+            Field::new("decimal128", DataType::Decimal128(38, 9), true),
+        ];
+        let mappings = mappings_for_schema(Schema::new(fields.clone()));
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(
+                    Decimal32Array::from(vec![
+                        Some(12_345_i32),
+                        Some(-12_345_i32),
+                        Some(0_i32),
+                        None,
+                    ])
+                    .with_precision_and_scale(9, 2)
+                    .unwrap(),
+                ) as ArrayRef,
+                Arc::new(
+                    Decimal64Array::from(vec![
+                        Some(1_234_567_890_i64),
+                        Some(-1_234_567_890_i64),
+                        Some(0_i64),
+                        None,
+                    ])
+                    .with_precision_and_scale(18, 4)
+                    .unwrap(),
+                ),
+                Arc::new(
+                    Decimal128Array::from(vec![
+                        Some(123_456_789_012_345_678_901_234_567_890_i128),
+                        Some(-123_456_789_012_345_678_901_234_567_890_i128),
+                        Some(0_i128),
+                        None,
+                    ])
+                    .with_precision_and_scale(38, 9)
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 0).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(12_345, 2)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 1).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(-12_345, 2)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 2).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(0, 2)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 3).unwrap(),
+            MssqlCell::Decimal(None)
+        );
+
+        assert_eq!(
+            view.mssql_cell(&mappings[1], 0).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(1_234_567_890, 4)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[1], 1).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(-1_234_567_890, 4)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[1], 2).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(0, 4)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[1], 3).unwrap(),
+            MssqlCell::Decimal(None)
+        );
+
+        assert_eq!(
+            view.mssql_cell(&mappings[2], 0).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(
+                123_456_789_012_345_678_901_234_567_890,
+                9,
+            )))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[2], 1).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(
+                -123_456_789_012_345_678_901_234_567_890,
+                9,
+            )))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[2], 2).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(0, 9)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[2], 3).unwrap(),
+            MssqlCell::Decimal(None)
+        );
+    }
+
+    #[test]
+    fn normalizes_negative_decimal_scale_at_runtime() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal128(3, -2),
+                true,
+            )]),
+            PlanOptions {
+                decimal_policy: DecimalPolicy::NormalizeNegativeScale,
+                ..PlanOptions::default()
+            },
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal128(3, -2),
+                true,
+            )])),
+            vec![Arc::new(
+                Decimal128Array::from(vec![Some(123_i128), Some(-123_i128), Some(0), None])
+                    .with_precision_and_scale(3, -2)
+                    .unwrap(),
+            )],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 0).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(12_300, 0)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 1).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(-12_300, 0)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 2).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(0, 0)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 3).unwrap(),
+            MssqlCell::Decimal(None)
+        );
+    }
+
+    #[test]
+    fn rejects_negative_decimal_scale_normalization_overflow() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal128(37, -1),
+                false,
+            )]),
+            PlanOptions {
+                decimal_policy: DecimalPolicy::NormalizeNegativeScale,
+                ..PlanOptions::default()
+            },
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal128(37, -1),
+                false,
+            )])),
+            vec![malicious_decimal128_array(
+                DataType::Decimal128(37, -1),
+                &[i128::MAX],
+            )],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let err = view.mssql_cell(&mappings[0], 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::DecimalOutOfRange,
+            Some(0),
+            Some((0, "amount")),
+        );
+    }
+
+    #[test]
+    fn converts_decimal128_to_owned_tiberius_numeric_with_scale() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(10, 3),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal128(10, 3),
+                true,
+            )])),
+            vec![Arc::new(
+                Decimal128Array::from(vec![Some(-123_456_i128)])
+                    .with_precision_and_scale(10, 3)
+                    .unwrap(),
+            )],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let row = view.tiberius_row_owned(0).unwrap();
+
+        assert_eq!(
+            row.get(0),
+            Some(&tiberius::ColumnData::Numeric(Some(
+                tiberius::numeric::Numeric::new_with_scale(-123_456, 3)
+            )))
+        );
+    }
+
+    #[test]
+    fn rejects_decimal_scale_that_tiberius_numeric_cannot_represent() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(38, 38),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal128(38, 38),
+                true,
+            )])),
+            vec![Arc::new(
+                Decimal128Array::from(vec![Some(1_i128)])
+                    .with_precision_and_scale(38, 38)
+                    .unwrap(),
+            )],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let err = view.tiberius_row_owned(0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::DecimalOutOfRange,
+            Some(0),
+            Some((0, "amount")),
+        );
+    }
+
+    #[test]
+    fn accepts_decimal_values_at_planned_precision_boundaries() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(5, 2),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal128(5, 2),
+                false,
+            )])),
+            vec![Arc::new(
+                Decimal128Array::from(vec![99_999_i128, -99_999_i128])
+                    .with_precision_and_scale(5, 2)
+                    .unwrap(),
+            )],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 0).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(99_999, 2)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 1).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(-99_999, 2)))
+        );
+    }
+
+    #[test]
+    fn rejects_decimal_values_outside_planned_precision() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(5, 2),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal128(5, 2),
+                false,
+            )])),
+            vec![malicious_decimal128_array(
+                DataType::Decimal128(5, 2),
+                &[100_000_i128, -100_000_i128],
+            )],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let positive = view.mssql_cell(&mappings[0], 0).unwrap_err();
+        assert_single_diagnostic(
+            positive,
+            DiagnosticCode::DecimalOutOfRange,
+            Some(0),
+            Some((0, "amount")),
+        );
+
+        let negative = view.mssql_cell(&mappings[0], 1).unwrap_err();
+        assert_single_diagnostic(
+            negative,
+            DiagnosticCode::DecimalOutOfRange,
+            Some(1),
+            Some((0, "amount")),
+        );
+    }
+
+    #[test]
     fn converts_uint64_checked_bigint_boundary_values() {
         let mappings = mappings_for_schema_with_options(
             Schema::new(vec![Field::new(
@@ -1779,11 +2466,117 @@ mod tests {
     }
 
     #[test]
-    fn rejects_policy_planned_decimal_runtime_conversion_until_implemented() {
-        assert_policy_planned_null_runtime_unsupported(
+    fn converts_decimal256_checked_downcast_values() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
             "amount",
-            DataType::Decimal128(10, 2),
-            PlanOptions::default(),
+            DataType::Decimal256(38, 4),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal256(38, 4),
+                true,
+            )])),
+            vec![Arc::new(
+                Decimal256Array::from(vec![
+                    Some(i256::from_i128(123_456_789_012_345_678_901_234_567_890)),
+                    Some(i256::from_i128(-123_456_789_012_345_678_901_234_567_890)),
+                    Some(i256::ZERO),
+                    None,
+                ])
+                .with_precision_and_scale(38, 4)
+                .unwrap(),
+            )],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 0).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(
+                123_456_789_012_345_678_901_234_567_890,
+                4,
+            )))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 1).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(
+                -123_456_789_012_345_678_901_234_567_890,
+                4,
+            )))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 2).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(0, 4)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 3).unwrap(),
+            MssqlCell::Decimal(None)
+        );
+    }
+
+    #[test]
+    fn rejects_decimal256_values_that_do_not_fit_i128_runtime_representation() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal256(38, 0),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal256(38, 0),
+                false,
+            )])),
+            vec![Arc::new(
+                Decimal256Array::from(vec![i256::from_i128(i128::MAX) + i256::ONE])
+                    .with_precision_and_scale(38, 0)
+                    .unwrap(),
+            )],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let err = view.mssql_cell(&mappings[0], 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::DecimalOutOfRange,
+            Some(0),
+            Some((0, "amount")),
+        );
+    }
+
+    #[test]
+    fn rejects_decimal256_checked_downcast_values_outside_planned_precision() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal256(5, 2),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal256(5, 2),
+                false,
+            )])),
+            vec![Arc::new(
+                Decimal256Array::from(vec![i256::from_i128(100_000)])
+                    .with_precision_and_scale(5, 2)
+                    .unwrap(),
+            )],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let err = view.mssql_cell(&mappings[0], 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::DecimalOutOfRange,
+            Some(0),
+            Some((0, "amount")),
         );
     }
 
@@ -2000,6 +2793,44 @@ mod tests {
     }
 
     #[test]
+    fn rejects_decimal_mapping_scale_mismatch_before_value_corruption() {
+        let mappings = vec![SchemaMapping::new(
+            ArrowFieldRef::new(0, "amount".to_owned(), false, DataType::Decimal128(5, 2)),
+            MssqlColumn::new(
+                Identifier::new("amount").unwrap(),
+                MssqlType::Decimal {
+                    precision: 5,
+                    scale: 0,
+                },
+                false,
+            ),
+        )];
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal128(5, 2),
+                false,
+            )])),
+            vec![Arc::new(
+                Decimal128Array::from(vec![123_i128])
+                    .with_precision_and_scale(5, 2)
+                    .unwrap(),
+            )],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let err = view.mssql_cell(&mappings[0], 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::SchemaMismatch,
+            Some(0),
+            Some((0, "amount")),
+        );
+    }
+
+    #[test]
     fn rejects_planned_column_index_outside_runtime_batch() {
         let mappings = mappings_for_schema(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -2208,6 +3039,16 @@ mod tests {
                 1,
             )
         }
+    }
+
+    fn malicious_decimal128_array(data_type: DataType, values: &[i128]) -> ArrayRef {
+        let data = ArrayData::builder(data_type)
+            .len(values.len())
+            .add_buffer(values.to_vec().into())
+            .build()
+            .unwrap();
+
+        Arc::new(Decimal128Array::from(data))
     }
 
     fn assert_single_diagnostic(
