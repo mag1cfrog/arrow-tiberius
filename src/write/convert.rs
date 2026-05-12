@@ -264,6 +264,10 @@ pub(crate) enum MssqlCell<'a> {
     BigInt(Option<i64>),
     /// SQL Server `decimal` cell.
     Decimal(Option<MssqlDecimal>),
+    /// SQL Server `date` cell.
+    Date(Option<MssqlDate>),
+    /// SQL Server `datetime2` cell.
+    DateTime2(Option<MssqlDateTime2>),
     /// SQL Server `real` cell.
     Real(Option<f32>),
     /// SQL Server `float` cell.
@@ -299,6 +303,99 @@ impl MssqlDecimal {
 
     fn to_tiberius_numeric(self) -> tiberius::numeric::Numeric {
         tiberius::numeric::Numeric::new_with_scale(self.unscaled, self.scale)
+    }
+}
+
+/// Semantic SQL Server date value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MssqlDate {
+    days: u32,
+}
+
+impl MssqlDate {
+    /// Creates a semantic date value from SQL Server's day count.
+    const fn new(days: u32) -> Self {
+        Self { days }
+    }
+
+    /// Returns the number of days from 0001-01-01.
+    pub(crate) const fn days(self) -> u32 {
+        self.days
+    }
+
+    fn to_tiberius_date(self) -> tiberius::time::Date {
+        tiberius::time::Date::new(self.days)
+    }
+}
+
+/// Semantic SQL Server datetime2 value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MssqlDateTime2 {
+    date: MssqlDate,
+    time: MssqlTime,
+}
+
+impl MssqlDateTime2 {
+    /// Creates a semantic datetime2 value from date and time components.
+    const fn new(date: MssqlDate, time: MssqlTime) -> Self {
+        Self { date, time }
+    }
+
+    /// Returns the date component.
+    pub(crate) const fn date(self) -> MssqlDate {
+        self.date
+    }
+
+    /// Returns the time component.
+    pub(crate) const fn time(self) -> MssqlTime {
+        self.time
+    }
+
+    fn to_tiberius_datetime2(self) -> tiberius::time::DateTime2 {
+        tiberius::time::DateTime2::new(self.date.to_tiberius_date(), self.time.to_tiberius_time())
+    }
+}
+
+/// Semantic SQL Server time-of-day value.
+///
+/// SQL Server stores `time`/`datetime2` time-of-day as an integer count of
+/// fractional-second increments since midnight. The `scale` says how fine each
+/// increment is: scale 0 means whole seconds, scale 3 means milliseconds, and
+/// scale 7 means 100ns ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MssqlTime {
+    /// Number of `10^-scale` second increments since midnight.
+    ///
+    /// For example, at scale 3 this is milliseconds since midnight, so
+    /// 12:00:00.123 is `43_200_123`.
+    increments: u64,
+    /// Fractional-second precision used by `increments`.
+    ///
+    /// `datetime2(3)` uses scale 3, so one increment is one millisecond.
+    scale: u8,
+}
+
+impl MssqlTime {
+    /// Creates a semantic time value from SQL Server increments and scale.
+    ///
+    /// This constructor assumes the caller has already validated that
+    /// `increments` fits inside one day for the selected `scale`.
+    const fn new(increments: u64, scale: u8) -> Self {
+        Self { increments, scale }
+    }
+
+    /// Returns the number of `10^-scale` second increments since midnight.
+    pub(crate) const fn increments(self) -> u64 {
+        self.increments
+    }
+
+    /// Returns the fractional-second precision used by the increments.
+    pub(crate) const fn scale(self) -> u8 {
+        self.scale
+    }
+
+    fn to_tiberius_time(self) -> tiberius::time::Time {
+        tiberius::time::Time::new(self.increments, self.scale)
     }
 }
 
@@ -408,6 +505,12 @@ pub(crate) fn mssql_cell_to_tiberius_borrowed(cell: MssqlCell<'_>) -> tiberius::
         MssqlCell::Decimal(value) => {
             tiberius::ColumnData::Numeric(value.map(MssqlDecimal::to_tiberius_numeric))
         }
+        MssqlCell::Date(value) => {
+            tiberius::ColumnData::Date(value.map(MssqlDate::to_tiberius_date))
+        }
+        MssqlCell::DateTime2(value) => {
+            tiberius::ColumnData::DateTime2(value.map(MssqlDateTime2::to_tiberius_datetime2))
+        }
         MssqlCell::Real(value) => tiberius::ColumnData::F32(value),
         MssqlCell::Float(value) => tiberius::ColumnData::F64(value),
         MssqlCell::NVarChar(value) => tiberius::ColumnData::String(value.map(Cow::Borrowed)),
@@ -425,6 +528,12 @@ pub(crate) fn mssql_cell_to_tiberius_owned(cell: MssqlCell<'_>) -> tiberius::Col
         MssqlCell::BigInt(value) => tiberius::ColumnData::I64(value),
         MssqlCell::Decimal(value) => {
             tiberius::ColumnData::Numeric(value.map(MssqlDecimal::to_tiberius_numeric))
+        }
+        MssqlCell::Date(value) => {
+            tiberius::ColumnData::Date(value.map(MssqlDate::to_tiberius_date))
+        }
+        MssqlCell::DateTime2(value) => {
+            tiberius::ColumnData::DateTime2(value.map(MssqlDateTime2::to_tiberius_datetime2))
         }
         MssqlCell::Real(value) => tiberius::ColumnData::F32(value),
         MssqlCell::Float(value) => tiberius::ColumnData::F64(value),
@@ -1014,8 +1123,8 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
     use super::{
-        ArrowCell, MssqlCell, MssqlDecimal, RecordBatchView, mssql_cell_to_tiberius_borrowed,
-        mssql_cell_to_tiberius_owned,
+        ArrowCell, MssqlCell, MssqlDate, MssqlDateTime2, MssqlDecimal, MssqlTime, RecordBatchView,
+        mssql_cell_to_tiberius_borrowed, mssql_cell_to_tiberius_owned,
     };
     use crate::{
         ArrowFieldRef, BinaryPolicy, Date64Policy, DecimalPolicy, DiagnosticCode, Error,
@@ -1704,6 +1813,28 @@ mod tests {
             tiberius::ColumnData::Numeric(None)
         );
         assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::Date(Some(MssqlDate::new(719_163)))),
+            tiberius::ColumnData::Date(Some(tiberius::time::Date::new(719_163)))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::Date(None)),
+            tiberius::ColumnData::Date(None)
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(719_163),
+                MssqlTime::new(43_200_123, 3),
+            )))),
+            tiberius::ColumnData::DateTime2(Some(tiberius::time::DateTime2::new(
+                tiberius::time::Date::new(719_163),
+                tiberius::time::Time::new(43_200_123, 3),
+            )))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::DateTime2(None)),
+            tiberius::ColumnData::DateTime2(None)
+        );
+        assert_eq!(
             mssql_cell_to_tiberius_borrowed(MssqlCell::Real(Some(1.25))),
             tiberius::ColumnData::F32(Some(1.25))
         );
@@ -1777,6 +1908,28 @@ mod tests {
         assert_eq!(
             mssql_cell_to_tiberius_owned(MssqlCell::Decimal(None)),
             tiberius::ColumnData::Numeric(None)
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_owned(MssqlCell::Date(Some(MssqlDate::new(719_163)))),
+            tiberius::ColumnData::Date(Some(tiberius::time::Date::new(719_163)))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_owned(MssqlCell::Date(None)),
+            tiberius::ColumnData::Date(None)
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_owned(MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(719_163),
+                MssqlTime::new(43_200_123, 3),
+            )))),
+            tiberius::ColumnData::DateTime2(Some(tiberius::time::DateTime2::new(
+                tiberius::time::Date::new(719_163),
+                tiberius::time::Time::new(43_200_123, 3),
+            )))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_owned(MssqlCell::DateTime2(None)),
+            tiberius::ColumnData::DateTime2(None)
         );
         assert_eq!(
             mssql_cell_to_tiberius_owned(MssqlCell::Real(Some(1.25))),
