@@ -18,6 +18,9 @@ use crate::{
     SchemaMapping,
 };
 
+const SQL_SERVER_DATE_UNIX_EPOCH_DAYS: i64 = 719_162;
+const SQL_SERVER_DATE_MAX_DAYS: i64 = 3_652_058;
+
 /// Borrowed value extracted from one Arrow array cell.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum ArrowCell<'a> {
@@ -61,196 +64,6 @@ pub(crate) enum ArrowCell<'a> {
     Utf8(&'a str),
     /// Arrow binary value.
     Binary(&'a [u8]),
-}
-
-impl<'a> ArrowCell<'a> {
-    fn to_mssql_bit(self, mapping: &SchemaMapping, row_index: usize) -> Result<bool> {
-        match self {
-            Self::Boolean(value) => Ok(value),
-            other => Err(value_conversion_error(row_mapping_diagnostic(
-                mapping,
-                row_index,
-                DiagnosticCode::ValueTypeMismatch,
-                format!("expected Arrow boolean payload, got {other:?}"),
-            ))),
-        }
-    }
-
-    fn to_mssql_tinyint(self, mapping: &SchemaMapping, row_index: usize) -> Result<u8> {
-        match self {
-            Self::UInt8(value) => Ok(value),
-            other => Err(value_conversion_error(row_mapping_diagnostic(
-                mapping,
-                row_index,
-                DiagnosticCode::ValueTypeMismatch,
-                format!("expected Arrow UInt8 payload, got {other:?}"),
-            ))),
-        }
-    }
-
-    fn to_mssql_smallint(self, mapping: &SchemaMapping, row_index: usize) -> Result<i16> {
-        match self {
-            Self::Int8(value) => Ok(i16::from(value)),
-            Self::Int16(value) => Ok(value),
-            other => Err(value_conversion_error(row_mapping_diagnostic(
-                mapping,
-                row_index,
-                DiagnosticCode::ValueTypeMismatch,
-                format!("expected Arrow Int8 or Int16 payload, got {other:?}"),
-            ))),
-        }
-    }
-
-    fn to_mssql_int(self, mapping: &SchemaMapping, row_index: usize) -> Result<i32> {
-        match self {
-            Self::Int32(value) => Ok(value),
-            Self::UInt16(value) => Ok(i32::from(value)),
-            other => Err(value_conversion_error(row_mapping_diagnostic(
-                mapping,
-                row_index,
-                DiagnosticCode::ValueTypeMismatch,
-                format!("expected Arrow Int32 or UInt16 payload, got {other:?}"),
-            ))),
-        }
-    }
-
-    fn to_mssql_bigint(self, mapping: &SchemaMapping, row_index: usize) -> Result<i64> {
-        match self {
-            Self::Int64(value) => Ok(value),
-            Self::UInt32(value) => Ok(i64::from(value)),
-            Self::UInt64(value) => i64::try_from(value).map_err(|_| {
-                value_conversion_error(row_mapping_diagnostic(
-                    mapping,
-                    row_index,
-                    DiagnosticCode::IntegerOutOfRange,
-                    format!("Arrow UInt64 value {value} does not fit planned SQL Server bigint"),
-                ))
-            }),
-            other => Err(value_conversion_error(row_mapping_diagnostic(
-                mapping,
-                row_index,
-                DiagnosticCode::ValueTypeMismatch,
-                format!("expected Arrow Int64, UInt32, or UInt64 payload, got {other:?}"),
-            ))),
-        }
-    }
-
-    fn to_mssql_decimal(self, mapping: &SchemaMapping, row_index: usize) -> Result<MssqlDecimal> {
-        let scale = decimal_scale(mapping, row_index)?;
-        validate_decimal_scale_compatibility(mapping, row_index, scale)?;
-
-        match (self, mapping.arrow().data_type()) {
-            (Self::UInt64(value), DataType::UInt64) if is_uint64_decimal20_0_mapping(mapping) => {
-                mssql_decimal(mapping, row_index, i128::from(value), scale)
-            }
-            (Self::Decimal32(value), DataType::Decimal32(_, arrow_scale)) if *arrow_scale >= 0 => {
-                mssql_decimal(mapping, row_index, i128::from(value), scale)
-            }
-            (Self::Decimal32(value), DataType::Decimal32(_, arrow_scale)) => {
-                let value =
-                    normalize_negative_scale(mapping, row_index, i128::from(value), *arrow_scale)?;
-                mssql_decimal(mapping, row_index, value, scale)
-            }
-            (Self::Decimal64(value), DataType::Decimal64(_, arrow_scale)) if *arrow_scale >= 0 => {
-                mssql_decimal(mapping, row_index, i128::from(value), scale)
-            }
-            (Self::Decimal64(value), DataType::Decimal64(_, arrow_scale)) => {
-                let value =
-                    normalize_negative_scale(mapping, row_index, i128::from(value), *arrow_scale)?;
-                mssql_decimal(mapping, row_index, value, scale)
-            }
-            (Self::Decimal128(value), DataType::Decimal128(_, arrow_scale))
-                if *arrow_scale >= 0 =>
-            {
-                mssql_decimal(mapping, row_index, value, scale)
-            }
-            (Self::Decimal128(value), DataType::Decimal128(_, arrow_scale)) => {
-                let value = normalize_negative_scale(mapping, row_index, value, *arrow_scale)?;
-                mssql_decimal(mapping, row_index, value, scale)
-            }
-            (Self::Decimal256(value), DataType::Decimal256(_, arrow_scale))
-                if *arrow_scale >= 0 =>
-            {
-                let value = value.to_i128().ok_or_else(|| {
-                    value_conversion_error(row_mapping_diagnostic(
-                        mapping,
-                        row_index,
-                        DiagnosticCode::DecimalOutOfRange,
-                        "Arrow Decimal256 value does not fit runtime i128 decimal representation",
-                    ))
-                })?;
-                mssql_decimal(mapping, row_index, value, scale)
-            }
-            (Self::Decimal256(value), DataType::Decimal256(_, arrow_scale)) => {
-                let value = value.to_i128().ok_or_else(|| {
-                    value_conversion_error(row_mapping_diagnostic(
-                        mapping,
-                        row_index,
-                        DiagnosticCode::DecimalOutOfRange,
-                        "Arrow Decimal256 value does not fit runtime i128 decimal representation",
-                    ))
-                })?;
-                let value = normalize_negative_scale(mapping, row_index, value, *arrow_scale)?;
-                mssql_decimal(mapping, row_index, value, scale)
-            }
-            other => Err(value_conversion_error(row_mapping_diagnostic(
-                mapping,
-                row_index,
-                DiagnosticCode::ValueTypeMismatch,
-                format!("expected Arrow decimal-compatible payload, got {other:?}"),
-            ))),
-        }
-    }
-
-    fn to_mssql_real(self, mapping: &SchemaMapping, row_index: usize) -> Result<f32> {
-        match self {
-            Self::Float32(value) if value.is_finite() => Ok(value),
-            Self::Float32(value) => Err(non_finite_float_error(mapping, row_index, value)),
-            other => Err(value_conversion_error(row_mapping_diagnostic(
-                mapping,
-                row_index,
-                DiagnosticCode::ValueTypeMismatch,
-                format!("expected Arrow Float32 payload, got {other:?}"),
-            ))),
-        }
-    }
-
-    fn to_mssql_float(self, mapping: &SchemaMapping, row_index: usize) -> Result<f64> {
-        match self {
-            Self::Float64(value) if value.is_finite() => Ok(value),
-            Self::Float64(value) => Err(non_finite_float_error(mapping, row_index, value)),
-            other => Err(value_conversion_error(row_mapping_diagnostic(
-                mapping,
-                row_index,
-                DiagnosticCode::ValueTypeMismatch,
-                format!("expected Arrow Float64 payload, got {other:?}"),
-            ))),
-        }
-    }
-
-    fn to_mssql_nvarchar(self, mapping: &SchemaMapping, row_index: usize) -> Result<&'a str> {
-        match self {
-            Self::Utf8(value) => Ok(value),
-            other => Err(value_conversion_error(row_mapping_diagnostic(
-                mapping,
-                row_index,
-                DiagnosticCode::ValueTypeMismatch,
-                format!("expected Arrow UTF-8 payload, got {other:?}"),
-            ))),
-        }
-    }
-
-    fn to_mssql_varbinary(self, mapping: &SchemaMapping, row_index: usize) -> Result<&'a [u8]> {
-        match self {
-            Self::Binary(value) => Ok(value),
-            other => Err(value_conversion_error(row_mapping_diagnostic(
-                mapping,
-                row_index,
-                DiagnosticCode::ValueTypeMismatch,
-                format!("expected Arrow binary payload, got {other:?}"),
-            ))),
-        }
-    }
 }
 
 /// Semantic SQL Server value for one planned cell.
@@ -652,6 +465,240 @@ fn extract_arrow_cell<'a>(
     }
 }
 
+fn mssql_bit_value(mapping: &SchemaMapping, row_index: usize, cell: ArrowCell<'_>) -> Result<bool> {
+    match cell {
+        ArrowCell::Boolean(value) => Ok(value),
+        other => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!("expected Arrow boolean payload, got {other:?}"),
+        ))),
+    }
+}
+
+fn mssql_tinyint_value(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    cell: ArrowCell<'_>,
+) -> Result<u8> {
+    match cell {
+        ArrowCell::UInt8(value) => Ok(value),
+        other => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!("expected Arrow UInt8 payload, got {other:?}"),
+        ))),
+    }
+}
+
+fn mssql_smallint_value(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    cell: ArrowCell<'_>,
+) -> Result<i16> {
+    match cell {
+        ArrowCell::Int8(value) => Ok(i16::from(value)),
+        ArrowCell::Int16(value) => Ok(value),
+        other => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!("expected Arrow Int8 or Int16 payload, got {other:?}"),
+        ))),
+    }
+}
+
+fn mssql_int_value(mapping: &SchemaMapping, row_index: usize, cell: ArrowCell<'_>) -> Result<i32> {
+    match cell {
+        ArrowCell::Int32(value) => Ok(value),
+        ArrowCell::UInt16(value) => Ok(i32::from(value)),
+        other => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!("expected Arrow Int32 or UInt16 payload, got {other:?}"),
+        ))),
+    }
+}
+
+fn mssql_bigint_value(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    cell: ArrowCell<'_>,
+) -> Result<i64> {
+    match cell {
+        ArrowCell::Int64(value) => Ok(value),
+        ArrowCell::UInt32(value) => Ok(i64::from(value)),
+        ArrowCell::UInt64(value) => i64::try_from(value).map_err(|_| {
+            value_conversion_error(row_mapping_diagnostic(
+                mapping,
+                row_index,
+                DiagnosticCode::IntegerOutOfRange,
+                format!("Arrow UInt64 value {value} does not fit planned SQL Server bigint"),
+            ))
+        }),
+        other => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!("expected Arrow Int64, UInt32, or UInt64 payload, got {other:?}"),
+        ))),
+    }
+}
+
+fn mssql_decimal_value(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    cell: ArrowCell<'_>,
+) -> Result<MssqlDecimal> {
+    let scale = decimal_scale(mapping, row_index)?;
+    validate_decimal_scale_compatibility(mapping, row_index, scale)?;
+
+    match (cell, mapping.arrow().data_type()) {
+        (ArrowCell::UInt64(value), DataType::UInt64) if is_uint64_decimal20_0_mapping(mapping) => {
+            mssql_decimal(mapping, row_index, i128::from(value), scale)
+        }
+        (ArrowCell::Decimal32(value), DataType::Decimal32(_, arrow_scale)) if *arrow_scale >= 0 => {
+            mssql_decimal(mapping, row_index, i128::from(value), scale)
+        }
+        (ArrowCell::Decimal32(value), DataType::Decimal32(_, arrow_scale)) => {
+            let value =
+                normalize_negative_scale(mapping, row_index, i128::from(value), *arrow_scale)?;
+            mssql_decimal(mapping, row_index, value, scale)
+        }
+        (ArrowCell::Decimal64(value), DataType::Decimal64(_, arrow_scale)) if *arrow_scale >= 0 => {
+            mssql_decimal(mapping, row_index, i128::from(value), scale)
+        }
+        (ArrowCell::Decimal64(value), DataType::Decimal64(_, arrow_scale)) => {
+            let value =
+                normalize_negative_scale(mapping, row_index, i128::from(value), *arrow_scale)?;
+            mssql_decimal(mapping, row_index, value, scale)
+        }
+        (ArrowCell::Decimal128(value), DataType::Decimal128(_, arrow_scale))
+            if *arrow_scale >= 0 =>
+        {
+            mssql_decimal(mapping, row_index, value, scale)
+        }
+        (ArrowCell::Decimal128(value), DataType::Decimal128(_, arrow_scale)) => {
+            let value = normalize_negative_scale(mapping, row_index, value, *arrow_scale)?;
+            mssql_decimal(mapping, row_index, value, scale)
+        }
+        (ArrowCell::Decimal256(value), DataType::Decimal256(_, arrow_scale))
+            if *arrow_scale >= 0 =>
+        {
+            let value = value.to_i128().ok_or_else(|| {
+                value_conversion_error(row_mapping_diagnostic(
+                    mapping,
+                    row_index,
+                    DiagnosticCode::DecimalOutOfRange,
+                    "Arrow Decimal256 value does not fit runtime i128 decimal representation",
+                ))
+            })?;
+            mssql_decimal(mapping, row_index, value, scale)
+        }
+        (ArrowCell::Decimal256(value), DataType::Decimal256(_, arrow_scale)) => {
+            let value = value.to_i128().ok_or_else(|| {
+                value_conversion_error(row_mapping_diagnostic(
+                    mapping,
+                    row_index,
+                    DiagnosticCode::DecimalOutOfRange,
+                    "Arrow Decimal256 value does not fit runtime i128 decimal representation",
+                ))
+            })?;
+            let value = normalize_negative_scale(mapping, row_index, value, *arrow_scale)?;
+            mssql_decimal(mapping, row_index, value, scale)
+        }
+        other => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!("expected Arrow decimal-compatible payload, got {other:?}"),
+        ))),
+    }
+}
+
+fn mssql_date_value(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    cell: ArrowCell<'_>,
+) -> Result<MssqlDate> {
+    match (cell, mapping.arrow().data_type()) {
+        (ArrowCell::Date32(value), DataType::Date32) => {
+            mssql_date_from_arrow_date32(mapping, row_index, value)
+        }
+        other => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!("expected Arrow Date32 payload, got {other:?}"),
+        ))),
+    }
+}
+
+fn mssql_real_value(mapping: &SchemaMapping, row_index: usize, cell: ArrowCell<'_>) -> Result<f32> {
+    match cell {
+        ArrowCell::Float32(value) if value.is_finite() => Ok(value),
+        ArrowCell::Float32(value) => Err(non_finite_float_error(mapping, row_index, value)),
+        other => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!("expected Arrow Float32 payload, got {other:?}"),
+        ))),
+    }
+}
+
+fn mssql_float_value(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    cell: ArrowCell<'_>,
+) -> Result<f64> {
+    match cell {
+        ArrowCell::Float64(value) if value.is_finite() => Ok(value),
+        ArrowCell::Float64(value) => Err(non_finite_float_error(mapping, row_index, value)),
+        other => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!("expected Arrow Float64 payload, got {other:?}"),
+        ))),
+    }
+}
+
+fn mssql_nvarchar_value<'a>(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    cell: ArrowCell<'a>,
+) -> Result<&'a str> {
+    match cell {
+        ArrowCell::Utf8(value) => Ok(value),
+        other => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!("expected Arrow UTF-8 payload, got {other:?}"),
+        ))),
+    }
+}
+
+fn mssql_varbinary_value<'a>(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    cell: ArrowCell<'a>,
+) -> Result<&'a [u8]> {
+    match cell {
+        ArrowCell::Binary(value) => Ok(value),
+        other => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!("expected Arrow binary payload, got {other:?}"),
+        ))),
+    }
+}
+
 fn mssql_cell_from_arrow_cell<'a>(
     mapping: &SchemaMapping,
     cell: ArrowCell<'a>,
@@ -671,26 +718,33 @@ fn mssql_cell_from_arrow_cell<'a>(
     }
 
     match mapping.mssql().ty() {
-        MssqlType::Bit => Ok(MssqlCell::Bit(Some(cell.to_mssql_bit(mapping, row_index)?))),
-        MssqlType::TinyInt => Ok(MssqlCell::TinyInt(Some(
-            cell.to_mssql_tinyint(mapping, row_index)?,
-        ))),
-        MssqlType::SmallInt => Ok(MssqlCell::SmallInt(Some(
-            cell.to_mssql_smallint(mapping, row_index)?,
-        ))),
-        MssqlType::Int => Ok(MssqlCell::Int(Some(cell.to_mssql_int(mapping, row_index)?))),
-        MssqlType::BigInt => Ok(MssqlCell::BigInt(Some(
-            cell.to_mssql_bigint(mapping, row_index)?,
-        ))),
-        MssqlType::Decimal { .. } => Ok(MssqlCell::Decimal(Some(
-            cell.to_mssql_decimal(mapping, row_index)?,
-        ))),
-        MssqlType::Real => Ok(MssqlCell::Real(Some(
-            cell.to_mssql_real(mapping, row_index)?,
-        ))),
-        MssqlType::Float { .. } => Ok(MssqlCell::Float(Some(
-            cell.to_mssql_float(mapping, row_index)?,
-        ))),
+        MssqlType::Bit => Ok(MssqlCell::Bit(Some(mssql_bit_value(
+            mapping, row_index, cell,
+        )?))),
+        MssqlType::TinyInt => Ok(MssqlCell::TinyInt(Some(mssql_tinyint_value(
+            mapping, row_index, cell,
+        )?))),
+        MssqlType::SmallInt => Ok(MssqlCell::SmallInt(Some(mssql_smallint_value(
+            mapping, row_index, cell,
+        )?))),
+        MssqlType::Int => Ok(MssqlCell::Int(Some(mssql_int_value(
+            mapping, row_index, cell,
+        )?))),
+        MssqlType::BigInt => Ok(MssqlCell::BigInt(Some(mssql_bigint_value(
+            mapping, row_index, cell,
+        )?))),
+        MssqlType::Decimal { .. } => Ok(MssqlCell::Decimal(Some(mssql_decimal_value(
+            mapping, row_index, cell,
+        )?))),
+        MssqlType::Date => Ok(MssqlCell::Date(Some(mssql_date_value(
+            mapping, row_index, cell,
+        )?))),
+        MssqlType::Real => Ok(MssqlCell::Real(Some(mssql_real_value(
+            mapping, row_index, cell,
+        )?))),
+        MssqlType::Float { .. } => Ok(MssqlCell::Float(Some(mssql_float_value(
+            mapping, row_index, cell,
+        )?))),
         MssqlType::NVarChar(length) => nvar_char_cell(mapping, row_index, *length, cell),
         MssqlType::VarBinary(length) => var_binary_cell(mapping, row_index, *length, cell),
         ty => Err(unsupported_value_conversion(
@@ -714,6 +768,7 @@ fn null_mssql_cell<'a>(mapping: &SchemaMapping, row_index: usize) -> Result<Mssq
         MssqlType::Decimal { .. } if supports_null_decimal_cell(mapping) => {
             Ok(MssqlCell::Decimal(None))
         }
+        MssqlType::Date => Ok(MssqlCell::Date(None)),
         MssqlType::Real => Ok(MssqlCell::Real(None)),
         MssqlType::Float { .. } => Ok(MssqlCell::Float(None)),
         MssqlType::NVarChar(_) => Ok(MssqlCell::NVarChar(None)),
@@ -905,13 +960,32 @@ fn decimal_max_unscaled(precision: u8) -> Option<i128> {
     10_i128.checked_pow(u32::from(precision))?.checked_sub(1)
 }
 
+fn mssql_date_from_arrow_date32(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    days_from_unix_epoch: i32,
+) -> Result<MssqlDate> {
+    let days = i64::from(days_from_unix_epoch) + SQL_SERVER_DATE_UNIX_EPOCH_DAYS;
+
+    if (0..=SQL_SERVER_DATE_MAX_DAYS).contains(&days) {
+        return Ok(MssqlDate::new(days as u32));
+    }
+
+    Err(value_conversion_error(row_mapping_diagnostic(
+        mapping,
+        row_index,
+        DiagnosticCode::TimestampOutOfRange,
+        format!("Arrow Date32 day offset {days_from_unix_epoch} is outside SQL Server date range"),
+    )))
+}
+
 fn nvar_char_cell<'a>(
     mapping: &SchemaMapping,
     row_index: usize,
     length: MssqlTypeLength,
     cell: ArrowCell<'a>,
 ) -> Result<MssqlCell<'a>> {
-    let value = cell.to_mssql_nvarchar(mapping, row_index)?;
+    let value = mssql_nvarchar_value(mapping, row_index, cell)?;
     let code_units = value.encode_utf16().count();
 
     if exceeds_length(length, code_units) {
@@ -934,7 +1008,7 @@ fn var_binary_cell<'a>(
     length: MssqlTypeLength,
     cell: ArrowCell<'a>,
 ) -> Result<MssqlCell<'a>> {
-    let value = cell.to_mssql_varbinary(mapping, row_index)?;
+    let value = mssql_varbinary_value(mapping, row_index, cell)?;
     let bytes = value.len();
 
     if exceeds_length(length, bytes) {
@@ -2809,12 +2883,121 @@ mod tests {
     }
 
     #[test]
-    fn rejects_policy_planned_date_runtime_conversion_until_implemented() {
-        assert_policy_planned_null_runtime_unsupported(
+    fn converts_date32_cells_to_mssql_date_with_boundaries_and_null() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
             "date_value",
             DataType::Date32,
-            PlanOptions::default(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "date_value",
+                DataType::Date32,
+                true,
+            )])),
+            vec![Arc::new(Date32Array::from(vec![
+                Some(0_i32),
+                Some(-1_i32),
+                Some(1_i32),
+                Some(-719_162_i32),
+                Some(2_932_896_i32),
+                None,
+            ]))],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 0).unwrap(),
+            MssqlCell::Date(Some(MssqlDate::new(719_162)))
         );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 1).unwrap(),
+            MssqlCell::Date(Some(MssqlDate::new(719_161)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 2).unwrap(),
+            MssqlCell::Date(Some(MssqlDate::new(719_163)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 3).unwrap(),
+            MssqlCell::Date(Some(MssqlDate::new(0)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 4).unwrap(),
+            MssqlCell::Date(Some(MssqlDate::new(3_652_058)))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 5).unwrap(),
+            MssqlCell::Date(None)
+        );
+    }
+
+    #[test]
+    fn rejects_date32_null_in_non_nullable_column() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "date_value",
+            DataType::Date32,
+            false,
+        )]));
+        let batch = unsafe_batch_for_field(
+            "date_value",
+            DataType::Date32,
+            Arc::new(Date32Array::from(vec![None::<i32>])),
+            false,
+        );
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let err = view.mssql_cell(&mappings[0], 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::NullInNonNullableColumn,
+            Some(0),
+            Some((0, "date_value")),
+        );
+    }
+
+    #[test]
+    fn rejects_date32_values_outside_sql_server_date_range() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "date_value",
+            DataType::Date32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "date_value",
+                DataType::Date32,
+                false,
+            )])),
+            vec![Arc::new(Date32Array::from(vec![
+                -719_163_i32,
+                2_932_897_i32,
+            ]))],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let below = view.mssql_cell(&mappings[0], 0).unwrap_err();
+        assert_single_diagnostic(
+            below,
+            DiagnosticCode::TimestampOutOfRange,
+            Some(0),
+            Some((0, "date_value")),
+        );
+
+        let above = view.mssql_cell(&mappings[0], 1).unwrap_err();
+        assert_single_diagnostic(
+            above,
+            DiagnosticCode::TimestampOutOfRange,
+            Some(1),
+            Some((0, "date_value")),
+        );
+    }
+
+    #[test]
+    fn rejects_policy_planned_date64_runtime_conversion_until_implemented() {
         assert_policy_planned_null_runtime_unsupported(
             "date64_value",
             DataType::Date64,
