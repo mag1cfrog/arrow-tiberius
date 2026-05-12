@@ -4,7 +4,8 @@ use arrow_array::RecordBatch;
 use futures_util::io::{AsyncRead, AsyncWrite};
 
 use crate::{
-    Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, Result, SchemaMapping, TableName,
+    Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, MssqlType, Result, SchemaMapping,
+    TableName,
 };
 
 use super::{SchemaCheck, convert::RecordBatchView};
@@ -110,6 +111,7 @@ where
         let state = WriterState::new(options.backend, options.schema_check, mappings)?;
         let request = match state.backend() {
             WriteBackend::BaselineTokenRow => {
+                validate_baseline_backend_mappings(state.mappings())?;
                 let table_sql = bulk_insert_table_sql(&table);
                 let request = client
                     .bulk_insert(&table_sql)
@@ -206,6 +208,31 @@ where
     Ok(())
 }
 
+fn validate_baseline_backend_mappings(mappings: &[SchemaMapping]) -> Result<()> {
+    let mut diagnostics = DiagnosticSet::new();
+
+    for mapping in mappings {
+        if matches!(
+            mapping.mssql().ty(),
+            MssqlType::Date | MssqlType::DateTime2 { .. }
+        ) {
+            diagnostics.push(bulk_target_backend_diagnostic(
+                mapping,
+                format!(
+                    "baseline token-row bulk writer does not support planned SQL Server type {} yet",
+                    mapping.mssql().ty().to_sql()
+                ),
+            ));
+        }
+    }
+
+    if diagnostics.has_errors() {
+        return Err(crate::Error::ValueConversion { diagnostics });
+    }
+
+    Ok(())
+}
+
 fn validate_bulk_target_column(
     position: usize,
     column: impl BulkTargetColumnMetadata,
@@ -243,6 +270,19 @@ fn validate_bulk_target_column(
             ),
         ));
     }
+
+    if matches!(
+        mapping.mssql().ty(),
+        MssqlType::Date | MssqlType::DateTime2 { .. }
+    ) {
+        diagnostics.push(bulk_target_backend_diagnostic(
+            mapping,
+            format!(
+                "baseline token-row bulk writer does not support planned SQL Server type {} yet",
+                mapping.mssql().ty().to_sql()
+            ),
+        ));
+    }
 }
 
 fn bulk_target_column_diagnostic(
@@ -253,6 +293,15 @@ fn bulk_target_column_diagnostic(
         mapping.arrow().index(),
         mapping.arrow().name(),
     ))
+}
+
+fn bulk_target_backend_diagnostic(
+    mapping: &SchemaMapping,
+    message: impl Into<String>,
+) -> Diagnostic {
+    Diagnostic::error(DiagnosticCode::ValueConversionUnsupported, message).with_field(
+        FieldRef::new(mapping.arrow().index(), mapping.arrow().name()),
+    )
 }
 
 trait BulkTargetColumnMetadata {
@@ -599,6 +648,76 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.message().contains("nullability true"))
         );
+    }
+
+    #[test]
+    fn bulk_target_column_validation_rejects_date_until_backend_supports_it() {
+        let mappings = vec![SchemaMapping::new(
+            ArrowFieldRef::new(0, "created_on".to_owned(), false, DataType::Date32),
+            MssqlColumn::new(
+                Identifier::new("created_on").unwrap(),
+                MssqlType::Date,
+                false,
+            ),
+        )];
+        let columns = vec![bulk_target_column(0, "created_on", false)];
+
+        let err = validate_bulk_target_columns(columns.into_iter(), &mappings).unwrap_err();
+
+        let Error::ValueConversion { diagnostics } = err else {
+            panic!("expected value conversion error");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics.all()[0];
+        assert_eq!(
+            diagnostic.code(),
+            DiagnosticCode::ValueConversionUnsupported
+        );
+        assert_eq!(
+            diagnostic.field().map(|field| field.name()),
+            Some("created_on")
+        );
+        assert!(
+            diagnostic
+                .message()
+                .contains("baseline token-row bulk writer")
+        );
+        assert!(diagnostic.message().contains("date"));
+    }
+
+    #[test]
+    fn bulk_target_column_validation_rejects_datetime2_until_backend_supports_it() {
+        let mappings = vec![SchemaMapping::new(
+            ArrowFieldRef::new(0, "created_at".to_owned(), false, DataType::Date64),
+            MssqlColumn::new(
+                Identifier::new("created_at").unwrap(),
+                MssqlType::DateTime2 { precision: 3 },
+                false,
+            ),
+        )];
+        let columns = vec![bulk_target_column(0, "created_at", false)];
+
+        let err = validate_bulk_target_columns(columns.into_iter(), &mappings).unwrap_err();
+
+        let Error::ValueConversion { diagnostics } = err else {
+            panic!("expected value conversion error");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics.all()[0];
+        assert_eq!(
+            diagnostic.code(),
+            DiagnosticCode::ValueConversionUnsupported
+        );
+        assert_eq!(
+            diagnostic.field().map(|field| field.name()),
+            Some("created_at")
+        );
+        assert!(
+            diagnostic
+                .message()
+                .contains("baseline token-row bulk writer")
+        );
+        assert!(diagnostic.message().contains("datetime2(3)"));
     }
 
     #[test]
