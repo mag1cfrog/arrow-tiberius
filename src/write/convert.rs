@@ -20,6 +20,8 @@ use crate::{
 
 const SQL_SERVER_DATE_UNIX_EPOCH_DAYS: i64 = 719_162;
 const SQL_SERVER_DATE_MAX_DAYS: i64 = 3_652_058;
+const MILLISECONDS_PER_DAY: i64 = 86_400_000;
+const SQL_SERVER_DATETIME2_DATE64_SCALE: u8 = 3;
 
 /// Borrowed value extracted from one Arrow array cell.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -637,6 +639,28 @@ fn mssql_date_value(
     }
 }
 
+fn mssql_datetime2_value(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    cell: ArrowCell<'_>,
+) -> Result<MssqlDateTime2> {
+    match (cell, mapping.arrow().data_type(), mapping.mssql().ty()) {
+        (
+            ArrowCell::Date64(value),
+            DataType::Date64,
+            MssqlType::DateTime2 {
+                precision: SQL_SERVER_DATETIME2_DATE64_SCALE,
+            },
+        ) => mssql_datetime2_from_arrow_date64(mapping, row_index, value),
+        other => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!("expected Arrow Date64 payload planned as datetime2(3), got {other:?}"),
+        ))),
+    }
+}
+
 fn mssql_real_value(mapping: &SchemaMapping, row_index: usize, cell: ArrowCell<'_>) -> Result<f32> {
     match cell {
         ArrowCell::Float32(value) if value.is_finite() => Ok(value),
@@ -739,6 +763,9 @@ fn mssql_cell_from_arrow_cell<'a>(
         MssqlType::Date => Ok(MssqlCell::Date(Some(mssql_date_value(
             mapping, row_index, cell,
         )?))),
+        MssqlType::DateTime2 { .. } => Ok(MssqlCell::DateTime2(Some(mssql_datetime2_value(
+            mapping, row_index, cell,
+        )?))),
         MssqlType::Real => Ok(MssqlCell::Real(Some(mssql_real_value(
             mapping, row_index, cell,
         )?))),
@@ -769,6 +796,9 @@ fn null_mssql_cell<'a>(mapping: &SchemaMapping, row_index: usize) -> Result<Mssq
             Ok(MssqlCell::Decimal(None))
         }
         MssqlType::Date => Ok(MssqlCell::Date(None)),
+        MssqlType::DateTime2 { .. } if supports_null_datetime2_cell(mapping) => {
+            Ok(MssqlCell::DateTime2(None))
+        }
         MssqlType::Real => Ok(MssqlCell::Real(None)),
         MssqlType::Float { .. } => Ok(MssqlCell::Float(None)),
         MssqlType::NVarChar(_) => Ok(MssqlCell::NVarChar(None)),
@@ -806,6 +836,18 @@ fn supports_null_decimal_cell(mapping: &SchemaMapping) -> bool {
             | DataType::Decimal128(_, _)
             | DataType::Decimal256(_, _)
     ) && matches!(mapping.mssql().ty(), MssqlType::Decimal { .. })
+}
+
+fn supports_null_datetime2_cell(mapping: &SchemaMapping) -> bool {
+    matches!(
+        (mapping.arrow().data_type(), mapping.mssql().ty()),
+        (
+            DataType::Date64,
+            MssqlType::DateTime2 {
+                precision: SQL_SERVER_DATETIME2_DATE64_SCALE
+            }
+        )
+    )
 }
 
 fn decimal_scale(mapping: &SchemaMapping, row_index: usize) -> Result<u8> {
@@ -977,6 +1019,35 @@ fn mssql_date_from_arrow_date32(
         DiagnosticCode::TimestampOutOfRange,
         format!("Arrow Date32 day offset {days_from_unix_epoch} is outside SQL Server date range"),
     )))
+}
+
+fn mssql_datetime2_from_arrow_date64(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    milliseconds_from_unix_epoch: i64,
+) -> Result<MssqlDateTime2> {
+    let days_from_unix_epoch = milliseconds_from_unix_epoch.div_euclid(MILLISECONDS_PER_DAY);
+    let milliseconds_since_midnight = milliseconds_from_unix_epoch.rem_euclid(MILLISECONDS_PER_DAY);
+    let days = days_from_unix_epoch + SQL_SERVER_DATE_UNIX_EPOCH_DAYS;
+
+    if !(0..=SQL_SERVER_DATE_MAX_DAYS).contains(&days) {
+        return Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::TimestampOutOfRange,
+            format!(
+                "Arrow Date64 millisecond value {milliseconds_from_unix_epoch} is outside SQL Server datetime2 range"
+            ),
+        )));
+    }
+
+    Ok(MssqlDateTime2::new(
+        MssqlDate::new(days as u32),
+        MssqlTime::new(
+            milliseconds_since_midnight as u64,
+            SQL_SERVER_DATETIME2_DATE64_SCALE,
+        ),
+    ))
 }
 
 fn nvar_char_cell<'a>(
@@ -2997,14 +3068,169 @@ mod tests {
     }
 
     #[test]
-    fn rejects_policy_planned_date64_runtime_conversion_until_implemented() {
-        assert_policy_planned_null_runtime_unsupported(
-            "date64_value",
-            DataType::Date64,
+    fn converts_date64_cells_to_mssql_datetime2_with_boundaries_and_null() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new("date_value", DataType::Date64, true)]),
             PlanOptions {
                 date64_policy: Date64Policy::TimestampDateTime2,
                 ..PlanOptions::default()
             },
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "date_value",
+                DataType::Date64,
+                true,
+            )])),
+            vec![Arc::new(Date64Array::from(vec![
+                Some(0_i64),
+                Some(-1_i64),
+                Some(86_400_123_i64),
+                Some(-62_135_596_800_000_i64),
+                Some(253_402_300_799_999_i64),
+                None,
+            ]))],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 0).unwrap(),
+            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(719_162),
+                MssqlTime::new(0, 3),
+            )))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 1).unwrap(),
+            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(719_161),
+                MssqlTime::new(86_399_999, 3),
+            )))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 2).unwrap(),
+            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(719_163),
+                MssqlTime::new(123, 3),
+            )))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 3).unwrap(),
+            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(0),
+                MssqlTime::new(0, 3),
+            )))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 4).unwrap(),
+            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(3_652_058),
+                MssqlTime::new(86_399_999, 3),
+            )))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 5).unwrap(),
+            MssqlCell::DateTime2(None)
+        );
+    }
+
+    #[test]
+    fn rejects_date64_null_in_non_nullable_column() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new("date_value", DataType::Date64, false)]),
+            PlanOptions {
+                date64_policy: Date64Policy::TimestampDateTime2,
+                ..PlanOptions::default()
+            },
+        );
+        let batch = unsafe_batch_for_field(
+            "date_value",
+            DataType::Date64,
+            Arc::new(Date64Array::from(vec![None::<i64>])),
+            false,
+        );
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let err = view.mssql_cell(&mappings[0], 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::NullInNonNullableColumn,
+            Some(0),
+            Some((0, "date_value")),
+        );
+    }
+
+    #[test]
+    fn rejects_date64_values_outside_sql_server_datetime2_range() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new("date_value", DataType::Date64, false)]),
+            PlanOptions {
+                date64_policy: Date64Policy::TimestampDateTime2,
+                ..PlanOptions::default()
+            },
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "date_value",
+                DataType::Date64,
+                false,
+            )])),
+            vec![Arc::new(Date64Array::from(vec![
+                -62_135_596_800_001_i64,
+                253_402_300_800_000_i64,
+            ]))],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let below = view.mssql_cell(&mappings[0], 0).unwrap_err();
+        assert_single_diagnostic(
+            below,
+            DiagnosticCode::TimestampOutOfRange,
+            Some(0),
+            Some((0, "date_value")),
+        );
+
+        let above = view.mssql_cell(&mappings[0], 1).unwrap_err();
+        assert_single_diagnostic(
+            above,
+            DiagnosticCode::TimestampOutOfRange,
+            Some(1),
+            Some((0, "date_value")),
+        );
+    }
+
+    #[test]
+    fn rejects_forged_date64_mapping_with_unsupported_datetime2_precision() {
+        let mapping = SchemaMapping::new(
+            ArrowFieldRef::new(0, "date_value".to_owned(), false, DataType::Date64),
+            MssqlColumn::new(
+                Identifier::new("date_value").unwrap(),
+                MssqlType::DateTime2 { precision: 7 },
+                false,
+            ),
+        );
+        let mappings = vec![mapping];
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "date_value",
+                DataType::Date64,
+                false,
+            )])),
+            vec![Arc::new(Date64Array::from(vec![0_i64]))],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let err = view.mssql_cell(&mappings[0], 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::ValueTypeMismatch,
+            Some(0),
+            Some((0, "date_value")),
         );
     }
 
