@@ -14,8 +14,8 @@ use arrow_buffer::i256;
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Field, Schema};
 use arrow_tiberius::{
-    BulkWriter, DecimalPolicy, DiagnosticCode, Error, MssqlProfile, PlanOptions, TableName,
-    UInt64Policy, WriteBackend, WriteOptions, create_table_sql_from_mappings,
+    BulkWriter, Date64Policy, DecimalPolicy, DiagnosticCode, Error, MssqlProfile, PlanOptions,
+    TableName, UInt64Policy, WriteBackend, WriteOptions, create_table_sql_from_mappings,
     plan_arrow_schema_to_mssql_mappings,
 };
 use tokio::net::TcpStream;
@@ -811,6 +811,173 @@ async fn baseline_writer_round_trips_decimal_policy_values() -> TestResult<()> {
         ensure_eq(rows[3].get::<&str, _>(3), None, "row 3 d128")?;
         ensure_eq(rows[3].get::<&str, _>(4), None, "row 3 d256")?;
         ensure_eq(rows[3].get::<&str, _>(5), None, "row 3 negative scale")?;
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    let drop_result = drop_table(&mut client, &table).await;
+    result?;
+    drop_result?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn baseline_writer_rejects_date32_until_backend_supports_it() -> TestResult<()> {
+    let Some((connection_string, database)) = integration_config() else {
+        eprintln!(
+            "skipping SQL Server Date32 backend support integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+        );
+        return Ok(());
+    };
+
+    let mut client = connect(&connection_string, &database).await?;
+    let table = unique_table_name()?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::Int32, false),
+        Field::new("date32_value", DataType::Date32, true),
+    ]));
+    let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
+        Arc::clone(&schema),
+        MssqlProfile::sql_server_2016_compat_100(),
+        PlanOptions::default(),
+    )?
+    .into_parts();
+
+    execute_sql(
+        &mut client,
+        create_table_sql_from_mappings(&table, &mappings),
+    )
+    .await?;
+
+    let result = async {
+        let err = match BulkWriter::new(
+            &mut client,
+            table.clone(),
+            mappings,
+            WriteOptions {
+                backend: WriteBackend::BaselineTokenRow,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        {
+            Ok(writer) => {
+                let _stats = writer.finish().await?;
+                return Err(test_error("Date32 baseline writer was accepted"));
+            }
+            Err(err) => err,
+        };
+
+        let diagnostics = match err {
+            Error::ValueConversion { diagnostics } => diagnostics,
+            other => {
+                return Err(test_error(format!(
+                    "expected value conversion error, got {other}"
+                )));
+            }
+        };
+        ensure(
+            diagnostics.all().iter().any(|diagnostic| {
+                diagnostic.code() == DiagnosticCode::ValueConversionUnsupported
+                    && diagnostic.row().is_none()
+                    && diagnostic
+                        .field()
+                        .is_some_and(|field| field.name() == "date32_value")
+            }),
+            "Date32 backend diagnostic should include field",
+        )?;
+        ensure_eq(
+            select_count(&mut client, &table).await?,
+            0,
+            "row count after rejected Date32 writer creation",
+        )?;
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    let drop_result = drop_table(&mut client, &table).await;
+    result?;
+    drop_result?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn baseline_writer_rejects_date64_datetime2_until_backend_supports_it() -> TestResult<()> {
+    let Some((connection_string, database)) = integration_config() else {
+        eprintln!(
+            "skipping SQL Server Date64 backend support integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+        );
+        return Ok(());
+    };
+
+    let mut client = connect(&connection_string, &database).await?;
+    let table = unique_table_name()?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::Int32, false),
+        Field::new("date64_value", DataType::Date64, false),
+    ]));
+    let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
+        Arc::clone(&schema),
+        MssqlProfile::sql_server_2016_compat_100(),
+        PlanOptions {
+            date64_policy: Date64Policy::TimestampDateTime2,
+            ..PlanOptions::default()
+        },
+    )?
+    .into_parts();
+
+    execute_sql(
+        &mut client,
+        create_table_sql_from_mappings(&table, &mappings),
+    )
+    .await?;
+
+    let result = async {
+        let err = match BulkWriter::new(
+            &mut client,
+            table.clone(),
+            mappings,
+            WriteOptions {
+                backend: WriteBackend::BaselineTokenRow,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        {
+            Ok(writer) => {
+                let _stats = writer.finish().await?;
+                return Err(test_error("Date64 datetime2 baseline writer was accepted"));
+            }
+            Err(err) => err,
+        };
+
+        let diagnostics = match err {
+            Error::ValueConversion { diagnostics } => diagnostics,
+            other => {
+                return Err(test_error(format!(
+                    "expected value conversion error, got {other}"
+                )));
+            }
+        };
+        ensure(
+            diagnostics.all().iter().any(|diagnostic| {
+                diagnostic.code() == DiagnosticCode::ValueConversionUnsupported
+                    && diagnostic.row().is_none()
+                    && diagnostic
+                        .field()
+                        .is_some_and(|field| field.name() == "date64_value")
+            }),
+            "Date64 backend diagnostic should include field",
+        )?;
+        ensure_eq(
+            select_count(&mut client, &table).await?,
+            0,
+            "row count after rejected Date64 writer creation",
+        )?;
 
         Ok::<(), Box<dyn std::error::Error>>(())
     }
