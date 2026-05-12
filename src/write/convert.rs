@@ -5,10 +5,10 @@
 use std::borrow::Cow;
 
 use arrow_array::{
-    Array, BinaryArray, BooleanArray, Decimal32Array, Decimal64Array, Decimal128Array,
-    Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    LargeBinaryArray, LargeStringArray, RecordBatch, StringArray, UInt8Array, UInt16Array,
-    UInt32Array, UInt64Array,
+    Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
+    Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
+    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_buffer::i256;
 use arrow_schema::DataType;
@@ -49,6 +49,10 @@ pub(crate) enum ArrowCell<'a> {
     Decimal128(i128),
     /// Arrow 256-bit decimal value.
     Decimal256(i256),
+    /// Arrow Date32 day offset from Unix epoch.
+    Date32(i32),
+    /// Arrow Date64 millisecond timestamp from Unix epoch.
+    Date64(i64),
     /// Arrow 32-bit floating point value.
     Float32(f32),
     /// Arrow 64-bit floating point value.
@@ -608,6 +612,14 @@ fn extract_arrow_cell<'a>(
             let array = downcast_array::<Decimal256Array>(array, mapping, row_index)?;
             Ok(ArrowCell::Decimal256(array.value(row_index)))
         }
+        DataType::Date32 => {
+            let array = downcast_array::<Date32Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Date32(array.value(row_index)))
+        }
+        DataType::Date64 => {
+            let array = downcast_array::<Date64Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Date64(array.value(row_index)))
+        }
         DataType::Float32 => {
             let array = downcast_array::<Float32Array>(array, mapping, row_index)?;
             Ok(ArrowCell::Float32(array.value(row_index)))
@@ -1113,10 +1125,10 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        ArrayRef, BinaryArray, BooleanArray, Decimal32Array, Decimal64Array, Decimal128Array,
-        Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-        LargeBinaryArray, LargeStringArray, RecordBatch, StringArray, UInt8Array, UInt16Array,
-        UInt32Array, UInt64Array, new_null_array,
+        ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array,
+        Decimal64Array, Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array,
+        Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch,
+        StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_null_array,
     };
     use arrow_buffer::i256;
     use arrow_data::ArrayData;
@@ -1446,6 +1458,69 @@ mod tests {
             ArrowCell::Decimal256(i256::ZERO)
         );
         assert_eq!(view.arrow_cell(&mappings[3], 3).unwrap(), ArrowCell::Null);
+    }
+
+    #[test]
+    fn extracts_date_arrow_cells() {
+        let fields = vec![
+            Field::new("date32", DataType::Date32, true),
+            Field::new("date64", DataType::Date64, true),
+        ];
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(fields.clone()),
+            PlanOptions {
+                date64_policy: Date64Policy::TimestampDateTime2,
+                ..PlanOptions::default()
+            },
+        );
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Date32Array::from(vec![
+                    Some(0_i32),
+                    Some(-1_i32),
+                    Some(1_i32),
+                    None,
+                ])) as ArrayRef,
+                Arc::new(Date64Array::from(vec![
+                    Some(0_i64),
+                    Some(-1_i64),
+                    Some(86_400_123_i64),
+                    None,
+                ])),
+            ],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        assert_eq!(
+            view.arrow_cell(&mappings[0], 0).unwrap(),
+            ArrowCell::Date32(0)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[0], 1).unwrap(),
+            ArrowCell::Date32(-1)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[0], 2).unwrap(),
+            ArrowCell::Date32(1)
+        );
+        assert_eq!(view.arrow_cell(&mappings[0], 3).unwrap(), ArrowCell::Null);
+
+        assert_eq!(
+            view.arrow_cell(&mappings[1], 0).unwrap(),
+            ArrowCell::Date64(0)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[1], 1).unwrap(),
+            ArrowCell::Date64(-1)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[1], 2).unwrap(),
+            ArrowCell::Date64(86_400_123)
+        );
+        assert_eq!(view.arrow_cell(&mappings[1], 3).unwrap(), ArrowCell::Null);
     }
 
     #[test]
