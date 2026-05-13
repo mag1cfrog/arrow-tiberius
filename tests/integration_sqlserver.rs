@@ -7,8 +7,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow_array::{
-    ArrayRef, BinaryArray, BooleanArray, Decimal32Array, Decimal64Array, Decimal128Array,
-    Decimal256Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray, UInt64Array,
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
+    Decimal128Array, Decimal256Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+    StringArray, UInt64Array,
 };
 use arrow_buffer::i256;
 use arrow_data::ArrayData;
@@ -824,10 +825,10 @@ async fn baseline_writer_round_trips_decimal_policy_values() -> TestResult<()> {
 }
 
 #[tokio::test]
-async fn baseline_writer_rejects_date32_until_backend_supports_it() -> TestResult<()> {
+async fn baseline_writer_round_trips_date32_values() -> TestResult<()> {
     let Some((connection_string, database)) = integration_config() else {
         eprintln!(
-            "skipping SQL Server Date32 backend support integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+            "skipping SQL Server Date32 round-trip integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
         );
         return Ok(());
     };
@@ -844,6 +845,18 @@ async fn baseline_writer_rejects_date32_until_backend_supports_it() -> TestResul
         PlanOptions::default(),
     )?
     .into_parts();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1_i32, 2, 3, 4])) as ArrayRef,
+            Arc::new(Date32Array::from(vec![
+                Some(-1_i32),
+                Some(0_i32),
+                Some(1_i32),
+                None,
+            ])),
+        ],
+    )?;
 
     execute_sql(
         &mut client,
@@ -852,7 +865,7 @@ async fn baseline_writer_rejects_date32_until_backend_supports_it() -> TestResul
     .await?;
 
     let result = async {
-        let err = match BulkWriter::new(
+        let mut writer = BulkWriter::new(
             &mut client,
             table.clone(),
             mappings,
@@ -861,38 +874,43 @@ async fn baseline_writer_rejects_date32_until_backend_supports_it() -> TestResul
                 ..WriteOptions::default()
             },
         )
-        .await
-        {
-            Ok(writer) => {
-                let _stats = writer.finish().await?;
-                return Err(test_error("Date32 baseline writer was accepted"));
-            }
-            Err(err) => err,
-        };
+        .await?;
+        let stats = writer.write_batch(&batch).await?;
 
-        let diagnostics = match err {
-            Error::ValueConversion { diagnostics } => diagnostics,
-            other => {
-                return Err(test_error(format!(
-                    "expected value conversion error, got {other}"
-                )));
-            }
-        };
-        ensure(
-            diagnostics.all().iter().any(|diagnostic| {
-                diagnostic.code() == DiagnosticCode::ValueConversionUnsupported
-                    && diagnostic.row().is_none()
-                    && diagnostic
-                        .field()
-                        .is_some_and(|field| field.name() == "date32_value")
-            }),
-            "Date32 backend diagnostic should include field",
-        )?;
+        ensure_eq(stats.rows_written, 4, "Date32 rows_written")?;
+        ensure_eq(stats.batches_written, 1, "Date32 batches_written")?;
+        ensure_eq(writer.finish().await?, stats, "Date32 finish stats")?;
+
+        let rows = client
+            .simple_query(format!(
+                "SELECT [row_id], CONVERT(varchar(20), [date32_value], 126) FROM {} ORDER BY [row_id]",
+                table.quoted_sql()
+            ))
+            .await?
+            .into_first_result()
+            .await?;
+
+        ensure_eq(rows.len(), 4, "Date32 row count")?;
+        ensure_eq(rows[0].get::<i32, _>(0), Some(1), "Date32 row 0 id")?;
         ensure_eq(
-            select_count(&mut client, &table).await?,
-            0,
-            "row count after rejected Date32 writer creation",
+            rows[0].get::<&str, _>(1),
+            Some("1969-12-31"),
+            "Date32 row 0 value",
         )?;
+        ensure_eq(rows[1].get::<i32, _>(0), Some(2), "Date32 row 1 id")?;
+        ensure_eq(
+            rows[1].get::<&str, _>(1),
+            Some("1970-01-01"),
+            "Date32 row 1 value",
+        )?;
+        ensure_eq(rows[2].get::<i32, _>(0), Some(3), "Date32 row 2 id")?;
+        ensure_eq(
+            rows[2].get::<&str, _>(1),
+            Some("1970-01-02"),
+            "Date32 row 2 value",
+        )?;
+        ensure_eq(rows[3].get::<i32, _>(0), Some(4), "Date32 row 3 id")?;
+        ensure_eq(rows[3].get::<&str, _>(1), None, "Date32 row 3 value")?;
 
         Ok::<(), Box<dyn std::error::Error>>(())
     }
@@ -906,10 +924,10 @@ async fn baseline_writer_rejects_date32_until_backend_supports_it() -> TestResul
 }
 
 #[tokio::test]
-async fn baseline_writer_rejects_date64_datetime2_until_backend_supports_it() -> TestResult<()> {
+async fn baseline_writer_round_trips_date64_datetime2_values() -> TestResult<()> {
     let Some((connection_string, database)) = integration_config() else {
         eprintln!(
-            "skipping SQL Server Date64 backend support integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+            "skipping SQL Server Date64 datetime2 round-trip integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
         );
         return Ok(());
     };
@@ -918,7 +936,7 @@ async fn baseline_writer_rejects_date64_datetime2_until_backend_supports_it() ->
     let table = unique_table_name()?;
     let schema = Arc::new(Schema::new(vec![
         Field::new("row_id", DataType::Int32, false),
-        Field::new("date64_value", DataType::Date64, false),
+        Field::new("date64_value", DataType::Date64, true),
     ]));
     let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
         Arc::clone(&schema),
@@ -929,6 +947,18 @@ async fn baseline_writer_rejects_date64_datetime2_until_backend_supports_it() ->
         },
     )?
     .into_parts();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1_i32, 2, 3, 4])) as ArrayRef,
+            Arc::new(Date64Array::from(vec![
+                Some(-1_i64),
+                Some(0_i64),
+                Some(86_400_123_i64),
+                None,
+            ])),
+        ],
+    )?;
 
     execute_sql(
         &mut client,
@@ -937,7 +967,7 @@ async fn baseline_writer_rejects_date64_datetime2_until_backend_supports_it() ->
     .await?;
 
     let result = async {
-        let err = match BulkWriter::new(
+        let mut writer = BulkWriter::new(
             &mut client,
             table.clone(),
             mappings,
@@ -946,38 +976,43 @@ async fn baseline_writer_rejects_date64_datetime2_until_backend_supports_it() ->
                 ..WriteOptions::default()
             },
         )
-        .await
-        {
-            Ok(writer) => {
-                let _stats = writer.finish().await?;
-                return Err(test_error("Date64 datetime2 baseline writer was accepted"));
-            }
-            Err(err) => err,
-        };
+        .await?;
+        let stats = writer.write_batch(&batch).await?;
 
-        let diagnostics = match err {
-            Error::ValueConversion { diagnostics } => diagnostics,
-            other => {
-                return Err(test_error(format!(
-                    "expected value conversion error, got {other}"
-                )));
-            }
-        };
-        ensure(
-            diagnostics.all().iter().any(|diagnostic| {
-                diagnostic.code() == DiagnosticCode::ValueConversionUnsupported
-                    && diagnostic.row().is_none()
-                    && diagnostic
-                        .field()
-                        .is_some_and(|field| field.name() == "date64_value")
-            }),
-            "Date64 backend diagnostic should include field",
-        )?;
+        ensure_eq(stats.rows_written, 4, "Date64 rows_written")?;
+        ensure_eq(stats.batches_written, 1, "Date64 batches_written")?;
+        ensure_eq(writer.finish().await?, stats, "Date64 finish stats")?;
+
+        let rows = client
+            .simple_query(format!(
+                "SELECT [row_id], CONVERT(varchar(30), [date64_value], 126) FROM {} ORDER BY [row_id]",
+                table.quoted_sql()
+            ))
+            .await?
+            .into_first_result()
+            .await?;
+
+        ensure_eq(rows.len(), 4, "Date64 row count")?;
+        ensure_eq(rows[0].get::<i32, _>(0), Some(1), "Date64 row 0 id")?;
         ensure_eq(
-            select_count(&mut client, &table).await?,
-            0,
-            "row count after rejected Date64 writer creation",
+            rows[0].get::<&str, _>(1),
+            Some("1969-12-31T23:59:59.999"),
+            "Date64 row 0 value",
         )?;
+        ensure_eq(rows[1].get::<i32, _>(0), Some(2), "Date64 row 1 id")?;
+        ensure_eq(
+            rows[1].get::<&str, _>(1),
+            Some("1970-01-01T00:00:00"),
+            "Date64 row 1 value",
+        )?;
+        ensure_eq(rows[2].get::<i32, _>(0), Some(3), "Date64 row 2 id")?;
+        ensure_eq(
+            rows[2].get::<&str, _>(1),
+            Some("1970-01-02T00:00:00.123"),
+            "Date64 row 2 value",
+        )?;
+        ensure_eq(rows[3].get::<i32, _>(0), Some(4), "Date64 row 3 id")?;
+        ensure_eq(rows[3].get::<&str, _>(1), None, "Date64 row 3 value")?;
 
         Ok::<(), Box<dyn std::error::Error>>(())
     }
