@@ -8,10 +8,11 @@ use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
     Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array,
     Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_buffer::i256;
-use arrow_schema::DataType;
+use arrow_schema::{DataType, TimeUnit};
 
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, MssqlType, MssqlTypeLength,
@@ -85,6 +86,14 @@ pub(crate) enum ArrowCell<'a> {
     Date32(i32),
     /// Arrow Date64 millisecond timestamp from Unix epoch.
     Date64(i64),
+    /// Arrow timestamp second offset from Unix epoch.
+    TimestampSecond(i64),
+    /// Arrow timestamp millisecond offset from Unix epoch.
+    TimestampMillisecond(i64),
+    /// Arrow timestamp microsecond offset from Unix epoch.
+    TimestampMicrosecond(i64),
+    /// Arrow timestamp nanosecond offset from Unix epoch.
+    TimestampNanosecond(i64),
     /// Arrow 32-bit floating point value.
     Float32(f32),
     /// Arrow 64-bit floating point value.
@@ -461,6 +470,31 @@ fn extract_arrow_cell<'a>(
         DataType::Date64 => {
             let array = downcast_array::<Date64Array>(array, mapping, row_index)?;
             Ok(ArrowCell::Date64(array.value(row_index)))
+        }
+        DataType::Timestamp(time_unit, timezone)
+            if timezone.as_ref().is_none_or(|tz| tz.is_empty()) =>
+        {
+            match time_unit {
+                TimeUnit::Second => {
+                    let array = downcast_array::<TimestampSecondArray>(array, mapping, row_index)?;
+                    Ok(ArrowCell::TimestampSecond(array.value(row_index)))
+                }
+                TimeUnit::Millisecond => {
+                    let array =
+                        downcast_array::<TimestampMillisecondArray>(array, mapping, row_index)?;
+                    Ok(ArrowCell::TimestampMillisecond(array.value(row_index)))
+                }
+                TimeUnit::Microsecond => {
+                    let array =
+                        downcast_array::<TimestampMicrosecondArray>(array, mapping, row_index)?;
+                    Ok(ArrowCell::TimestampMicrosecond(array.value(row_index)))
+                }
+                TimeUnit::Nanosecond => {
+                    let array =
+                        downcast_array::<TimestampNanosecondArray>(array, mapping, row_index)?;
+                    Ok(ArrowCell::TimestampNanosecond(array.value(row_index)))
+                }
+            }
         }
         DataType::Float32 => {
             let array = downcast_array::<Float32Array>(array, mapping, row_index)?;
@@ -1300,7 +1334,9 @@ mod tests {
         ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array,
         Decimal64Array, Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array,
         Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch,
-        StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_null_array,
+        StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
+        UInt64Array, new_null_array,
     };
     use arrow_buffer::i256;
     use arrow_data::ArrayData;
@@ -1539,6 +1575,113 @@ mod tests {
             ArrowCell::UInt64(u64::MAX)
         );
         assert_eq!(view.arrow_cell(&mappings[0], 4).unwrap(), ArrowCell::Null);
+    }
+
+    #[test]
+    fn extracts_timezone_free_timestamp_arrow_cells_at_i64_boundaries() {
+        let mappings = mappings_for_schema(Schema::new(vec![
+            Field::new("ts_s", DataType::Timestamp(TimeUnit::Second, None), true),
+            Field::new(
+                "ts_ms",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                true,
+            ),
+            Field::new(
+                "ts_us",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new(
+                "ts_ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("ts_s", DataType::Timestamp(TimeUnit::Second, None), true),
+                Field::new(
+                    "ts_ms",
+                    DataType::Timestamp(TimeUnit::Millisecond, None),
+                    true,
+                ),
+                Field::new(
+                    "ts_us",
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    true,
+                ),
+                Field::new(
+                    "ts_ns",
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    true,
+                ),
+            ])),
+            vec![
+                Arc::new(TimestampSecondArray::from(vec![
+                    Some(i64::MIN),
+                    Some(0),
+                    Some(i64::MAX),
+                    None,
+                ])) as ArrayRef,
+                Arc::new(TimestampMillisecondArray::from(vec![
+                    Some(i64::MIN),
+                    Some(0),
+                    Some(i64::MAX),
+                    None,
+                ])),
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    Some(i64::MIN),
+                    Some(0),
+                    Some(i64::MAX),
+                    None,
+                ])),
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    Some(i64::MIN),
+                    Some(0),
+                    Some(i64::MAX),
+                    None,
+                ])),
+            ],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        assert_eq!(
+            view.arrow_cell(&mappings[0], 0).unwrap(),
+            ArrowCell::TimestampSecond(i64::MIN)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[0], 2).unwrap(),
+            ArrowCell::TimestampSecond(i64::MAX)
+        );
+        assert_eq!(view.arrow_cell(&mappings[0], 3).unwrap(), ArrowCell::Null);
+        assert_eq!(
+            view.arrow_cell(&mappings[1], 0).unwrap(),
+            ArrowCell::TimestampMillisecond(i64::MIN)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[1], 2).unwrap(),
+            ArrowCell::TimestampMillisecond(i64::MAX)
+        );
+        assert_eq!(view.arrow_cell(&mappings[1], 3).unwrap(), ArrowCell::Null);
+        assert_eq!(
+            view.arrow_cell(&mappings[2], 0).unwrap(),
+            ArrowCell::TimestampMicrosecond(i64::MIN)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[2], 2).unwrap(),
+            ArrowCell::TimestampMicrosecond(i64::MAX)
+        );
+        assert_eq!(view.arrow_cell(&mappings[2], 3).unwrap(), ArrowCell::Null);
+        assert_eq!(
+            view.arrow_cell(&mappings[3], 0).unwrap(),
+            ArrowCell::TimestampNanosecond(i64::MIN)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[3], 2).unwrap(),
+            ArrowCell::TimestampNanosecond(i64::MAX)
+        );
+        assert_eq!(view.arrow_cell(&mappings[3], 3).unwrap(), ArrowCell::Null);
     }
 
     #[test]
