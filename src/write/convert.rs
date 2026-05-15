@@ -541,31 +541,24 @@ fn extract_arrow_cell<'a>(
             let array = downcast_array::<Date64Array>(array, mapping, row_index)?;
             Ok(ArrowCell::Date64(array.value(row_index)))
         }
-        DataType::Timestamp(time_unit, timezone)
-            if timezone.as_ref().is_none_or(|tz| tz.is_empty()) =>
-        {
-            match time_unit {
-                TimeUnit::Second => {
-                    let array = downcast_array::<TimestampSecondArray>(array, mapping, row_index)?;
-                    Ok(ArrowCell::TimestampSecond(array.value(row_index)))
-                }
-                TimeUnit::Millisecond => {
-                    let array =
-                        downcast_array::<TimestampMillisecondArray>(array, mapping, row_index)?;
-                    Ok(ArrowCell::TimestampMillisecond(array.value(row_index)))
-                }
-                TimeUnit::Microsecond => {
-                    let array =
-                        downcast_array::<TimestampMicrosecondArray>(array, mapping, row_index)?;
-                    Ok(ArrowCell::TimestampMicrosecond(array.value(row_index)))
-                }
-                TimeUnit::Nanosecond => {
-                    let array =
-                        downcast_array::<TimestampNanosecondArray>(array, mapping, row_index)?;
-                    Ok(ArrowCell::TimestampNanosecond(array.value(row_index)))
-                }
+        DataType::Timestamp(time_unit, _) => match time_unit {
+            TimeUnit::Second => {
+                let array = downcast_array::<TimestampSecondArray>(array, mapping, row_index)?;
+                Ok(ArrowCell::TimestampSecond(array.value(row_index)))
             }
-        }
+            TimeUnit::Millisecond => {
+                let array = downcast_array::<TimestampMillisecondArray>(array, mapping, row_index)?;
+                Ok(ArrowCell::TimestampMillisecond(array.value(row_index)))
+            }
+            TimeUnit::Microsecond => {
+                let array = downcast_array::<TimestampMicrosecondArray>(array, mapping, row_index)?;
+                Ok(ArrowCell::TimestampMicrosecond(array.value(row_index)))
+            }
+            TimeUnit::Nanosecond => {
+                let array = downcast_array::<TimestampNanosecondArray>(array, mapping, row_index)?;
+                Ok(ArrowCell::TimestampNanosecond(array.value(row_index)))
+            }
+        },
         DataType::Float32 => {
             let array = downcast_array::<Float32Array>(array, mapping, row_index)?;
             Ok(ArrowCell::Float32(array.value(row_index)))
@@ -2128,6 +2121,79 @@ mod tests {
             ArrowCell::TimestampNanosecond(i64::MAX)
         );
         assert_eq!(view.arrow_cell(&mappings[3], 3).unwrap(), ArrowCell::Null);
+    }
+
+    #[test]
+    fn extracts_timezone_aware_timestamp_arrow_cells_without_losing_epoch_values() {
+        let options = PlanOptions {
+            timezone_policy: TimezonePolicy::DateTimeOffset,
+            ..PlanOptions::default()
+        };
+        let schema = Schema::new(vec![
+            Field::new(
+                "ts_s",
+                DataType::Timestamp(TimeUnit::Second, Some("America/New_York".into())),
+                true,
+            ),
+            Field::new(
+                "ts_ms",
+                DataType::Timestamp(TimeUnit::Millisecond, Some("+02:30".into())),
+                true,
+            ),
+            Field::new(
+                "ts_us",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+            Field::new(
+                "ts_ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("-07".into())),
+                true,
+            ),
+        ]);
+        let mappings = mappings_for_schema_with_options(schema.clone(), options);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(
+                    TimestampSecondArray::from(vec![Some(1_i64), None])
+                        .with_timezone("America/New_York"),
+                ) as ArrayRef,
+                Arc::new(
+                    TimestampMillisecondArray::from(vec![Some(2_i64), None])
+                        .with_timezone("+02:30"),
+                ),
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![Some(3_i64), None]).with_timezone("UTC"),
+                ),
+                Arc::new(
+                    TimestampNanosecondArray::from(vec![Some(4_i64), None]).with_timezone("-07"),
+                ),
+            ],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        assert_eq!(
+            view.arrow_cell(&mappings[0], 0).unwrap(),
+            ArrowCell::TimestampSecond(1)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[1], 0).unwrap(),
+            ArrowCell::TimestampMillisecond(2)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[2], 0).unwrap(),
+            ArrowCell::TimestampMicrosecond(3)
+        );
+        assert_eq!(
+            view.arrow_cell(&mappings[3], 0).unwrap(),
+            ArrowCell::TimestampNanosecond(4)
+        );
+
+        for mapping in &mappings {
+            assert_eq!(view.arrow_cell(mapping, 1).unwrap(), ArrowCell::Null);
+        }
     }
 
     #[test]
