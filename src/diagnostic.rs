@@ -29,6 +29,11 @@ pub enum DiagnosticCode {
     IntegerOutOfRange,
     /// A timestamp value is outside the supported range.
     TimestampOutOfRange,
+    /// A timestamp timezone cannot be mapped to a deterministic SQL Server value.
+    ///
+    /// This is used for invalid timezone names, invalid fixed offset strings,
+    /// and resolved offsets SQL Server cannot represent.
+    TimezoneUnsupported,
     /// A runtime batch schema does not match the planned schema.
     SchemaMismatch,
     /// A requested write backend is unavailable.
