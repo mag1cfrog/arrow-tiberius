@@ -4762,6 +4762,95 @@ mod tests {
     }
 
     #[test]
+    fn rejects_timezone_aware_normalized_utc_values_outside_datetime2_range() {
+        let options = PlanOptions {
+            timezone_policy: TimezonePolicy::NormalizeUtcDateTime2,
+            ..PlanOptions::default()
+        };
+        let schema = Schema::new(vec![Field::new(
+            "ts_s",
+            DataType::Timestamp(TimeUnit::Second, Some("America/New_York".into())),
+            false,
+        )]);
+        let mappings = mappings_for_schema_with_options(schema.clone(), options);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(
+                TimestampSecondArray::from(vec![i64::MIN, i64::MAX])
+                    .with_timezone("America/New_York"),
+            )],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let below = view.mssql_cell(&mappings[0], 0).unwrap_err();
+        assert_single_diagnostic(
+            below,
+            DiagnosticCode::TimestampOutOfRange,
+            Some(0),
+            Some((0, "ts_s")),
+        );
+
+        let above = view.mssql_cell(&mappings[0], 1).unwrap_err();
+        assert_single_diagnostic(
+            above,
+            DiagnosticCode::TimestampOutOfRange,
+            Some(1),
+            Some((0, "ts_s")),
+        );
+    }
+
+    #[test]
+    fn rejects_datetimeoffset_values_outside_local_sql_server_range_after_offset() {
+        let options = PlanOptions {
+            timezone_policy: TimezonePolicy::DateTimeOffset,
+            ..PlanOptions::default()
+        };
+        let schema = Schema::new(vec![
+            Field::new(
+                "too_early",
+                DataType::Timestamp(TimeUnit::Second, Some("-14:00".into())),
+                false,
+            ),
+            Field::new(
+                "too_late",
+                DataType::Timestamp(TimeUnit::Second, Some("+14:00".into())),
+                false,
+            ),
+        ]);
+        let mappings = mappings_for_schema_with_options(schema.clone(), options);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(
+                    TimestampSecondArray::from(vec![-62_135_596_800_i64]).with_timezone("-14:00"),
+                ) as ArrayRef,
+                Arc::new(
+                    TimestampSecondArray::from(vec![253_402_300_799_i64]).with_timezone("+14:00"),
+                ),
+            ],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let below = view.mssql_cell(&mappings[0], 0).unwrap_err();
+        assert_single_diagnostic(
+            below,
+            DiagnosticCode::TimestampOutOfRange,
+            Some(0),
+            Some((0, "too_early")),
+        );
+
+        let above = view.mssql_cell(&mappings[1], 0).unwrap_err();
+        assert_single_diagnostic(
+            above,
+            DiagnosticCode::TimestampOutOfRange,
+            Some(0),
+            Some((1, "too_late")),
+        );
+    }
+
+    #[test]
     fn rejects_nanosecond_timestamp_precision_loss_by_default() {
         let mappings = mappings_for_schema(Schema::new(vec![Field::new(
             "ts_ns",
