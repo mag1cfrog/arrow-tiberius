@@ -223,6 +223,9 @@ impl MssqlDateTime2 {
 }
 
 /// Semantic SQL Server datetimeoffset value.
+///
+/// TDS encodes `datetimeoffset` as a UTC `datetime2` component plus an offset.
+/// SQL Server displays that instant as local time by applying the offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MssqlDateTimeOffset {
     datetime2: MssqlDateTime2,
@@ -230,7 +233,7 @@ pub(crate) struct MssqlDateTimeOffset {
 }
 
 impl MssqlDateTimeOffset {
-    /// Creates a semantic datetimeoffset value from local date/time and offset.
+    /// Creates a semantic datetimeoffset value from UTC date/time and offset.
     ///
     /// The offset is expressed as minutes from UTC, matching SQL Server and
     /// Tiberius `datetimeoffset` encoding.
@@ -241,7 +244,7 @@ impl MssqlDateTimeOffset {
         }
     }
 
-    /// Returns the local date/time component.
+    /// Returns the UTC date/time component used by TDS encoding.
     pub(crate) const fn datetime2(self) -> MssqlDateTime2 {
         self.datetime2
     }
@@ -1680,6 +1683,23 @@ fn mssql_datetime2_from_arrow_timestamp_nanosecond(
     )
 }
 
+fn validate_datetimeoffset_local_range(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    local_ticks_from_unix_epoch: i128,
+    unit_name: &str,
+    source_value: i64,
+) -> Result<()> {
+    mssql_datetime2_from_unix_epoch_100ns_ticks(
+        mapping,
+        row_index,
+        local_ticks_from_unix_epoch,
+        unit_name,
+        source_value,
+    )
+    .map(|_| ())
+}
+
 fn mssql_datetimeoffset_from_utc_100ns_ticks(
     mapping: &SchemaMapping,
     row_index: usize,
@@ -1701,15 +1721,16 @@ fn mssql_datetimeoffset_from_utc_100ns_ticks(
                 ),
             ))
         })?;
-    let datetime2 = mssql_datetime2_from_unix_epoch_100ns_ticks(
+    validate_datetimeoffset_local_range(mapping, row_index, local_ticks, unit_name, source_value)?;
+    let utc_datetime2 = mssql_datetime2_from_unix_epoch_100ns_ticks(
         mapping,
         row_index,
-        local_ticks,
+        utc_ticks_from_unix_epoch,
         unit_name,
         source_value,
     )?;
 
-    Ok(MssqlDateTimeOffset::new(datetime2, offset_minutes))
+    Ok(MssqlDateTimeOffset::new(utc_datetime2, offset_minutes))
 }
 
 fn epoch_parts_from_milliseconds(
@@ -4633,7 +4654,7 @@ mod tests {
         assert_eq!(
             view.mssql_cell(&mappings[0], 0).unwrap(),
             MssqlCell::DateTimeOffset(Some(MssqlDateTimeOffset::new(
-                MssqlDateTime2::new(MssqlDate::new(719_162), MssqlTime::new(90_000_000_000, 7)),
+                MssqlDateTime2::new(MssqlDate::new(719_162), MssqlTime::new(0, 7)),
                 150,
             )))
         );
@@ -4644,7 +4665,7 @@ mod tests {
         assert_eq!(
             view.mssql_cell(&mappings[1], 0).unwrap(),
             MssqlCell::DateTimeOffset(Some(MssqlDateTimeOffset::new(
-                MssqlDateTime2::new(MssqlDate::new(719_161), MssqlTime::new(612_000_000_000, 7)),
+                MssqlDateTime2::new(MssqlDate::new(719_162), MssqlTime::new(0, 7)),
                 -420,
             )))
         );
@@ -4686,14 +4707,14 @@ mod tests {
         assert_eq!(
             view.mssql_cell(&mappings[0], 0).unwrap(),
             MssqlCell::DateTimeOffset(Some(MssqlDateTimeOffset::new(
-                MssqlDateTime2::new(MssqlDate::new(739_282), MssqlTime::new(252_000_000_000, 7)),
+                MssqlDateTime2::new(MssqlDate::new(739_282), MssqlTime::new(432_000_000_000, 7)),
                 -300,
             )))
         );
         assert_eq!(
             view.mssql_cell(&mappings[0], 1).unwrap(),
             MssqlCell::DateTimeOffset(Some(MssqlDateTimeOffset::new(
-                MssqlDateTime2::new(MssqlDate::new(739_423), MssqlTime::new(288_000_000_000, 7)),
+                MssqlDateTime2::new(MssqlDate::new(739_423), MssqlTime::new(432_000_000_000, 7)),
                 -240,
             )))
         );
