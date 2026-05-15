@@ -1077,12 +1077,8 @@ fn null_mssql_cell<'a>(mapping: &SchemaMapping, row_index: usize) -> Result<Mssq
             Ok(MssqlCell::Decimal(None))
         }
         MssqlType::Date => Ok(MssqlCell::Date(None)),
-        MssqlType::DateTime2 { .. } if supports_null_datetime2_cell(mapping) => {
-            Ok(MssqlCell::DateTime2(None))
-        }
-        MssqlType::DateTimeOffset { .. } if supports_null_datetimeoffset_cell(mapping) => {
-            Ok(MssqlCell::DateTimeOffset(None))
-        }
+        MssqlType::DateTime2 { .. } => null_datetime2_cell(mapping, row_index),
+        MssqlType::DateTimeOffset { .. } => null_datetimeoffset_cell(mapping, row_index),
         MssqlType::Real => Ok(MssqlCell::Real(None)),
         MssqlType::Float { .. } => Ok(MssqlCell::Float(None)),
         MssqlType::NVarChar(_) => Ok(MssqlCell::NVarChar(None)),
@@ -1122,28 +1118,62 @@ fn supports_null_decimal_cell(mapping: &SchemaMapping) -> bool {
     ) && matches!(mapping.mssql().ty(), MssqlType::Decimal { .. })
 }
 
+fn null_datetime2_cell<'a>(mapping: &SchemaMapping, row_index: usize) -> Result<MssqlCell<'a>> {
+    if !supports_null_datetime2_cell(mapping) {
+        return Err(unsupported_value_conversion(
+            mapping,
+            row_index,
+            format!(
+                "planned SQL Server type {} is not supported yet",
+                mapping.mssql().ty().to_sql()
+            ),
+        ));
+    }
+
+    validate_null_timestamp_timezone_metadata(mapping, row_index)?;
+    Ok(MssqlCell::DateTime2(None))
+}
+
 fn supports_null_datetime2_cell(mapping: &SchemaMapping) -> bool {
-    match (mapping.arrow().data_type(), mapping.mssql().ty()) {
+    matches!(
+        (mapping.arrow().data_type(), mapping.mssql().ty()),
         (
             DataType::Date64,
             MssqlType::DateTime2 {
                 precision: SQL_SERVER_DATETIME2_DATE64_SCALE,
             },
-        ) => true,
-        (
+        ) | (
             DataType::Timestamp(
                 TimeUnit::Second
-                | TimeUnit::Millisecond
-                | TimeUnit::Microsecond
-                | TimeUnit::Nanosecond,
+                    | TimeUnit::Millisecond
+                    | TimeUnit::Microsecond
+                    | TimeUnit::Nanosecond,
                 _,
             ),
             MssqlType::DateTime2 {
                 precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
             },
-        ) => true,
-        _ => false,
+        )
+    )
+}
+
+fn null_datetimeoffset_cell<'a>(
+    mapping: &SchemaMapping,
+    row_index: usize,
+) -> Result<MssqlCell<'a>> {
+    if !supports_null_datetimeoffset_cell(mapping) {
+        return Err(unsupported_value_conversion(
+            mapping,
+            row_index,
+            format!(
+                "planned SQL Server type {} is not supported yet",
+                mapping.mssql().ty().to_sql()
+            ),
+        ));
     }
+
+    validate_null_timestamp_timezone_metadata(mapping, row_index)?;
+    Ok(MssqlCell::DateTimeOffset(None))
 }
 
 fn supports_null_datetimeoffset_cell(mapping: &SchemaMapping) -> bool {
@@ -1162,6 +1192,17 @@ fn supports_null_datetimeoffset_cell(mapping: &SchemaMapping) -> bool {
             }
         )
     )
+}
+
+fn validate_null_timestamp_timezone_metadata(
+    mapping: &SchemaMapping,
+    row_index: usize,
+) -> Result<()> {
+    if let DataType::Timestamp(_, timezone) = mapping.arrow().data_type() {
+        validate_timestamp_timezone_metadata(mapping, row_index, timezone.as_deref())?;
+    }
+
+    Ok(())
 }
 
 fn decimal_scale(mapping: &SchemaMapping, row_index: usize) -> Result<u8> {
@@ -4578,6 +4619,37 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_timezone_metadata_for_null_normalized_utc_datetime2() {
+        let options = PlanOptions {
+            timezone_policy: TimezonePolicy::NormalizeUtcDateTime2,
+            ..PlanOptions::default()
+        };
+        let schema = Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Second, Some("Foobar".into())),
+            true,
+        )]);
+        let mappings = mappings_for_schema_with_options(schema.clone(), options);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(
+                TimestampSecondArray::from(vec![None::<i64>]).with_timezone("Foobar"),
+            )],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let err = view.mssql_cell(&mappings[0], 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::TimezoneUnsupported,
+            Some(0),
+            Some((0, "ts")),
+        );
+    }
+
+    #[test]
     fn applies_nanosecond_policy_to_timezone_aware_normalized_utc_datetime2() {
         let options = PlanOptions {
             timezone_policy: TimezonePolicy::NormalizeUtcDateTime2,
@@ -4736,6 +4808,37 @@ mod tests {
             Arc::new(schema),
             vec![Arc::new(
                 TimestampSecondArray::from(vec![0_i64]).with_timezone("Foobar"),
+            )],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let err = view.mssql_cell(&mappings[0], 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::TimezoneUnsupported,
+            Some(0),
+            Some((0, "ts")),
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_timezone_metadata_for_null_datetimeoffset() {
+        let options = PlanOptions {
+            timezone_policy: TimezonePolicy::DateTimeOffset,
+            ..PlanOptions::default()
+        };
+        let schema = Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Second, Some("Foobar".into())),
+            true,
+        )]);
+        let mappings = mappings_for_schema_with_options(schema.clone(), options);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(
+                TimestampSecondArray::from(vec![None::<i64>]).with_timezone("Foobar"),
             )],
         )
         .unwrap();
