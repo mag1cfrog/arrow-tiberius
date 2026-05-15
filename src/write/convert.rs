@@ -784,9 +784,9 @@ fn mssql_datetime2_value(
             MssqlType::DateTime2 {
                 precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
             },
-        ) if timezone.as_ref().is_none_or(|tz| tz.is_empty()) => {
-            let ticks = i128::from(value) * TICKS_100NS_PER_SECOND;
-            mssql_datetime2_from_unix_epoch_100ns_ticks(mapping, row_index, ticks, "second", value)
+        ) => {
+            validate_timestamp_timezone_metadata(mapping, row_index, timezone.as_deref())?;
+            mssql_datetime2_from_arrow_timestamp_second(mapping, row_index, value)
         }
         (
             ArrowCell::TimestampMillisecond(value),
@@ -794,15 +794,9 @@ fn mssql_datetime2_value(
             MssqlType::DateTime2 {
                 precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
             },
-        ) if timezone.as_ref().is_none_or(|tz| tz.is_empty()) => {
-            let ticks = i128::from(value) * TICKS_100NS_PER_MILLISECOND;
-            mssql_datetime2_from_unix_epoch_100ns_ticks(
-                mapping,
-                row_index,
-                ticks,
-                "millisecond",
-                value,
-            )
+        ) => {
+            validate_timestamp_timezone_metadata(mapping, row_index, timezone.as_deref())?;
+            mssql_datetime2_from_arrow_timestamp_millisecond(mapping, row_index, value)
         }
         (
             ArrowCell::TimestampMicrosecond(value),
@@ -810,15 +804,9 @@ fn mssql_datetime2_value(
             MssqlType::DateTime2 {
                 precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
             },
-        ) if timezone.as_ref().is_none_or(|tz| tz.is_empty()) => {
-            let ticks = i128::from(value) * TICKS_100NS_PER_MICROSECOND;
-            mssql_datetime2_from_unix_epoch_100ns_ticks(
-                mapping,
-                row_index,
-                ticks,
-                "microsecond",
-                value,
-            )
+        ) => {
+            validate_timestamp_timezone_metadata(mapping, row_index, timezone.as_deref())?;
+            mssql_datetime2_from_arrow_timestamp_microsecond(mapping, row_index, value)
         }
         (
             ArrowCell::TimestampNanosecond(value),
@@ -826,19 +814,13 @@ fn mssql_datetime2_value(
             MssqlType::DateTime2 {
                 precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
             },
-        ) if timezone.as_ref().is_none_or(|tz| tz.is_empty()) => {
-            let ticks = nanoseconds_to_100ns_ticks(
+        ) => {
+            validate_timestamp_timezone_metadata(mapping, row_index, timezone.as_deref())?;
+            mssql_datetime2_from_arrow_timestamp_nanosecond(
                 mapping,
                 row_index,
                 value,
                 runtime_mapping.nanosecond_policy(),
-            )?;
-            mssql_datetime2_from_unix_epoch_100ns_ticks(
-                mapping,
-                row_index,
-                ticks,
-                "nanosecond",
-                value,
             )
         }
         other => Err(value_conversion_error(row_mapping_diagnostic(
@@ -846,7 +828,7 @@ fn mssql_datetime2_value(
             row_index,
             DiagnosticCode::ValueTypeMismatch,
             format!(
-                "expected Arrow Date64 or timezone-free timestamp payload planned as datetime2, got {other:?}"
+                "expected Arrow Date64 or timestamp payload planned as datetime2, got {other:?}"
             ),
         ))),
     }
@@ -1047,12 +1029,12 @@ fn supports_null_datetime2_cell(mapping: &SchemaMapping) -> bool {
                 | TimeUnit::Millisecond
                 | TimeUnit::Microsecond
                 | TimeUnit::Nanosecond,
-                timezone,
+                _,
             ),
             MssqlType::DateTime2 {
                 precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
             },
-        ) => timezone.as_ref().is_none_or(|tz| tz.is_empty()),
+        ) => true,
         _ => false,
     }
 }
@@ -1297,6 +1279,18 @@ fn nanoseconds_to_100ns_ticks(
     }
 }
 
+fn validate_timestamp_timezone_metadata(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    timezone: Option<&str>,
+) -> Result<()> {
+    let Some(timezone) = timezone.filter(|timezone| !timezone.is_empty()) else {
+        return Ok(());
+    };
+
+    timezone_resolution_from_metadata(mapping, row_index, timezone).map(|_| ())
+}
+
 /// Resolved timezone metadata for a planned Arrow timestamp column.
 ///
 /// Arrow timestamp timezone metadata can contain either a fixed offset or a
@@ -1500,6 +1494,68 @@ fn mssql_datetime2_from_unix_epoch_100ns_ticks(
         MssqlDate::new(days),
         MssqlTime::new(ticks_since_midnight, SQL_SERVER_DATETIME2_TIMESTAMP_SCALE),
     ))
+}
+
+fn mssql_datetime2_from_arrow_timestamp_second(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    seconds_from_unix_epoch: i64,
+) -> Result<MssqlDateTime2> {
+    let ticks = i128::from(seconds_from_unix_epoch) * TICKS_100NS_PER_SECOND;
+    mssql_datetime2_from_unix_epoch_100ns_ticks(
+        mapping,
+        row_index,
+        ticks,
+        "second",
+        seconds_from_unix_epoch,
+    )
+}
+
+fn mssql_datetime2_from_arrow_timestamp_millisecond(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    milliseconds_from_unix_epoch: i64,
+) -> Result<MssqlDateTime2> {
+    let ticks = i128::from(milliseconds_from_unix_epoch) * TICKS_100NS_PER_MILLISECOND;
+    mssql_datetime2_from_unix_epoch_100ns_ticks(
+        mapping,
+        row_index,
+        ticks,
+        "millisecond",
+        milliseconds_from_unix_epoch,
+    )
+}
+
+fn mssql_datetime2_from_arrow_timestamp_microsecond(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    microseconds_from_unix_epoch: i64,
+) -> Result<MssqlDateTime2> {
+    let ticks = i128::from(microseconds_from_unix_epoch) * TICKS_100NS_PER_MICROSECOND;
+    mssql_datetime2_from_unix_epoch_100ns_ticks(
+        mapping,
+        row_index,
+        ticks,
+        "microsecond",
+        microseconds_from_unix_epoch,
+    )
+}
+
+fn mssql_datetime2_from_arrow_timestamp_nanosecond(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    nanoseconds_from_unix_epoch: i64,
+    policy: NanosecondPolicy,
+) -> Result<MssqlDateTime2> {
+    let ticks =
+        nanoseconds_to_100ns_ticks(mapping, row_index, nanoseconds_from_unix_epoch, policy)?;
+    mssql_datetime2_from_unix_epoch_100ns_ticks(
+        mapping,
+        row_index,
+        ticks,
+        "nanosecond",
+        nanoseconds_from_unix_epoch,
+    )
 }
 
 fn nvar_char_cell<'a>(
@@ -4184,6 +4240,147 @@ mod tests {
             MssqlCell::DateTime2(Some(MssqlDateTime2::new(
                 MssqlDate::new(719_161),
                 MssqlTime::new(863_999_999_999, 7),
+            )))
+        );
+    }
+
+    #[test]
+    fn converts_timezone_aware_timestamp_cells_to_normalized_utc_datetime2() {
+        let options = PlanOptions {
+            timezone_policy: TimezonePolicy::NormalizeUtcDateTime2,
+            ..PlanOptions::default()
+        };
+        let schema = Schema::new(vec![
+            Field::new(
+                "new_york",
+                DataType::Timestamp(TimeUnit::Second, Some("America/New_York".into())),
+                true,
+            ),
+            Field::new(
+                "offset",
+                DataType::Timestamp(TimeUnit::Millisecond, Some("+02:30".into())),
+                true,
+            ),
+            Field::new(
+                "utc",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+        ]);
+        let mappings = mappings_for_schema_with_options(schema.clone(), options);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(
+                    TimestampSecondArray::from(vec![Some(0_i64), None])
+                        .with_timezone("America/New_York"),
+                ) as ArrayRef,
+                Arc::new(
+                    TimestampMillisecondArray::from(vec![Some(0_i64), None])
+                        .with_timezone("+02:30"),
+                ),
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![Some(1_234_567_i64), None])
+                        .with_timezone("UTC"),
+                ),
+            ],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 0).unwrap(),
+            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(719_162),
+                MssqlTime::new(0, 7),
+            )))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 1).unwrap(),
+            MssqlCell::DateTime2(None)
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[1], 0).unwrap(),
+            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(719_162),
+                MssqlTime::new(0, 7),
+            )))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[1], 1).unwrap(),
+            MssqlCell::DateTime2(None)
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[2], 0).unwrap(),
+            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(719_162),
+                MssqlTime::new(12_345_670, 7),
+            )))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[2], 1).unwrap(),
+            MssqlCell::DateTime2(None)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_timezone_metadata_for_normalized_utc_datetime2() {
+        let options = PlanOptions {
+            timezone_policy: TimezonePolicy::NormalizeUtcDateTime2,
+            ..PlanOptions::default()
+        };
+        let schema = Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Second, Some("Foobar".into())),
+            false,
+        )]);
+        let mappings = mappings_for_schema_with_options(schema.clone(), options);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(
+                TimestampSecondArray::from(vec![0_i64]).with_timezone("Foobar"),
+            )],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let err = view.mssql_cell(&mappings[0], 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::TimezoneUnsupported,
+            Some(0),
+            Some((0, "ts")),
+        );
+    }
+
+    #[test]
+    fn applies_nanosecond_policy_to_timezone_aware_normalized_utc_datetime2() {
+        let options = PlanOptions {
+            timezone_policy: TimezonePolicy::NormalizeUtcDateTime2,
+            nanosecond_policy: NanosecondPolicy::RoundTo100ns,
+            ..PlanOptions::default()
+        };
+        let schema = Schema::new(vec![Field::new(
+            "ts_ns",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("America/New_York".into())),
+            false,
+        )]);
+        let mappings = mappings_for_schema_with_options(schema.clone(), options);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(
+                TimestampNanosecondArray::from(vec![150_i64]).with_timezone("America/New_York"),
+            )],
+        )
+        .unwrap();
+        let view = RecordBatchView::new_with_options(&batch, &mappings, &options).unwrap();
+
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 0).unwrap(),
+            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(719_162),
+                MssqlTime::new(2, 7),
             )))
         );
     }
