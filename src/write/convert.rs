@@ -23,6 +23,12 @@ const SQL_SERVER_DATE_UNIX_EPOCH_DAYS: i64 = 719_162;
 const SQL_SERVER_DATE_MAX_DAYS: i64 = 3_652_058;
 const MILLISECONDS_PER_DAY: i64 = 86_400_000;
 const SQL_SERVER_DATETIME2_DATE64_SCALE: u8 = 3;
+const SQL_SERVER_DATETIME2_TIMESTAMP_SCALE: u8 = 7;
+const TICKS_100NS_PER_SECOND: i128 = 10_000_000;
+const TICKS_100NS_PER_MILLISECOND: i128 = 10_000;
+const TICKS_100NS_PER_MICROSECOND: i128 = 10;
+const TICKS_100NS_PER_DAY: i128 = 864_000_000_000;
+const NANOSECONDS_PER_100NS_TICK: i64 = 100;
 
 /// Direction-specific runtime context for Arrow-to-MSSQL value conversion.
 #[derive(Debug, Clone, Copy)]
@@ -259,14 +265,28 @@ impl MssqlTime {
 pub(crate) struct RecordBatchView<'a> {
     batch: &'a RecordBatch,
     mappings: &'a [SchemaMapping],
+    plan_options: PlanOptions,
 }
 
 impl<'a> RecordBatchView<'a> {
     /// Creates a conversion view after validating batch columns against mappings.
     pub(crate) fn new(batch: &'a RecordBatch, mappings: &'a [SchemaMapping]) -> Result<Self> {
+        Self::new_with_options(batch, mappings, &PlanOptions::default())
+    }
+
+    /// Creates a conversion view with explicit write conversion policies.
+    pub(crate) fn new_with_options(
+        batch: &'a RecordBatch,
+        mappings: &'a [SchemaMapping],
+        plan_options: &PlanOptions,
+    ) -> Result<Self> {
         validate_runtime_columns(batch, mappings)?;
 
-        Ok(Self { batch, mappings })
+        Ok(Self {
+            batch,
+            mappings,
+            plan_options: *plan_options,
+        })
     }
 
     /// Returns the number of rows in the runtime batch.
@@ -318,7 +338,8 @@ impl<'a> RecordBatchView<'a> {
     /// Converts one planned cell into a semantic SQL Server cell.
     fn mssql_cell(&self, mapping: &SchemaMapping, row_index: usize) -> Result<MssqlCell<'_>> {
         let cell = self.arrow_cell(mapping, row_index)?;
-        mssql_cell_from_arrow_cell(mapping, cell, row_index)
+        let runtime_mapping = ArrowToMssqlRuntimeMapping::new(mapping, &self.plan_options);
+        mssql_cell_from_arrow_cell(runtime_mapping, cell, row_index)
     }
 
     /// Converts one runtime row into semantic SQL Server cells in mapping order.
@@ -701,10 +722,12 @@ fn mssql_date_value(
 }
 
 fn mssql_datetime2_value(
-    mapping: &SchemaMapping,
+    runtime_mapping: ArrowToMssqlRuntimeMapping<'_>,
     row_index: usize,
     cell: ArrowCell<'_>,
 ) -> Result<MssqlDateTime2> {
+    let mapping = runtime_mapping.mapping();
+
     match (cell, mapping.arrow().data_type(), mapping.mssql().ty()) {
         (
             ArrowCell::Date64(value),
@@ -713,11 +736,76 @@ fn mssql_datetime2_value(
                 precision: SQL_SERVER_DATETIME2_DATE64_SCALE,
             },
         ) => mssql_datetime2_from_arrow_date64(mapping, row_index, value),
+        (
+            ArrowCell::TimestampSecond(value),
+            DataType::Timestamp(TimeUnit::Second, timezone),
+            MssqlType::DateTime2 {
+                precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
+            },
+        ) if timezone.as_ref().is_none_or(|tz| tz.is_empty()) => {
+            let ticks = i128::from(value) * TICKS_100NS_PER_SECOND;
+            mssql_datetime2_from_unix_epoch_100ns_ticks(mapping, row_index, ticks, "second", value)
+        }
+        (
+            ArrowCell::TimestampMillisecond(value),
+            DataType::Timestamp(TimeUnit::Millisecond, timezone),
+            MssqlType::DateTime2 {
+                precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
+            },
+        ) if timezone.as_ref().is_none_or(|tz| tz.is_empty()) => {
+            let ticks = i128::from(value) * TICKS_100NS_PER_MILLISECOND;
+            mssql_datetime2_from_unix_epoch_100ns_ticks(
+                mapping,
+                row_index,
+                ticks,
+                "millisecond",
+                value,
+            )
+        }
+        (
+            ArrowCell::TimestampMicrosecond(value),
+            DataType::Timestamp(TimeUnit::Microsecond, timezone),
+            MssqlType::DateTime2 {
+                precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
+            },
+        ) if timezone.as_ref().is_none_or(|tz| tz.is_empty()) => {
+            let ticks = i128::from(value) * TICKS_100NS_PER_MICROSECOND;
+            mssql_datetime2_from_unix_epoch_100ns_ticks(
+                mapping,
+                row_index,
+                ticks,
+                "microsecond",
+                value,
+            )
+        }
+        (
+            ArrowCell::TimestampNanosecond(value),
+            DataType::Timestamp(TimeUnit::Nanosecond, timezone),
+            MssqlType::DateTime2 {
+                precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
+            },
+        ) if timezone.as_ref().is_none_or(|tz| tz.is_empty()) => {
+            let ticks = nanoseconds_to_100ns_ticks(
+                mapping,
+                row_index,
+                value,
+                runtime_mapping.nanosecond_policy(),
+            )?;
+            mssql_datetime2_from_unix_epoch_100ns_ticks(
+                mapping,
+                row_index,
+                ticks,
+                "nanosecond",
+                value,
+            )
+        }
         other => Err(value_conversion_error(row_mapping_diagnostic(
             mapping,
             row_index,
             DiagnosticCode::ValueTypeMismatch,
-            format!("expected Arrow Date64 payload planned as datetime2(3), got {other:?}"),
+            format!(
+                "expected Arrow Date64 or timezone-free timestamp payload planned as datetime2, got {other:?}"
+            ),
         ))),
     }
 }
@@ -785,10 +873,12 @@ fn mssql_varbinary_value<'a>(
 }
 
 fn mssql_cell_from_arrow_cell<'a>(
-    mapping: &SchemaMapping,
+    runtime_mapping: ArrowToMssqlRuntimeMapping<'_>,
     cell: ArrowCell<'a>,
     row_index: usize,
 ) -> Result<MssqlCell<'a>> {
+    let mapping = runtime_mapping.mapping();
+
     if matches!(cell, ArrowCell::Null) {
         if !mapping.mssql().nullable() {
             return Err(value_conversion_error(row_mapping_diagnostic(
@@ -825,7 +915,9 @@ fn mssql_cell_from_arrow_cell<'a>(
             mapping, row_index, cell,
         )?))),
         MssqlType::DateTime2 { .. } => Ok(MssqlCell::DateTime2(Some(mssql_datetime2_value(
-            mapping, row_index, cell,
+            runtime_mapping,
+            row_index,
+            cell,
         )?))),
         MssqlType::Real => Ok(MssqlCell::Real(Some(mssql_real_value(
             mapping, row_index, cell,
@@ -900,15 +992,27 @@ fn supports_null_decimal_cell(mapping: &SchemaMapping) -> bool {
 }
 
 fn supports_null_datetime2_cell(mapping: &SchemaMapping) -> bool {
-    matches!(
-        (mapping.arrow().data_type(), mapping.mssql().ty()),
+    match (mapping.arrow().data_type(), mapping.mssql().ty()) {
         (
             DataType::Date64,
             MssqlType::DateTime2 {
-                precision: SQL_SERVER_DATETIME2_DATE64_SCALE
-            }
-        )
-    )
+                precision: SQL_SERVER_DATETIME2_DATE64_SCALE,
+            },
+        ) => true,
+        (
+            DataType::Timestamp(
+                TimeUnit::Second
+                | TimeUnit::Millisecond
+                | TimeUnit::Microsecond
+                | TimeUnit::Nanosecond,
+                timezone,
+            ),
+            MssqlType::DateTime2 {
+                precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
+            },
+        ) => timezone.as_ref().is_none_or(|tz| tz.is_empty()),
+        _ => false,
+    }
 }
 
 fn decimal_scale(mapping: &SchemaMapping, row_index: usize) -> Result<u8> {
@@ -1108,6 +1212,95 @@ fn mssql_datetime2_from_arrow_date64(
             milliseconds_since_midnight as u64,
             SQL_SERVER_DATETIME2_DATE64_SCALE,
         ),
+    ))
+}
+
+fn nanoseconds_to_100ns_ticks(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    nanoseconds_from_unix_epoch: i64,
+    policy: NanosecondPolicy,
+) -> Result<i128> {
+    let base_ticks = nanoseconds_from_unix_epoch.div_euclid(NANOSECONDS_PER_100NS_TICK);
+    let remainder = nanoseconds_from_unix_epoch.rem_euclid(NANOSECONDS_PER_100NS_TICK);
+
+    match policy {
+        NanosecondPolicy::RejectNon100ns if remainder == 0 => Ok(i128::from(base_ticks)),
+        NanosecondPolicy::RejectNon100ns => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::LossyConversionRequiresPolicy,
+            format!(
+                "Arrow timestamp nanosecond value {nanoseconds_from_unix_epoch} is not divisible by 100ns"
+            ),
+        ))),
+        NanosecondPolicy::TruncateTo100ns => Ok(i128::from(base_ticks)),
+        NanosecondPolicy::RoundTo100ns => {
+            let rounded_ticks = if remainder >= 50 {
+                base_ticks.checked_add(1).ok_or_else(|| {
+                    value_conversion_error(row_mapping_diagnostic(
+                        mapping,
+                        row_index,
+                        DiagnosticCode::TimestampOutOfRange,
+                        format!(
+                            "Arrow timestamp nanosecond value {nanoseconds_from_unix_epoch} overflows while rounding to 100ns"
+                        ),
+                    ))
+                })?
+            } else {
+                base_ticks
+            };
+            Ok(i128::from(rounded_ticks))
+        }
+    }
+}
+
+fn mssql_datetime2_from_unix_epoch_100ns_ticks(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    ticks_from_unix_epoch: i128,
+    unit_name: &str,
+    source_value: i64,
+) -> Result<MssqlDateTime2> {
+    let days_from_unix_epoch = ticks_from_unix_epoch.div_euclid(TICKS_100NS_PER_DAY);
+    let ticks_since_midnight = ticks_from_unix_epoch.rem_euclid(TICKS_100NS_PER_DAY);
+    let days = days_from_unix_epoch + i128::from(SQL_SERVER_DATE_UNIX_EPOCH_DAYS);
+
+    if !(0..=i128::from(SQL_SERVER_DATE_MAX_DAYS)).contains(&days) {
+        return Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::TimestampOutOfRange,
+            format!(
+                "Arrow timestamp {unit_name} value {source_value} is outside SQL Server datetime2 range"
+            ),
+        )));
+    }
+
+    let days = u32::try_from(days).map_err(|_| {
+        value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::TimestampOutOfRange,
+            format!(
+                "Arrow timestamp {unit_name} value {source_value} has an invalid SQL Server date component"
+            ),
+        ))
+    })?;
+    let ticks_since_midnight = u64::try_from(ticks_since_midnight).map_err(|_| {
+        value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::TimestampOutOfRange,
+            format!(
+                "Arrow timestamp {unit_name} value {source_value} has an invalid SQL Server time component"
+            ),
+        ))
+    })?;
+
+    Ok(MssqlDateTime2::new(
+        MssqlDate::new(days),
+        MssqlTime::new(ticks_since_midnight, SQL_SERVER_DATETIME2_TIMESTAMP_SCALE),
     ))
 }
 
@@ -1389,7 +1582,7 @@ mod tests {
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
                 true,
             )]),
-            options.clone(),
+            options,
         );
 
         let runtime_mapping = ArrowToMssqlRuntimeMapping::new(&mappings[0], &options);
@@ -3433,11 +3626,268 @@ mod tests {
     }
 
     #[test]
-    fn rejects_policy_planned_timestamp_runtime_conversion_until_implemented() {
-        assert_policy_planned_null_runtime_unsupported(
-            "created_at",
-            DataType::Timestamp(TimeUnit::Millisecond, None),
-            PlanOptions::default(),
+    fn converts_timezone_free_timestamp_cells_to_datetime2_7_with_boundaries_and_nulls() {
+        let mappings = mappings_for_schema(Schema::new(vec![
+            Field::new("ts_s", DataType::Timestamp(TimeUnit::Second, None), true),
+            Field::new(
+                "ts_ms",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                true,
+            ),
+            Field::new(
+                "ts_us",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new(
+                "ts_ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("ts_s", DataType::Timestamp(TimeUnit::Second, None), true),
+                Field::new(
+                    "ts_ms",
+                    DataType::Timestamp(TimeUnit::Millisecond, None),
+                    true,
+                ),
+                Field::new(
+                    "ts_us",
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    true,
+                ),
+                Field::new(
+                    "ts_ns",
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    true,
+                ),
+            ])),
+            vec![
+                Arc::new(TimestampSecondArray::from(vec![
+                    Some(0_i64),
+                    Some(-1_i64),
+                    None,
+                ])) as ArrayRef,
+                Arc::new(TimestampMillisecondArray::from(vec![
+                    Some(0_i64),
+                    Some(-1_i64),
+                    None,
+                ])),
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    Some(1_234_567_i64),
+                    Some(-1_i64),
+                    None,
+                ])),
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    Some(123_456_700_i64),
+                    Some(-100_i64),
+                    None,
+                ])),
+            ],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 0).unwrap(),
+            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(719_162),
+                MssqlTime::new(0, 7),
+            )))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 1).unwrap(),
+            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(719_161),
+                MssqlTime::new(863_990_000_000, 7),
+            )))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[0], 2).unwrap(),
+            MssqlCell::DateTime2(None)
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[1], 1).unwrap(),
+            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(719_161),
+                MssqlTime::new(863_999_990_000, 7),
+            )))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[2], 0).unwrap(),
+            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(719_162),
+                MssqlTime::new(12_345_670, 7),
+            )))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[2], 1).unwrap(),
+            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(719_161),
+                MssqlTime::new(863_999_999_990, 7),
+            )))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[3], 0).unwrap(),
+            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(719_162),
+                MssqlTime::new(1_234_567, 7),
+            )))
+        );
+        assert_eq!(
+            view.mssql_cell(&mappings[3], 1).unwrap(),
+            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(719_161),
+                MssqlTime::new(863_999_999_999, 7),
+            )))
+        );
+    }
+
+    #[test]
+    fn rejects_nanosecond_timestamp_precision_loss_by_default() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "ts_ns",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "ts_ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            )])),
+            vec![Arc::new(TimestampNanosecondArray::from(vec![101_i64]))],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let err = view.mssql_cell(&mappings[0], 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::LossyConversionRequiresPolicy,
+            Some(0),
+            Some((0, "ts_ns")),
+        );
+    }
+
+    #[test]
+    fn applies_nanosecond_round_and_truncate_policies_at_runtime() {
+        let options = PlanOptions {
+            nanosecond_policy: NanosecondPolicy::RoundTo100ns,
+            ..PlanOptions::default()
+        };
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "ts_ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            )]),
+            options,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "ts_ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            )])),
+            vec![Arc::new(TimestampNanosecondArray::from(vec![
+                149_i64, 150_i64, -149_i64,
+            ]))],
+        )
+        .unwrap();
+        let round_view = RecordBatchView::new_with_options(&batch, &mappings, &options).unwrap();
+        let truncate_view = RecordBatchView::new_with_options(
+            &batch,
+            &mappings,
+            &PlanOptions {
+                nanosecond_policy: NanosecondPolicy::TruncateTo100ns,
+                ..PlanOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            round_view.mssql_cell(&mappings[0], 0).unwrap(),
+            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(719_162),
+                MssqlTime::new(1, 7),
+            )))
+        );
+        assert_eq!(
+            round_view.mssql_cell(&mappings[0], 1).unwrap(),
+            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(719_162),
+                MssqlTime::new(2, 7),
+            )))
+        );
+        assert_eq!(
+            round_view.mssql_cell(&mappings[0], 2).unwrap(),
+            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(719_161),
+                MssqlTime::new(863_999_999_999, 7),
+            )))
+        );
+        assert_eq!(
+            truncate_view.mssql_cell(&mappings[0], 0).unwrap(),
+            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(719_162),
+                MssqlTime::new(1, 7),
+            )))
+        );
+        assert_eq!(
+            truncate_view.mssql_cell(&mappings[0], 1).unwrap(),
+            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(719_162),
+                MssqlTime::new(1, 7),
+            )))
+        );
+        assert_eq!(
+            truncate_view.mssql_cell(&mappings[0], 2).unwrap(),
+            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(719_161),
+                MssqlTime::new(863_999_999_998, 7),
+            )))
+        );
+    }
+
+    #[test]
+    fn rejects_timestamp_values_outside_sql_server_datetime2_range() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "ts_s",
+            DataType::Timestamp(TimeUnit::Second, None),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "ts_s",
+                DataType::Timestamp(TimeUnit::Second, None),
+                false,
+            )])),
+            vec![Arc::new(TimestampSecondArray::from(vec![
+                i64::MIN,
+                i64::MAX,
+            ]))],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        let below = view.mssql_cell(&mappings[0], 0).unwrap_err();
+        assert_single_diagnostic(
+            below,
+            DiagnosticCode::TimestampOutOfRange,
+            Some(0),
+            Some((0, "ts_s")),
+        );
+
+        let above = view.mssql_cell(&mappings[0], 1).unwrap_err();
+        assert_single_diagnostic(
+            above,
+            DiagnosticCode::TimestampOutOfRange,
+            Some(1),
+            Some((0, "ts_s")),
         );
     }
 

@@ -4,7 +4,8 @@ use arrow_array::RecordBatch;
 use futures_util::io::{AsyncRead, AsyncWrite};
 
 use crate::{
-    Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, Result, SchemaMapping, TableName,
+    Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, PlanOptions, Result, SchemaMapping,
+    TableName,
 };
 
 use super::{SchemaCheck, convert::RecordBatchView};
@@ -28,6 +29,8 @@ pub struct WriteOptions {
     pub backend: WriteBackend,
     /// Batch schema validation policy.
     pub schema_check: SchemaCheck,
+    /// Planning/runtime conversion policies used by policy-dependent write conversions.
+    pub plan_options: PlanOptions,
 }
 
 /// Cumulative write statistics.
@@ -43,6 +46,7 @@ pub struct WriteStats {
 struct WriterState {
     backend: WriteBackend,
     schema_check: SchemaCheck,
+    plan_options: PlanOptions,
     mappings: Vec<SchemaMapping>,
     stats: WriteStats,
 }
@@ -51,6 +55,7 @@ impl WriterState {
     fn new(
         requested_backend: WriteBackend,
         schema_check: SchemaCheck,
+        plan_options: PlanOptions,
         mappings: Vec<SchemaMapping>,
     ) -> Result<Self> {
         let backend = resolve_backend(requested_backend)?;
@@ -58,6 +63,7 @@ impl WriterState {
         Ok(Self {
             backend,
             schema_check,
+            plan_options,
             mappings,
             stats: WriteStats::default(),
         })
@@ -73,6 +79,10 @@ impl WriterState {
 
     fn schema_check(&self) -> SchemaCheck {
         self.schema_check
+    }
+
+    fn plan_options(&self) -> &PlanOptions {
+        &self.plan_options
     }
 
     fn stats(&self) -> WriteStats {
@@ -107,7 +117,12 @@ where
         mappings: Vec<SchemaMapping>,
         options: WriteOptions,
     ) -> Result<Self> {
-        let state = WriterState::new(options.backend, options.schema_check, mappings)?;
+        let state = WriterState::new(
+            options.backend,
+            options.schema_check,
+            options.plan_options,
+            mappings,
+        )?;
         let request = match state.backend() {
             WriteBackend::BaselineTokenRow => {
                 let table_sql = bulk_insert_table_sql(&table);
@@ -161,9 +176,10 @@ fn record_batch_view<'a>(
     batch: &'a RecordBatch,
     mappings: &'a [SchemaMapping],
     schema_check: SchemaCheck,
+    plan_options: &PlanOptions,
 ) -> Result<RecordBatchView<'a>> {
     match schema_check {
-        SchemaCheck::Strict => RecordBatchView::new(batch, mappings),
+        SchemaCheck::Strict => RecordBatchView::new_with_options(batch, mappings, plan_options),
     }
 }
 
@@ -285,7 +301,12 @@ async fn write_batch_to_sink<Sink>(
 where
     Sink: TokenRowSink,
 {
-    let view = record_batch_view(batch, state.mappings(), state.schema_check())?;
+    let view = record_batch_view(
+        batch,
+        state.mappings(),
+        state.schema_check(),
+        state.plan_options(),
+    )?;
     validate_batch_rows(&view)?;
     let rows_written = usize_to_u64_saturating(view.row_count());
 
@@ -353,8 +374,8 @@ mod tests {
         validate_batch_rows, validate_bulk_target_columns, write_batch_to_sink,
     };
     use crate::{
-        ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, SchemaCheck,
-        SchemaMapping, TableName,
+        ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, PlanOptions,
+        SchemaCheck, SchemaMapping, TableName,
     };
 
     #[test]
@@ -368,6 +389,7 @@ mod tests {
 
         assert_eq!(options.backend, WriteBackend::Auto);
         assert_eq!(options.schema_check, SchemaCheck::Strict);
+        assert_eq!(options.plan_options, PlanOptions::default());
     }
 
     #[test]
@@ -380,6 +402,7 @@ mod tests {
             let options = WriteOptions {
                 backend,
                 schema_check: SchemaCheck::Strict,
+                ..WriteOptions::default()
             };
 
             assert_eq!(options.backend, backend);
@@ -422,8 +445,13 @@ mod tests {
     fn writer_state_starts_with_resolved_backend_mappings_and_zero_stats() {
         let mappings = vec![mapping("id")];
 
-        let state =
-            WriterState::new(WriteBackend::Auto, SchemaCheck::Strict, mappings.clone()).unwrap();
+        let state = WriterState::new(
+            WriteBackend::Auto,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings.clone(),
+        )
+        .unwrap();
 
         assert_eq!(state.backend(), WriteBackend::BaselineTokenRow);
         assert_eq!(state.schema_check(), SchemaCheck::Strict);
@@ -436,6 +464,7 @@ mod tests {
         let mut state = WriterState::new(
             WriteBackend::BaselineTokenRow,
             SchemaCheck::Strict,
+            PlanOptions::default(),
             Vec::new(),
         )
         .unwrap();
@@ -474,7 +503,13 @@ mod tests {
     fn strict_batch_validation_accepts_supported_rows_without_owning_payloads() {
         let batch = int32_batch("id", &[1, 2]);
         let mappings = [mapping("id")];
-        let view = record_batch_view(&batch, &mappings, SchemaCheck::Strict).unwrap();
+        let view = record_batch_view(
+            &batch,
+            &mappings,
+            SchemaCheck::Strict,
+            &PlanOptions::default(),
+        )
+        .unwrap();
 
         validate_batch_rows(&view).unwrap();
 
@@ -485,7 +520,13 @@ mod tests {
     #[test]
     fn strict_batch_view_rejects_runtime_schema_mismatch_before_send() {
         let batch = int32_batch("renamed_id", &[1]);
-        let err = record_batch_view(&batch, &[mapping("id")], SchemaCheck::Strict).unwrap_err();
+        let err = record_batch_view(
+            &batch,
+            &[mapping("id")],
+            SchemaCheck::Strict,
+            &PlanOptions::default(),
+        )
+        .unwrap_err();
 
         let Error::ValueConversion { diagnostics } = err else {
             panic!("expected value conversion error");
@@ -520,7 +561,13 @@ mod tests {
             ),
         )];
 
-        let view = record_batch_view(&batch, &mappings, SchemaCheck::Strict).unwrap();
+        let view = record_batch_view(
+            &batch,
+            &mappings,
+            SchemaCheck::Strict,
+            &PlanOptions::default(),
+        )
+        .unwrap();
         let err = validate_batch_rows(&view).unwrap_err();
 
         let Error::ValueConversion { diagnostics } = err else {
@@ -607,6 +654,7 @@ mod tests {
         let mut state = WriterState::new(
             WriteBackend::BaselineTokenRow,
             SchemaCheck::Strict,
+            PlanOptions::default(),
             mappings,
         )
         .unwrap();
@@ -631,6 +679,7 @@ mod tests {
         let mut state = WriterState::new(
             WriteBackend::BaselineTokenRow,
             SchemaCheck::Strict,
+            PlanOptions::default(),
             mappings,
         )
         .unwrap();
@@ -676,6 +725,7 @@ mod tests {
         let mut state = WriterState::new(
             WriteBackend::BaselineTokenRow,
             SchemaCheck::Strict,
+            PlanOptions::default(),
             mappings,
         )
         .unwrap();
@@ -699,6 +749,7 @@ mod tests {
         let mut state = WriterState::new(
             WriteBackend::BaselineTokenRow,
             SchemaCheck::Strict,
+            PlanOptions::default(),
             mappings,
         )
         .unwrap();
