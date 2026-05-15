@@ -129,6 +129,8 @@ pub(crate) enum MssqlCell<'a> {
     Date(Option<MssqlDate>),
     /// SQL Server `datetime2` cell.
     DateTime2(Option<MssqlDateTime2>),
+    /// SQL Server `datetimeoffset` cell.
+    DateTimeOffset(Option<MssqlDateTimeOffset>),
     /// SQL Server `real` cell.
     Real(Option<f32>),
     /// SQL Server `float` cell.
@@ -214,6 +216,43 @@ impl MssqlDateTime2 {
 
     fn to_tiberius_datetime2(self) -> tiberius::time::DateTime2 {
         tiberius::time::DateTime2::new(self.date.to_tiberius_date(), self.time.to_tiberius_time())
+    }
+}
+
+/// Semantic SQL Server datetimeoffset value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MssqlDateTimeOffset {
+    datetime2: MssqlDateTime2,
+    offset_minutes: i16,
+}
+
+impl MssqlDateTimeOffset {
+    /// Creates a semantic datetimeoffset value from local date/time and offset.
+    ///
+    /// The offset is expressed as minutes from UTC, matching SQL Server and
+    /// Tiberius `datetimeoffset` encoding.
+    const fn new(datetime2: MssqlDateTime2, offset_minutes: i16) -> Self {
+        Self {
+            datetime2,
+            offset_minutes,
+        }
+    }
+
+    /// Returns the local date/time component.
+    pub(crate) const fn datetime2(self) -> MssqlDateTime2 {
+        self.datetime2
+    }
+
+    /// Returns the number of minutes from UTC.
+    pub(crate) const fn offset_minutes(self) -> i16 {
+        self.offset_minutes
+    }
+
+    fn to_tiberius_datetimeoffset(self) -> tiberius::time::DateTimeOffset {
+        tiberius::time::DateTimeOffset::new(
+            self.datetime2.to_tiberius_datetime2(),
+            self.offset_minutes,
+        )
     }
 }
 
@@ -387,6 +426,9 @@ pub(crate) fn mssql_cell_to_tiberius_borrowed(cell: MssqlCell<'_>) -> tiberius::
         MssqlCell::DateTime2(value) => {
             tiberius::ColumnData::DateTime2(value.map(MssqlDateTime2::to_tiberius_datetime2))
         }
+        MssqlCell::DateTimeOffset(value) => tiberius::ColumnData::DateTimeOffset(
+            value.map(MssqlDateTimeOffset::to_tiberius_datetimeoffset),
+        ),
         MssqlCell::Real(value) => tiberius::ColumnData::F32(value),
         MssqlCell::Float(value) => tiberius::ColumnData::F64(value),
         MssqlCell::NVarChar(value) => tiberius::ColumnData::String(value.map(Cow::Borrowed)),
@@ -411,6 +453,9 @@ pub(crate) fn mssql_cell_to_tiberius_owned(cell: MssqlCell<'_>) -> tiberius::Col
         MssqlCell::DateTime2(value) => {
             tiberius::ColumnData::DateTime2(value.map(MssqlDateTime2::to_tiberius_datetime2))
         }
+        MssqlCell::DateTimeOffset(value) => tiberius::ColumnData::DateTimeOffset(
+            value.map(MssqlDateTimeOffset::to_tiberius_datetimeoffset),
+        ),
         MssqlCell::Real(value) => tiberius::ColumnData::F32(value),
         MssqlCell::Float(value) => tiberius::ColumnData::F64(value),
         MssqlCell::NVarChar(value) => {
@@ -1536,8 +1581,9 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
     use super::{
-        ArrowCell, ArrowToMssqlRuntimeMapping, MssqlCell, MssqlDate, MssqlDateTime2, MssqlDecimal,
-        MssqlTime, RecordBatchView, mssql_cell_to_tiberius_borrowed, mssql_cell_to_tiberius_owned,
+        ArrowCell, ArrowToMssqlRuntimeMapping, MssqlCell, MssqlDate, MssqlDateTime2,
+        MssqlDateTimeOffset, MssqlDecimal, MssqlTime, RecordBatchView,
+        mssql_cell_to_tiberius_borrowed, mssql_cell_to_tiberius_owned,
     };
     use crate::{
         ArrowFieldRef, BinaryPolicy, Date64Policy, DecimalPolicy, DiagnosticCode, Error,
@@ -2446,6 +2492,25 @@ mod tests {
             tiberius::ColumnData::DateTime2(None)
         );
         assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::DateTimeOffset(Some(
+                MssqlDateTimeOffset::new(
+                    MssqlDateTime2::new(MssqlDate::new(719_163), MssqlTime::new(43_200_123, 3)),
+                    -420,
+                ),
+            ))),
+            tiberius::ColumnData::DateTimeOffset(Some(tiberius::time::DateTimeOffset::new(
+                tiberius::time::DateTime2::new(
+                    tiberius::time::Date::new(719_163),
+                    tiberius::time::Time::new(43_200_123, 3),
+                ),
+                -420,
+            )))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::DateTimeOffset(None)),
+            tiberius::ColumnData::DateTimeOffset(None)
+        );
+        assert_eq!(
             mssql_cell_to_tiberius_borrowed(MssqlCell::Real(Some(1.25))),
             tiberius::ColumnData::F32(Some(1.25))
         );
@@ -2543,6 +2608,25 @@ mod tests {
             tiberius::ColumnData::DateTime2(None)
         );
         assert_eq!(
+            mssql_cell_to_tiberius_owned(MssqlCell::DateTimeOffset(Some(
+                MssqlDateTimeOffset::new(
+                    MssqlDateTime2::new(MssqlDate::new(719_163), MssqlTime::new(43_200_123, 3)),
+                    330,
+                ),
+            ))),
+            tiberius::ColumnData::DateTimeOffset(Some(tiberius::time::DateTimeOffset::new(
+                tiberius::time::DateTime2::new(
+                    tiberius::time::Date::new(719_163),
+                    tiberius::time::Time::new(43_200_123, 3),
+                ),
+                330,
+            )))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_owned(MssqlCell::DateTimeOffset(None)),
+            tiberius::ColumnData::DateTimeOffset(None)
+        );
+        assert_eq!(
             mssql_cell_to_tiberius_owned(MssqlCell::Real(Some(1.25))),
             tiberius::ColumnData::F32(Some(1.25))
         );
@@ -2572,6 +2656,15 @@ mod tests {
             mssql_cell_to_tiberius_owned(MssqlCell::VarBinary(None)),
             tiberius::ColumnData::Binary(None)
         );
+    }
+
+    #[test]
+    fn mssql_datetimeoffset_exposes_datetime_and_offset_components() {
+        let datetime2 = MssqlDateTime2::new(MssqlDate::new(719_163), MssqlTime::new(1, 7));
+        let datetimeoffset = MssqlDateTimeOffset::new(datetime2, -840);
+
+        assert_eq!(datetimeoffset.datetime2(), datetime2);
+        assert_eq!(datetimeoffset.offset_minutes(), -840);
     }
 
     #[test]
