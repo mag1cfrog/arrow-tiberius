@@ -1,10 +1,10 @@
 //! Arrow schema type to MSSQL type planning.
 
-use arrow_schema::{DataType, Field, TimeUnit};
+use arrow_schema::{DataType, Field};
 
 use crate::write::{
-    BinaryPolicy, Date64Policy, Decimal256Policy, DecimalPolicy, NanosecondPolicy, PlanOptions,
-    StringPolicy, TimezonePolicy, UInt64Policy,
+    BinaryPolicy, Date64Policy, Decimal256Policy, DecimalPolicy, PlanOptions, StringPolicy,
+    TimezonePolicy, UInt64Policy,
 };
 use crate::{Diagnostic, DiagnosticCode, FieldRef, MssqlType, MssqlTypeLength};
 
@@ -49,11 +49,9 @@ pub(crate) fn plan_arrow_data_type_as_mssql_type(
         ),
         DataType::Date32 => Ok(MssqlType::Date),
         DataType::Date64 => plan_arrow_date64_as_mssql_type(options.date64_policy, index, field),
-        DataType::Timestamp(unit, timezone) => plan_arrow_timestamp_as_mssql_type(
-            *unit,
+        DataType::Timestamp(_, timezone) => plan_arrow_timestamp_as_mssql_type(
             timezone.as_deref(),
             options.timezone_policy,
-            options.nanosecond_policy,
             index,
             field,
         ),
@@ -230,10 +228,8 @@ fn plan_arrow_date64_as_mssql_type(
 }
 
 fn plan_arrow_timestamp_as_mssql_type(
-    unit: TimeUnit,
     timezone: Option<&str>,
     timezone_policy: TimezonePolicy,
-    nanosecond_policy: NanosecondPolicy,
     index: usize,
     field: &Field,
 ) -> std::result::Result<MssqlType, Diagnostic> {
@@ -244,16 +240,6 @@ fn plan_arrow_timestamp_as_mssql_type(
             index,
             field,
             "timezone-aware timestamps require TimezonePolicy::DateTimeOffset or TimezonePolicy::NormalizeUtcDateTime2",
-        ));
-    }
-
-    if matches!(unit, TimeUnit::Nanosecond)
-        && matches!(nanosecond_policy, NanosecondPolicy::RejectNon100ns)
-    {
-        return Err(observed_data_required_for_arrow_to_mssql(
-            index,
-            field,
-            "nanosecond timestamps require observed values to verify 100ns divisibility",
         ));
     }
 
@@ -629,15 +615,16 @@ mod tests {
     }
 
     #[test]
-    fn nanosecond_timestamps_require_precision_policy_or_observed_validation() {
+    fn nanosecond_timestamp_policy_is_enforced_at_runtime() {
         let data_type = DataType::Timestamp(TimeUnit::Nanosecond, None);
 
-        assert_diagnostic(
-            plan_type(data_type.clone(), PlanOptions::default()).unwrap_err(),
-            DiagnosticCode::ObservedDataRequired,
+        assert_eq!(
+            plan_type(data_type.clone(), PlanOptions::default()).unwrap(),
+            MssqlType::DateTime2 { precision: 7 }
         );
 
         for nanosecond_policy in [
+            NanosecondPolicy::RejectNon100ns,
             NanosecondPolicy::RoundTo100ns,
             NanosecondPolicy::TruncateTo100ns,
         ] {

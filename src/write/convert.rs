@@ -14,14 +14,41 @@ use arrow_buffer::i256;
 use arrow_schema::DataType;
 
 use crate::{
-    Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, MssqlType, MssqlTypeLength, Result,
-    SchemaMapping,
+    Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, MssqlType, MssqlTypeLength,
+    NanosecondPolicy, PlanOptions, Result, SchemaMapping,
 };
 
 const SQL_SERVER_DATE_UNIX_EPOCH_DAYS: i64 = 719_162;
 const SQL_SERVER_DATE_MAX_DAYS: i64 = 3_652_058;
 const MILLISECONDS_PER_DAY: i64 = 86_400_000;
 const SQL_SERVER_DATETIME2_DATE64_SCALE: u8 = 3;
+
+/// Direction-specific runtime context for Arrow-to-MSSQL value conversion.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ArrowToMssqlRuntimeMapping<'a> {
+    mapping: &'a SchemaMapping,
+    nanosecond_policy: NanosecondPolicy,
+}
+
+impl<'a> ArrowToMssqlRuntimeMapping<'a> {
+    /// Creates runtime conversion context from structural mapping and write options.
+    pub(crate) const fn new(mapping: &'a SchemaMapping, options: &PlanOptions) -> Self {
+        Self {
+            mapping,
+            nanosecond_policy: options.nanosecond_policy,
+        }
+    }
+
+    /// Returns the structural Arrow/MSSQL mapping.
+    pub(crate) const fn mapping(self) -> &'a SchemaMapping {
+        self.mapping
+    }
+
+    /// Returns the nanosecond timestamp policy selected for write conversion.
+    pub(crate) const fn nanosecond_policy(self) -> NanosecondPolicy {
+        self.nanosecond_policy
+    }
+}
 
 /// Borrowed value extracted from one Arrow array cell.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1280,13 +1307,13 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
     use super::{
-        ArrowCell, MssqlCell, MssqlDate, MssqlDateTime2, MssqlDecimal, MssqlTime, RecordBatchView,
-        mssql_cell_to_tiberius_borrowed, mssql_cell_to_tiberius_owned,
+        ArrowCell, ArrowToMssqlRuntimeMapping, MssqlCell, MssqlDate, MssqlDateTime2, MssqlDecimal,
+        MssqlTime, RecordBatchView, mssql_cell_to_tiberius_borrowed, mssql_cell_to_tiberius_owned,
     };
     use crate::{
         ArrowFieldRef, BinaryPolicy, Date64Policy, DecimalPolicy, DiagnosticCode, Error,
-        Identifier, MssqlColumn, MssqlProfile, MssqlType, PlanOptions, SchemaMapping, StringPolicy,
-        UInt64Policy, plan_arrow_schema_to_mssql_mappings,
+        Identifier, MssqlColumn, MssqlProfile, MssqlType, NanosecondPolicy, PlanOptions,
+        SchemaMapping, StringPolicy, UInt64Policy, plan_arrow_schema_to_mssql_mappings,
     };
 
     #[test]
@@ -1312,6 +1339,34 @@ mod tests {
         assert_eq!(view.row_count(), 2);
         assert_eq!(view.mappings().len(), 2);
         view.check_row_index(1).unwrap();
+    }
+
+    #[test]
+    fn runtime_mapping_keeps_write_policy_out_of_schema_mapping() {
+        let options = PlanOptions {
+            nanosecond_policy: NanosecondPolicy::TruncateTo100ns,
+            ..PlanOptions::default()
+        };
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            )]),
+            options.clone(),
+        );
+
+        let runtime_mapping = ArrowToMssqlRuntimeMapping::new(&mappings[0], &options);
+
+        assert_eq!(runtime_mapping.mapping(), &mappings[0]);
+        assert_eq!(
+            runtime_mapping.nanosecond_policy(),
+            NanosecondPolicy::TruncateTo100ns
+        );
+        assert_eq!(
+            mappings[0].mssql().ty(),
+            &MssqlType::DateTime2 { precision: 7 }
+        );
     }
 
     #[test]
