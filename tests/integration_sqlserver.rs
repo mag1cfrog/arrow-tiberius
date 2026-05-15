@@ -9,15 +9,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
     Decimal128Array, Decimal256Array, Float64Array, Int32Array, Int64Array, RecordBatch,
-    StringArray, UInt64Array,
+    StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt64Array,
 };
 use arrow_buffer::i256;
 use arrow_data::ArrayData;
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use arrow_tiberius::{
-    BulkWriter, Date64Policy, DecimalPolicy, DiagnosticCode, Error, MssqlProfile, PlanOptions,
-    TableName, UInt64Policy, WriteBackend, WriteOptions, create_table_sql_from_mappings,
-    plan_arrow_schema_to_mssql_mappings,
+    BulkWriter, Date64Policy, DecimalPolicy, DiagnosticCode, Error, MssqlProfile, NanosecondPolicy,
+    PlanOptions, TableName, UInt64Policy, WriteBackend, WriteOptions,
+    create_table_sql_from_mappings, plan_arrow_schema_to_mssql_mappings,
 };
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -1013,6 +1014,180 @@ async fn baseline_writer_round_trips_date64_datetime2_values() -> TestResult<()>
         )?;
         ensure_eq(rows[3].get::<i32, _>(0), Some(4), "Date64 row 3 id")?;
         ensure_eq(rows[3].get::<&str, _>(1), None, "Date64 row 3 value")?;
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    let drop_result = drop_table(&mut client, &table).await;
+    result?;
+    drop_result?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn baseline_writer_round_trips_timezone_free_timestamp_datetime2_values() -> TestResult<()> {
+    let Some((connection_string, database)) = integration_config() else {
+        eprintln!(
+            "skipping SQL Server timezone-free timestamp round-trip integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+        );
+        return Ok(());
+    };
+
+    let mut client = connect(&connection_string, &database).await?;
+    let table = unique_table_name()?;
+    let plan_options = PlanOptions {
+        nanosecond_policy: NanosecondPolicy::TruncateTo100ns,
+        ..PlanOptions::default()
+    };
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::Int32, false),
+        Field::new("ts_s", DataType::Timestamp(TimeUnit::Second, None), true),
+        Field::new(
+            "ts_ms",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        ),
+        Field::new(
+            "ts_us",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        ),
+        Field::new(
+            "ts_ns",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
+    ]));
+    let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
+        Arc::clone(&schema),
+        MssqlProfile::sql_server_2016_compat_100(),
+        plan_options,
+    )?
+    .into_parts();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1_i32, 2, 3])) as ArrayRef,
+            Arc::new(TimestampSecondArray::from(vec![
+                Some(0_i64),
+                Some(-1_i64),
+                None,
+            ])),
+            Arc::new(TimestampMillisecondArray::from(vec![
+                Some(-1_i64),
+                Some(86_400_123_i64),
+                None,
+            ])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                Some(1_234_567_i64),
+                Some(0_i64),
+                None,
+            ])),
+            Arc::new(TimestampNanosecondArray::from(vec![
+                Some(123_456_789_i64),
+                Some(-149_i64),
+                None,
+            ])),
+        ],
+    )?;
+
+    execute_sql(
+        &mut client,
+        create_table_sql_from_mappings(&table, &mappings),
+    )
+    .await?;
+
+    let result = async {
+        let mut writer = BulkWriter::new(
+            &mut client,
+            table.clone(),
+            mappings,
+            WriteOptions {
+                backend: WriteBackend::BaselineTokenRow,
+                plan_options,
+                ..WriteOptions::default()
+            },
+        )
+        .await?;
+        let stats = writer.write_batch(&batch).await?;
+
+        ensure_eq(stats.rows_written, 3, "timestamp rows_written")?;
+        ensure_eq(stats.batches_written, 1, "timestamp batches_written")?;
+        ensure_eq(writer.finish().await?, stats, "timestamp finish stats")?;
+
+        let rows = client
+            .simple_query(format!(
+                "SELECT [row_id], CONVERT(varchar(40), [ts_s], 126), CONVERT(varchar(40), [ts_ms], 126), CONVERT(varchar(40), [ts_us], 126), CONVERT(varchar(40), [ts_ns], 126) FROM {} ORDER BY [row_id]",
+                table.quoted_sql()
+            ))
+            .await?
+            .into_first_result()
+            .await?;
+
+        ensure_eq(rows.len(), 3, "timestamp row count")?;
+        ensure_eq(rows[0].get::<i32, _>(0), Some(1), "timestamp row 0 id")?;
+        ensure_eq(
+            rows[0].get::<&str, _>(1),
+            Some("1970-01-01T00:00:00"),
+            "timestamp row 0 second",
+        )?;
+        ensure_eq(
+            rows[0].get::<&str, _>(2),
+            Some("1969-12-31T23:59:59.9990000"),
+            "timestamp row 0 millisecond",
+        )?;
+        ensure_eq(
+            rows[0].get::<&str, _>(3),
+            Some("1970-01-01T00:00:01.2345670"),
+            "timestamp row 0 microsecond",
+        )?;
+        ensure_eq(
+            rows[0].get::<&str, _>(4),
+            Some("1970-01-01T00:00:00.1234567"),
+            "timestamp row 0 nanosecond",
+        )?;
+
+        ensure_eq(rows[1].get::<i32, _>(0), Some(2), "timestamp row 1 id")?;
+        ensure_eq(
+            rows[1].get::<&str, _>(1),
+            Some("1969-12-31T23:59:59"),
+            "timestamp row 1 second",
+        )?;
+        ensure_eq(
+            rows[1].get::<&str, _>(2),
+            Some("1970-01-02T00:00:00.1230000"),
+            "timestamp row 1 millisecond",
+        )?;
+        ensure_eq(
+            rows[1].get::<&str, _>(3),
+            Some("1970-01-01T00:00:00"),
+            "timestamp row 1 microsecond",
+        )?;
+        ensure_eq(
+            rows[1].get::<&str, _>(4),
+            Some("1969-12-31T23:59:59.9999998"),
+            "timestamp row 1 nanosecond",
+        )?;
+
+        ensure_eq(rows[2].get::<i32, _>(0), Some(3), "timestamp row 2 id")?;
+        ensure_eq(rows[2].get::<&str, _>(1), None, "timestamp row 2 second")?;
+        ensure_eq(
+            rows[2].get::<&str, _>(2),
+            None,
+            "timestamp row 2 millisecond",
+        )?;
+        ensure_eq(
+            rows[2].get::<&str, _>(3),
+            None,
+            "timestamp row 2 microsecond",
+        )?;
+        ensure_eq(
+            rows[2].get::<&str, _>(4),
+            None,
+            "timestamp row 2 nanosecond",
+        )?;
 
         Ok::<(), Box<dyn std::error::Error>>(())
     }
