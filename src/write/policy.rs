@@ -1,7 +1,7 @@
 //! Write-path options and conversion policies.
 
 /// Planning options for Arrow-to-SQL Server conversion.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct PlanOptions {
     /// SQL Server text target policy.
     pub string_policy: StringPolicy,
