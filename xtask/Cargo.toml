@@ -6,3 +6,7 @@ publish = false
 
 [lints]
 workspace = true
+
+[dependencies]
+arrow-array = "58.2.0"
+arrow-schema = "58.2.0"
