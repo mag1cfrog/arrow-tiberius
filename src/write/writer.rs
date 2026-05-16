@@ -126,20 +126,15 @@ where
         let request = match state.backend() {
             WriteBackend::BaselineTokenRow => {
                 let table_sql = bulk_insert_table_sql(&table);
-                let request = client
-                    .bulk_insert(&table_sql)
+                let columns = client
+                    .bulk_insert_columns(&table_sql)
                     .await
                     .map_err(|source| crate::Error::Tiberius { source })?;
-                if let Err(validation_error) =
-                    validate_bulk_target_columns(request.columns(), state.mappings())
-                {
-                    request
-                        .finalize()
-                        .await
-                        .map_err(|source| crate::Error::Tiberius { source })?;
-                    return Err(validation_error);
-                }
-                request
+                validate_bulk_target_columns(columns.iter(), state.mappings())?;
+                client
+                    .bulk_insert_with_columns(&table_sql, columns)
+                    .await
+                    .map_err(|source| crate::Error::Tiberius { source })?
             }
             WriteBackend::Auto | WriteBackend::DirectRawBulk => {
                 return Err(execution_unavailable(state.backend()));
