@@ -13,7 +13,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow_tiberius::{
-    BulkWriter, MssqlProfile, PlanOptions, TableName, WriteBackend, WriteOptions,
+    BulkWriter, MssqlProfile, PlanOptions, SchemaMapping, TableName, WriteBackend, WriteOptions,
     create_table_sql_from_mappings, plan_arrow_schema_to_mssql_mappings,
 };
 use tokio::net::TcpStream;
@@ -112,6 +112,13 @@ fn print_baseline_summary(
     println!("  output: {}", options.benchmark.output);
     println!("  batches written: {}", report.stats.batches_written);
     println!("  rows written: {}", report.stats.rows_written);
+    println!(
+        "  write rows/sec: {}",
+        format_rows_per_second(
+            report.stats.rows_written,
+            report.timings.write + report.timings.finish
+        )
+    );
     println!("  validated rows: {}", report.validated_rows);
     println!(
         "  existing connection: {}",
@@ -466,13 +473,7 @@ async fn run_baseline_async(
     let setup_start = Instant::now();
     let mut client = connect(&connection.connection_string, &connection.database).await?;
     let schema = (options.benchmark.scenario.schema)();
-    let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
-        Arc::clone(&schema),
-        MssqlProfile::sql_server_2016_compat_100(),
-        PlanOptions::default(),
-    )
-    .map_err(WriterBenchError::ArrowTiberius)?
-    .into_parts();
+    let mappings = benchmark_mappings_for_schema(Arc::clone(&schema))?;
     report.timings.setup += setup_start.elapsed();
 
     for _repeat_index in 0..options.benchmark.repeat {
@@ -531,7 +532,7 @@ async fn run_baseline_repeat(
         format!("DROP TABLE IF EXISTS {}", table.quoted_sql()),
     )
     .await?;
-    execute_sql(client, create_table_sql_from_mappings(table, mappings)).await?;
+    execute_sql(client, benchmark_table_sql(table, mappings)).await?;
     let mut writer = BulkWriter::new(
         client,
         table.clone(),
@@ -643,8 +644,34 @@ fn unique_benchmark_table_name() -> Result<TableName, WriterBenchError> {
     TableName::new("dbo", table).map_err(WriterBenchError::ArrowTiberius)
 }
 
+fn benchmark_table_sql(table: &TableName, mappings: &[SchemaMapping]) -> String {
+    create_table_sql_from_mappings(table, mappings)
+}
+
+fn benchmark_mappings_for_schema(
+    schema: SchemaRef,
+) -> Result<Vec<SchemaMapping>, WriterBenchError> {
+    let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
+        schema,
+        MssqlProfile::sql_server_2016_compat_100(),
+        PlanOptions::default(),
+    )
+    .map_err(WriterBenchError::ArrowTiberius)?
+    .into_parts();
+
+    Ok(mappings)
+}
+
 fn format_duration(duration: Duration) -> String {
     format!("{:.3}s", duration.as_secs_f64())
+}
+
+fn format_rows_per_second(rows: u64, elapsed: Duration) -> String {
+    if elapsed.is_zero() {
+        return "n/a".to_owned();
+    }
+
+    format!("{:.2}", rows as f64 / elapsed.as_secs_f64())
 }
 
 fn summarize_generated_batches(
@@ -1505,6 +1532,48 @@ mod tests {
         assert_eq!(options.sql_server.image, "custom-sqlserver");
         assert_eq!(options.sql_server.database, "bench_db");
         assert!(options.sql_server.keep_container);
+    }
+
+    #[test]
+    fn renders_narrow_numeric_benchmark_table_ddl() {
+        let table = arrow_tiberius::TableName::new("dbo", "bench").unwrap();
+        let schema = (super::scenario_by_name("narrow_numeric").unwrap().schema)();
+        let mappings = super::benchmark_mappings_for_schema(schema).unwrap();
+        let sql = super::benchmark_table_sql(&table, &mappings);
+
+        assert_eq!(
+            sql,
+            "CREATE TABLE [dbo].[bench] (\n    [id32] int NOT NULL,\n    [id64] bigint NOT NULL,\n    [score] float(53) NOT NULL\n);"
+        );
+    }
+
+    #[test]
+    fn renders_mixed_nullable_benchmark_table_ddl() {
+        let table = arrow_tiberius::TableName::new("dbo", "bench").unwrap();
+        let schema = (super::scenario_by_name("mixed_nullable").unwrap().schema)();
+        let mappings = super::benchmark_mappings_for_schema(schema).unwrap();
+        let sql = super::benchmark_table_sql(&table, &mappings);
+
+        assert_eq!(
+            sql,
+            "CREATE TABLE [dbo].[bench] (\n    [id32] int NOT NULL,\n    [maybe_id64] bigint NULL,\n    [maybe_score] float(53) NULL,\n    [category] nvarchar(max) NULL\n);"
+        );
+    }
+
+    #[test]
+    fn formats_rows_per_second_for_report_output() {
+        assert_eq!(
+            super::format_rows_per_second(2_500, std::time::Duration::from_millis(500)),
+            "5000.00"
+        );
+    }
+
+    #[test]
+    fn formats_zero_elapsed_rows_per_second_without_panicking() {
+        assert_eq!(
+            super::format_rows_per_second(2_500, std::time::Duration::ZERO),
+            "n/a"
+        );
     }
 
     #[test]
