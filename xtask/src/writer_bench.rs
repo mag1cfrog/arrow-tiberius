@@ -4,8 +4,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow_array::{
-    ArrayRef, BinaryArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
-    TimestampMillisecondArray,
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int32Array,
+    Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
@@ -114,7 +114,7 @@ struct BenchmarkScenarioDefinition {
     name: &'static str,
     description: &'static str,
     schema: fn() -> SchemaRef,
-    columns: fn(offset: usize, len: usize) -> Vec<ArrayRef>,
+    columns: fn(offset: usize, len: usize) -> Result<Vec<ArrayRef>, WriterBenchError>,
 }
 
 impl fmt::Display for BenchmarkScenarioDefinition {
@@ -144,10 +144,42 @@ const WIDE_MIXED_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefini
     columns: wide_mixed_columns,
 };
 
+const DECIMAL_TEMPORAL_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
+    name: "decimal_temporal",
+    description: "Finance-style decimals, dates, and timestamps",
+    schema: decimal_temporal_schema,
+    columns: decimal_temporal_columns,
+};
+
+const STRING_HEAVY_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
+    name: "string_heavy",
+    description: "Large variable text and binary payload rows",
+    schema: string_heavy_schema,
+    columns: string_heavy_columns,
+};
+
+const WIDE_SPARSE_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
+    name: "wide_sparse",
+    description: "Thirty-two mixed columns with sparse nullable values",
+    schema: wide_sparse_schema,
+    columns: wide_sparse_columns,
+};
+
+const TPCH_LINEITEM_LIKE_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
+    name: "tpch_lineitem_like",
+    description: "TPC-H lineitem-inspired transport workload without external dbgen",
+    schema: tpch_lineitem_like_schema,
+    columns: tpch_lineitem_like_columns,
+};
+
 const SCENARIOS: &[BenchmarkScenarioDefinition] = &[
     NARROW_NUMERIC_SCENARIO,
     MIXED_NULLABLE_SCENARIO,
     WIDE_MIXED_SCENARIO,
+    DECIMAL_TEMPORAL_SCENARIO,
+    STRING_HEAVY_SCENARIO,
+    WIDE_SPARSE_SCENARIO,
+    TPCH_LINEITEM_LIKE_SCENARIO,
 ];
 
 fn scenario_by_name(name: &str) -> Option<&'static BenchmarkScenarioDefinition> {
@@ -253,7 +285,7 @@ fn generate_batch(
     offset: usize,
     len: usize,
 ) -> Result<RecordBatch, WriterBenchError> {
-    let columns = (scenario.columns)(offset, len);
+    let columns = (scenario.columns)(offset, len)?;
 
     RecordBatch::try_new(schema, columns).map_err(WriterBenchError::Arrow)
 }
@@ -266,7 +298,7 @@ fn narrow_numeric_schema() -> SchemaRef {
     ]))
 }
 
-fn narrow_numeric_columns(offset: usize, len: usize) -> Vec<ArrayRef> {
+fn narrow_numeric_columns(offset: usize, len: usize) -> Result<Vec<ArrayRef>, WriterBenchError> {
     let id32 = (offset..offset + len)
         .map(deterministic_i32)
         .collect::<Int32Array>();
@@ -277,7 +309,7 @@ fn narrow_numeric_columns(offset: usize, len: usize) -> Vec<ArrayRef> {
         .map(deterministic_score)
         .collect::<Float64Array>();
 
-    vec![Arc::new(id32), Arc::new(id64), Arc::new(score)]
+    Ok(vec![Arc::new(id32), Arc::new(id64), Arc::new(score)])
 }
 
 fn mixed_nullable_schema() -> SchemaRef {
@@ -289,7 +321,7 @@ fn mixed_nullable_schema() -> SchemaRef {
     ]))
 }
 
-fn mixed_nullable_columns(offset: usize, len: usize) -> Vec<ArrayRef> {
+fn mixed_nullable_columns(offset: usize, len: usize) -> Result<Vec<ArrayRef>, WriterBenchError> {
     let id32 = (offset..offset + len)
         .map(deterministic_i32)
         .collect::<Int32Array>();
@@ -322,12 +354,12 @@ fn mixed_nullable_columns(offset: usize, len: usize) -> Vec<ArrayRef> {
         })
         .collect::<StringArray>();
 
-    vec![
+    Ok(vec![
         Arc::new(id32),
         Arc::new(maybe_id64),
         Arc::new(maybe_score),
         Arc::new(category),
-    ]
+    ])
 }
 
 fn wide_mixed_schema() -> SchemaRef {
@@ -347,7 +379,7 @@ fn wide_mixed_schema() -> SchemaRef {
     ]))
 }
 
-fn wide_mixed_columns(offset: usize, len: usize) -> Vec<ArrayRef> {
+fn wide_mixed_columns(offset: usize, len: usize) -> Result<Vec<ArrayRef>, WriterBenchError> {
     let status_values = ["queued", "active", "settled", "failed", "cancelled"];
     let region_values = ["us-west", "us-east", "eu-central", "ap-south"];
     let id = (offset..offset + len)
@@ -405,7 +437,7 @@ fn wide_mixed_columns(offset: usize, len: usize) -> Vec<ArrayRef> {
         })
         .collect::<BinaryArray>();
 
-    vec![
+    Ok(vec![
         Arc::new(id),
         Arc::new(account_id),
         Arc::new(event_time_ms),
@@ -414,7 +446,7 @@ fn wide_mixed_columns(offset: usize, len: usize) -> Vec<ArrayRef> {
         Arc::new(region),
         Arc::new(description),
         Arc::new(payload),
-    ]
+    ])
 }
 
 fn deterministic_description(row: usize) -> String {
@@ -441,6 +473,400 @@ fn deterministic_payload(row: usize) -> Vec<u8> {
     let len = 8 + row % 57;
     (0..len)
         .map(|index| ((row.wrapping_mul(31) + index.wrapping_mul(17)) % 251) as u8)
+        .collect()
+}
+
+fn decimal_temporal_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("transaction_id", DataType::Int64, false),
+        Field::new("account_id", DataType::Int32, false),
+        Field::new("amount", DataType::Decimal128(18, 4), false),
+        Field::new("fee", DataType::Decimal128(12, 4), true),
+        Field::new("trade_date", DataType::Date32, false),
+        Field::new(
+            "posted_at_ms",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
+        Field::new("approved", DataType::Boolean, true),
+    ]))
+}
+
+fn decimal_temporal_columns(offset: usize, len: usize) -> Result<Vec<ArrayRef>, WriterBenchError> {
+    let transaction_id = (offset..offset + len)
+        .map(|row| 500_000_000_i64 + row as i64)
+        .collect::<Int64Array>();
+    let account_id = (offset..offset + len)
+        .map(|row| 10_000 + (row % 200_000) as i32)
+        .collect::<Int32Array>();
+    let amount = decimal128_array(
+        (offset..offset + len).map(|row| {
+            let sign = if row % 13 == 0 { -1_i128 } else { 1_i128 };
+            Some(sign * (1_000_000_i128 + (row % 50_000_000) as i128))
+        }),
+        18,
+        4,
+    )?;
+    let fee = decimal128_array(
+        (offset..offset + len).map(|row| {
+            if row % 11 == 0 {
+                None
+            } else {
+                Some(25_i128 + (row % 10_000) as i128)
+            }
+        }),
+        12,
+        4,
+    )?;
+    let trade_date = Date32Array::from_iter_values(
+        (offset..offset + len).map(|row| 19_723_i32 + (row % 365) as i32),
+    );
+    let posted_at_ms = TimestampMillisecondArray::from_iter_values(
+        (offset..offset + len).map(|row| 1_735_689_600_000_i64 + (row as i64 * 17_000)),
+    );
+    let approved = (offset..offset + len)
+        .map(|row| {
+            if row % 17 == 0 {
+                None
+            } else {
+                Some(row % 3 != 0)
+            }
+        })
+        .collect::<BooleanArray>();
+
+    Ok(vec![
+        Arc::new(transaction_id),
+        Arc::new(account_id),
+        Arc::new(amount),
+        Arc::new(fee),
+        Arc::new(trade_date),
+        Arc::new(posted_at_ms),
+        Arc::new(approved),
+    ])
+}
+
+fn string_heavy_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("tenant", DataType::Utf8, false),
+        Field::new("document_type", DataType::Utf8, true),
+        Field::new("title", DataType::Utf8, true),
+        Field::new("body", DataType::Utf8, true),
+        Field::new("metadata", DataType::Utf8, true),
+        Field::new("payload", DataType::Binary, true),
+    ]))
+}
+
+fn string_heavy_columns(offset: usize, len: usize) -> Result<Vec<ArrayRef>, WriterBenchError> {
+    let document_types = ["invoice", "event", "profile", "message", "audit"];
+    let id = (offset..offset + len)
+        .map(|row| 900_000_000_i64 + row as i64)
+        .collect::<Int64Array>();
+    let tenant = (offset..offset + len)
+        .map(|row| Some(format!("tenant-{:04}", row % 512)))
+        .collect::<StringArray>();
+    let document_type = (offset..offset + len)
+        .map(|row| {
+            if row % 37 == 0 {
+                None
+            } else {
+                Some(document_types[row % document_types.len()].to_owned())
+            }
+        })
+        .collect::<StringArray>();
+    let title = (offset..offset + len)
+        .map(|row| {
+            if row % 41 == 0 {
+                None
+            } else {
+                Some(format!("document title {row:012}"))
+            }
+        })
+        .collect::<StringArray>();
+    let body = (offset..offset + len)
+        .map(|row| {
+            if row % 43 == 0 {
+                None
+            } else {
+                Some(deterministic_text(row, 512 + row % 2_048))
+            }
+        })
+        .collect::<StringArray>();
+    let metadata = (offset..offset + len)
+        .map(|row| {
+            if row % 47 == 0 {
+                None
+            } else {
+                Some(format!(
+                    "{{\"tenant\":{},\"source\":{},\"sequence\":{row}}}",
+                    row % 512,
+                    row % 17
+                ))
+            }
+        })
+        .collect::<StringArray>();
+    let payload = (offset..offset + len)
+        .map(|row| {
+            if row % 53 == 0 {
+                None
+            } else {
+                Some(deterministic_payload_with_len(row, 1_024 + row % 4_096))
+            }
+        })
+        .collect::<BinaryArray>();
+
+    Ok(vec![
+        Arc::new(id),
+        Arc::new(tenant),
+        Arc::new(document_type),
+        Arc::new(title),
+        Arc::new(body),
+        Arc::new(metadata),
+        Arc::new(payload),
+    ])
+}
+
+fn wide_sparse_schema() -> SchemaRef {
+    let mut fields = Vec::with_capacity(32);
+
+    for index in 0..8 {
+        fields.push(Field::new(
+            format!("metric_i32_{index:02}"),
+            DataType::Int32,
+            index != 0,
+        ));
+    }
+    for index in 0..8 {
+        fields.push(Field::new(
+            format!("metric_f64_{index:02}"),
+            DataType::Float64,
+            true,
+        ));
+    }
+    for index in 0..8 {
+        fields.push(Field::new(format!("tag_{index:02}"), DataType::Utf8, true));
+    }
+    for index in 0..8 {
+        fields.push(Field::new(
+            format!("flag_{index:02}"),
+            DataType::Boolean,
+            true,
+        ));
+    }
+
+    Arc::new(Schema::new(fields))
+}
+
+fn wide_sparse_columns(offset: usize, len: usize) -> Result<Vec<ArrayRef>, WriterBenchError> {
+    let mut columns = Vec::with_capacity(32);
+
+    for column in 0..8 {
+        columns.push(Arc::new(wide_sparse_i32_column(offset, len, column)) as ArrayRef);
+    }
+    for column in 0..8 {
+        columns.push(Arc::new(wide_sparse_f64_column(offset, len, column)) as ArrayRef);
+    }
+    for column in 0..8 {
+        columns.push(Arc::new(wide_sparse_string_column(offset, len, column)) as ArrayRef);
+    }
+    for column in 0..8 {
+        columns.push(Arc::new(wide_sparse_bool_column(offset, len, column)) as ArrayRef);
+    }
+
+    Ok(columns)
+}
+
+fn tpch_lineitem_like_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("l_orderkey", DataType::Int64, false),
+        Field::new("l_partkey", DataType::Int64, false),
+        Field::new("l_suppkey", DataType::Int64, false),
+        Field::new("l_linenumber", DataType::Int32, false),
+        Field::new("l_quantity", DataType::Decimal128(15, 2), false),
+        Field::new("l_extendedprice", DataType::Decimal128(18, 2), false),
+        Field::new("l_discount", DataType::Decimal128(10, 4), false),
+        Field::new("l_tax", DataType::Decimal128(10, 4), false),
+        Field::new("l_returnflag", DataType::Utf8, false),
+        Field::new("l_linestatus", DataType::Utf8, false),
+        Field::new("l_shipdate", DataType::Date32, false),
+        Field::new("l_commitdate", DataType::Date32, false),
+        Field::new("l_receiptdate", DataType::Date32, false),
+        Field::new("l_shipinstruct", DataType::Utf8, false),
+        Field::new("l_shipmode", DataType::Utf8, false),
+        Field::new("l_comment", DataType::Utf8, true),
+    ]))
+}
+
+fn tpch_lineitem_like_columns(
+    offset: usize,
+    len: usize,
+) -> Result<Vec<ArrayRef>, WriterBenchError> {
+    let return_flags = ["A", "N", "R"];
+    let line_statuses = ["F", "O"];
+    let ship_instructs = [
+        "DELIVER IN PERSON",
+        "COLLECT COD",
+        "NONE",
+        "TAKE BACK RETURN",
+    ];
+    let ship_modes = ["AIR", "FOB", "MAIL", "RAIL", "REG AIR", "SHIP", "TRUCK"];
+
+    let orderkey = (offset..offset + len)
+        .map(|row| 1_i64 + (row / 4) as i64)
+        .collect::<Int64Array>();
+    let partkey = (offset..offset + len)
+        .map(|row| 1_i64 + (row % 200_000) as i64)
+        .collect::<Int64Array>();
+    let suppkey = (offset..offset + len)
+        .map(|row| 1_i64 + (row % 10_000) as i64)
+        .collect::<Int64Array>();
+    let linenumber = (offset..offset + len)
+        .map(|row| 1 + (row % 7) as i32)
+        .collect::<Int32Array>();
+    let quantity = decimal128_array(
+        (offset..offset + len).map(|row| Some(100_i128 + (row % 5_000) as i128)),
+        15,
+        2,
+    )?;
+    let extendedprice = decimal128_array(
+        (offset..offset + len).map(|row| Some(10_000_i128 + (row % 900_000) as i128)),
+        18,
+        2,
+    )?;
+    let discount = decimal128_array(
+        (offset..offset + len).map(|row| Some((row % 1_000) as i128)),
+        10,
+        4,
+    )?;
+    let tax = decimal128_array(
+        (offset..offset + len).map(|row| Some((row % 800) as i128)),
+        10,
+        4,
+    )?;
+    let returnflag = (offset..offset + len)
+        .map(|row| Some(return_flags[row % return_flags.len()]))
+        .collect::<StringArray>();
+    let linestatus = (offset..offset + len)
+        .map(|row| Some(line_statuses[(row / 5) % line_statuses.len()]))
+        .collect::<StringArray>();
+    let shipdate = Date32Array::from_iter_values(
+        (offset..offset + len).map(|row| 8_400_i32 + (row % 2_500) as i32),
+    );
+    let commitdate = Date32Array::from_iter_values(
+        (offset..offset + len).map(|row| 8_430_i32 + (row % 2_500) as i32),
+    );
+    let receiptdate = Date32Array::from_iter_values(
+        (offset..offset + len).map(|row| 8_460_i32 + (row % 2_500) as i32),
+    );
+    let shipinstruct = (offset..offset + len)
+        .map(|row| Some(ship_instructs[row % ship_instructs.len()]))
+        .collect::<StringArray>();
+    let shipmode = (offset..offset + len)
+        .map(|row| Some(ship_modes[row % ship_modes.len()]))
+        .collect::<StringArray>();
+    let comment = (offset..offset + len)
+        .map(|row| {
+            if row % 101 == 0 {
+                None
+            } else {
+                Some(deterministic_text(row, 24 + row % 96))
+            }
+        })
+        .collect::<StringArray>();
+
+    Ok(vec![
+        Arc::new(orderkey),
+        Arc::new(partkey),
+        Arc::new(suppkey),
+        Arc::new(linenumber),
+        Arc::new(quantity),
+        Arc::new(extendedprice),
+        Arc::new(discount),
+        Arc::new(tax),
+        Arc::new(returnflag),
+        Arc::new(linestatus),
+        Arc::new(shipdate),
+        Arc::new(commitdate),
+        Arc::new(receiptdate),
+        Arc::new(shipinstruct),
+        Arc::new(shipmode),
+        Arc::new(comment),
+    ])
+}
+
+fn decimal128_array(
+    values: impl IntoIterator<Item = Option<i128>>,
+    precision: u8,
+    scale: i8,
+) -> Result<Decimal128Array, WriterBenchError> {
+    Decimal128Array::from(values.into_iter().collect::<Vec<_>>())
+        .with_precision_and_scale(precision, scale)
+        .map_err(WriterBenchError::Arrow)
+}
+
+fn wide_sparse_i32_column(offset: usize, len: usize, column: usize) -> Int32Array {
+    (offset..offset + len)
+        .map(|row| {
+            if column != 0 && row % (column + 11) == 0 {
+                None
+            } else {
+                Some((row.wrapping_mul(column + 3) % 1_000_000) as i32)
+            }
+        })
+        .collect()
+}
+
+fn wide_sparse_f64_column(offset: usize, len: usize, column: usize) -> Float64Array {
+    (offset..offset + len)
+        .map(|row| {
+            if row % (column + 13) == 0 {
+                None
+            } else {
+                Some((row.wrapping_mul(column + 19) % 10_000) as f64 / 10.0)
+            }
+        })
+        .collect()
+}
+
+fn wide_sparse_string_column(offset: usize, len: usize, column: usize) -> StringArray {
+    (offset..offset + len)
+        .map(|row| {
+            if row % (column + 17) == 0 {
+                None
+            } else {
+                Some(format!("tag-{column:02}-{}", row % 128))
+            }
+        })
+        .collect()
+}
+
+fn wide_sparse_bool_column(offset: usize, len: usize, column: usize) -> BooleanArray {
+    (offset..offset + len)
+        .map(|row| {
+            if row % (column + 23) == 0 {
+                None
+            } else {
+                Some((row + column).is_multiple_of(2))
+            }
+        })
+        .collect()
+}
+
+fn deterministic_text(row: usize, len: usize) -> String {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789 ";
+    let mut value = String::with_capacity(len);
+
+    for index in 0..len {
+        let byte = ALPHABET[(row.wrapping_mul(31) + index.wrapping_mul(7)) % ALPHABET.len()];
+        value.push(char::from(byte));
+    }
+
+    value
+}
+
+fn deterministic_payload_with_len(row: usize, len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|index| ((row.wrapping_mul(131) + index.wrapping_mul(29)) % 251) as u8)
         .collect()
 }
 
@@ -537,8 +963,8 @@ fn scenario_names() -> String {
 mod tests {
     use super::{BenchmarkOutput, WriterBenchError, WriterBenchOptions};
     use arrow_array::{
-        Array, BinaryArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
-        TimestampMillisecondArray,
+        Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int32Array,
+        Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
     };
     use arrow_schema::{DataType, TimeUnit};
     use std::ffi::OsString;
@@ -886,6 +1312,145 @@ mod tests {
     }
 
     #[test]
+    fn decimal_temporal_covers_finance_and_time_types() {
+        let options = WriterBenchOptions {
+            rows: 64,
+            batch_size: 64,
+            scenario: super::scenario_by_name("decimal_temporal").unwrap(),
+            repeat: 1,
+            output: BenchmarkOutput::Human,
+        };
+
+        let batches = generated_batches(&options);
+        let batch = &batches[0];
+        let schema = batch.schema();
+
+        assert_eq!(schema.field(2).data_type(), &DataType::Decimal128(18, 4));
+        assert_eq!(schema.field(3).data_type(), &DataType::Decimal128(12, 4));
+        assert_eq!(schema.field(4).data_type(), &DataType::Date32);
+        assert_eq!(
+            schema.field(5).data_type(),
+            &DataType::Timestamp(TimeUnit::Millisecond, None)
+        );
+        assert_eq!(schema.field(6).data_type(), &DataType::Boolean);
+        assert!(batch.column(2).as_any().is::<Decimal128Array>());
+        assert!(batch.column(3).as_any().is::<Decimal128Array>());
+        assert!(batch.column(4).as_any().is::<Date32Array>());
+        assert!(batch.column(5).as_any().is::<TimestampMillisecondArray>());
+        assert!(batch.column(6).as_any().is::<BooleanArray>());
+        assert!(batch.column(3).null_count() > 0);
+        assert!(batch.column(6).null_count() > 0);
+    }
+
+    #[test]
+    fn string_heavy_has_kb_scale_variable_payloads() {
+        let options = WriterBenchOptions {
+            rows: 128,
+            batch_size: 128,
+            scenario: super::scenario_by_name("string_heavy").unwrap(),
+            repeat: 1,
+            output: BenchmarkOutput::Human,
+        };
+
+        let batches = generated_batches(&options);
+        let batch = &batches[0];
+        let body = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let payload = batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+
+        assert!(body.null_count() > 0);
+        assert!(payload.null_count() > 0);
+        assert!(body.value(1).len() >= 512);
+        assert!(payload.value(1).len() >= 1_024);
+        assert_ne!(body.value(1).len(), body.value(2).len());
+        assert_ne!(payload.value(1).len(), payload.value(2).len());
+    }
+
+    #[test]
+    fn wide_sparse_has_many_columns_and_sparse_nulls() {
+        let options = WriterBenchOptions {
+            rows: 256,
+            batch_size: 256,
+            scenario: super::scenario_by_name("wide_sparse").unwrap(),
+            repeat: 1,
+            output: BenchmarkOutput::Human,
+        };
+
+        let batches = generated_batches(&options);
+        let batch = &batches[0];
+        let schema = batch.schema();
+
+        assert_eq!(schema.fields().len(), 32);
+        assert_eq!(schema.field(0).data_type(), &DataType::Int32);
+        assert_eq!(schema.field(8).data_type(), &DataType::Float64);
+        assert_eq!(schema.field(16).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(24).data_type(), &DataType::Boolean);
+        assert!(!schema.field(0).is_nullable());
+        assert!(schema.field(1).is_nullable());
+        assert!(batch.column(0).null_count() == 0);
+        assert!(batch.column(1).null_count() > 0);
+        assert!(batch.column(8).null_count() > 0);
+        assert!(batch.column(16).null_count() > 0);
+        assert!(batch.column(24).null_count() > 0);
+    }
+
+    #[test]
+    fn tpch_lineitem_like_covers_order_line_transport_shape() {
+        let options = WriterBenchOptions {
+            rows: 128,
+            batch_size: 128,
+            scenario: super::scenario_by_name("tpch_lineitem_like").unwrap(),
+            repeat: 1,
+            output: BenchmarkOutput::Human,
+        };
+
+        let batches = generated_batches(&options);
+        let batch = &batches[0];
+        let schema = batch.schema();
+
+        assert_eq!(schema.fields().len(), 16);
+        assert_eq!(schema.field(0).name(), "l_orderkey");
+        assert_eq!(schema.field(4).data_type(), &DataType::Decimal128(15, 2));
+        assert_eq!(schema.field(5).data_type(), &DataType::Decimal128(18, 2));
+        assert_eq!(schema.field(10).data_type(), &DataType::Date32);
+        assert_eq!(schema.field(15).data_type(), &DataType::Utf8);
+        assert!(batch.column(4).as_any().is::<Decimal128Array>());
+        assert!(batch.column(10).as_any().is::<Date32Array>());
+        assert!(batch.column(15).null_count() > 0);
+    }
+
+    #[test]
+    fn realistic_scenarios_stream_multiple_batches() {
+        for scenario_name in [
+            "wide_mixed",
+            "decimal_temporal",
+            "string_heavy",
+            "wide_sparse",
+            "tpch_lineitem_like",
+        ] {
+            let options = WriterBenchOptions {
+                rows: 4_097,
+                batch_size: 1_024,
+                scenario: super::scenario_by_name(scenario_name).unwrap(),
+                repeat: 1,
+                output: BenchmarkOutput::Human,
+            };
+
+            let summary = super::summarize_generated_batches(&options).unwrap();
+
+            assert_eq!(summary.rows, 4_097);
+            assert_eq!(summary.batches, 5);
+        }
+    }
+
+    #[test]
     fn lazy_reader_emits_no_empty_batch_for_exact_multiple() {
         let options = WriterBenchOptions {
             rows: 8,
@@ -966,7 +1531,18 @@ mod tests {
             .map(|scenario| scenario.name)
             .collect::<Vec<_>>();
 
-        assert_eq!(names, ["narrow_numeric", "mixed_nullable", "wide_mixed"]);
+        assert_eq!(
+            names,
+            [
+                "narrow_numeric",
+                "mixed_nullable",
+                "wide_mixed",
+                "decimal_temporal",
+                "string_heavy",
+                "wide_sparse",
+                "tpch_lineitem_like"
+            ]
+        );
         assert!(
             super::SCENARIOS
                 .iter()
