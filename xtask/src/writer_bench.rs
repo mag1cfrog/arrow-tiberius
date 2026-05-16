@@ -3,8 +3,11 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_array::{
+    ArrayRef, BinaryArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    TimestampMillisecondArray,
+};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
 pub(super) fn run(args: &[OsString]) -> Result<(), WriterBenchError> {
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
@@ -134,8 +137,18 @@ const MIXED_NULLABLE_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDe
     columns: mixed_nullable_columns,
 };
 
-const SCENARIOS: &[BenchmarkScenarioDefinition] =
-    &[NARROW_NUMERIC_SCENARIO, MIXED_NULLABLE_SCENARIO];
+const WIDE_MIXED_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
+    name: "wide_mixed",
+    description: "Ingestion-style ids, event time, categories, text, and binary payloads",
+    schema: wide_mixed_schema,
+    columns: wide_mixed_columns,
+};
+
+const SCENARIOS: &[BenchmarkScenarioDefinition] = &[
+    NARROW_NUMERIC_SCENARIO,
+    MIXED_NULLABLE_SCENARIO,
+    WIDE_MIXED_SCENARIO,
+];
 
 fn scenario_by_name(name: &str) -> Option<&'static BenchmarkScenarioDefinition> {
     SCENARIOS.iter().find(|scenario| scenario.name == name)
@@ -317,6 +330,120 @@ fn mixed_nullable_columns(offset: usize, len: usize) -> Vec<ArrayRef> {
     ]
 }
 
+fn wide_mixed_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("account_id", DataType::Int32, false),
+        Field::new(
+            "event_time_ms",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
+        Field::new("amount", DataType::Float64, true),
+        Field::new("status", DataType::Utf8, true),
+        Field::new("region", DataType::Utf8, true),
+        Field::new("description", DataType::Utf8, true),
+        Field::new("payload", DataType::Binary, true),
+    ]))
+}
+
+fn wide_mixed_columns(offset: usize, len: usize) -> Vec<ArrayRef> {
+    let status_values = ["queued", "active", "settled", "failed", "cancelled"];
+    let region_values = ["us-west", "us-east", "eu-central", "ap-south"];
+    let id = (offset..offset + len)
+        .map(|row| 10_000_000_i64 + row as i64)
+        .collect::<Int64Array>();
+    let account_id = (offset..offset + len)
+        .map(|row| 1_000 + (row % 50_000) as i32)
+        .collect::<Int32Array>();
+    let event_time_ms = TimestampMillisecondArray::from_iter_values(
+        (offset..offset + len).map(|row| 1_735_689_600_000_i64 + (row as i64 * 1_000)),
+    );
+    let amount = (offset..offset + len)
+        .map(|row| {
+            if row % 17 == 0 {
+                None
+            } else {
+                Some(((row % 1_000_000) as f64 + 25.0) / 100.0)
+            }
+        })
+        .collect::<Float64Array>();
+    let status = (offset..offset + len)
+        .map(|row| {
+            if row % 19 == 0 {
+                None
+            } else {
+                Some(status_values[row % status_values.len()])
+            }
+        })
+        .collect::<StringArray>();
+    let region = (offset..offset + len)
+        .map(|row| {
+            if row % 23 == 0 {
+                None
+            } else {
+                Some(region_values[(row / 3) % region_values.len()])
+            }
+        })
+        .collect::<StringArray>();
+    let description = (offset..offset + len)
+        .map(|row| {
+            if row % 29 == 0 {
+                None
+            } else {
+                Some(deterministic_description(row))
+            }
+        })
+        .collect::<StringArray>();
+    let payload = (offset..offset + len)
+        .map(|row| {
+            if row % 31 == 0 {
+                None
+            } else {
+                Some(deterministic_payload(row))
+            }
+        })
+        .collect::<BinaryArray>();
+
+    vec![
+        Arc::new(id),
+        Arc::new(account_id),
+        Arc::new(event_time_ms),
+        Arc::new(amount),
+        Arc::new(status),
+        Arc::new(region),
+        Arc::new(description),
+        Arc::new(payload),
+    ]
+}
+
+fn deterministic_description(row: usize) -> String {
+    let words = [
+        "batch",
+        "transfer",
+        "ledger",
+        "route",
+        "validated",
+        "checkpoint",
+    ];
+    let repeats = 1 + row % 7;
+    let mut value = format!("event-{row:012}");
+
+    for index in 0..repeats {
+        value.push('-');
+        value.push_str(words[(row + index) % words.len()]);
+    }
+
+    value
+}
+
+fn deterministic_payload(row: usize) -> Vec<u8> {
+    let len = 8 + row % 57;
+    (0..len)
+        .map(|index| ((row.wrapping_mul(31) + index.wrapping_mul(17)) % 251) as u8)
+        .collect()
+}
+
 fn deterministic_i32(row: usize) -> i32 {
     let mixed = row.wrapping_mul(1_103_515_245).wrapping_add(12_345);
     (mixed % 1_000_000) as i32
@@ -409,8 +536,11 @@ fn scenario_names() -> String {
 #[cfg(test)]
 mod tests {
     use super::{BenchmarkOutput, WriterBenchError, WriterBenchOptions};
-    use arrow_array::{Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
-    use arrow_schema::DataType;
+    use arrow_array::{
+        Array, BinaryArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+        TimestampMillisecondArray,
+    };
+    use arrow_schema::{DataType, TimeUnit};
     use std::ffi::OsString;
 
     #[test]
@@ -642,6 +772,120 @@ mod tests {
     }
 
     #[test]
+    fn wide_mixed_schema_matches_definition() {
+        let options = WriterBenchOptions {
+            rows: 1,
+            batch_size: 1,
+            scenario: super::scenario_by_name("wide_mixed").unwrap(),
+            repeat: 1,
+            output: BenchmarkOutput::Human,
+        };
+
+        let batches = generated_batches(&options);
+        let schema = batches[0].schema();
+
+        assert_eq!(schema.fields().len(), 8);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+        assert!(!schema.field(0).is_nullable());
+        assert_eq!(schema.field(1).name(), "account_id");
+        assert_eq!(schema.field(1).data_type(), &DataType::Int32);
+        assert!(!schema.field(1).is_nullable());
+        assert_eq!(schema.field(2).name(), "event_time_ms");
+        assert_eq!(
+            schema.field(2).data_type(),
+            &DataType::Timestamp(TimeUnit::Millisecond, None)
+        );
+        assert!(!schema.field(2).is_nullable());
+        assert_eq!(schema.field(3).name(), "amount");
+        assert_eq!(schema.field(3).data_type(), &DataType::Float64);
+        assert!(schema.field(3).is_nullable());
+        assert_eq!(schema.field(4).name(), "status");
+        assert_eq!(schema.field(4).data_type(), &DataType::Utf8);
+        assert!(schema.field(4).is_nullable());
+        assert_eq!(schema.field(5).name(), "region");
+        assert_eq!(schema.field(5).data_type(), &DataType::Utf8);
+        assert!(schema.field(5).is_nullable());
+        assert_eq!(schema.field(6).name(), "description");
+        assert_eq!(schema.field(6).data_type(), &DataType::Utf8);
+        assert!(schema.field(6).is_nullable());
+        assert_eq!(schema.field(7).name(), "payload");
+        assert_eq!(schema.field(7).data_type(), &DataType::Binary);
+        assert!(schema.field(7).is_nullable());
+    }
+
+    #[test]
+    fn wide_mixed_contains_variable_text_binary_and_nulls() {
+        let options = WriterBenchOptions {
+            rows: 128,
+            batch_size: 128,
+            scenario: super::scenario_by_name("wide_mixed").unwrap(),
+            repeat: 1,
+            output: BenchmarkOutput::Human,
+        };
+
+        let batches = generated_batches(&options);
+        let batch = &batches[0];
+        let description = batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let payload = batch
+            .column(7)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+
+        assert!(batch.column(3).null_count() > 0);
+        assert!(batch.column(4).null_count() > 0);
+        assert!(batch.column(5).null_count() > 0);
+        assert!(description.null_count() > 0);
+        assert!(payload.null_count() > 0);
+        assert_ne!(description.value(1).len(), description.value(2).len());
+        assert_ne!(payload.value(1).len(), payload.value(2).len());
+    }
+
+    #[test]
+    fn wide_mixed_runtime_array_types_match_schema() {
+        let options = WriterBenchOptions {
+            rows: 3,
+            batch_size: 3,
+            scenario: super::scenario_by_name("wide_mixed").unwrap(),
+            repeat: 1,
+            output: BenchmarkOutput::Human,
+        };
+
+        let batches = generated_batches(&options);
+        let batch = &batches[0];
+
+        assert!(batch.column(0).as_any().is::<Int64Array>());
+        assert!(batch.column(1).as_any().is::<Int32Array>());
+        assert!(batch.column(2).as_any().is::<TimestampMillisecondArray>());
+        assert!(batch.column(3).as_any().is::<Float64Array>());
+        assert!(batch.column(4).as_any().is::<StringArray>());
+        assert!(batch.column(5).as_any().is::<StringArray>());
+        assert!(batch.column(6).as_any().is::<StringArray>());
+        assert!(batch.column(7).as_any().is::<BinaryArray>());
+    }
+
+    #[test]
+    fn wide_mixed_is_deterministic_across_readers() {
+        let options = WriterBenchOptions {
+            rows: 257,
+            batch_size: 31,
+            scenario: super::scenario_by_name("wide_mixed").unwrap(),
+            repeat: 1,
+            output: BenchmarkOutput::Human,
+        };
+
+        let first = generated_batches(&options);
+        let second = generated_batches(&options);
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
     fn lazy_reader_emits_no_empty_batch_for_exact_multiple() {
         let options = WriterBenchOptions {
             rows: 8,
@@ -722,7 +966,7 @@ mod tests {
             .map(|scenario| scenario.name)
             .collect::<Vec<_>>();
 
-        assert_eq!(names, ["narrow_numeric", "mixed_nullable"]);
+        assert_eq!(names, ["narrow_numeric", "mixed_nullable", "wide_mixed"]);
         assert!(
             super::SCENARIOS
                 .iter()
