@@ -9,6 +9,8 @@ use std::process::{Command, ExitCode, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod writer_bench;
+
 fn main() -> ExitCode {
     match run(env::args_os().skip(1)) {
         Ok(()) => ExitCode::SUCCESS,
@@ -36,6 +38,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), XtaskError> {
             let options = SqlServerTestOptions::parse(&args[1..])?;
             run_sqlserver_tests(&options)
         }
+        Some("writer-bench") => writer_bench::run(&args[1..]).map_err(XtaskError::WriterBench),
         Some(command) => Err(XtaskError::UnknownCommand(command.to_owned())),
     }
 }
@@ -86,7 +89,7 @@ fn run_sqlserver_tests(options: &SqlServerTestOptions) -> Result<(), XtaskError>
 
 fn print_help() {
     println!(
-        "Usage:\n  cargo xtask sqlserver-test [OPTIONS]\n\nCommands:\n  sqlserver-test    Run SQL Server integration tests\n\nOptions:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Test database name\n  --keep-container            Keep the container after the task exits\n  -h, --help                  Print help"
+        "Usage:\n  cargo xtask <COMMAND> [OPTIONS]\n\nCommands:\n  sqlserver-test    Run SQL Server integration tests\n  writer-bench      Generate writer benchmark inputs and summaries\n\nRun `cargo xtask <COMMAND> --help` for command-specific options."
     );
 }
 
@@ -475,6 +478,7 @@ enum XtaskError {
         seconds: u64,
         last_error: Option<String>,
     },
+    WriterBench(writer_bench::WriterBenchError),
 }
 
 impl fmt::Display for XtaskError {
@@ -513,6 +517,7 @@ impl fmt::Display for XtaskError {
                 }
                 Ok(())
             }
+            Self::WriterBench(source) => write!(f, "{source}"),
         }
     }
 }
