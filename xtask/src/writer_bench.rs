@@ -1,5 +1,6 @@
 use std::ffi::OsString;
 use std::fmt;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -45,8 +46,8 @@ fn run_baseline(args: &[OsString]) -> Result<(), WriterBenchError> {
         return Ok(());
     }
 
-    let options = WriterBenchOptions::parse(args)?;
-    let summary = summarize_generated_batches(&options)?;
+    let options = BaselineBenchOptions::parse(args)?;
+    let summary = summarize_generated_batches(&options.benchmark)?;
     print_baseline_summary(&options, &summary);
     Ok(())
 }
@@ -62,7 +63,7 @@ fn print_help() {
 
 fn print_baseline_help() {
     println!(
-        "Usage:\n  cargo xtask writer-bench baseline [OPTIONS]\n\nOptions:\n  --rows <COUNT>          Total rows to generate [default: 100000]\n  --batch-size <COUNT>    Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>       Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>        Number of benchmark repeats [default: 1]\n  --output <FORMAT>       Output format: human [default: human]\n  -h, --help              Print help"
+        "Usage:\n  cargo xtask writer-bench baseline [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep the container after the task exits\n  -h, --help                  Print help"
     );
 }
 
@@ -77,16 +78,30 @@ fn print_summary(options: &WriterBenchOptions, summary: &GeneratedBatchSummary) 
     println!("  generated rows per repeat: {}", summary.rows);
 }
 
-fn print_baseline_summary(options: &WriterBenchOptions, summary: &GeneratedBatchSummary) {
+fn print_baseline_summary(options: &BaselineBenchOptions, summary: &GeneratedBatchSummary) {
     println!("writer-bench baseline");
     println!("  backend: baseline_token_row");
-    println!("  rows per repeat: {}", options.rows);
-    println!("  batch size: {}", options.batch_size);
-    println!("  scenario: {}", options.scenario);
-    println!("  repeat: {}", options.repeat);
-    println!("  output: {}", options.output);
+    println!("  rows per repeat: {}", options.benchmark.rows);
+    println!("  batch size: {}", options.benchmark.batch_size);
+    println!("  scenario: {}", options.benchmark.scenario);
+    println!("  repeat: {}", options.benchmark.repeat);
+    println!("  output: {}", options.benchmark.output);
     println!("  batches per repeat: {}", summary.batches);
     println!("  generated rows per repeat: {}", summary.rows);
+    println!(
+        "  existing connection: {}",
+        options.sql_server.connection_string.is_some()
+    );
+    println!("  database: {}", options.sql_server.database);
+    if let Some(runtime) = &options.sql_server.container_runtime {
+        println!("  container runtime: {}", runtime.display());
+    } else if options.sql_server.connection_string.is_some() {
+        println!("  container runtime: <not used>");
+    } else {
+        println!("  container runtime: <auto>");
+    }
+    println!("  image: {}", options.sql_server.image);
+    println!("  keep container: {}", options.sql_server.keep_container);
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +169,104 @@ impl WriterBenchOptions {
         }
 
         Ok(options)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BaselineBenchOptions {
+    benchmark: WriterBenchOptions,
+    sql_server: BaselineSqlServerOptions,
+}
+
+impl BaselineBenchOptions {
+    fn parse(args: &[OsString]) -> Result<Self, WriterBenchError> {
+        let mut options = Self {
+            benchmark: WriterBenchOptions::default(),
+            sql_server: BaselineSqlServerOptions::default(),
+        };
+        let mut index = 0;
+
+        while index < args.len() {
+            let arg = args[index]
+                .to_str()
+                .ok_or_else(|| WriterBenchError::InvalidUtf8Argument(args[index].clone()))?;
+
+            match arg {
+                "-h" | "--help" => {
+                    print_baseline_help();
+                    return Ok(options);
+                }
+                "--rows" => {
+                    options.benchmark.rows =
+                        parse_positive_usize("--rows", &required_value(args, index)?)?;
+                    index += 1;
+                }
+                "--batch-size" => {
+                    options.benchmark.batch_size =
+                        parse_positive_usize("--batch-size", &required_value(args, index)?)?;
+                    index += 1;
+                }
+                "--scenario" => {
+                    options.benchmark.scenario = parse_scenario(&required_value(args, index)?)?;
+                    index += 1;
+                }
+                "--repeat" => {
+                    options.benchmark.repeat =
+                        parse_positive_usize("--repeat", &required_value(args, index)?)?;
+                    index += 1;
+                }
+                "--output" => {
+                    options.benchmark.output = required_value(args, index)?.parse()?;
+                    index += 1;
+                }
+                "--container-runtime" => {
+                    options.sql_server.container_runtime =
+                        Some(PathBuf::from(required_value(args, index)?));
+                    index += 1;
+                }
+                "--connection-string" => {
+                    options.sql_server.connection_string = Some(required_value(args, index)?);
+                    index += 1;
+                }
+                "--image" => {
+                    options.sql_server.image = required_value(args, index)?;
+                    index += 1;
+                }
+                "--database" => {
+                    options.sql_server.database = required_value(args, index)?;
+                    index += 1;
+                }
+                "--keep-container" => {
+                    options.sql_server.keep_container = true;
+                }
+                other => return Err(WriterBenchError::UnknownOption(other.to_owned())),
+            }
+
+            index += 1;
+        }
+
+        Ok(options)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BaselineSqlServerOptions {
+    container_runtime: Option<PathBuf>,
+    connection_string: Option<String>,
+    image: String,
+    database: String,
+    keep_container: bool,
+}
+
+impl Default for BaselineSqlServerOptions {
+    fn default() -> Self {
+        Self {
+            container_runtime: None,
+            connection_string: None,
+            image: "mcr.microsoft.com/mssql/server:2017-latest".to_owned(),
+            database: "arrow_tiberius_benchmark".to_owned(),
+            keep_container: false,
+        }
     }
 }
 
@@ -1018,6 +1131,7 @@ mod tests {
     };
     use arrow_schema::{DataType, TimeUnit};
     use std::ffi::OsString;
+    use std::path::PathBuf;
 
     #[test]
     fn parses_writer_bench_defaults() {
@@ -1111,6 +1225,49 @@ mod tests {
         ];
 
         super::run(&args).unwrap();
+    }
+
+    #[test]
+    fn parses_baseline_sql_server_options_without_leaking_connection_string() {
+        let args = [
+            OsString::from("--rows"),
+            OsString::from("17"),
+            OsString::from("--container-runtime"),
+            OsString::from("podman"),
+            OsString::from("--connection-string"),
+            OsString::from("server=tcp:127.0.0.1,1433;password=secret"),
+            OsString::from("--image"),
+            OsString::from("custom-sqlserver"),
+            OsString::from("--database"),
+            OsString::from("bench_db"),
+            OsString::from("--keep-container"),
+        ];
+
+        let options = super::BaselineBenchOptions::parse(&args).unwrap();
+
+        assert_eq!(options.benchmark.rows, 17);
+        assert_eq!(
+            options.sql_server.container_runtime,
+            Some(PathBuf::from("podman"))
+        );
+        assert_eq!(
+            options.sql_server.connection_string.as_deref(),
+            Some("server=tcp:127.0.0.1,1433;password=secret")
+        );
+        assert_eq!(options.sql_server.image, "custom-sqlserver");
+        assert_eq!(options.sql_server.database, "bench_db");
+        assert!(options.sql_server.keep_container);
+    }
+
+    #[test]
+    fn rejects_missing_baseline_sql_server_option_value() {
+        let args = [OsString::from("--connection-string")];
+        let err = super::BaselineBenchOptions::parse(&args).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::MissingOptionValue(option) if option == "--connection-string"
+        ));
     }
 
     #[test]
