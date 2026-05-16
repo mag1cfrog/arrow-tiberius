@@ -1,33 +1,90 @@
 use std::ffi::OsString;
 use std::fmt;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
+use crate::sqlserver;
 use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int32Array,
     Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow_tiberius::{
+    BulkWriter, MssqlProfile, PlanOptions, SchemaMapping, TableName, WriteBackend, WriteOptions,
+    create_table_sql_from_mappings, plan_arrow_schema_to_mssql_mappings,
+};
+use tokio::net::TcpStream;
+use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
+
+static BENCH_TABLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn run(args: &[OsString]) -> Result<(), WriterBenchError> {
-    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+    if args.is_empty()
+        || args
+            .first()
+            .is_some_and(|arg| arg == "-h" || arg == "--help")
+    {
         print_help();
         return Ok(());
     }
 
+    if let Some(command) = args.first().and_then(|arg| arg.to_str()) {
+        if command == "baseline" {
+            return run_baseline(&args[1..]);
+        }
+
+        if !command.starts_with('-') {
+            return Err(WriterBenchError::UnknownCommand(command.to_owned()));
+        }
+    }
+
+    run_generated_summary(args)
+}
+
+fn run_generated_summary(args: &[OsString]) -> Result<(), WriterBenchError> {
     let options = WriterBenchOptions::parse(args)?;
     let summary = summarize_generated_batches(&options)?;
     print_summary(&options, &summary);
     Ok(())
 }
 
+fn run_baseline(args: &[OsString]) -> Result<(), WriterBenchError> {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print_baseline_help();
+        return Ok(());
+    }
+
+    let options = BaselineBenchOptions::parse(args)?;
+    let connection = options
+        .sql_server
+        .connect_or_start()
+        .map_err(WriterBenchError::SqlServer)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .map_err(WriterBenchError::Io)?;
+    let report = runtime.block_on(run_baseline_async(&options, &connection))?;
+
+    print_baseline_summary(&options, &report, &connection);
+    Ok(())
+}
+
 fn print_help() {
     println!(
-        "Usage:\n  cargo xtask writer-bench [OPTIONS]\n\nOptions:\n  --rows <COUNT>          Total rows to generate [default: 100000]\n  --batch-size <COUNT>    Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>       Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>        Number of benchmark repeats [default: 1]\n  --output <FORMAT>       Output format: human [default: human]\n  -h, --help              Print help\n\nScenarios:"
+        "Usage:\n  cargo xtask writer-bench [OPTIONS]\n  cargo xtask writer-bench baseline [OPTIONS]\n\nCommands:\n  baseline    Run the baseline TokenRow SQL Server writer benchmark\n\nOptions:\n  --rows <COUNT>          Total rows to generate [default: 100000]\n  --batch-size <COUNT>    Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>       Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>        Number of benchmark repeats [default: 1]\n  --output <FORMAT>       Output format: human [default: human]\n  -h, --help              Print help\n\nScenarios:"
     );
     for scenario in SCENARIOS {
         println!("  {:<16}  {}", scenario.name, scenario.description);
     }
+}
+
+fn print_baseline_help() {
+    println!(
+        "Usage:\n  cargo xtask writer-bench baseline [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep the container after the task exits\n  -h, --help                  Print help"
+    );
 }
 
 fn print_summary(options: &WriterBenchOptions, summary: &GeneratedBatchSummary) {
@@ -39,6 +96,50 @@ fn print_summary(options: &WriterBenchOptions, summary: &GeneratedBatchSummary) 
     println!("  output: {}", options.output);
     println!("  batches per repeat: {}", summary.batches);
     println!("  generated rows per repeat: {}", summary.rows);
+}
+
+fn print_baseline_summary(
+    options: &BaselineBenchOptions,
+    report: &BaselineBenchReport,
+    connection: &sqlserver::SqlServerConnection,
+) {
+    println!("writer-bench baseline");
+    println!("  backend: baseline_token_row");
+    println!("  rows per repeat: {}", options.benchmark.rows);
+    println!("  batch size: {}", options.benchmark.batch_size);
+    println!("  scenario: {}", options.benchmark.scenario);
+    println!("  repeat: {}", options.benchmark.repeat);
+    println!("  output: {}", options.benchmark.output);
+    println!("  batches written: {}", report.stats.batches_written);
+    println!("  rows written: {}", report.stats.rows_written);
+    println!(
+        "  write rows/sec: {}",
+        format_rows_per_second(
+            report.stats.rows_written,
+            report.timings.write + report.timings.finish
+        )
+    );
+    println!("  validated rows: {}", report.validated_rows);
+    println!(
+        "  existing connection: {}",
+        options.sql_server.connection_string.is_some()
+    );
+    println!("  database: {}", connection.database);
+    if let Some(runtime) = &options.sql_server.container_runtime {
+        println!("  container runtime: {}", runtime.display());
+    } else if options.sql_server.connection_string.is_some() {
+        println!("  container runtime: <not used>");
+    } else {
+        println!("  container runtime: <auto>");
+    }
+    println!("  image: {}", options.sql_server.image);
+    println!("  keep container: {}", options.sql_server.keep_container);
+    println!("  setup: {}", format_duration(report.timings.setup));
+    println!("  write: {}", format_duration(report.timings.write));
+    println!("  finish: {}", format_duration(report.timings.finish));
+    println!("  validate: {}", format_duration(report.timings.validate));
+    println!("  cleanup: {}", format_duration(report.timings.cleanup));
+    println!("  total: {}", format_duration(report.timings.total));
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +199,83 @@ impl WriterBenchOptions {
                 "--output" => {
                     options.output = required_value(args, index)?.parse()?;
                     index += 1;
+                }
+                other => return Err(WriterBenchError::UnknownOption(other.to_owned())),
+            }
+
+            index += 1;
+        }
+
+        Ok(options)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BaselineBenchOptions {
+    benchmark: WriterBenchOptions,
+    sql_server: sqlserver::SqlServerConnectionOptions,
+}
+
+impl BaselineBenchOptions {
+    fn parse(args: &[OsString]) -> Result<Self, WriterBenchError> {
+        let mut options = Self {
+            benchmark: WriterBenchOptions::default(),
+            sql_server: sqlserver::SqlServerConnectionOptions::benchmark_default(),
+        };
+        let mut index = 0;
+
+        while index < args.len() {
+            let arg = args[index]
+                .to_str()
+                .ok_or_else(|| WriterBenchError::InvalidUtf8Argument(args[index].clone()))?;
+
+            match arg {
+                "-h" | "--help" => {
+                    print_baseline_help();
+                    return Ok(options);
+                }
+                "--rows" => {
+                    options.benchmark.rows =
+                        parse_positive_usize("--rows", &required_value(args, index)?)?;
+                    index += 1;
+                }
+                "--batch-size" => {
+                    options.benchmark.batch_size =
+                        parse_positive_usize("--batch-size", &required_value(args, index)?)?;
+                    index += 1;
+                }
+                "--scenario" => {
+                    options.benchmark.scenario = parse_scenario(&required_value(args, index)?)?;
+                    index += 1;
+                }
+                "--repeat" => {
+                    options.benchmark.repeat =
+                        parse_positive_usize("--repeat", &required_value(args, index)?)?;
+                    index += 1;
+                }
+                "--output" => {
+                    options.benchmark.output = required_value(args, index)?.parse()?;
+                    index += 1;
+                }
+                "--container-runtime" => {
+                    options.sql_server.container_runtime =
+                        Some(PathBuf::from(required_value(args, index)?));
+                    index += 1;
+                }
+                "--connection-string" => {
+                    options.sql_server.connection_string = Some(required_value(args, index)?);
+                    index += 1;
+                }
+                "--image" => {
+                    options.sql_server.image = required_value(args, index)?;
+                    index += 1;
+                }
+                "--database" => {
+                    options.sql_server.database = required_value(args, index)?;
+                    index += 1;
+                }
+                "--keep-container" => {
+                    options.sql_server.keep_container = true;
                 }
                 other => return Err(WriterBenchError::UnknownOption(other.to_owned())),
             }
@@ -225,9 +403,13 @@ struct GeneratedBatchReader {
 
 impl GeneratedBatchReader {
     fn new(options: &WriterBenchOptions) -> Self {
+        Self::new_with_schema(options, (options.scenario.schema)())
+    }
+
+    fn new_with_schema(options: &WriterBenchOptions, schema: SchemaRef) -> Self {
         Self {
             scenario: options.scenario,
-            schema: (options.scenario.schema)(),
+            schema,
             rows: options.rows,
             batch_size: options.batch_size,
             next_offset: 0,
@@ -260,6 +442,236 @@ impl Iterator for GeneratedBatchReader {
 struct GeneratedBatchSummary {
     batches: usize,
     rows: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BaselineBenchReport {
+    stats: arrow_tiberius::WriteStats,
+    validated_rows: u64,
+    timings: BaselineBenchTimings,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BaselineBenchTimings {
+    setup: Duration,
+    write: Duration,
+    finish: Duration,
+    validate: Duration,
+    cleanup: Duration,
+    total: Duration,
+}
+
+type BenchClient = tiberius::Client<Compat<TcpStream>>;
+
+async fn run_baseline_async(
+    options: &BaselineBenchOptions,
+    connection: &sqlserver::SqlServerConnection,
+) -> Result<BaselineBenchReport, WriterBenchError> {
+    let total_start = Instant::now();
+    let mut report = BaselineBenchReport::default();
+
+    let setup_start = Instant::now();
+    let mut client = connect(&connection.connection_string, &connection.database).await?;
+    let schema = (options.benchmark.scenario.schema)();
+    let mappings = benchmark_mappings_for_schema(Arc::clone(&schema))?;
+    report.timings.setup += setup_start.elapsed();
+
+    for _repeat_index in 0..options.benchmark.repeat {
+        let table = unique_benchmark_table_name()?;
+        let repeat_report =
+            run_baseline_repeat(&mut client, options, &schema, &mappings, &table).await;
+        let cleanup_start = Instant::now();
+        let cleanup_result = drop_table(&mut client, &table).await;
+        report.timings.cleanup += cleanup_start.elapsed();
+
+        if let Err(source) = cleanup_result {
+            if repeat_report.is_err() {
+                eprintln!(
+                    "warning: failed to clean up benchmark table {} after benchmark failure: {source}",
+                    table.quoted_sql()
+                );
+            } else {
+                return Err(WriterBenchError::Tiberius(source));
+            }
+        }
+
+        let repeat_report = repeat_report?;
+        report.stats.rows_written = report
+            .stats
+            .rows_written
+            .saturating_add(repeat_report.stats.rows_written);
+        report.stats.batches_written = report
+            .stats
+            .batches_written
+            .saturating_add(repeat_report.stats.batches_written);
+        report.validated_rows = report
+            .validated_rows
+            .saturating_add(repeat_report.validated_rows);
+        report.timings.setup += repeat_report.timings.setup;
+        report.timings.write += repeat_report.timings.write;
+        report.timings.finish += repeat_report.timings.finish;
+        report.timings.validate += repeat_report.timings.validate;
+    }
+
+    report.timings.total = total_start.elapsed();
+    Ok(report)
+}
+
+async fn run_baseline_repeat(
+    client: &mut BenchClient,
+    options: &BaselineBenchOptions,
+    schema: &SchemaRef,
+    mappings: &[arrow_tiberius::SchemaMapping],
+    table: &TableName,
+) -> Result<BaselineBenchReport, WriterBenchError> {
+    let mut report = BaselineBenchReport::default();
+    let setup_start = Instant::now();
+
+    execute_sql(
+        client,
+        format!("DROP TABLE IF EXISTS {}", table.quoted_sql()),
+    )
+    .await?;
+    execute_sql(client, benchmark_table_sql(table, mappings)).await?;
+    let mut writer = BulkWriter::new(
+        client,
+        table.clone(),
+        mappings.to_vec(),
+        WriteOptions {
+            backend: WriteBackend::BaselineTokenRow,
+            ..WriteOptions::default()
+        },
+    )
+    .await
+    .map_err(WriterBenchError::ArrowTiberius)?;
+    report.timings.setup += setup_start.elapsed();
+
+    let write_start = Instant::now();
+    for batch in GeneratedBatchReader::new_with_schema(&options.benchmark, Arc::clone(schema)) {
+        let batch = batch?;
+        report.stats = writer
+            .write_batch(&batch)
+            .await
+            .map_err(WriterBenchError::ArrowTiberius)?;
+    }
+    report.timings.write += write_start.elapsed();
+
+    let finish_start = Instant::now();
+    report.stats = writer
+        .finish()
+        .await
+        .map_err(WriterBenchError::ArrowTiberius)?;
+    report.timings.finish += finish_start.elapsed();
+
+    let validate_start = Instant::now();
+    report.validated_rows = select_count(client, table).await?;
+    report.timings.validate += validate_start.elapsed();
+
+    if report.validated_rows != report.stats.rows_written {
+        return Err(WriterBenchError::RowCountMismatch {
+            expected: report.stats.rows_written,
+            actual: report.validated_rows,
+        });
+    }
+
+    Ok(report)
+}
+
+async fn connect(connection_string: &str, database: &str) -> Result<BenchClient, WriterBenchError> {
+    let connection_string = format!("{connection_string};database={database}");
+    let config = tiberius::Config::from_ado_string(&connection_string)
+        .map_err(WriterBenchError::Tiberius)?;
+    let tcp = TcpStream::connect(config.get_addr())
+        .await
+        .map_err(WriterBenchError::Io)?;
+
+    tiberius::Client::connect(config, tcp.compat_write())
+        .await
+        .map_err(WriterBenchError::Tiberius)
+}
+
+async fn execute_sql(client: &mut BenchClient, sql: String) -> Result<(), WriterBenchError> {
+    client
+        .simple_query(sql)
+        .await
+        .map_err(WriterBenchError::Tiberius)?
+        .into_results()
+        .await
+        .map_err(WriterBenchError::Tiberius)?;
+
+    Ok(())
+}
+
+async fn drop_table(client: &mut BenchClient, table: &TableName) -> tiberius::Result<()> {
+    client
+        .simple_query(format!("DROP TABLE IF EXISTS {}", table.quoted_sql()))
+        .await?
+        .into_results()
+        .await?;
+
+    Ok(())
+}
+
+async fn select_count(
+    client: &mut BenchClient,
+    table: &TableName,
+) -> Result<u64, WriterBenchError> {
+    let row = client
+        .simple_query(format!("SELECT COUNT_BIG(*) FROM {}", table.quoted_sql()))
+        .await
+        .map_err(WriterBenchError::Tiberius)?
+        .into_row()
+        .await
+        .map_err(WriterBenchError::Tiberius)?
+        .ok_or_else(|| {
+            WriterBenchError::Validation("SELECT COUNT_BIG(*) returned no row".to_owned())
+        })?;
+    let count = row.get::<i64, _>(0).ok_or_else(|| {
+        WriterBenchError::Validation("SELECT COUNT_BIG(*) did not return bigint".to_owned())
+    })?;
+
+    u64::try_from(count).map_err(|_| {
+        WriterBenchError::Validation(format!(
+            "SELECT COUNT_BIG(*) returned negative count {count}"
+        ))
+    })
+}
+
+fn unique_benchmark_table_name() -> Result<TableName, WriterBenchError> {
+    let counter = BENCH_TABLE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let table = format!("arrow_tiberius_bench_{}_{}", std::process::id(), counter);
+
+    TableName::new("dbo", table).map_err(WriterBenchError::ArrowTiberius)
+}
+
+fn benchmark_table_sql(table: &TableName, mappings: &[SchemaMapping]) -> String {
+    create_table_sql_from_mappings(table, mappings)
+}
+
+fn benchmark_mappings_for_schema(
+    schema: SchemaRef,
+) -> Result<Vec<SchemaMapping>, WriterBenchError> {
+    let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
+        schema,
+        MssqlProfile::sql_server_2016_compat_100(),
+        PlanOptions::default(),
+    )
+    .map_err(WriterBenchError::ArrowTiberius)?
+    .into_parts();
+
+    Ok(mappings)
+}
+
+fn format_duration(duration: Duration) -> String {
+    format!("{:.3}s", duration.as_secs_f64())
+}
+
+fn format_rows_per_second(rows: u64, elapsed: Duration) -> String {
+    if elapsed.is_zero() {
+        return "n/a".to_owned();
+    }
+
+    format!("{:.2}", rows as f64 / elapsed.as_secs_f64())
 }
 
 fn summarize_generated_batches(
@@ -918,6 +1330,7 @@ fn option_name(args: &[OsString], index: usize) -> String {
 
 #[derive(Debug)]
 pub(super) enum WriterBenchError {
+    UnknownCommand(String),
     UnknownOption(String),
     MissingOptionValue(String),
     InvalidUtf8Argument(OsString),
@@ -925,11 +1338,18 @@ pub(super) enum WriterBenchError {
     InvalidScenario(String),
     InvalidOutput(String),
     Arrow(arrow_schema::ArrowError),
+    ArrowTiberius(arrow_tiberius::Error),
+    Tiberius(tiberius::error::Error),
+    SqlServer(sqlserver::SqlServerError),
+    Io(std::io::Error),
+    Validation(String),
+    RowCountMismatch { expected: u64, actual: u64 },
 }
 
 impl fmt::Display for WriterBenchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnknownCommand(command) => write!(f, "unknown writer-bench command `{command}`"),
             Self::UnknownOption(option) => write!(f, "unknown writer-bench option `{option}`"),
             Self::MissingOptionValue(option) => write!(f, "missing value for `{option}`"),
             Self::InvalidUtf8Argument(arg) => write!(f, "argument is not valid UTF-8: {arg:?}"),
@@ -947,6 +1367,15 @@ impl fmt::Display for WriterBenchError {
                 write!(f, "unknown writer-bench output `{value}`; expected human")
             }
             Self::Arrow(source) => write!(f, "failed to generate Arrow benchmark data: {source}"),
+            Self::ArrowTiberius(source) => write!(f, "arrow-tiberius benchmark failed: {source}"),
+            Self::Tiberius(source) => write!(f, "SQL Server benchmark operation failed: {source}"),
+            Self::SqlServer(source) => write!(f, "{source}"),
+            Self::Io(source) => write!(f, "benchmark I/O failed: {source}"),
+            Self::Validation(reason) => write!(f, "benchmark validation failed: {reason}"),
+            Self::RowCountMismatch { expected, actual } => write!(
+                f,
+                "benchmark row-count validation failed: expected {expected}, got {actual}"
+            ),
         }
     }
 }
@@ -968,6 +1397,7 @@ mod tests {
     };
     use arrow_schema::{DataType, TimeUnit};
     use std::ffi::OsString;
+    use std::path::PathBuf;
 
     #[test]
     fn parses_writer_bench_defaults() {
@@ -1046,6 +1476,130 @@ mod tests {
         let err = WriterBenchOptions::parse(&args).unwrap_err();
 
         assert!(matches!(err, WriterBenchError::InvalidOutput(value) if value == "json"));
+    }
+
+    #[test]
+    fn parses_baseline_command_with_shared_generation_options() {
+        let args = [
+            OsString::from("--rows"),
+            OsString::from("10"),
+            OsString::from("--batch-size"),
+            OsString::from("4"),
+            OsString::from("--scenario"),
+            OsString::from("mixed_nullable"),
+            OsString::from("--connection-string"),
+            OsString::from("server=tcp:127.0.0.1,1433;password=secret"),
+            OsString::from("--database"),
+            OsString::from("bench_db"),
+        ];
+
+        let options = super::BaselineBenchOptions::parse(&args).unwrap();
+
+        assert_eq!(options.benchmark.rows, 10);
+        assert_eq!(options.benchmark.batch_size, 4);
+        assert_eq!(options.benchmark.scenario.name, "mixed_nullable");
+        assert_eq!(options.sql_server.database, "bench_db");
+        assert!(options.sql_server.connection_string.is_some());
+    }
+
+    #[test]
+    fn parses_baseline_sql_server_options_without_leaking_connection_string() {
+        let args = [
+            OsString::from("--rows"),
+            OsString::from("17"),
+            OsString::from("--container-runtime"),
+            OsString::from("podman"),
+            OsString::from("--connection-string"),
+            OsString::from("server=tcp:127.0.0.1,1433;password=secret"),
+            OsString::from("--image"),
+            OsString::from("custom-sqlserver"),
+            OsString::from("--database"),
+            OsString::from("bench_db"),
+            OsString::from("--keep-container"),
+        ];
+
+        let options = super::BaselineBenchOptions::parse(&args).unwrap();
+
+        assert_eq!(options.benchmark.rows, 17);
+        assert_eq!(
+            options.sql_server.container_runtime,
+            Some(PathBuf::from("podman"))
+        );
+        assert_eq!(
+            options.sql_server.connection_string.as_deref(),
+            Some("server=tcp:127.0.0.1,1433;password=secret")
+        );
+        assert_eq!(options.sql_server.image, "custom-sqlserver");
+        assert_eq!(options.sql_server.database, "bench_db");
+        assert!(options.sql_server.keep_container);
+    }
+
+    #[test]
+    fn renders_narrow_numeric_benchmark_table_ddl() {
+        let table = arrow_tiberius::TableName::new("dbo", "bench").unwrap();
+        let schema = (super::scenario_by_name("narrow_numeric").unwrap().schema)();
+        let mappings = super::benchmark_mappings_for_schema(schema).unwrap();
+        let sql = super::benchmark_table_sql(&table, &mappings);
+
+        assert_eq!(
+            sql,
+            "CREATE TABLE [dbo].[bench] (\n    [id32] int NOT NULL,\n    [id64] bigint NOT NULL,\n    [score] float(53) NOT NULL\n);"
+        );
+    }
+
+    #[test]
+    fn renders_mixed_nullable_benchmark_table_ddl() {
+        let table = arrow_tiberius::TableName::new("dbo", "bench").unwrap();
+        let schema = (super::scenario_by_name("mixed_nullable").unwrap().schema)();
+        let mappings = super::benchmark_mappings_for_schema(schema).unwrap();
+        let sql = super::benchmark_table_sql(&table, &mappings);
+
+        assert_eq!(
+            sql,
+            "CREATE TABLE [dbo].[bench] (\n    [id32] int NOT NULL,\n    [maybe_id64] bigint NULL,\n    [maybe_score] float(53) NULL,\n    [category] nvarchar(max) NULL\n);"
+        );
+    }
+
+    #[test]
+    fn formats_rows_per_second_for_report_output() {
+        assert_eq!(
+            super::format_rows_per_second(2_500, std::time::Duration::from_millis(500)),
+            "5000.00"
+        );
+    }
+
+    #[test]
+    fn formats_zero_elapsed_rows_per_second_without_panicking() {
+        assert_eq!(
+            super::format_rows_per_second(2_500, std::time::Duration::ZERO),
+            "n/a"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_baseline_sql_server_option_value() {
+        let args = [OsString::from("--connection-string")];
+        let err = super::BaselineBenchOptions::parse(&args).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::MissingOptionValue(option) if option == "--connection-string"
+        ));
+    }
+
+    #[test]
+    fn baseline_help_does_not_parse_generation_options() {
+        let args = [OsString::from("baseline"), OsString::from("--help")];
+
+        super::run(&args).unwrap();
+    }
+
+    #[test]
+    fn rejects_unknown_writer_bench_command() {
+        let args = [OsString::from("direct")];
+        let err = super::run(&args).unwrap_err();
+
+        assert!(matches!(err, WriterBenchError::UnknownCommand(command) if command == "direct"));
     }
 
     #[test]
