@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use crate::sqlserver;
 use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int32Array,
     Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
@@ -47,8 +48,12 @@ fn run_baseline(args: &[OsString]) -> Result<(), WriterBenchError> {
     }
 
     let options = BaselineBenchOptions::parse(args)?;
+    let connection = options
+        .sql_server
+        .connect_or_start()
+        .map_err(WriterBenchError::SqlServer)?;
     let summary = summarize_generated_batches(&options.benchmark)?;
-    print_baseline_summary(&options, &summary);
+    print_baseline_summary(&options, &summary, &connection);
     Ok(())
 }
 
@@ -78,7 +83,11 @@ fn print_summary(options: &WriterBenchOptions, summary: &GeneratedBatchSummary) 
     println!("  generated rows per repeat: {}", summary.rows);
 }
 
-fn print_baseline_summary(options: &BaselineBenchOptions, summary: &GeneratedBatchSummary) {
+fn print_baseline_summary(
+    options: &BaselineBenchOptions,
+    summary: &GeneratedBatchSummary,
+    connection: &sqlserver::SqlServerConnection,
+) {
     println!("writer-bench baseline");
     println!("  backend: baseline_token_row");
     println!("  rows per repeat: {}", options.benchmark.rows);
@@ -92,7 +101,7 @@ fn print_baseline_summary(options: &BaselineBenchOptions, summary: &GeneratedBat
         "  existing connection: {}",
         options.sql_server.connection_string.is_some()
     );
-    println!("  database: {}", options.sql_server.database);
+    println!("  database: {}", connection.database);
     if let Some(runtime) = &options.sql_server.container_runtime {
         println!("  container runtime: {}", runtime.display());
     } else if options.sql_server.connection_string.is_some() {
@@ -175,14 +184,14 @@ impl WriterBenchOptions {
 #[derive(Debug, Clone)]
 struct BaselineBenchOptions {
     benchmark: WriterBenchOptions,
-    sql_server: BaselineSqlServerOptions,
+    sql_server: sqlserver::SqlServerConnectionOptions,
 }
 
 impl BaselineBenchOptions {
     fn parse(args: &[OsString]) -> Result<Self, WriterBenchError> {
         let mut options = Self {
             benchmark: WriterBenchOptions::default(),
-            sql_server: BaselineSqlServerOptions::default(),
+            sql_server: sqlserver::SqlServerConnectionOptions::benchmark_default(),
         };
         let mut index = 0;
 
@@ -246,27 +255,6 @@ impl BaselineBenchOptions {
         }
 
         Ok(options)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BaselineSqlServerOptions {
-    container_runtime: Option<PathBuf>,
-    connection_string: Option<String>,
-    image: String,
-    database: String,
-    keep_container: bool,
-}
-
-impl Default for BaselineSqlServerOptions {
-    fn default() -> Self {
-        Self {
-            container_runtime: None,
-            connection_string: None,
-            image: "mcr.microsoft.com/mssql/server:2017-latest".to_owned(),
-            database: "arrow_tiberius_benchmark".to_owned(),
-            keep_container: false,
-        }
     }
 }
 
@@ -1087,6 +1075,7 @@ pub(super) enum WriterBenchError {
     InvalidScenario(String),
     InvalidOutput(String),
     Arrow(arrow_schema::ArrowError),
+    SqlServer(sqlserver::SqlServerError),
 }
 
 impl fmt::Display for WriterBenchError {
@@ -1110,6 +1099,7 @@ impl fmt::Display for WriterBenchError {
                 write!(f, "unknown writer-bench output `{value}`; expected human")
             }
             Self::Arrow(source) => write!(f, "failed to generate Arrow benchmark data: {source}"),
+            Self::SqlServer(source) => write!(f, "{source}"),
         }
     }
 }
@@ -1222,6 +1212,10 @@ mod tests {
             OsString::from("4"),
             OsString::from("--scenario"),
             OsString::from("mixed_nullable"),
+            OsString::from("--connection-string"),
+            OsString::from("server=tcp:127.0.0.1,1433;password=secret"),
+            OsString::from("--database"),
+            OsString::from("bench_db"),
         ];
 
         super::run(&args).unwrap();
