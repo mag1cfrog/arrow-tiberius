@@ -10,28 +10,76 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
 pub(super) fn run(args: &[OsString]) -> Result<(), WriterBenchError> {
-    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+    if args.is_empty()
+        || args
+            .first()
+            .is_some_and(|arg| arg == "-h" || arg == "--help")
+    {
         print_help();
         return Ok(());
     }
 
+    if let Some(command) = args.first().and_then(|arg| arg.to_str()) {
+        if command == "baseline" {
+            return run_baseline(&args[1..]);
+        }
+
+        if !command.starts_with('-') {
+            return Err(WriterBenchError::UnknownCommand(command.to_owned()));
+        }
+    }
+
+    run_generated_summary(args)
+}
+
+fn run_generated_summary(args: &[OsString]) -> Result<(), WriterBenchError> {
     let options = WriterBenchOptions::parse(args)?;
     let summary = summarize_generated_batches(&options)?;
     print_summary(&options, &summary);
     Ok(())
 }
 
+fn run_baseline(args: &[OsString]) -> Result<(), WriterBenchError> {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print_baseline_help();
+        return Ok(());
+    }
+
+    let options = WriterBenchOptions::parse(args)?;
+    let summary = summarize_generated_batches(&options)?;
+    print_baseline_summary(&options, &summary);
+    Ok(())
+}
+
 fn print_help() {
     println!(
-        "Usage:\n  cargo xtask writer-bench [OPTIONS]\n\nOptions:\n  --rows <COUNT>          Total rows to generate [default: 100000]\n  --batch-size <COUNT>    Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>       Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>        Number of benchmark repeats [default: 1]\n  --output <FORMAT>       Output format: human [default: human]\n  -h, --help              Print help\n\nScenarios:"
+        "Usage:\n  cargo xtask writer-bench [OPTIONS]\n  cargo xtask writer-bench baseline [OPTIONS]\n\nCommands:\n  baseline    Run the baseline TokenRow SQL Server writer benchmark\n\nOptions:\n  --rows <COUNT>          Total rows to generate [default: 100000]\n  --batch-size <COUNT>    Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>       Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>        Number of benchmark repeats [default: 1]\n  --output <FORMAT>       Output format: human [default: human]\n  -h, --help              Print help\n\nScenarios:"
     );
     for scenario in SCENARIOS {
         println!("  {:<16}  {}", scenario.name, scenario.description);
     }
 }
 
+fn print_baseline_help() {
+    println!(
+        "Usage:\n  cargo xtask writer-bench baseline [OPTIONS]\n\nOptions:\n  --rows <COUNT>          Total rows to generate [default: 100000]\n  --batch-size <COUNT>    Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>       Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>        Number of benchmark repeats [default: 1]\n  --output <FORMAT>       Output format: human [default: human]\n  -h, --help              Print help"
+    );
+}
+
 fn print_summary(options: &WriterBenchOptions, summary: &GeneratedBatchSummary) {
     println!("writer-bench");
+    println!("  rows per repeat: {}", options.rows);
+    println!("  batch size: {}", options.batch_size);
+    println!("  scenario: {}", options.scenario);
+    println!("  repeat: {}", options.repeat);
+    println!("  output: {}", options.output);
+    println!("  batches per repeat: {}", summary.batches);
+    println!("  generated rows per repeat: {}", summary.rows);
+}
+
+fn print_baseline_summary(options: &WriterBenchOptions, summary: &GeneratedBatchSummary) {
+    println!("writer-bench baseline");
+    println!("  backend: baseline_token_row");
     println!("  rows per repeat: {}", options.rows);
     println!("  batch size: {}", options.batch_size);
     println!("  scenario: {}", options.scenario);
@@ -918,6 +966,7 @@ fn option_name(args: &[OsString], index: usize) -> String {
 
 #[derive(Debug)]
 pub(super) enum WriterBenchError {
+    UnknownCommand(String),
     UnknownOption(String),
     MissingOptionValue(String),
     InvalidUtf8Argument(OsString),
@@ -930,6 +979,7 @@ pub(super) enum WriterBenchError {
 impl fmt::Display for WriterBenchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnknownCommand(command) => write!(f, "unknown writer-bench command `{command}`"),
             Self::UnknownOption(option) => write!(f, "unknown writer-bench option `{option}`"),
             Self::MissingOptionValue(option) => write!(f, "missing value for `{option}`"),
             Self::InvalidUtf8Argument(arg) => write!(f, "argument is not valid UTF-8: {arg:?}"),
@@ -1046,6 +1096,36 @@ mod tests {
         let err = WriterBenchOptions::parse(&args).unwrap_err();
 
         assert!(matches!(err, WriterBenchError::InvalidOutput(value) if value == "json"));
+    }
+
+    #[test]
+    fn runs_baseline_command_with_shared_generation_options() {
+        let args = [
+            OsString::from("baseline"),
+            OsString::from("--rows"),
+            OsString::from("10"),
+            OsString::from("--batch-size"),
+            OsString::from("4"),
+            OsString::from("--scenario"),
+            OsString::from("mixed_nullable"),
+        ];
+
+        super::run(&args).unwrap();
+    }
+
+    #[test]
+    fn baseline_help_does_not_parse_generation_options() {
+        let args = [OsString::from("baseline"), OsString::from("--help")];
+
+        super::run(&args).unwrap();
+    }
+
+    #[test]
+    fn rejects_unknown_writer_bench_command() {
+        let args = [OsString::from("direct")];
+        let err = super::run(&args).unwrap_err();
+
+        assert!(matches!(err, WriterBenchError::UnknownCommand(command) if command == "direct"));
     }
 
     #[test]
