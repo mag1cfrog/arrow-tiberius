@@ -111,7 +111,7 @@ impl SqlServerContainer {
             .arg(format!("127.0.0.1:{host_port}:1433"))
             .arg(&options.image);
 
-        run_command(&mut command, "start SQL Server container")?;
+        run_command_capture(&mut command)?;
 
         Ok(Self {
             runtime,
@@ -245,24 +245,6 @@ fn find_on_path(executable: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-fn run_command(command: &mut Command, description: &'static str) -> Result<(), SqlServerError> {
-    let status = command
-        .status()
-        .map_err(|source| SqlServerError::CommandSpawn {
-            description,
-            source,
-        })?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(SqlServerError::CommandStatus {
-            description,
-            status,
-        })
-    }
-}
-
 fn run_command_capture(command: &mut Command) -> Result<(), SqlServerError> {
     let output = command
         .output()
@@ -349,10 +331,6 @@ pub(crate) enum SqlServerError {
         description: &'static str,
         source: std::io::Error,
     },
-    CommandStatus {
-        description: &'static str,
-        status: std::process::ExitStatus,
-    },
     CommandFailed(String, String),
     PortBind(std::io::Error),
     InvalidDatabaseName(String),
@@ -374,12 +352,6 @@ impl fmt::Display for SqlServerError {
                 source,
             } => {
                 write!(f, "failed to {description}: {source}")
-            }
-            Self::CommandStatus {
-                description,
-                status,
-            } => {
-                write!(f, "{description} failed with {status}")
             }
             Self::CommandFailed(command, message) => write!(f, "{command} failed: {message}"),
             Self::PortBind(source) => write!(f, "failed to reserve a local port: {source}"),

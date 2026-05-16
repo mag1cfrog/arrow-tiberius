@@ -3,6 +3,8 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::sqlserver;
 use arrow_array::{
@@ -10,6 +12,14 @@ use arrow_array::{
     Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow_tiberius::{
+    BulkWriter, MssqlProfile, PlanOptions, TableName, WriteBackend, WriteOptions,
+    create_table_sql_from_mappings, plan_arrow_schema_to_mssql_mappings,
+};
+use tokio::net::TcpStream;
+use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
+
+static BENCH_TABLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn run(args: &[OsString]) -> Result<(), WriterBenchError> {
     if args.is_empty()
@@ -52,8 +62,13 @@ fn run_baseline(args: &[OsString]) -> Result<(), WriterBenchError> {
         .sql_server
         .connect_or_start()
         .map_err(WriterBenchError::SqlServer)?;
-    let summary = summarize_generated_batches(&options.benchmark)?;
-    print_baseline_summary(&options, &summary, &connection);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .map_err(WriterBenchError::Io)?;
+    let report = runtime.block_on(run_baseline_async(&options, &connection))?;
+
+    print_baseline_summary(&options, &report, &connection);
     Ok(())
 }
 
@@ -85,7 +100,7 @@ fn print_summary(options: &WriterBenchOptions, summary: &GeneratedBatchSummary) 
 
 fn print_baseline_summary(
     options: &BaselineBenchOptions,
-    summary: &GeneratedBatchSummary,
+    report: &BaselineBenchReport,
     connection: &sqlserver::SqlServerConnection,
 ) {
     println!("writer-bench baseline");
@@ -95,8 +110,9 @@ fn print_baseline_summary(
     println!("  scenario: {}", options.benchmark.scenario);
     println!("  repeat: {}", options.benchmark.repeat);
     println!("  output: {}", options.benchmark.output);
-    println!("  batches per repeat: {}", summary.batches);
-    println!("  generated rows per repeat: {}", summary.rows);
+    println!("  batches written: {}", report.stats.batches_written);
+    println!("  rows written: {}", report.stats.rows_written);
+    println!("  validated rows: {}", report.validated_rows);
     println!(
         "  existing connection: {}",
         options.sql_server.connection_string.is_some()
@@ -111,6 +127,12 @@ fn print_baseline_summary(
     }
     println!("  image: {}", options.sql_server.image);
     println!("  keep container: {}", options.sql_server.keep_container);
+    println!("  setup: {}", format_duration(report.timings.setup));
+    println!("  write: {}", format_duration(report.timings.write));
+    println!("  finish: {}", format_duration(report.timings.finish));
+    println!("  validate: {}", format_duration(report.timings.validate));
+    println!("  cleanup: {}", format_duration(report.timings.cleanup));
+    println!("  total: {}", format_duration(report.timings.total));
 }
 
 #[derive(Debug, Clone)]
@@ -374,9 +396,13 @@ struct GeneratedBatchReader {
 
 impl GeneratedBatchReader {
     fn new(options: &WriterBenchOptions) -> Self {
+        Self::new_with_schema(options, (options.scenario.schema)())
+    }
+
+    fn new_with_schema(options: &WriterBenchOptions, schema: SchemaRef) -> Self {
         Self {
             scenario: options.scenario,
-            schema: (options.scenario.schema)(),
+            schema,
             rows: options.rows,
             batch_size: options.batch_size,
             next_offset: 0,
@@ -409,6 +435,216 @@ impl Iterator for GeneratedBatchReader {
 struct GeneratedBatchSummary {
     batches: usize,
     rows: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BaselineBenchReport {
+    stats: arrow_tiberius::WriteStats,
+    validated_rows: u64,
+    timings: BaselineBenchTimings,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BaselineBenchTimings {
+    setup: Duration,
+    write: Duration,
+    finish: Duration,
+    validate: Duration,
+    cleanup: Duration,
+    total: Duration,
+}
+
+type BenchClient = tiberius::Client<Compat<TcpStream>>;
+
+async fn run_baseline_async(
+    options: &BaselineBenchOptions,
+    connection: &sqlserver::SqlServerConnection,
+) -> Result<BaselineBenchReport, WriterBenchError> {
+    let total_start = Instant::now();
+    let mut report = BaselineBenchReport::default();
+
+    let setup_start = Instant::now();
+    let mut client = connect(&connection.connection_string, &connection.database).await?;
+    let schema = (options.benchmark.scenario.schema)();
+    let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
+        Arc::clone(&schema),
+        MssqlProfile::sql_server_2016_compat_100(),
+        PlanOptions::default(),
+    )
+    .map_err(WriterBenchError::ArrowTiberius)?
+    .into_parts();
+    report.timings.setup += setup_start.elapsed();
+
+    for _repeat_index in 0..options.benchmark.repeat {
+        let table = unique_benchmark_table_name()?;
+        let repeat_report =
+            run_baseline_repeat(&mut client, options, &schema, &mappings, &table).await;
+        let cleanup_start = Instant::now();
+        let cleanup_result = drop_table(&mut client, &table).await;
+        report.timings.cleanup += cleanup_start.elapsed();
+
+        if let Err(source) = cleanup_result {
+            if repeat_report.is_err() {
+                eprintln!(
+                    "warning: failed to clean up benchmark table {} after benchmark failure: {source}",
+                    table.quoted_sql()
+                );
+            } else {
+                return Err(WriterBenchError::Tiberius(source));
+            }
+        }
+
+        let repeat_report = repeat_report?;
+        report.stats.rows_written = report
+            .stats
+            .rows_written
+            .saturating_add(repeat_report.stats.rows_written);
+        report.stats.batches_written = report
+            .stats
+            .batches_written
+            .saturating_add(repeat_report.stats.batches_written);
+        report.validated_rows = report
+            .validated_rows
+            .saturating_add(repeat_report.validated_rows);
+        report.timings.setup += repeat_report.timings.setup;
+        report.timings.write += repeat_report.timings.write;
+        report.timings.finish += repeat_report.timings.finish;
+        report.timings.validate += repeat_report.timings.validate;
+    }
+
+    report.timings.total = total_start.elapsed();
+    Ok(report)
+}
+
+async fn run_baseline_repeat(
+    client: &mut BenchClient,
+    options: &BaselineBenchOptions,
+    schema: &SchemaRef,
+    mappings: &[arrow_tiberius::SchemaMapping],
+    table: &TableName,
+) -> Result<BaselineBenchReport, WriterBenchError> {
+    let mut report = BaselineBenchReport::default();
+    let setup_start = Instant::now();
+
+    execute_sql(
+        client,
+        format!("DROP TABLE IF EXISTS {}", table.quoted_sql()),
+    )
+    .await?;
+    execute_sql(client, create_table_sql_from_mappings(table, mappings)).await?;
+    let mut writer = BulkWriter::new(
+        client,
+        table.clone(),
+        mappings.to_vec(),
+        WriteOptions {
+            backend: WriteBackend::BaselineTokenRow,
+            ..WriteOptions::default()
+        },
+    )
+    .await
+    .map_err(WriterBenchError::ArrowTiberius)?;
+    report.timings.setup += setup_start.elapsed();
+
+    let write_start = Instant::now();
+    for batch in GeneratedBatchReader::new_with_schema(&options.benchmark, Arc::clone(schema)) {
+        let batch = batch?;
+        report.stats = writer
+            .write_batch(&batch)
+            .await
+            .map_err(WriterBenchError::ArrowTiberius)?;
+    }
+    report.timings.write += write_start.elapsed();
+
+    let finish_start = Instant::now();
+    report.stats = writer
+        .finish()
+        .await
+        .map_err(WriterBenchError::ArrowTiberius)?;
+    report.timings.finish += finish_start.elapsed();
+
+    let validate_start = Instant::now();
+    report.validated_rows = select_count(client, table).await?;
+    report.timings.validate += validate_start.elapsed();
+
+    if report.validated_rows != report.stats.rows_written {
+        return Err(WriterBenchError::RowCountMismatch {
+            expected: report.stats.rows_written,
+            actual: report.validated_rows,
+        });
+    }
+
+    Ok(report)
+}
+
+async fn connect(connection_string: &str, database: &str) -> Result<BenchClient, WriterBenchError> {
+    let connection_string = format!("{connection_string};database={database}");
+    let config = tiberius::Config::from_ado_string(&connection_string)
+        .map_err(WriterBenchError::Tiberius)?;
+    let tcp = TcpStream::connect(config.get_addr())
+        .await
+        .map_err(WriterBenchError::Io)?;
+
+    tiberius::Client::connect(config, tcp.compat_write())
+        .await
+        .map_err(WriterBenchError::Tiberius)
+}
+
+async fn execute_sql(client: &mut BenchClient, sql: String) -> Result<(), WriterBenchError> {
+    client
+        .simple_query(sql)
+        .await
+        .map_err(WriterBenchError::Tiberius)?
+        .into_results()
+        .await
+        .map_err(WriterBenchError::Tiberius)?;
+
+    Ok(())
+}
+
+async fn drop_table(client: &mut BenchClient, table: &TableName) -> tiberius::Result<()> {
+    client
+        .simple_query(format!("DROP TABLE IF EXISTS {}", table.quoted_sql()))
+        .await?
+        .into_results()
+        .await?;
+
+    Ok(())
+}
+
+async fn select_count(
+    client: &mut BenchClient,
+    table: &TableName,
+) -> Result<u64, WriterBenchError> {
+    let row = client
+        .simple_query(format!("SELECT COUNT_BIG(*) FROM {}", table.quoted_sql()))
+        .await
+        .map_err(WriterBenchError::Tiberius)?
+        .into_row()
+        .await
+        .map_err(WriterBenchError::Tiberius)?
+        .ok_or_else(|| {
+            WriterBenchError::Validation("SELECT COUNT_BIG(*) returned no row".to_owned())
+        })?;
+    let count = row.get::<i64, _>(0).ok_or_else(|| {
+        WriterBenchError::Validation("SELECT COUNT_BIG(*) did not return bigint".to_owned())
+    })?;
+
+    u64::try_from(count).map_err(|_| {
+        WriterBenchError::Validation(format!(
+            "SELECT COUNT_BIG(*) returned negative count {count}"
+        ))
+    })
+}
+
+fn unique_benchmark_table_name() -> Result<TableName, WriterBenchError> {
+    let counter = BENCH_TABLE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let table = format!("arrow_tiberius_bench_{}_{}", std::process::id(), counter);
+
+    TableName::new("dbo", table).map_err(WriterBenchError::ArrowTiberius)
+}
+
+fn format_duration(duration: Duration) -> String {
+    format!("{:.3}s", duration.as_secs_f64())
 }
 
 fn summarize_generated_batches(
@@ -1075,7 +1311,12 @@ pub(super) enum WriterBenchError {
     InvalidScenario(String),
     InvalidOutput(String),
     Arrow(arrow_schema::ArrowError),
+    ArrowTiberius(arrow_tiberius::Error),
+    Tiberius(tiberius::error::Error),
     SqlServer(sqlserver::SqlServerError),
+    Io(std::io::Error),
+    Validation(String),
+    RowCountMismatch { expected: u64, actual: u64 },
 }
 
 impl fmt::Display for WriterBenchError {
@@ -1099,7 +1340,15 @@ impl fmt::Display for WriterBenchError {
                 write!(f, "unknown writer-bench output `{value}`; expected human")
             }
             Self::Arrow(source) => write!(f, "failed to generate Arrow benchmark data: {source}"),
+            Self::ArrowTiberius(source) => write!(f, "arrow-tiberius benchmark failed: {source}"),
+            Self::Tiberius(source) => write!(f, "SQL Server benchmark operation failed: {source}"),
             Self::SqlServer(source) => write!(f, "{source}"),
+            Self::Io(source) => write!(f, "benchmark I/O failed: {source}"),
+            Self::Validation(reason) => write!(f, "benchmark validation failed: {reason}"),
+            Self::RowCountMismatch { expected, actual } => write!(
+                f,
+                "benchmark row-count validation failed: expected {expected}, got {actual}"
+            ),
         }
     }
 }
@@ -1203,9 +1452,8 @@ mod tests {
     }
 
     #[test]
-    fn runs_baseline_command_with_shared_generation_options() {
+    fn parses_baseline_command_with_shared_generation_options() {
         let args = [
-            OsString::from("baseline"),
             OsString::from("--rows"),
             OsString::from("10"),
             OsString::from("--batch-size"),
@@ -1218,7 +1466,13 @@ mod tests {
             OsString::from("bench_db"),
         ];
 
-        super::run(&args).unwrap();
+        let options = super::BaselineBenchOptions::parse(&args).unwrap();
+
+        assert_eq!(options.benchmark.rows, 10);
+        assert_eq!(options.benchmark.batch_size, 4);
+        assert_eq!(options.benchmark.scenario.name, "mixed_nullable");
+        assert_eq!(options.sql_server.database, "bench_db");
+        assert!(options.sql_server.connection_string.is_some());
     }
 
     #[test]
