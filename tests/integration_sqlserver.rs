@@ -16,9 +16,10 @@ use arrow_buffer::i256;
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use arrow_tiberius::{
-    BulkWriter, Date64Policy, DecimalPolicy, DiagnosticCode, Error, MssqlProfile, NanosecondPolicy,
-    PlanOptions, TableName, TimezonePolicy, UInt64Policy, WriteBackend, WriteOptions,
-    create_table_sql_from_mappings, plan_arrow_schema_to_mssql_mappings,
+    ArrowFieldRef, BulkWriter, Date64Policy, DecimalPolicy, DiagnosticCode, Error, Identifier,
+    MssqlColumn, MssqlProfile, MssqlType, NanosecondPolicy, PlanOptions, SchemaMapping, TableName,
+    TimezonePolicy, UInt64Policy, WriteBackend, WriteOptions, create_table_sql_from_mappings,
+    plan_arrow_schema_to_mssql_mappings,
 };
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -1625,18 +1626,9 @@ async fn baseline_writer_rejects_target_table_schema_drift() -> TestResult<()> {
         let mut writer = BulkWriter::new(
             &mut client,
             table.clone(),
-            vec![arrow_tiberius::SchemaMapping::new(
-                arrow_tiberius::ArrowFieldRef::new(
-                    0,
-                    "renamed_id".to_owned(),
-                    false,
-                    DataType::Int32,
-                ),
-                arrow_tiberius::MssqlColumn::new(
-                    arrow_tiberius::Identifier::new("renamed_id")?,
-                    arrow_tiberius::MssqlType::Int,
-                    false,
-                ),
+            vec![SchemaMapping::new(
+                ArrowFieldRef::new(0, "renamed_id".to_owned(), false, DataType::Int32),
+                MssqlColumn::new(Identifier::new("renamed_id")?, MssqlType::Int, false),
             )],
             WriteOptions {
                 backend: WriteBackend::BaselineTokenRow,
