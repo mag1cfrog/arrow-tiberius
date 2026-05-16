@@ -26,12 +26,12 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), XtaskError> {
 
     match args.first().and_then(|arg| arg.to_str()) {
         None | Some("-h" | "--help") => {
-            print_help();
+            print_top_level_help();
             Ok(())
         }
         Some("sqlserver-test") => {
             if args[1..].iter().any(|arg| arg == "-h" || arg == "--help") {
-                print_help();
+                print_sqlserver_test_help();
                 return Ok(());
             }
 
@@ -87,9 +87,15 @@ fn run_sqlserver_tests(options: &SqlServerTestOptions) -> Result<(), XtaskError>
     Ok(())
 }
 
-fn print_help() {
+fn print_top_level_help() {
     println!(
         "Usage:\n  cargo xtask <COMMAND> [OPTIONS]\n\nCommands:\n  sqlserver-test    Run SQL Server integration tests\n  writer-bench      Generate writer benchmark inputs and summaries\n\nRun `cargo xtask <COMMAND> --help` for command-specific options."
+    );
+}
+
+fn print_sqlserver_test_help() {
+    println!(
+        "Usage:\n  cargo xtask sqlserver-test [OPTIONS]\n\nOptions:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Test database name\n  --keep-container            Keep the container after the task exits\n  -h, --help                  Print help"
     );
 }
 
@@ -290,7 +296,7 @@ impl SqlServerTestOptions {
 
             match arg {
                 "-h" | "--help" => {
-                    print_help();
+                    print_sqlserver_test_help();
                     return Ok(options);
                 }
                 "--container-runtime" => {
@@ -573,5 +579,12 @@ mod tests {
         let err = SqlServerTestOptions::parse(&args).unwrap_err();
 
         assert!(matches!(err, XtaskError::UnknownOption(option) if option == "--wat"));
+    }
+
+    #[test]
+    fn sqlserver_help_is_command_specific() {
+        let result = super::run([OsString::from("sqlserver-test"), OsString::from("--help")]);
+
+        assert!(result.is_ok());
     }
 }

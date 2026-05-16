@@ -32,13 +32,13 @@ fn print_help() {
 
 fn print_summary(options: &WriterBenchOptions, summary: &GeneratedBatchSummary) {
     println!("writer-bench");
-    println!("  rows: {}", options.rows);
+    println!("  rows per repeat: {}", options.rows);
     println!("  batch size: {}", options.batch_size);
     println!("  scenario: {}", options.scenario);
     println!("  repeat: {}", options.repeat);
     println!("  output: {}", options.output);
-    println!("  batches: {}", summary.batches);
-    println!("  generated rows: {}", summary.rows);
+    println!("  batches per repeat: {}", summary.batches);
+    println!("  generated rows per repeat: {}", summary.rows);
 }
 
 #[derive(Debug, Clone)]
