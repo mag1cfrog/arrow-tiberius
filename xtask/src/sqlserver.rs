@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[derive(Debug)]
 pub(crate) struct SqlServerConnection {
     pub(crate) connection_string: String,
+    pub(crate) container_connection_string: Option<String>,
     pub(crate) database: String,
     _container: Option<SqlServerContainer>,
 }
@@ -107,6 +108,7 @@ impl SqlServerConnectionOptions {
         if let Some(connection_string) = &self.connection_string {
             return Ok(SqlServerConnection {
                 connection_string: connection_string.clone(),
+                container_connection_string: None,
                 database: self.database.clone(),
                 _container: None,
             });
@@ -114,16 +116,14 @@ impl SqlServerConnectionOptions {
 
         let runtime = self.resolve_container_runtime()?;
         let container = SqlServerContainer::start(self, runtime, network)?;
-        let connection = if network.is_some() {
-            container.container_connection()
-        } else {
-            container.host_connection()
-        };
+        let connection = container.host_connection();
+        let container_connection = network.is_some().then(|| container.container_connection());
         container.wait_until_ready()?;
         container.initialize_database(&self.database)?;
 
         Ok(SqlServerConnection {
             connection_string: connection,
+            container_connection_string: container_connection,
             database: self.database.clone(),
             _container: Some(container),
         })
@@ -493,6 +493,7 @@ mod tests {
             connection.connection_string,
             "server=tcp:127.0.0.1,1433;password=secret"
         );
+        assert_eq!(connection.container_connection_string, None);
     }
 
     #[test]
