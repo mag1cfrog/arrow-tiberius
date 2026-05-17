@@ -5,7 +5,6 @@ use std::path::Path;
 use std::time::Instant;
 
 use arrow_ipc::reader::FileReader;
-use arrow_odbc::arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
 use arrow_odbc::arrow::datatypes::{DataType, Field, Schema};
 use arrow_odbc::arrow::record_batch::{RecordBatch, RecordBatchIterator};
 use arrow_odbc::insert_into_table;
@@ -102,7 +101,7 @@ fn run_repeat(
     execute_sql(connection, &format!("DROP TABLE IF EXISTS {table}"))?;
     execute_sql(connection, &create_table_sql(table, &options.scenario)?)?;
 
-    let input = batches_for_options(options)?;
+    let input = ipc_batches_for_scenario(&options.input_ipc, &options.scenario, options.rows)?;
     let mut reader = RecordBatchIterator::new(input.batches.into_iter().map(Ok), input.schema);
     insert_into_table(connection, &mut reader, table, options.batch_size)?;
 
@@ -123,26 +122,6 @@ struct InputBatches {
     schema: std::sync::Arc<Schema>,
     batches: Vec<RecordBatch>,
     rows: usize,
-}
-
-fn batches_for_options(options: &BenchOptions) -> Result<InputBatches, Box<dyn Error>> {
-    if let Some(path) = &options.input_ipc {
-        return ipc_batches_for_scenario(path, &options.scenario, options.rows);
-    }
-
-    let schema = schema_for_scenario(&options.scenario)?;
-    let batches = batches_for_scenario(
-        &options.scenario,
-        schema.clone(),
-        options.rows,
-        options.batch_size,
-    )?;
-
-    Ok(InputBatches {
-        schema,
-        batches,
-        rows: options.rows,
-    })
 }
 
 fn ipc_batches_for_scenario(
@@ -253,123 +232,6 @@ fn mixed_nullable_schema() -> std::sync::Arc<Schema> {
     ]))
 }
 
-fn batches_for_scenario(
-    scenario: &str,
-    schema: std::sync::Arc<Schema>,
-    rows: usize,
-    batch_size: usize,
-) -> Result<Vec<RecordBatch>, Box<dyn Error>> {
-    match scenario {
-        "narrow_numeric" => narrow_numeric_batches(schema, rows, batch_size),
-        "mixed_nullable" => mixed_nullable_batches(schema, rows, batch_size),
-        other => Err(format!("unsupported scenario `{other}`").into()),
-    }
-}
-
-fn narrow_numeric_batches(
-    schema: std::sync::Arc<Schema>,
-    rows: usize,
-    batch_size: usize,
-) -> Result<Vec<RecordBatch>, Box<dyn Error>> {
-    let mut batches = Vec::new();
-    let mut offset = 0;
-
-    while offset < rows {
-        let len = batch_size.min(rows - offset);
-        let id32 = (offset..offset + len)
-            .map(deterministic_i32)
-            .collect::<Int32Array>();
-        let id64 = (offset..offset + len)
-            .map(|row| i64::from(deterministic_i32(row)) * 1_000)
-            .collect::<Int64Array>();
-        let score = (offset..offset + len)
-            .map(deterministic_score)
-            .collect::<Float64Array>();
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                std::sync::Arc::new(id32),
-                std::sync::Arc::new(id64),
-                std::sync::Arc::new(score),
-            ],
-        )?;
-
-        batches.push(batch);
-        offset += len;
-    }
-
-    Ok(batches)
-}
-
-fn mixed_nullable_batches(
-    schema: std::sync::Arc<Schema>,
-    rows: usize,
-    batch_size: usize,
-) -> Result<Vec<RecordBatch>, Box<dyn Error>> {
-    let mut batches = Vec::new();
-    let mut offset = 0;
-
-    while offset < rows {
-        let len = batch_size.min(rows - offset);
-        let id32 = (offset..offset + len)
-            .map(deterministic_i32)
-            .collect::<Int32Array>();
-        let maybe_id64 = (offset..offset + len)
-            .map(|row| {
-                if row % 7 == 0 {
-                    None
-                } else {
-                    Some(i64::from(deterministic_i32(row)) * 10)
-                }
-            })
-            .collect::<Int64Array>();
-        let maybe_score = (offset..offset + len)
-            .map(|row| {
-                if row % 11 == 0 {
-                    None
-                } else {
-                    Some(deterministic_score(row))
-                }
-            })
-            .collect::<Float64Array>();
-        let category_values = ["alpha", "beta", "gamma", "delta", "epsilon"];
-        let category = (offset..offset + len)
-            .map(|row| {
-                if row % 5 == 0 {
-                    None
-                } else {
-                    Some(category_values[row % category_values.len()])
-                }
-            })
-            .collect::<StringArray>();
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                std::sync::Arc::new(id32),
-                std::sync::Arc::new(maybe_id64),
-                std::sync::Arc::new(maybe_score),
-                std::sync::Arc::new(category),
-            ],
-        )?;
-
-        batches.push(batch);
-        offset += len;
-    }
-
-    Ok(batches)
-}
-
-fn deterministic_i32(row: usize) -> i32 {
-    (row as i32)
-        .wrapping_mul(1_103_515_245)
-        .wrapping_add(12_345)
-}
-
-fn deterministic_score(row: usize) -> f64 {
-    let value = row.wrapping_mul(48_271) % 1_000_003;
-    value as f64 / 97.0
-}
-
 fn rows_per_second(rows: u64, elapsed: std::time::Duration) -> f64 {
     if elapsed.is_zero() {
         return 0.0;
@@ -395,7 +257,7 @@ struct BenchOptions {
     batch_size: usize,
     scenario: String,
     repeat: usize,
-    input_ipc: Option<std::path::PathBuf>,
+    input_ipc: std::path::PathBuf,
 }
 
 impl BenchOptions {
@@ -405,8 +267,9 @@ impl BenchOptions {
             batch_size: 8_192,
             scenario: "narrow_numeric".to_owned(),
             repeat: 1,
-            input_ipc: None,
+            input_ipc: std::path::PathBuf::new(),
         };
+        let mut input_ipc = None;
         let mut index = 0;
 
         while index < args.len() {
@@ -429,7 +292,7 @@ impl BenchOptions {
                 }
                 "--input-ipc" => {
                     index += 1;
-                    options.input_ipc = Some(std::path::PathBuf::from(required_arg(
+                    input_ipc = Some(std::path::PathBuf::from(required_arg(
                         "--input-ipc",
                         args.get(index),
                     )?));
@@ -439,6 +302,9 @@ impl BenchOptions {
 
             index += 1;
         }
+
+        options.input_ipc =
+            input_ipc.ok_or("missing required arrow-odbc runner option `--input-ipc <FILE>`")?;
 
         Ok(options)
     }
@@ -463,15 +329,15 @@ fn required_arg<'a>(option: &str, value: Option<&'a String>) -> Result<&'a str, 
 #[cfg(test)]
 mod tests {
     use super::{
-        BenchOptions, batches_for_options, create_table_sql, ipc_batches_for_scenario,
-        is_supported_scenario, mixed_nullable_batches, mixed_nullable_schema,
-        narrow_numeric_batches, narrow_numeric_schema, rows_per_second,
+        BenchOptions, create_table_sql, ipc_batches_for_scenario, is_supported_scenario,
+        mixed_nullable_schema, narrow_numeric_schema, rows_per_second,
     };
     use arrow_ipc::writer::FileWriter;
-    use arrow_odbc::arrow::array::Array;
+    use arrow_odbc::arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
     use arrow_odbc::arrow::datatypes::Schema;
     use arrow_odbc::arrow::record_batch::RecordBatch;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -487,6 +353,8 @@ mod tests {
             "narrow_numeric".to_owned(),
             "--repeat".to_owned(),
             "3".to_owned(),
+            "--input-ipc".to_owned(),
+            "/workspace/bench.arrow".to_owned(),
         ])
         .expect("valid options should parse");
 
@@ -494,7 +362,10 @@ mod tests {
         assert_eq!(options.batch_size, 8);
         assert_eq!(options.scenario, "narrow_numeric");
         assert_eq!(options.repeat, 3);
-        assert!(options.input_ipc.is_none());
+        assert_eq!(
+            options.input_ipc.as_path(),
+            std::path::Path::new("/workspace/bench.arrow")
+        );
     }
 
     #[test]
@@ -509,9 +380,22 @@ mod tests {
 
         assert_eq!(options.rows, 25);
         assert_eq!(
-            options.input_ipc.as_deref(),
-            Some(std::path::Path::new("/workspace/bench.arrow"))
+            options.input_ipc.as_path(),
+            std::path::Path::new("/workspace/bench.arrow")
         );
+    }
+
+    #[test]
+    fn rejects_missing_input_ipc() {
+        let err = BenchOptions::parse(vec![
+            "--rows".to_owned(),
+            "25".to_owned(),
+            "--scenario".to_owned(),
+            "mixed_nullable".to_owned(),
+        ])
+        .expect_err("input IPC should be required");
+
+        assert!(err.to_string().contains("--input-ipc"));
     }
 
     #[test]
@@ -557,40 +441,9 @@ mod tests {
     }
 
     #[test]
-    fn narrow_numeric_batches_cover_tail_rows() {
-        let schema = narrow_numeric_schema();
-        let batches = narrow_numeric_batches(schema, 25, 8).expect("batches should build");
-        let lengths = batches
-            .iter()
-            .map(arrow_odbc::arrow::record_batch::RecordBatch::num_rows)
-            .collect::<Vec<_>>();
-
-        assert_eq!(lengths, vec![8, 8, 8, 1]);
-    }
-
-    #[test]
-    fn mixed_nullable_batches_cover_tail_rows_and_nulls() {
-        let schema = mixed_nullable_schema();
-        let batches = mixed_nullable_batches(schema, 25, 8).expect("batches should build");
-        let lengths = batches
-            .iter()
-            .map(arrow_odbc::arrow::record_batch::RecordBatch::num_rows)
-            .collect::<Vec<_>>();
-        let first = &batches[0];
-
-        assert_eq!(lengths, vec![8, 8, 8, 1]);
-        assert!(first.column(1).is_null(0));
-        assert!(first.column(1).is_valid(1));
-        assert!(first.column(2).is_null(0));
-        assert!(first.column(2).is_valid(1));
-        assert!(first.column(3).is_null(0));
-        assert!(first.column(3).is_valid(1));
-    }
-
-    #[test]
     fn reads_input_ipc_batches_for_matching_scenario() {
         let schema = mixed_nullable_schema();
-        let batches = mixed_nullable_batches(schema.clone(), 25, 8).expect("batches should build");
+        let batches = mixed_nullable_test_batches(schema.clone(), &[8, 8, 8, 1]);
         let path = temp_ipc_path("mixed");
         write_ipc_file(&path, schema.as_ref(), &batches);
 
@@ -607,7 +460,7 @@ mod tests {
     #[test]
     fn rejects_input_ipc_schema_mismatch() {
         let schema = narrow_numeric_schema();
-        let batches = narrow_numeric_batches(schema.clone(), 4, 4).expect("batches should build");
+        let batches = narrow_numeric_test_batches(schema.clone());
         let path = temp_ipc_path("schema-mismatch");
         write_ipc_file(&path, schema.as_ref(), &batches);
 
@@ -622,7 +475,7 @@ mod tests {
     #[test]
     fn rejects_input_ipc_row_count_mismatch() {
         let schema = mixed_nullable_schema();
-        let batches = mixed_nullable_batches(schema.clone(), 25, 8).expect("batches should build");
+        let batches = mixed_nullable_test_batches(schema.clone(), &[8, 8, 8, 1]);
         let path = temp_ipc_path("row-mismatch");
         write_ipc_file(&path, schema.as_ref(), &batches);
 
@@ -635,20 +488,14 @@ mod tests {
     }
 
     #[test]
-    fn input_ipc_options_use_file_batches_instead_of_generating() {
+    fn input_ipc_preserves_file_batch_boundaries() {
         let schema = mixed_nullable_schema();
-        let batches = mixed_nullable_batches(schema.clone(), 25, 8).expect("batches should build");
+        let batches = mixed_nullable_test_batches(schema.clone(), &[8, 8, 8, 1]);
         let path = temp_ipc_path("options");
         write_ipc_file(&path, schema.as_ref(), &batches);
-        let options = BenchOptions {
-            rows: 25,
-            batch_size: 2,
-            scenario: "mixed_nullable".to_owned(),
-            repeat: 1,
-            input_ipc: Some(path.clone()),
-        };
 
-        let input = batches_for_options(&options).expect("input IPC batches should load");
+        let input = ipc_batches_for_scenario(&path, "mixed_nullable", 25)
+            .expect("input IPC batches should load");
         let lengths = input
             .batches
             .iter()
@@ -675,6 +522,78 @@ mod tests {
         }
 
         writer.finish().expect("IPC file should finish");
+    }
+
+    fn narrow_numeric_test_batches(schema: Arc<Schema>) -> Vec<RecordBatch> {
+        vec![
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+                    Arc::new(Int64Array::from(vec![10_i64, 20, 30, 40])),
+                    Arc::new(Float64Array::from(vec![1.25, 2.5, 3.75, 5.0])),
+                ],
+            )
+            .expect("narrow numeric test batch should build"),
+        ]
+    }
+
+    fn mixed_nullable_test_batches(schema: Arc<Schema>, lengths: &[usize]) -> Vec<RecordBatch> {
+        let mut offset = 0;
+        let mut batches = Vec::with_capacity(lengths.len());
+
+        for &len in lengths {
+            let start = offset;
+            offset += len;
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(
+                        (start..offset)
+                            .map(|row| row as i32)
+                            .collect::<Int32Array>(),
+                    ),
+                    Arc::new(
+                        (start..offset)
+                            .map(|row| {
+                                if row % 7 == 0 {
+                                    None
+                                } else {
+                                    Some(row as i64 * 10)
+                                }
+                            })
+                            .collect::<Int64Array>(),
+                    ),
+                    Arc::new(
+                        (start..offset)
+                            .map(|row| {
+                                if row % 11 == 0 {
+                                    None
+                                } else {
+                                    Some(row as f64 / 10.0)
+                                }
+                            })
+                            .collect::<Float64Array>(),
+                    ),
+                    Arc::new(
+                        (start..offset)
+                            .map(|row| {
+                                if row % 5 == 0 {
+                                    None
+                                } else {
+                                    Some(format!("category-{}", row % 3))
+                                }
+                            })
+                            .collect::<StringArray>(),
+                    ),
+                ],
+            )
+            .expect("mixed nullable test batch should build");
+
+            batches.push(batch);
+        }
+
+        batches
     }
 
     fn temp_ipc_path(name: &str) -> PathBuf {
