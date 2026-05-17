@@ -356,9 +356,14 @@ fn print_compare_summary(options: &CompareBenchOptions, report: &CompareBenchRep
                 println!("    cleanup: {}", format_duration(report.timings.cleanup));
                 println!("    total: {}", format_duration(report.timings.total));
             }
-            CompareBackendBenchReport::ArrowOdbc => {
-                println!("    status: completed");
-                println!("    metrics: see arrow-odbc runner output above");
+            CompareBackendBenchReport::ArrowOdbc { report } => {
+                println!("    rows written: {}", report.rows_written);
+                println!(
+                    "    write rows/sec: {}",
+                    format_rows_per_second(report.rows_written, report.write_elapsed)
+                );
+                println!("    validated rows: {}", report.rows_written);
+                println!("    write: {}", format_duration(report.write_elapsed));
             }
         }
     }
@@ -938,12 +943,55 @@ fn run_arrow_odbc_runner_for_benchmark(
     ipc_dataset: &ManagedIpcDataset,
 ) -> Result<(), WriterBenchError> {
     println!("  action: run_arrow_odbc_runner");
+    let command_options = arrow_odbc_runner_command_options(
+        benchmark,
+        runner_image,
+        network,
+        connection,
+        ipc_dataset,
+    )?;
+
+    odbc_runner::run_runner_command(&command_options).map_err(WriterBenchError::OdbcRunner)
+}
+
+fn run_arrow_odbc_runner_for_benchmark_capture(
+    benchmark: &WriterBenchOptions,
+    runner_image: &odbc_runner::ManagedRunnerImage,
+    network: Option<&sqlserver::ManagedNetwork>,
+    connection: &sqlserver::SqlServerConnection,
+    ipc_dataset: &ManagedIpcDataset,
+) -> Result<ArrowOdbcBenchReport, WriterBenchError> {
+    println!("  action: run_arrow_odbc_runner");
+    let command_options = arrow_odbc_runner_command_options(
+        benchmark,
+        runner_image,
+        network,
+        connection,
+        ipc_dataset,
+    )?;
+    let output = odbc_runner::run_runner_command_capture(&command_options)
+        .map_err(WriterBenchError::OdbcRunner)?;
+
+    print!("{}", output.stdout);
+    eprint!("{}", output.stderr);
+
+    parse_arrow_odbc_runner_report(&format!("{}\n{}", output.stdout, output.stderr))
+}
+
+fn arrow_odbc_runner_command_options(
+    benchmark: &WriterBenchOptions,
+    runner_image: &odbc_runner::ManagedRunnerImage,
+    network: Option<&sqlserver::ManagedNetwork>,
+    connection: &sqlserver::SqlServerConnection,
+    ipc_dataset: &ManagedIpcDataset,
+) -> Result<odbc_runner::RunnerCommandOptions, WriterBenchError> {
     let container_path = ipc_dataset.container_path.as_deref().ok_or_else(|| {
         WriterBenchError::Validation(
             "arrow-odbc benchmark requires an IPC dataset container path".to_owned(),
         )
     })?;
-    let command_options = runner_image.command_options(
+
+    Ok(runner_image.command_options(
         network.map(|network| network.name().to_owned()),
         vec![
             (
@@ -962,9 +1010,7 @@ fn run_arrow_odbc_runner_for_benchmark(
         Some(repository_root()?),
         Some("/workspace".to_owned()),
         arrow_odbc_runner_args(benchmark, container_path),
-    );
-
-    odbc_runner::run_runner_command(&command_options).map_err(WriterBenchError::OdbcRunner)
+    ))
 }
 
 fn arrow_odbc_runner_args(benchmark: &WriterBenchOptions, input_ipc: &str) -> Vec<String> {
@@ -988,6 +1034,55 @@ fn arrow_odbc_runner_args(benchmark: &WriterBenchOptions, input_ipc: &str) -> Ve
         "--input-ipc".to_owned(),
         input_ipc.to_owned(),
     ]
+}
+
+fn parse_arrow_odbc_runner_report(output: &str) -> Result<ArrowOdbcBenchReport, WriterBenchError> {
+    let rows_written = parse_arrow_odbc_runner_u64(output, "rows written")?;
+    let write_seconds = parse_arrow_odbc_runner_f64(output, "write seconds")?;
+
+    if !write_seconds.is_finite() || write_seconds < 0.0 {
+        return Err(WriterBenchError::Validation(format!(
+            "arrow-odbc runner reported invalid write seconds `{write_seconds}`"
+        )));
+    }
+
+    Ok(ArrowOdbcBenchReport {
+        rows_written,
+        write_elapsed: Duration::from_secs_f64(write_seconds),
+    })
+}
+
+fn parse_arrow_odbc_runner_u64(output: &str, label: &str) -> Result<u64, WriterBenchError> {
+    parse_arrow_odbc_runner_value(output, label)?
+        .parse::<u64>()
+        .map_err(|source| {
+            WriterBenchError::Validation(format!(
+                "arrow-odbc runner reported invalid {label}: {source}"
+            ))
+        })
+}
+
+fn parse_arrow_odbc_runner_f64(output: &str, label: &str) -> Result<f64, WriterBenchError> {
+    parse_arrow_odbc_runner_value(output, label)?
+        .parse::<f64>()
+        .map_err(|source| {
+            WriterBenchError::Validation(format!(
+                "arrow-odbc runner reported invalid {label}: {source}"
+            ))
+        })
+}
+
+fn parse_arrow_odbc_runner_value<'a>(
+    output: &'a str,
+    label: &str,
+) -> Result<&'a str, WriterBenchError> {
+    let prefix = format!("{label}:");
+    output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(&prefix).map(str::trim))
+        .ok_or_else(|| {
+            WriterBenchError::Validation(format!("arrow-odbc runner output is missing `{label}`"))
+        })
 }
 
 fn odbc_connection_string(
@@ -1248,16 +1343,22 @@ struct CompareBenchReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompareBackendBenchReport {
     Baseline { report: BaselineBenchReport },
-    ArrowOdbc,
+    ArrowOdbc { report: ArrowOdbcBenchReport },
 }
 
 impl CompareBackendBenchReport {
     fn backend(&self) -> BenchmarkBackend {
         match self {
             Self::Baseline { .. } => BenchmarkBackend::Baseline,
-            Self::ArrowOdbc => BenchmarkBackend::ArrowOdbc,
+            Self::ArrowOdbc { .. } => BenchmarkBackend::ArrowOdbc,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArrowOdbcBenchReport {
+    rows_written: u64,
+    write_elapsed: Duration,
 }
 
 type BenchClient = tiberius::Client<Compat<TcpStream>>;
@@ -1324,14 +1425,14 @@ fn run_compare_benchmark(
                     "arrow-odbc runner image was not prepared for compare".to_owned(),
                 )
             })?;
-            run_arrow_odbc_runner_for_benchmark(
+            let report = run_arrow_odbc_runner_for_benchmark_capture(
                 &options.benchmark,
                 runner_image,
                 network.as_ref(),
                 &connection,
                 &ipc_dataset,
             )?;
-            backends.push(CompareBackendBenchReport::ArrowOdbc);
+            backends.push(CompareBackendBenchReport::ArrowOdbc { report });
         }
 
         Ok(CompareBenchReport {
@@ -2864,6 +2965,45 @@ mod tests {
             args.windows(2)
                 .any(|pair| pair == ["--input-ipc", "/workspace/target/bench.arrow"])
         );
+    }
+
+    #[test]
+    fn parses_arrow_odbc_runner_report_from_noisy_output() {
+        let output = "\
+Compiling unrelated crate
+arrow-odbc runner
+  database: arrow_tiberius_benchmark
+  rows written: 25
+  write seconds: 0.067
+  write rows/sec: 375.43
+";
+
+        let report = super::parse_arrow_odbc_runner_report(output).unwrap();
+
+        assert_eq!(report.rows_written, 25);
+        assert_eq!(report.write_elapsed, std::time::Duration::from_millis(67));
+    }
+
+    #[test]
+    fn rejects_arrow_odbc_runner_report_missing_rows() {
+        let err = super::parse_arrow_odbc_runner_report("write seconds: 0.1").unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message) if message.contains("missing `rows written`")
+        ));
+    }
+
+    #[test]
+    fn rejects_arrow_odbc_runner_report_negative_seconds() {
+        let output = "rows written: 25\nwrite seconds: -1";
+
+        let err = super::parse_arrow_odbc_runner_report(output).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message) if message.contains("invalid write seconds")
+        ));
     }
 
     #[test]

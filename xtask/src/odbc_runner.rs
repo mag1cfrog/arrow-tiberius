@@ -121,6 +121,38 @@ pub(crate) fn run_runner_command(options: &RunnerCommandOptions) -> Result<(), O
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunnerCommandOutput {
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+}
+
+pub(crate) fn run_runner_command_capture(
+    options: &RunnerCommandOptions,
+) -> Result<RunnerCommandOutput, OdbcRunnerError> {
+    let output = Command::new(&options.container_runtime)
+        .args(options.container_args())
+        .output()
+        .map_err(|source| OdbcRunnerError::CommandSpawn {
+            description: "run arrow-odbc runner command",
+            source,
+        })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    if output.status.success() {
+        Ok(RunnerCommandOutput { stdout, stderr })
+    } else {
+        print!("{stdout}");
+        eprint!("{stderr}");
+        Err(OdbcRunnerError::CommandStatus {
+            description: "run arrow-odbc runner command",
+            status: output.status,
+        })
+    }
+}
+
 pub(crate) fn remove_runner_image(options: &RunnerImageOptions) -> Result<(), OdbcRunnerError> {
     let mut command = Command::new(&options.container_runtime);
     command
