@@ -19,6 +19,8 @@ use arrow_tiberius::{
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
+mod dataset;
+
 static BENCH_TABLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn run(args: &[OsString]) -> Result<(), WriterBenchError> {
@@ -38,6 +40,10 @@ pub(super) fn run(args: &[OsString]) -> Result<(), WriterBenchError> {
 
         if command == "arrow-odbc" {
             return run_arrow_odbc(&args[1..]);
+        }
+
+        if command == "ipc" {
+            return run_ipc_dataset(&args[1..]);
         }
 
         if !command.starts_with('-') {
@@ -102,9 +108,34 @@ fn run_arrow_odbc(args: &[OsString]) -> Result<(), WriterBenchError> {
     Ok(())
 }
 
+fn run_ipc_dataset(args: &[OsString]) -> Result<(), WriterBenchError> {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print_ipc_help();
+        return Ok(());
+    }
+
+    let options = IpcDatasetOptions::parse(args)?;
+    let written = dataset::write_ipc_dataset(&options.benchmark, &options.path)?;
+    let replayed = dataset::summarize_ipc_dataset(&options.path)?;
+
+    if written != replayed {
+        return Err(WriterBenchError::Validation(format!(
+            "IPC dataset replay summary mismatch: wrote {written:?}, replayed {replayed:?}"
+        )));
+    }
+
+    println!("writer-bench ipc");
+    println!("  path: {}", options.path.display());
+    println!("  scenario: {}", options.benchmark.scenario);
+    println!("  rows: {}", written.rows);
+    println!("  batches: {}", written.batches);
+    println!("  batch size: {}", options.benchmark.batch_size);
+    Ok(())
+}
+
 fn print_help() {
     println!(
-        "Usage:\n  cargo xtask writer-bench [OPTIONS]\n  cargo xtask writer-bench baseline [OPTIONS]\n  cargo xtask writer-bench arrow-odbc [OPTIONS]\n\nCommands:\n  baseline      Run the baseline TokenRow SQL Server writer benchmark\n  arrow-odbc    Run the optional arrow-odbc SQL Server writer benchmark\n\nOptions:\n  --rows <COUNT>          Total rows to generate [default: 100000]\n  --batch-size <COUNT>    Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>       Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>        Number of benchmark repeats [default: 1]\n  --output <FORMAT>       Output format: human [default: human]\n  -h, --help              Print help\n\nScenarios:"
+        "Usage:\n  cargo xtask writer-bench [OPTIONS]\n  cargo xtask writer-bench baseline [OPTIONS]\n  cargo xtask writer-bench arrow-odbc [OPTIONS]\n  cargo xtask writer-bench ipc [OPTIONS]\n\nCommands:\n  baseline      Run the baseline TokenRow SQL Server writer benchmark\n  arrow-odbc    Run the optional arrow-odbc SQL Server writer benchmark\n  ipc           Generate a benchmark Arrow IPC dataset file\n\nOptions:\n  --rows <COUNT>          Total rows to generate [default: 100000]\n  --batch-size <COUNT>    Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>       Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>        Number of benchmark repeats [default: 1]\n  --output <FORMAT>       Output format: human [default: human]\n  -h, --help              Print help\n\nScenarios:"
     );
     for scenario in SCENARIOS {
         println!("  {:<16}  {}", scenario.name, scenario.description);
@@ -120,6 +151,12 @@ fn print_baseline_help() {
 fn print_arrow_odbc_help() {
     println!(
         "Usage:\n  cargo xtask writer-bench arrow-odbc [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Supported scenarios: narrow_numeric, mixed_nullable [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>      Managed arrow-odbc runner image tag\n  --keep-runner-image         Keep the managed arrow-odbc runner image after the task exits\n  -h, --help                  Print help\n\nThis is a SQL Server write-path comparison only. The arrow-odbc runner image contains unixODBC, Microsoft ODBC Driver 18 for SQL Server, and Rust."
+    );
+}
+
+fn print_ipc_help() {
+    println!(
+        "Usage:\n  cargo xtask writer-bench ipc --path <FILE> [OPTIONS]\n\nData Options:\n  --path <FILE>               Arrow IPC file to create\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  -h, --help                  Print help\n\nThe IPC file is the shared benchmark dataset boundary used by compare backends."
     );
 }
 
@@ -243,6 +280,62 @@ impl WriterBenchOptions {
         }
 
         Ok(options)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IpcDatasetOptions {
+    benchmark: WriterBenchOptions,
+    path: PathBuf,
+}
+
+impl IpcDatasetOptions {
+    fn parse(args: &[OsString]) -> Result<Self, WriterBenchError> {
+        let mut benchmark = WriterBenchOptions::default();
+        let mut path = None;
+        let mut index = 0;
+
+        while index < args.len() {
+            let arg = args[index]
+                .to_str()
+                .ok_or_else(|| WriterBenchError::InvalidUtf8Argument(args[index].clone()))?;
+
+            match arg {
+                "-h" | "--help" => {
+                    print_ipc_help();
+                    return Ok(Self {
+                        benchmark,
+                        path: PathBuf::new(),
+                    });
+                }
+                "--path" => {
+                    path = Some(PathBuf::from(required_value(args, index)?));
+                    index += 1;
+                }
+                "--rows" => {
+                    benchmark.rows = parse_positive_usize("--rows", &required_value(args, index)?)?;
+                    index += 1;
+                }
+                "--batch-size" => {
+                    benchmark.batch_size =
+                        parse_positive_usize("--batch-size", &required_value(args, index)?)?;
+                    index += 1;
+                }
+                "--scenario" => {
+                    benchmark.scenario = parse_scenario(&required_value(args, index)?)?;
+                    index += 1;
+                }
+                other => return Err(WriterBenchError::UnknownOption(other.to_owned())),
+            }
+
+            index += 1;
+        }
+
+        let path = path.ok_or_else(|| {
+            WriterBenchError::Validation("writer-bench ipc requires --path <FILE>".to_owned())
+        })?;
+
+        Ok(Self { benchmark, path })
     }
 }
 
@@ -1712,6 +1805,9 @@ mod tests {
     use arrow_schema::{DataType, TimeUnit};
     use std::ffi::OsString;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn parses_writer_bench_defaults() {
@@ -1834,6 +1930,59 @@ mod tests {
             options.sql_server.container_runtime,
             Some(PathBuf::from("podman"))
         );
+    }
+
+    #[test]
+    fn parses_ipc_dataset_command_options() {
+        let args = [
+            OsString::from("--path"),
+            OsString::from("/tmp/bench.arrow"),
+            OsString::from("--rows"),
+            OsString::from("25"),
+            OsString::from("--batch-size"),
+            OsString::from("5"),
+            OsString::from("--scenario"),
+            OsString::from("mixed_nullable"),
+        ];
+
+        let options = super::IpcDatasetOptions::parse(&args).unwrap();
+
+        assert_eq!(options.path, PathBuf::from("/tmp/bench.arrow"));
+        assert_eq!(options.benchmark.rows, 25);
+        assert_eq!(options.benchmark.batch_size, 5);
+        assert_eq!(options.benchmark.scenario.name, "mixed_nullable");
+    }
+
+    #[test]
+    fn ipc_dataset_command_requires_path() {
+        let args = [OsString::from("--rows"), OsString::from("25")];
+        let err = super::IpcDatasetOptions::parse(&args).unwrap_err();
+
+        assert!(matches!(err, WriterBenchError::Validation(message) if message.contains("--path")));
+    }
+
+    #[test]
+    fn ipc_dataset_command_writes_replayable_file() {
+        let path = temp_test_file("writer-bench-ipc");
+        let args = [
+            OsString::from("ipc"),
+            OsString::from("--path"),
+            OsString::from(&path),
+            OsString::from("--rows"),
+            OsString::from("17"),
+            OsString::from("--batch-size"),
+            OsString::from("6"),
+            OsString::from("--scenario"),
+            OsString::from("mixed_nullable"),
+        ];
+
+        super::run(&args).unwrap();
+        let summary = super::dataset::summarize_ipc_dataset(&path).unwrap();
+
+        assert_eq!(summary.rows, 17);
+        assert_eq!(summary.batches, 3);
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -2544,5 +2693,13 @@ mod tests {
         super::GeneratedBatchReader::new(options)
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
+    }
+
+    fn temp_test_file(name: &str) -> PathBuf {
+        let counter = TEST_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "arrow-tiberius-{name}-{}-{counter}.arrow",
+            std::process::id()
+        ))
     }
 }
