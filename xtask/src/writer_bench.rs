@@ -90,17 +90,16 @@ fn run_arrow_odbc(args: &[OsString]) -> Result<(), WriterBenchError> {
         .map_err(WriterBenchError::SqlServer)?;
     let mut runner_image = build_arrow_odbc_runner_image(&options)?;
     let runner_image_tag = runner_image.image_tag().to_owned();
-    validate_arrow_odbc_runner(&runner_image, network.as_ref(), &connection)?;
+    run_arrow_odbc_runner(&options, &runner_image, network.as_ref(), &connection)?;
     runner_image
         .cleanup()
         .map_err(WriterBenchError::OdbcRunner)?;
 
-    Err(WriterBenchError::ArrowOdbcUnavailable {
-        reason: format!(
-            "arrow-odbc runner container is not wired yet after preparing {} for {}",
-            runner_image_tag, connection.database
-        ),
-    })
+    println!("writer-bench arrow-odbc");
+    println!("  backend: arrow_odbc");
+    println!("  runner image: {}", runner_image_tag);
+    println!("  database: {}", connection.database);
+    Ok(())
 }
 
 fn print_help() {
@@ -120,7 +119,7 @@ fn print_baseline_help() {
 
 fn print_arrow_odbc_help() {
     println!(
-        "Usage:\n  cargo xtask writer-bench arrow-odbc [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Supported scenarios: narrow_numeric, mixed_nullable [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>      Managed arrow-odbc runner image tag\n  --keep-runner-image         Keep the managed arrow-odbc runner image after the task exits\n  -h, --help                  Print help\n\nThis is a SQL Server write-path comparison only. The arrow-odbc runner image contains unixODBC, Microsoft ODBC Driver 18 for SQL Server, and Rust."
+        "Usage:\n  cargo xtask writer-bench arrow-odbc [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Supported scenarios: narrow_numeric [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>      Managed arrow-odbc runner image tag\n  --keep-runner-image         Keep the managed arrow-odbc runner image after the task exits\n  -h, --help                  Print help\n\nThis is a SQL Server write-path comparison only. The arrow-odbc runner image contains unixODBC, Microsoft ODBC Driver 18 for SQL Server, and Rust."
     );
 }
 
@@ -428,7 +427,7 @@ fn parse_writer_sqlserver_options(
 }
 
 fn is_arrow_odbc_supported_scenario(scenario: &BenchmarkScenarioDefinition) -> bool {
-    matches!(scenario.name, "narrow_numeric" | "mixed_nullable")
+    matches!(scenario.name, "narrow_numeric")
 }
 
 fn create_arrow_odbc_network(
@@ -477,12 +476,13 @@ fn build_arrow_odbc_runner_image(
         .map_err(WriterBenchError::OdbcRunner)
 }
 
-fn validate_arrow_odbc_runner(
+fn run_arrow_odbc_runner(
+    options: &ArrowOdbcBenchOptions,
     runner_image: &odbc_runner::ManagedRunnerImage,
     network: Option<&sqlserver::ManagedNetwork>,
     connection: &sqlserver::SqlServerConnection,
 ) -> Result<(), WriterBenchError> {
-    println!("  action: validate_arrow_odbc_runner");
+    println!("  action: run_arrow_odbc_runner");
     let command_options = runner_image.command_options(
         network.map(|network| network.name().to_owned()),
         vec![
@@ -509,7 +509,15 @@ fn validate_arrow_odbc_runner(
             "--target-dir".to_owned(),
             "/tmp/arrow-tiberius-odbc-runner-target".to_owned(),
             "--".to_owned(),
-            "validate".to_owned(),
+            "bench".to_owned(),
+            "--rows".to_owned(),
+            options.benchmark.rows.to_string(),
+            "--batch-size".to_owned(),
+            options.benchmark.batch_size.to_string(),
+            "--scenario".to_owned(),
+            options.benchmark.scenario.name.to_owned(),
+            "--repeat".to_owned(),
+            options.benchmark.repeat.to_string(),
         ],
     );
 
@@ -1645,7 +1653,6 @@ pub(super) enum WriterBenchError {
     Validation(String),
     RowCountMismatch { expected: u64, actual: u64 },
     UnsupportedArrowOdbcScenario { scenario: String },
-    ArrowOdbcUnavailable { reason: String },
 }
 
 impl fmt::Display for WriterBenchError {
@@ -1681,11 +1688,8 @@ impl fmt::Display for WriterBenchError {
             ),
             Self::UnsupportedArrowOdbcScenario { scenario } => write!(
                 f,
-                "arrow-odbc benchmark scenario `{scenario}` is not supported yet; expected narrow_numeric or mixed_nullable"
+                "arrow-odbc benchmark scenario `{scenario}` is not supported yet; expected narrow_numeric"
             ),
-            Self::ArrowOdbcUnavailable { reason } => {
-                write!(f, "arrow-odbc benchmark is unavailable: {reason}")
-            }
         }
     }
 }
@@ -1940,7 +1944,7 @@ mod tests {
             OsString::from("--batch-size"),
             OsString::from("5"),
             OsString::from("--scenario"),
-            OsString::from("mixed_nullable"),
+            OsString::from("narrow_numeric"),
             OsString::from("--connection-string"),
             OsString::from("server=tcp:127.0.0.1,1433;password=secret"),
             OsString::from("--database"),
@@ -1951,7 +1955,7 @@ mod tests {
 
         assert_eq!(options.benchmark.rows, 25);
         assert_eq!(options.benchmark.batch_size, 5);
-        assert_eq!(options.benchmark.scenario.name, "mixed_nullable");
+        assert_eq!(options.benchmark.scenario.name, "narrow_numeric");
         assert_eq!(options.sql_server.database, "bench_db");
         assert!(options.sql_server.connection_string.is_some());
         assert!(!options.keep_runner_image);

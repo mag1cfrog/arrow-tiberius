@@ -1,7 +1,13 @@
 use std::env;
 use std::error::Error;
+use std::time::Instant;
 
-use arrow_odbc::odbc_api::Environment;
+use arrow_odbc::arrow::array::{Float64Array, Int32Array, Int64Array};
+use arrow_odbc::arrow::datatypes::{DataType, Field, Schema};
+use arrow_odbc::arrow::record_batch::{RecordBatch, RecordBatchIterator};
+use arrow_odbc::insert_into_table;
+use arrow_odbc::odbc_api::buffers::TextRowSet;
+use arrow_odbc::odbc_api::{Connection, Cursor, Environment};
 
 const CONNECTION_STRING_ENV: &str = "ARROW_TIBERIUS_BENCH_ODBC_CONNECTION_STRING";
 const DATABASE_ENV: &str = "ARROW_TIBERIUS_BENCH_DATABASE";
@@ -11,6 +17,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     match command.as_deref() {
         Some("validate") => validate(),
+        Some("bench") => bench(env::args().skip(2).collect()),
         Some(command) => Err(format!("unknown arrow-odbc runner command `{command}`").into()),
         None => Err("missing arrow-odbc runner command".into()),
     }
@@ -27,6 +34,183 @@ fn validate() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn bench(args: Vec<String>) -> Result<(), Box<dyn Error>> {
+    let options = BenchOptions::parse(args)?;
+    if options.scenario != "narrow_numeric" {
+        return Err(format!(
+            "arrow-odbc runner only supports narrow_numeric in this slice, got {}",
+            options.scenario
+        )
+        .into());
+    }
+
+    let connection_string = required_env(CONNECTION_STRING_ENV)?;
+    let database = required_env(DATABASE_ENV)?;
+    let environment = Environment::new()?;
+    let connection =
+        environment.connect_with_connection_string(&connection_string, Default::default())?;
+
+    let mut total_rows = 0_u64;
+    let write_start = Instant::now();
+
+    for repeat in 0..options.repeat {
+        let table = format!(
+            "dbo.arrow_tiberius_odbc_bench_{}_{}",
+            std::process::id(),
+            repeat
+        );
+        let repeat_result = run_repeat(&connection, &table, &options);
+        let cleanup_result = execute_sql(&connection, &format!("DROP TABLE IF EXISTS {table}"));
+
+        if let Err(error) = cleanup_result {
+            if repeat_result.is_err() {
+                eprintln!(
+                    "warning: failed to clean up arrow-odbc benchmark table {table}: {error}"
+                );
+            } else {
+                return Err(error);
+            }
+        }
+
+        total_rows = total_rows.saturating_add(repeat_result?);
+    }
+
+    let write_elapsed = write_start.elapsed();
+
+    println!("arrow-odbc runner");
+    println!("  database: {database}");
+    println!("  scenario: {}", options.scenario);
+    println!("  repeat: {}", options.repeat);
+    println!("  rows written: {total_rows}");
+    println!("  write seconds: {:.3}", write_elapsed.as_secs_f64());
+    println!(
+        "  write rows/sec: {:.2}",
+        rows_per_second(total_rows, write_elapsed)
+    );
+
+    Ok(())
+}
+
+fn run_repeat(
+    connection: &Connection<'_>,
+    table: &str,
+    options: &BenchOptions,
+) -> Result<u64, Box<dyn Error>> {
+    execute_sql(connection, &format!("DROP TABLE IF EXISTS {table}"))?;
+    execute_sql(
+        connection,
+        &format!(
+            "CREATE TABLE {table} (id32 int NOT NULL, id64 bigint NOT NULL, score float(53) NOT NULL)"
+        ),
+    )?;
+
+    let schema = narrow_numeric_schema();
+    let batches = narrow_numeric_batches(schema.clone(), options.rows, options.batch_size)?;
+    let mut reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+    insert_into_table(connection, &mut reader, table, options.batch_size)?;
+
+    let actual = select_count(connection, table)?;
+    let expected = u64::try_from(options.rows)?;
+    if actual != expected {
+        return Err(format!(
+            "arrow-odbc row-count validation failed: expected {expected}, got {actual}"
+        )
+        .into());
+    }
+
+    Ok(actual)
+}
+
+fn execute_sql(connection: &Connection<'_>, sql: &str) -> Result<(), Box<dyn Error>> {
+    connection.execute(sql, (), None)?;
+    Ok(())
+}
+
+fn select_count(connection: &Connection<'_>, table: &str) -> Result<u64, Box<dyn Error>> {
+    let sql = format!("SELECT COUNT_BIG(*) FROM {table}");
+    let cursor = connection
+        .execute(&sql, (), None)?
+        .ok_or("SELECT COUNT_BIG(*) did not return a cursor")?;
+    let text = cursor_to_string(cursor)?;
+    let count = text.trim().parse::<u64>()?;
+
+    Ok(count)
+}
+
+fn cursor_to_string(mut cursor: impl Cursor) -> Result<String, Box<dyn Error>> {
+    let mut buffer = TextRowSet::for_cursor(1, &mut cursor, Some(64))?;
+    let mut row_set_cursor = cursor.bind_buffer(&mut buffer)?;
+    let row_set = row_set_cursor.fetch()?.ok_or("cursor returned no rows")?;
+    let value = row_set
+        .at_as_str(0, 0)?
+        .ok_or("cursor count cell was NULL")?
+        .to_owned();
+
+    Ok(value)
+}
+
+fn narrow_numeric_schema() -> std::sync::Arc<Schema> {
+    std::sync::Arc::new(Schema::new(vec![
+        Field::new("id32", DataType::Int32, false),
+        Field::new("id64", DataType::Int64, false),
+        Field::new("score", DataType::Float64, false),
+    ]))
+}
+
+fn narrow_numeric_batches(
+    schema: std::sync::Arc<Schema>,
+    rows: usize,
+    batch_size: usize,
+) -> Result<Vec<RecordBatch>, Box<dyn Error>> {
+    let mut batches = Vec::new();
+    let mut offset = 0;
+
+    while offset < rows {
+        let len = batch_size.min(rows - offset);
+        let id32 = (offset..offset + len)
+            .map(deterministic_i32)
+            .collect::<Int32Array>();
+        let id64 = (offset..offset + len)
+            .map(|row| i64::from(deterministic_i32(row)) * 1_000)
+            .collect::<Int64Array>();
+        let score = (offset..offset + len)
+            .map(deterministic_score)
+            .collect::<Float64Array>();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                std::sync::Arc::new(id32),
+                std::sync::Arc::new(id64),
+                std::sync::Arc::new(score),
+            ],
+        )?;
+
+        batches.push(batch);
+        offset += len;
+    }
+
+    Ok(batches)
+}
+
+fn deterministic_i32(row: usize) -> i32 {
+    (row as i32)
+        .wrapping_mul(1_103_515_245)
+        .wrapping_add(12_345)
+}
+
+fn deterministic_score(row: usize) -> f64 {
+    let value = row.wrapping_mul(48_271) % 1_000_003;
+    value as f64 / 97.0
+}
+
+fn rows_per_second(rows: u64, elapsed: std::time::Duration) -> f64 {
+    if elapsed.is_zero() {
+        return 0.0;
+    }
+
+    rows as f64 / elapsed.as_secs_f64()
+}
+
 fn required_env(name: &str) -> Result<String, Box<dyn Error>> {
     let value =
         env::var(name).map_err(|_| format!("missing required environment variable {name}"))?;
@@ -36,4 +220,132 @@ fn required_env(name: &str) -> Result<String, Box<dyn Error>> {
     }
 
     Ok(value)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BenchOptions {
+    rows: usize,
+    batch_size: usize,
+    scenario: String,
+    repeat: usize,
+}
+
+impl BenchOptions {
+    fn parse(args: Vec<String>) -> Result<Self, Box<dyn Error>> {
+        let mut options = Self {
+            rows: 100_000,
+            batch_size: 8_192,
+            scenario: "narrow_numeric".to_owned(),
+            repeat: 1,
+        };
+        let mut index = 0;
+
+        while index < args.len() {
+            match args[index].as_str() {
+                "--rows" => {
+                    index += 1;
+                    options.rows = parse_positive_usize("--rows", args.get(index))?;
+                }
+                "--batch-size" => {
+                    index += 1;
+                    options.batch_size = parse_positive_usize("--batch-size", args.get(index))?;
+                }
+                "--scenario" => {
+                    index += 1;
+                    options.scenario = required_arg("--scenario", args.get(index))?.to_owned();
+                }
+                "--repeat" => {
+                    index += 1;
+                    options.repeat = parse_positive_usize("--repeat", args.get(index))?;
+                }
+                other => return Err(format!("unknown arrow-odbc runner option `{other}`").into()),
+            }
+
+            index += 1;
+        }
+
+        Ok(options)
+    }
+}
+
+fn parse_positive_usize(option: &str, value: Option<&String>) -> Result<usize, Box<dyn Error>> {
+    let parsed = required_arg(option, value)?.parse::<usize>()?;
+
+    if parsed == 0 {
+        return Err(format!("{option} must be greater than zero").into());
+    }
+
+    Ok(parsed)
+}
+
+fn required_arg<'a>(option: &str, value: Option<&'a String>) -> Result<&'a str, Box<dyn Error>> {
+    value
+        .map(String::as_str)
+        .ok_or_else(|| format!("missing value for {option}").into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BenchOptions, narrow_numeric_batches, narrow_numeric_schema, rows_per_second};
+
+    #[test]
+    fn parses_bench_options() {
+        let options = BenchOptions::parse(vec![
+            "--rows".to_owned(),
+            "25".to_owned(),
+            "--batch-size".to_owned(),
+            "8".to_owned(),
+            "--scenario".to_owned(),
+            "narrow_numeric".to_owned(),
+            "--repeat".to_owned(),
+            "3".to_owned(),
+        ])
+        .expect("valid options should parse");
+
+        assert_eq!(options.rows, 25);
+        assert_eq!(options.batch_size, 8);
+        assert_eq!(options.scenario, "narrow_numeric");
+        assert_eq!(options.repeat, 3);
+    }
+
+    #[test]
+    fn rejects_zero_rows() {
+        let err = BenchOptions::parse(vec!["--rows".to_owned(), "0".to_owned()])
+            .expect_err("zero rows should be rejected");
+
+        assert!(err.to_string().contains("--rows"));
+    }
+
+    #[test]
+    fn rejects_missing_option_value() {
+        let err = BenchOptions::parse(vec!["--batch-size".to_owned()])
+            .expect_err("missing value should be rejected");
+
+        assert!(err.to_string().contains("--batch-size"));
+    }
+
+    #[test]
+    fn rejects_unknown_option() {
+        let err = BenchOptions::parse(vec!["--unexpected".to_owned()])
+            .expect_err("unknown option should be rejected");
+
+        assert!(err.to_string().contains("--unexpected"));
+    }
+
+    #[test]
+    fn narrow_numeric_batches_cover_tail_rows() {
+        let schema = narrow_numeric_schema();
+        let batches = narrow_numeric_batches(schema, 25, 8).expect("batches should build");
+        let lengths = batches
+            .iter()
+            .map(arrow_odbc::arrow::record_batch::RecordBatch::num_rows)
+            .collect::<Vec<_>>();
+
+        assert_eq!(lengths, vec![8, 8, 8, 1]);
+    }
+
+    #[test]
+    fn rows_per_second_handles_zero_elapsed() {
+        assert_eq!(rows_per_second(25, std::time::Duration::ZERO), 0.0);
+    }
 }
