@@ -482,13 +482,7 @@ fn validate_arrow_odbc_runner(
     network: Option<&sqlserver::ManagedNetwork>,
     connection: &sqlserver::SqlServerConnection,
 ) -> Result<(), WriterBenchError> {
-    println!("  action: validate_runner_odbc_driver");
-    let script = "\
-        odbcinst -q -d | grep -F '[ODBC Driver 18 for SQL Server]' && \
-        test -f Cargo.toml && \
-        test -f xtask/Cargo.toml && \
-        test -n \"$ARROW_TIBERIUS_BENCH_CONNECTION_STRING\" && \
-        test -n \"$ARROW_TIBERIUS_BENCH_DATABASE\"";
+    println!("  action: validate_arrow_odbc_runner");
     let command_options = runner_image.command_options(
         network.map(|network| network.name().to_owned()),
         vec![
@@ -497,16 +491,90 @@ fn validate_arrow_odbc_runner(
                 connection.connection_string.clone(),
             ),
             (
+                "ARROW_TIBERIUS_BENCH_ODBC_CONNECTION_STRING".to_owned(),
+                odbc_connection_string(connection)?,
+            ),
+            (
                 "ARROW_TIBERIUS_BENCH_DATABASE".to_owned(),
                 connection.database.clone(),
             ),
         ],
         Some(repository_root()?),
         Some("/workspace".to_owned()),
-        vec!["sh".to_owned(), "-lc".to_owned(), script.to_owned()],
+        vec![
+            "cargo".to_owned(),
+            "run".to_owned(),
+            "--manifest-path".to_owned(),
+            "xtask/arrow-odbc-runner/Cargo.toml".to_owned(),
+            "--target-dir".to_owned(),
+            "/tmp/arrow-tiberius-odbc-runner-target".to_owned(),
+            "--".to_owned(),
+            "validate".to_owned(),
+        ],
     );
 
     odbc_runner::run_runner_command(&command_options).map_err(WriterBenchError::OdbcRunner)
+}
+
+fn odbc_connection_string(
+    connection: &sqlserver::SqlServerConnection,
+) -> Result<String, WriterBenchError> {
+    odbc_connection_string_from_parts(&connection.connection_string, &connection.database)
+}
+
+fn odbc_connection_string_from_parts(
+    connection_string: &str,
+    database: &str,
+) -> Result<String, WriterBenchError> {
+    let server =
+        connection_setting(connection_string, &["server", "data source"]).ok_or_else(|| {
+            WriterBenchError::Validation(
+                "SQL Server connection string is missing server for ODBC runner".to_owned(),
+            )
+        })?;
+    let user = connection_setting(connection_string, &["user id", "uid"]).ok_or_else(|| {
+        WriterBenchError::Validation(
+            "SQL Server connection string is missing user id for ODBC runner".to_owned(),
+        )
+    })?;
+    let password =
+        connection_setting(connection_string, &["password", "pwd"]).ok_or_else(|| {
+            WriterBenchError::Validation(
+                "SQL Server connection string is missing password for ODBC runner".to_owned(),
+            )
+        })?;
+    let trust_server_certificate =
+        connection_setting(connection_string, &["trustservercertificate"]).unwrap_or("yes");
+
+    Ok(format!(
+        "Driver={{ODBC Driver 18 for SQL Server}};Server={server};UID={user};PWD={password};Database={database};TrustServerCertificate={};",
+        odbc_bool_value(trust_server_certificate)
+    ))
+}
+
+fn connection_setting<'a>(connection_string: &'a str, names: &[&str]) -> Option<&'a str> {
+    connection_string.split(';').find_map(|segment| {
+        let (name, value) = segment.split_once('=')?;
+        let name = name.trim();
+        let value = value.trim();
+
+        if value.is_empty() {
+            return None;
+        }
+
+        names
+            .iter()
+            .any(|expected| name.eq_ignore_ascii_case(expected))
+            .then_some(value)
+    })
+}
+
+fn odbc_bool_value(value: &str) -> &'static str {
+    if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes") || value == "1" {
+        "yes"
+    } else {
+        "no"
+    }
 }
 
 fn repository_root() -> Result<PathBuf, WriterBenchError> {
@@ -1904,6 +1972,33 @@ mod tests {
         let network = super::create_arrow_odbc_network(&options).unwrap();
 
         assert!(network.is_none());
+    }
+
+    #[test]
+    fn arrow_odbc_connection_string_is_derived_from_sql_server_connection() {
+        let odbc = super::odbc_connection_string_from_parts(
+            "server=tcp:sqlserver,1433;user id=sa;password=secret;TrustServerCertificate=true",
+            "bench_db",
+        )
+        .unwrap();
+
+        assert_eq!(
+            odbc,
+            "Driver={ODBC Driver 18 for SQL Server};Server=tcp:sqlserver,1433;UID=sa;PWD=secret;Database=bench_db;TrustServerCertificate=yes;"
+        );
+    }
+
+    #[test]
+    fn arrow_odbc_connection_string_rejects_missing_password() {
+        let err = super::odbc_connection_string_from_parts(
+            "server=tcp:sqlserver,1433;user id=sa",
+            "bench_db",
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, WriterBenchError::Validation(message) if message.contains("password"))
+        );
     }
 
     #[test]
