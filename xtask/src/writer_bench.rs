@@ -1,12 +1,12 @@
 use std::ffi::OsString;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::sqlserver;
+use crate::{odbc_runner, sqlserver};
 use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int32Array,
     Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
@@ -19,7 +19,11 @@ use arrow_tiberius::{
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
+mod dataset;
+
 static BENCH_TABLE_COUNTER: AtomicU64 = AtomicU64::new(0);
+static BENCH_IPC_COUNTER: AtomicU64 = AtomicU64::new(0);
+const ODBC_TABLE_PLACEHOLDER: &str = "__ARROW_TIBERIUS_ODBC_TABLE__";
 
 pub(super) fn run(args: &[OsString]) -> Result<(), WriterBenchError> {
     if args.is_empty()
@@ -34,6 +38,18 @@ pub(super) fn run(args: &[OsString]) -> Result<(), WriterBenchError> {
     if let Some(command) = args.first().and_then(|arg| arg.to_str()) {
         if command == "baseline" {
             return run_baseline(&args[1..]);
+        }
+
+        if command == "arrow-odbc" {
+            return run_arrow_odbc(&args[1..]);
+        }
+
+        if command == "compare" {
+            return run_compare(&args[1..]);
+        }
+
+        if command == "ipc" {
+            return run_ipc_dataset(&args[1..]);
         }
 
         if !command.starts_with('-') {
@@ -72,9 +88,159 @@ fn run_baseline(args: &[OsString]) -> Result<(), WriterBenchError> {
     Ok(())
 }
 
+fn run_arrow_odbc(args: &[OsString]) -> Result<(), WriterBenchError> {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print_arrow_odbc_help();
+        return Ok(());
+    }
+
+    let options = ArrowOdbcBenchOptions::parse(args)?;
+    let network = create_arrow_odbc_network(&options)?;
+    let connection = options
+        .sql_server
+        .connect_or_start_with_network(network.as_ref())
+        .map_err(WriterBenchError::SqlServer)?;
+    let mut runner_image = build_arrow_odbc_runner_image(&options)?;
+    let runner_image_tag = runner_image.image_tag().to_owned();
+    let ipc_dataset = prepare_arrow_odbc_ipc_dataset(&options)?;
+    let runner_result = run_arrow_odbc_runner(
+        &options,
+        &runner_image,
+        network.as_ref(),
+        &connection,
+        &ipc_dataset,
+    );
+    let dataset_cleanup_result = ipc_dataset.cleanup();
+    runner_image
+        .cleanup()
+        .map_err(WriterBenchError::OdbcRunner)?;
+    runner_result?;
+    dataset_cleanup_result?;
+
+    println!("writer-bench arrow-odbc");
+    println!("  backend: arrow_odbc");
+    println!("  runner image: {}", runner_image_tag);
+    println!("  database: {}", connection.database);
+    Ok(())
+}
+
+fn run_compare(args: &[OsString]) -> Result<(), WriterBenchError> {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print_compare_help();
+        return Ok(());
+    }
+
+    let options = CompareBenchOptions::parse(args)?;
+    let report = run_compare_benchmark(&options)?;
+
+    print_compare_summary(&options, &report);
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ManagedIpcDataset {
+    host_path: PathBuf,
+    container_path: Option<String>,
+}
+
+impl ManagedIpcDataset {
+    fn cleanup(&self) -> Result<(), WriterBenchError> {
+        if self.host_path.exists() {
+            std::fs::remove_file(&self.host_path).map_err(WriterBenchError::Io)?;
+        }
+
+        Ok(())
+    }
+}
+
+fn prepare_arrow_odbc_ipc_dataset(
+    options: &ArrowOdbcBenchOptions,
+) -> Result<ManagedIpcDataset, WriterBenchError> {
+    let root = repository_root()?;
+    let dataset_dir = root.join("target").join("arrow-tiberius-writer-bench");
+    std::fs::create_dir_all(&dataset_dir).map_err(WriterBenchError::Io)?;
+
+    let counter = BENCH_IPC_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let filename = format!(
+        "arrow-odbc-{}-{}-{counter}.arrow",
+        std::process::id(),
+        options.benchmark.scenario.name
+    );
+    let host_path = dataset_dir.join(&filename);
+    let container_path = format!("/workspace/target/arrow-tiberius-writer-bench/{filename}");
+    let summary = dataset::write_ipc_dataset(&options.benchmark, &host_path)?;
+
+    println!("writer-bench arrow-odbc");
+    println!("  action: prepare_ipc_dataset");
+    println!("  path: {}", host_path.display());
+    println!("  container path: {container_path}");
+    println!("  rows: {}", summary.rows);
+    println!("  batches: {}", summary.batches);
+
+    Ok(ManagedIpcDataset {
+        host_path,
+        container_path: Some(container_path),
+    })
+}
+
+fn prepare_compare_ipc_dataset(
+    options: &CompareBenchOptions,
+) -> Result<ManagedIpcDataset, WriterBenchError> {
+    let root = repository_root()?;
+    let dataset_dir = root.join("target").join("arrow-tiberius-writer-bench");
+    std::fs::create_dir_all(&dataset_dir).map_err(WriterBenchError::Io)?;
+
+    let counter = BENCH_IPC_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let filename = format!(
+        "compare-{}-{}-{counter}.arrow",
+        std::process::id(),
+        options.benchmark.scenario.name
+    );
+    let host_path = dataset_dir.join(&filename);
+    let container_path = format!("/workspace/target/arrow-tiberius-writer-bench/{filename}");
+    let summary = dataset::write_ipc_dataset(&options.benchmark, &host_path)?;
+
+    println!("writer-bench compare");
+    println!("  action: prepare_ipc_dataset");
+    println!("  path: {}", host_path.display());
+    println!("  container path: {container_path}");
+    println!("  rows: {}", summary.rows);
+    println!("  batches: {}", summary.batches);
+
+    Ok(ManagedIpcDataset {
+        host_path,
+        container_path: Some(container_path),
+    })
+}
+
+fn run_ipc_dataset(args: &[OsString]) -> Result<(), WriterBenchError> {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print_ipc_help();
+        return Ok(());
+    }
+
+    let options = IpcDatasetOptions::parse(args)?;
+    let written = dataset::write_ipc_dataset(&options.benchmark, &options.path)?;
+    let replayed = dataset::summarize_ipc_dataset(&options.path)?;
+
+    if written != replayed {
+        return Err(WriterBenchError::Validation(format!(
+            "IPC dataset replay summary mismatch: wrote {written:?}, replayed {replayed:?}"
+        )));
+    }
+
+    println!("writer-bench ipc");
+    println!("  path: {}", options.path.display());
+    println!("  scenario: {}", options.benchmark.scenario);
+    println!("  rows: {}", written.rows);
+    println!("  batches: {}", written.batches);
+    println!("  batch size: {}", options.benchmark.batch_size);
+    Ok(())
+}
+
 fn print_help() {
     println!(
-        "Usage:\n  cargo xtask writer-bench [OPTIONS]\n  cargo xtask writer-bench baseline [OPTIONS]\n\nCommands:\n  baseline    Run the baseline TokenRow SQL Server writer benchmark\n\nOptions:\n  --rows <COUNT>          Total rows to generate [default: 100000]\n  --batch-size <COUNT>    Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>       Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>        Number of benchmark repeats [default: 1]\n  --output <FORMAT>       Output format: human [default: human]\n  -h, --help              Print help\n\nScenarios:"
+        "Usage:\n  cargo xtask writer-bench [OPTIONS]\n  cargo xtask writer-bench baseline [OPTIONS]\n  cargo xtask writer-bench arrow-odbc [OPTIONS]\n  cargo xtask writer-bench compare [OPTIONS]\n  cargo xtask writer-bench ipc [OPTIONS]\n\nCommands:\n  baseline      Run the baseline TokenRow SQL Server writer benchmark\n  arrow-odbc    Run the optional arrow-odbc SQL Server writer benchmark\n  compare       Compare writer backends over one shared Arrow IPC dataset\n  ipc           Generate a benchmark Arrow IPC dataset file\n\nOptions:\n  --rows <COUNT>          Total rows to generate [default: 100000]\n  --batch-size <COUNT>    Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>       Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>        Number of benchmark repeats [default: 1]\n  --output <FORMAT>       Output format: human [default: human]\n  -h, --help              Print help\n\nScenarios:"
     );
     for scenario in SCENARIOS {
         println!("  {:<16}  {}", scenario.name, scenario.description);
@@ -84,6 +250,24 @@ fn print_help() {
 fn print_baseline_help() {
     println!(
         "Usage:\n  cargo xtask writer-bench baseline [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep the container after the task exits\n  -h, --help                  Print help"
+    );
+}
+
+fn print_arrow_odbc_help() {
+    println!(
+        "Usage:\n  cargo xtask writer-bench arrow-odbc [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>      Managed arrow-odbc runner image tag\n  --keep-runner-image         Keep the managed arrow-odbc runner image after the task exits\n  -h, --help                  Print help\n\nThis is a SQL Server write-path comparison only. The arrow-odbc runner image contains unixODBC, Microsoft ODBC Driver 18 for SQL Server, and Rust."
+    );
+}
+
+fn print_compare_help() {
+    println!(
+        "Usage:\n  cargo xtask writer-bench compare [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --backends <LIST>           Comma-separated backends: baseline,arrow-odbc [default: baseline,arrow-odbc]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>      Managed arrow-odbc runner image tag\n  --keep-runner-image         Keep the managed arrow-odbc runner image after the task exits\n  -h, --help                  Print help\n\nCompare runs use one shared Arrow IPC dataset as the fairness boundary."
+    );
+}
+
+fn print_ipc_help() {
+    println!(
+        "Usage:\n  cargo xtask writer-bench ipc --path <FILE> [OPTIONS]\n\nData Options:\n  --path <FILE>               Arrow IPC file to create\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  -h, --help                  Print help\n\nThe IPC file is the shared benchmark dataset boundary used by compare backends."
     );
 }
 
@@ -140,6 +324,50 @@ fn print_baseline_summary(
     println!("  validate: {}", format_duration(report.timings.validate));
     println!("  cleanup: {}", format_duration(report.timings.cleanup));
     println!("  total: {}", format_duration(report.timings.total));
+}
+
+fn print_compare_summary(options: &CompareBenchOptions, report: &CompareBenchReport) {
+    println!("writer-bench compare");
+    println!("  rows per repeat: {}", options.benchmark.rows);
+    println!("  batch size: {}", options.benchmark.batch_size);
+    println!("  scenario: {}", options.benchmark.scenario);
+    println!("  repeat: {}", options.benchmark.repeat);
+    println!("  output: {}", options.benchmark.output);
+    println!("  dataset: {}", report.ipc_dataset.display());
+    println!("  database: {}", report.database);
+
+    for backend in &report.backends {
+        println!("  backend: {}", backend.backend());
+        match backend {
+            CompareBackendBenchReport::Baseline { report } => {
+                println!("    batches written: {}", report.stats.batches_written);
+                println!("    rows written: {}", report.stats.rows_written);
+                println!(
+                    "    write rows/sec: {}",
+                    format_rows_per_second(
+                        report.stats.rows_written,
+                        report.timings.write + report.timings.finish
+                    )
+                );
+                println!("    validated rows: {}", report.validated_rows);
+                println!("    setup: {}", format_duration(report.timings.setup));
+                println!("    write: {}", format_duration(report.timings.write));
+                println!("    finish: {}", format_duration(report.timings.finish));
+                println!("    validate: {}", format_duration(report.timings.validate));
+                println!("    cleanup: {}", format_duration(report.timings.cleanup));
+                println!("    total: {}", format_duration(report.timings.total));
+            }
+            CompareBackendBenchReport::ArrowOdbc { report } => {
+                println!("    rows written: {}", report.rows_written);
+                println!(
+                    "    write rows/sec: {}",
+                    format_rows_per_second(report.rows_written, report.write_elapsed)
+                );
+                println!("    validated rows: {}", report.rows_written);
+                println!("    write: {}", format_duration(report.write_elapsed));
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -207,6 +435,62 @@ impl WriterBenchOptions {
         }
 
         Ok(options)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IpcDatasetOptions {
+    benchmark: WriterBenchOptions,
+    path: PathBuf,
+}
+
+impl IpcDatasetOptions {
+    fn parse(args: &[OsString]) -> Result<Self, WriterBenchError> {
+        let mut benchmark = WriterBenchOptions::default();
+        let mut path = None;
+        let mut index = 0;
+
+        while index < args.len() {
+            let arg = args[index]
+                .to_str()
+                .ok_or_else(|| WriterBenchError::InvalidUtf8Argument(args[index].clone()))?;
+
+            match arg {
+                "-h" | "--help" => {
+                    print_ipc_help();
+                    return Ok(Self {
+                        benchmark,
+                        path: PathBuf::new(),
+                    });
+                }
+                "--path" => {
+                    path = Some(PathBuf::from(required_value(args, index)?));
+                    index += 1;
+                }
+                "--rows" => {
+                    benchmark.rows = parse_positive_usize("--rows", &required_value(args, index)?)?;
+                    index += 1;
+                }
+                "--batch-size" => {
+                    benchmark.batch_size =
+                        parse_positive_usize("--batch-size", &required_value(args, index)?)?;
+                    index += 1;
+                }
+                "--scenario" => {
+                    benchmark.scenario = parse_scenario(&required_value(args, index)?)?;
+                    index += 1;
+                }
+                other => return Err(WriterBenchError::UnknownOption(other.to_owned())),
+            }
+
+            index += 1;
+        }
+
+        let path = path.ok_or_else(|| {
+            WriterBenchError::Validation("writer-bench ipc requires --path <FILE>".to_owned())
+        })?;
+
+        Ok(Self { benchmark, path })
     }
 }
 
@@ -285,6 +569,595 @@ impl BaselineBenchOptions {
 
         Ok(options)
     }
+}
+
+#[derive(Debug, Clone)]
+struct ArrowOdbcBenchOptions {
+    benchmark: WriterBenchOptions,
+    sql_server: sqlserver::SqlServerConnectionOptions,
+    runner_image: String,
+    keep_runner_image: bool,
+}
+
+impl ArrowOdbcBenchOptions {
+    fn parse(args: &[OsString]) -> Result<Self, WriterBenchError> {
+        parse_writer_sqlserver_options(args, print_arrow_odbc_help)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CompareBenchOptions {
+    benchmark: WriterBenchOptions,
+    sql_server: sqlserver::SqlServerConnectionOptions,
+    backends: Vec<BenchmarkBackend>,
+    runner_image: String,
+    keep_runner_image: bool,
+}
+
+impl CompareBenchOptions {
+    fn parse(args: &[OsString]) -> Result<Self, WriterBenchError> {
+        let mut options = Self {
+            benchmark: WriterBenchOptions::default(),
+            sql_server: sqlserver::SqlServerConnectionOptions::benchmark_default(),
+            backends: vec![BenchmarkBackend::Baseline, BenchmarkBackend::ArrowOdbc],
+            runner_image: odbc_runner::DEFAULT_RUNNER_IMAGE_TAG.to_owned(),
+            keep_runner_image: false,
+        };
+        let mut index = 0;
+
+        while index < args.len() {
+            let arg = args[index]
+                .to_str()
+                .ok_or_else(|| WriterBenchError::InvalidUtf8Argument(args[index].clone()))?;
+
+            match arg {
+                "-h" | "--help" => {
+                    print_compare_help();
+                    return Ok(options);
+                }
+                "--rows" => {
+                    options.benchmark.rows =
+                        parse_positive_usize("--rows", &required_value(args, index)?)?;
+                    index += 1;
+                }
+                "--batch-size" => {
+                    options.benchmark.batch_size =
+                        parse_positive_usize("--batch-size", &required_value(args, index)?)?;
+                    index += 1;
+                }
+                "--scenario" => {
+                    options.benchmark.scenario = parse_scenario(&required_value(args, index)?)?;
+                    index += 1;
+                }
+                "--repeat" => {
+                    options.benchmark.repeat =
+                        parse_positive_usize("--repeat", &required_value(args, index)?)?;
+                    index += 1;
+                }
+                "--output" => {
+                    options.benchmark.output = required_value(args, index)?.parse()?;
+                    index += 1;
+                }
+                "--backends" => {
+                    options.backends = parse_benchmark_backends(&required_value(args, index)?)?;
+                    index += 1;
+                }
+                "--container-runtime" => {
+                    options.sql_server.container_runtime =
+                        Some(PathBuf::from(required_value(args, index)?));
+                    index += 1;
+                }
+                "--connection-string" => {
+                    options.sql_server.connection_string = Some(required_value(args, index)?);
+                    index += 1;
+                }
+                "--image" => {
+                    options.sql_server.image = required_value(args, index)?;
+                    index += 1;
+                }
+                "--database" => {
+                    options.sql_server.database = required_value(args, index)?;
+                    index += 1;
+                }
+                "--keep-container" => {
+                    options.sql_server.keep_container = true;
+                }
+                "--runner-image" => {
+                    options.runner_image = required_value(args, index)?;
+                    index += 1;
+                }
+                "--keep-runner-image" => {
+                    options.keep_runner_image = true;
+                }
+                other => return Err(WriterBenchError::UnknownOption(other.to_owned())),
+            }
+
+            index += 1;
+        }
+
+        Ok(options)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchmarkBackend {
+    Baseline,
+    ArrowOdbc,
+}
+
+impl fmt::Display for BenchmarkBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Baseline => f.write_str("baseline"),
+            Self::ArrowOdbc => f.write_str("arrow-odbc"),
+        }
+    }
+}
+
+impl FromStr for BenchmarkBackend {
+    type Err = WriterBenchError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "baseline" => Ok(Self::Baseline),
+            "arrow-odbc" => Ok(Self::ArrowOdbc),
+            other => Err(WriterBenchError::Validation(format!(
+                "unknown writer-bench compare backend `{other}`; expected baseline or arrow-odbc"
+            ))),
+        }
+    }
+}
+
+fn parse_benchmark_backends(value: &str) -> Result<Vec<BenchmarkBackend>, WriterBenchError> {
+    let mut backends = Vec::new();
+
+    for raw_backend in value.split(',') {
+        let raw_backend = raw_backend.trim();
+        if raw_backend.is_empty() {
+            return Err(WriterBenchError::Validation(
+                "writer-bench compare --backends contains an empty backend name".to_owned(),
+            ));
+        }
+
+        let backend = raw_backend.parse::<BenchmarkBackend>()?;
+        if backends.contains(&backend) {
+            return Err(WriterBenchError::Validation(format!(
+                "writer-bench compare backend `{backend}` was provided more than once"
+            )));
+        }
+
+        backends.push(backend);
+    }
+
+    if backends.is_empty() {
+        return Err(WriterBenchError::Validation(
+            "writer-bench compare requires at least one backend".to_owned(),
+        ));
+    }
+
+    Ok(backends)
+}
+
+fn parse_writer_sqlserver_options(
+    args: &[OsString],
+    print_command_help: fn(),
+) -> Result<ArrowOdbcBenchOptions, WriterBenchError> {
+    let mut options = ArrowOdbcBenchOptions {
+        benchmark: WriterBenchOptions::default(),
+        sql_server: sqlserver::SqlServerConnectionOptions::benchmark_default(),
+        runner_image: odbc_runner::DEFAULT_RUNNER_IMAGE_TAG.to_owned(),
+        keep_runner_image: false,
+    };
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = args[index]
+            .to_str()
+            .ok_or_else(|| WriterBenchError::InvalidUtf8Argument(args[index].clone()))?;
+
+        match arg {
+            "-h" | "--help" => {
+                print_command_help();
+                return Ok(options);
+            }
+            "--rows" => {
+                options.benchmark.rows =
+                    parse_positive_usize("--rows", &required_value(args, index)?)?;
+                index += 1;
+            }
+            "--batch-size" => {
+                options.benchmark.batch_size =
+                    parse_positive_usize("--batch-size", &required_value(args, index)?)?;
+                index += 1;
+            }
+            "--scenario" => {
+                options.benchmark.scenario = parse_scenario(&required_value(args, index)?)?;
+                index += 1;
+            }
+            "--repeat" => {
+                options.benchmark.repeat =
+                    parse_positive_usize("--repeat", &required_value(args, index)?)?;
+                index += 1;
+            }
+            "--output" => {
+                options.benchmark.output = required_value(args, index)?.parse()?;
+                index += 1;
+            }
+            "--container-runtime" => {
+                options.sql_server.container_runtime =
+                    Some(PathBuf::from(required_value(args, index)?));
+                index += 1;
+            }
+            "--connection-string" => {
+                options.sql_server.connection_string = Some(required_value(args, index)?);
+                index += 1;
+            }
+            "--image" => {
+                options.sql_server.image = required_value(args, index)?;
+                index += 1;
+            }
+            "--database" => {
+                options.sql_server.database = required_value(args, index)?;
+                index += 1;
+            }
+            "--keep-container" => {
+                options.sql_server.keep_container = true;
+            }
+            "--runner-image" => {
+                options.runner_image = required_value(args, index)?;
+                index += 1;
+            }
+            "--keep-runner-image" => {
+                options.keep_runner_image = true;
+            }
+            other => return Err(WriterBenchError::UnknownOption(other.to_owned())),
+        }
+
+        index += 1;
+    }
+
+    Ok(options)
+}
+
+fn create_arrow_odbc_network(
+    options: &ArrowOdbcBenchOptions,
+) -> Result<Option<sqlserver::ManagedNetwork>, WriterBenchError> {
+    create_odbc_runner_network(&options.sql_server)
+}
+
+fn create_compare_network(
+    options: &CompareBenchOptions,
+) -> Result<Option<sqlserver::ManagedNetwork>, WriterBenchError> {
+    if options.backends.contains(&BenchmarkBackend::ArrowOdbc) {
+        create_odbc_runner_network(&options.sql_server)
+    } else {
+        Ok(None)
+    }
+}
+
+fn create_odbc_runner_network(
+    sql_server: &sqlserver::SqlServerConnectionOptions,
+) -> Result<Option<sqlserver::ManagedNetwork>, WriterBenchError> {
+    if sql_server.connection_string.is_some() {
+        return Ok(None);
+    }
+
+    let container_runtime = sql_server
+        .resolve_runtime()
+        .map_err(WriterBenchError::SqlServer)?;
+    let network = sqlserver::ManagedNetwork::create(container_runtime, sql_server.keep_container)
+        .map_err(WriterBenchError::SqlServer)?;
+
+    println!("writer-bench arrow-odbc");
+    println!("  action: prepare_container_network");
+    println!("  network: {}", network.name());
+    println!("  keep network: {}", sql_server.keep_container);
+
+    Ok(Some(network))
+}
+
+fn build_arrow_odbc_runner_image(
+    options: &ArrowOdbcBenchOptions,
+) -> Result<odbc_runner::ManagedRunnerImage, WriterBenchError> {
+    build_odbc_runner_image(
+        &options.sql_server,
+        &options.runner_image,
+        options.keep_runner_image,
+    )
+}
+
+fn build_compare_odbc_runner_image(
+    options: &CompareBenchOptions,
+) -> Result<odbc_runner::ManagedRunnerImage, WriterBenchError> {
+    build_odbc_runner_image(
+        &options.sql_server,
+        &options.runner_image,
+        options.keep_runner_image,
+    )
+}
+
+fn build_odbc_runner_image(
+    sql_server: &sqlserver::SqlServerConnectionOptions,
+    runner_image: &str,
+    keep_runner_image: bool,
+) -> Result<odbc_runner::ManagedRunnerImage, WriterBenchError> {
+    let container_runtime = sql_server
+        .resolve_runtime()
+        .map_err(WriterBenchError::SqlServer)?;
+    let image_options = odbc_runner::RunnerImageOptions {
+        container_runtime,
+        image_tag: runner_image.to_owned(),
+        manifest_dir: repository_root()?,
+    };
+
+    println!("writer-bench arrow-odbc");
+    println!("  action: prepare_runner_image");
+    println!("  image: {}", image_options.image_tag);
+    println!("  dockerfile: {}", image_options.dockerfile().display());
+    println!("  keep image: {keep_runner_image}");
+
+    odbc_runner::ManagedRunnerImage::build(image_options, keep_runner_image)
+        .map_err(WriterBenchError::OdbcRunner)
+}
+
+fn run_arrow_odbc_runner(
+    options: &ArrowOdbcBenchOptions,
+    runner_image: &odbc_runner::ManagedRunnerImage,
+    network: Option<&sqlserver::ManagedNetwork>,
+    connection: &sqlserver::SqlServerConnection,
+    ipc_dataset: &ManagedIpcDataset,
+) -> Result<(), WriterBenchError> {
+    run_arrow_odbc_runner_for_benchmark(
+        &options.benchmark,
+        runner_image,
+        network,
+        connection,
+        ipc_dataset,
+    )
+}
+
+fn run_arrow_odbc_runner_for_benchmark(
+    benchmark: &WriterBenchOptions,
+    runner_image: &odbc_runner::ManagedRunnerImage,
+    network: Option<&sqlserver::ManagedNetwork>,
+    connection: &sqlserver::SqlServerConnection,
+    ipc_dataset: &ManagedIpcDataset,
+) -> Result<(), WriterBenchError> {
+    println!("  action: run_arrow_odbc_runner");
+    let command_options = arrow_odbc_runner_command_options(
+        benchmark,
+        runner_image,
+        network,
+        connection,
+        ipc_dataset,
+    )?;
+
+    odbc_runner::run_runner_command(&command_options).map_err(WriterBenchError::OdbcRunner)
+}
+
+fn run_arrow_odbc_runner_for_benchmark_capture(
+    benchmark: &WriterBenchOptions,
+    runner_image: &odbc_runner::ManagedRunnerImage,
+    network: Option<&sqlserver::ManagedNetwork>,
+    connection: &sqlserver::SqlServerConnection,
+    ipc_dataset: &ManagedIpcDataset,
+) -> Result<ArrowOdbcBenchReport, WriterBenchError> {
+    println!("  action: run_arrow_odbc_runner");
+    let command_options = arrow_odbc_runner_command_options(
+        benchmark,
+        runner_image,
+        network,
+        connection,
+        ipc_dataset,
+    )?;
+    let output = odbc_runner::run_runner_command_capture(&command_options)
+        .map_err(WriterBenchError::OdbcRunner)?;
+
+    print!("{}", output.stdout);
+    eprint!("{}", output.stderr);
+
+    parse_arrow_odbc_runner_report(&format!("{}\n{}", output.stdout, output.stderr))
+}
+
+fn arrow_odbc_runner_command_options(
+    benchmark: &WriterBenchOptions,
+    runner_image: &odbc_runner::ManagedRunnerImage,
+    network: Option<&sqlserver::ManagedNetwork>,
+    connection: &sqlserver::SqlServerConnection,
+    ipc_dataset: &ManagedIpcDataset,
+) -> Result<odbc_runner::RunnerCommandOptions, WriterBenchError> {
+    let container_path = ipc_dataset.container_path.as_deref().ok_or_else(|| {
+        WriterBenchError::Validation(
+            "arrow-odbc benchmark requires an IPC dataset container path".to_owned(),
+        )
+    })?;
+
+    Ok(runner_image.command_options(
+        network.map(|network| network.name().to_owned()),
+        vec![
+            (
+                "ARROW_TIBERIUS_BENCH_CONNECTION_STRING".to_owned(),
+                connection.connection_string.clone(),
+            ),
+            (
+                "ARROW_TIBERIUS_BENCH_ODBC_CONNECTION_STRING".to_owned(),
+                odbc_connection_string(connection)?,
+            ),
+            (
+                "ARROW_TIBERIUS_BENCH_DATABASE".to_owned(),
+                connection.database.clone(),
+            ),
+        ],
+        Some(repository_root()?),
+        Some("/workspace".to_owned()),
+        arrow_odbc_runner_args(benchmark, container_path)?,
+    ))
+}
+
+fn arrow_odbc_runner_args(
+    benchmark: &WriterBenchOptions,
+    input_ipc: &str,
+) -> Result<Vec<String>, WriterBenchError> {
+    let create_table_sql_template = arrow_odbc_create_table_sql_template(benchmark)?;
+
+    Ok(vec![
+        "cargo".to_owned(),
+        "run".to_owned(),
+        "--manifest-path".to_owned(),
+        "xtask/arrow-odbc-runner/Cargo.toml".to_owned(),
+        "--target-dir".to_owned(),
+        "/tmp/arrow-tiberius-odbc-runner-target".to_owned(),
+        "--".to_owned(),
+        "bench".to_owned(),
+        "--rows".to_owned(),
+        benchmark.rows.to_string(),
+        "--batch-size".to_owned(),
+        benchmark.batch_size.to_string(),
+        "--scenario".to_owned(),
+        benchmark.scenario.name.to_owned(),
+        "--repeat".to_owned(),
+        benchmark.repeat.to_string(),
+        "--input-ipc".to_owned(),
+        input_ipc.to_owned(),
+        "--create-table-sql-template".to_owned(),
+        create_table_sql_template,
+    ])
+}
+
+fn arrow_odbc_create_table_sql_template(
+    benchmark: &WriterBenchOptions,
+) -> Result<String, WriterBenchError> {
+    let placeholder_table =
+        TableName::new("dbo", ODBC_TABLE_PLACEHOLDER).map_err(WriterBenchError::ArrowTiberius)?;
+    let schema = (benchmark.scenario.schema)();
+    let mappings = benchmark_mappings_for_schema(schema)?;
+    let sql = benchmark_table_sql(&placeholder_table, &mappings);
+    let quoted_placeholder = placeholder_table.quoted_sql();
+
+    Ok(sql.replace(&quoted_placeholder, ODBC_TABLE_PLACEHOLDER))
+}
+
+fn parse_arrow_odbc_runner_report(output: &str) -> Result<ArrowOdbcBenchReport, WriterBenchError> {
+    let rows_written = parse_arrow_odbc_runner_u64(output, "rows written")?;
+    let write_seconds = parse_arrow_odbc_runner_f64(output, "write seconds")?;
+
+    if !write_seconds.is_finite() || write_seconds < 0.0 {
+        return Err(WriterBenchError::Validation(format!(
+            "arrow-odbc runner reported invalid write seconds `{write_seconds}`"
+        )));
+    }
+
+    Ok(ArrowOdbcBenchReport {
+        rows_written,
+        write_elapsed: Duration::from_secs_f64(write_seconds),
+    })
+}
+
+fn parse_arrow_odbc_runner_u64(output: &str, label: &str) -> Result<u64, WriterBenchError> {
+    parse_arrow_odbc_runner_value(output, label)?
+        .parse::<u64>()
+        .map_err(|source| {
+            WriterBenchError::Validation(format!(
+                "arrow-odbc runner reported invalid {label}: {source}"
+            ))
+        })
+}
+
+fn parse_arrow_odbc_runner_f64(output: &str, label: &str) -> Result<f64, WriterBenchError> {
+    parse_arrow_odbc_runner_value(output, label)?
+        .parse::<f64>()
+        .map_err(|source| {
+            WriterBenchError::Validation(format!(
+                "arrow-odbc runner reported invalid {label}: {source}"
+            ))
+        })
+}
+
+fn parse_arrow_odbc_runner_value<'a>(
+    output: &'a str,
+    label: &str,
+) -> Result<&'a str, WriterBenchError> {
+    let prefix = format!("{label}:");
+    output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(&prefix).map(str::trim))
+        .ok_or_else(|| {
+            WriterBenchError::Validation(format!("arrow-odbc runner output is missing `{label}`"))
+        })
+}
+
+fn odbc_connection_string(
+    connection: &sqlserver::SqlServerConnection,
+) -> Result<String, WriterBenchError> {
+    let connection_string = connection
+        .container_connection_string
+        .as_deref()
+        .unwrap_or(&connection.connection_string);
+    odbc_connection_string_from_parts(connection_string, &connection.database)
+}
+
+fn odbc_connection_string_from_parts(
+    connection_string: &str,
+    database: &str,
+) -> Result<String, WriterBenchError> {
+    let server =
+        connection_setting(connection_string, &["server", "data source"]).ok_or_else(|| {
+            WriterBenchError::Validation(
+                "SQL Server connection string is missing server for ODBC runner".to_owned(),
+            )
+        })?;
+    let user = connection_setting(connection_string, &["user id", "uid"]).ok_or_else(|| {
+        WriterBenchError::Validation(
+            "SQL Server connection string is missing user id for ODBC runner".to_owned(),
+        )
+    })?;
+    let password =
+        connection_setting(connection_string, &["password", "pwd"]).ok_or_else(|| {
+            WriterBenchError::Validation(
+                "SQL Server connection string is missing password for ODBC runner".to_owned(),
+            )
+        })?;
+    let trust_server_certificate =
+        connection_setting(connection_string, &["trustservercertificate"]).unwrap_or("yes");
+
+    Ok(format!(
+        "Driver={{ODBC Driver 18 for SQL Server}};Server={server};UID={user};PWD={password};Database={database};TrustServerCertificate={};",
+        odbc_bool_value(trust_server_certificate)
+    ))
+}
+
+fn connection_setting<'a>(connection_string: &'a str, names: &[&str]) -> Option<&'a str> {
+    connection_string.split(';').find_map(|segment| {
+        let (name, value) = segment.split_once('=')?;
+        let name = name.trim();
+        let value = value.trim();
+
+        if value.is_empty() {
+            return None;
+        }
+
+        names
+            .iter()
+            .any(|expected| name.eq_ignore_ascii_case(expected))
+            .then_some(value)
+    })
+}
+
+fn odbc_bool_value(value: &str) -> &'static str {
+    if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes") || value == "1" {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn repository_root() -> Result<PathBuf, WriterBenchError> {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            WriterBenchError::Validation("xtask manifest directory has no parent".to_owned())
+        })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -461,6 +1334,34 @@ struct BaselineBenchTimings {
     total: Duration,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompareBenchReport {
+    ipc_dataset: PathBuf,
+    database: String,
+    backends: Vec<CompareBackendBenchReport>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompareBackendBenchReport {
+    Baseline { report: BaselineBenchReport },
+    ArrowOdbc { report: ArrowOdbcBenchReport },
+}
+
+impl CompareBackendBenchReport {
+    fn backend(&self) -> BenchmarkBackend {
+        match self {
+            Self::Baseline { .. } => BenchmarkBackend::Baseline,
+            Self::ArrowOdbc { .. } => BenchmarkBackend::ArrowOdbc,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArrowOdbcBenchReport {
+    rows_written: u64,
+    write_elapsed: Duration,
+}
+
 type BenchClient = tiberius::Client<Compat<TcpStream>>;
 
 async fn run_baseline_async(
@@ -468,61 +1369,196 @@ async fn run_baseline_async(
     connection: &sqlserver::SqlServerConnection,
 ) -> Result<BaselineBenchReport, WriterBenchError> {
     let total_start = Instant::now();
-    let mut report = BaselineBenchReport::default();
-
     let setup_start = Instant::now();
-    let mut client = connect(&connection.connection_string, &connection.database).await?;
-    let schema = (options.benchmark.scenario.schema)();
-    let mappings = benchmark_mappings_for_schema(Arc::clone(&schema))?;
-    report.timings.setup += setup_start.elapsed();
+    let ipc_dataset = prepare_baseline_ipc_dataset(options)?;
+    let ipc_setup = setup_start.elapsed();
 
-    for _repeat_index in 0..options.benchmark.repeat {
-        let table = unique_benchmark_table_name()?;
-        let repeat_report =
-            run_baseline_repeat(&mut client, options, &schema, &mappings, &table).await;
-        let cleanup_start = Instant::now();
-        let cleanup_result = drop_table(&mut client, &table).await;
-        report.timings.cleanup += cleanup_start.elapsed();
-
-        if let Err(source) = cleanup_result {
-            if repeat_report.is_err() {
-                eprintln!(
-                    "warning: failed to clean up benchmark table {} after benchmark failure: {source}",
-                    table.quoted_sql()
-                );
-            } else {
-                return Err(WriterBenchError::Tiberius(source));
-            }
-        }
-
-        let repeat_report = repeat_report?;
-        report.stats.rows_written = report
-            .stats
-            .rows_written
-            .saturating_add(repeat_report.stats.rows_written);
-        report.stats.batches_written = report
-            .stats
-            .batches_written
-            .saturating_add(repeat_report.stats.batches_written);
-        report.validated_rows = report
-            .validated_rows
-            .saturating_add(repeat_report.validated_rows);
-        report.timings.setup += repeat_report.timings.setup;
-        report.timings.write += repeat_report.timings.write;
-        report.timings.finish += repeat_report.timings.finish;
-        report.timings.validate += repeat_report.timings.validate;
-    }
-
+    let run_result =
+        run_baseline_benchmark_from_ipc(&options.benchmark, connection, &ipc_dataset.host_path)
+            .await;
+    let dataset_cleanup_result = ipc_dataset.cleanup();
+    let mut report = run_result?;
+    dataset_cleanup_result?;
+    report.timings.setup += ipc_setup;
     report.timings.total = total_start.elapsed();
     Ok(report)
 }
 
-async fn run_baseline_repeat(
-    client: &mut BenchClient,
+fn run_compare_benchmark(
+    options: &CompareBenchOptions,
+) -> Result<CompareBenchReport, WriterBenchError> {
+    let network = create_compare_network(options)?;
+    let connection = options
+        .sql_server
+        .connect_or_start_with_network(network.as_ref())
+        .map_err(WriterBenchError::SqlServer)?;
+    let mut runner_image = if options.backends.contains(&BenchmarkBackend::ArrowOdbc) {
+        Some(build_compare_odbc_runner_image(options)?)
+    } else {
+        None
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .map_err(WriterBenchError::Io)?;
+    let ipc_dataset = prepare_compare_ipc_dataset(options)?;
+    let run_result = (|| {
+        let mut backends = Vec::new();
+
+        if options.backends.contains(&BenchmarkBackend::Baseline) {
+            let report = runtime.block_on(async {
+                let backend_start = Instant::now();
+                let mut report = run_baseline_benchmark_from_ipc(
+                    &options.benchmark,
+                    &connection,
+                    &ipc_dataset.host_path,
+                )
+                .await?;
+                report.timings.total = backend_start.elapsed();
+                Ok::<_, WriterBenchError>(report)
+            })?;
+            backends.push(CompareBackendBenchReport::Baseline { report });
+        }
+
+        if options.backends.contains(&BenchmarkBackend::ArrowOdbc) {
+            let runner_image = runner_image.as_ref().ok_or_else(|| {
+                WriterBenchError::Validation(
+                    "arrow-odbc runner image was not prepared for compare".to_owned(),
+                )
+            })?;
+            let report = run_arrow_odbc_runner_for_benchmark_capture(
+                &options.benchmark,
+                runner_image,
+                network.as_ref(),
+                &connection,
+                &ipc_dataset,
+            )?;
+            backends.push(CompareBackendBenchReport::ArrowOdbc { report });
+        }
+
+        Ok(CompareBenchReport {
+            ipc_dataset: ipc_dataset.host_path.clone(),
+            database: connection.database.clone(),
+            backends,
+        })
+    })();
+    let dataset_cleanup_result = ipc_dataset.cleanup();
+    let runner_cleanup_result = if let Some(runner_image) = runner_image.as_mut() {
+        runner_image.cleanup().map_err(WriterBenchError::OdbcRunner)
+    } else {
+        Ok(())
+    };
+    let report = run_result?;
+    dataset_cleanup_result?;
+    runner_cleanup_result?;
+
+    Ok(report)
+}
+
+async fn run_baseline_benchmark_from_ipc(
+    benchmark: &WriterBenchOptions,
+    connection: &sqlserver::SqlServerConnection,
+    ipc_path: &Path,
+) -> Result<BaselineBenchReport, WriterBenchError> {
+    let mut report = BaselineBenchReport::default();
+
+    let setup_start = Instant::now();
+    let mut client = connect(&connection.connection_string, &connection.database).await?;
+    let schema = (benchmark.scenario.schema)();
+    let mappings = benchmark_mappings_for_schema(Arc::clone(&schema))?;
+    report.timings.setup += setup_start.elapsed();
+
+    for _repeat_index in 0..benchmark.repeat {
+        let repeat_result = async {
+            let table = unique_benchmark_table_name()?;
+            let repeat_report =
+                run_baseline_repeat_from_ipc(&mut client, &mappings, &table, ipc_path).await;
+            let cleanup_start = Instant::now();
+            let cleanup_result = drop_table(&mut client, &table).await;
+            report.timings.cleanup += cleanup_start.elapsed();
+
+            if let Err(source) = cleanup_result {
+                if repeat_report.is_err() {
+                    eprintln!(
+                        "warning: failed to clean up benchmark table {} after benchmark failure: {source}",
+                        table.quoted_sql()
+                    );
+                } else {
+                    return Err(WriterBenchError::Tiberius(source));
+                }
+            }
+
+            let repeat_report = repeat_report?;
+            report.stats.rows_written = report
+                .stats
+                .rows_written
+                .saturating_add(repeat_report.stats.rows_written);
+            report.stats.batches_written = report
+                .stats
+                .batches_written
+                .saturating_add(repeat_report.stats.batches_written);
+            report.validated_rows = report
+                .validated_rows
+                .saturating_add(repeat_report.validated_rows);
+            report.timings.setup += repeat_report.timings.setup;
+            report.timings.write += repeat_report.timings.write;
+            report.timings.finish += repeat_report.timings.finish;
+            report.timings.validate += repeat_report.timings.validate;
+
+            Ok(())
+        }
+        .await;
+        repeat_result?;
+    }
+
+    Ok(report)
+}
+
+fn prepare_baseline_ipc_dataset(
     options: &BaselineBenchOptions,
-    schema: &SchemaRef,
+) -> Result<ManagedIpcDataset, WriterBenchError> {
+    let root = repository_root()?;
+    let dataset_dir = root.join("target").join("arrow-tiberius-writer-bench");
+    std::fs::create_dir_all(&dataset_dir).map_err(WriterBenchError::Io)?;
+
+    let counter = BENCH_IPC_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let filename = format!(
+        "baseline-{}-{}-{counter}.arrow",
+        std::process::id(),
+        options.benchmark.scenario.name
+    );
+    let host_path = dataset_dir.join(&filename);
+    let summary = dataset::write_ipc_dataset(&options.benchmark, &host_path)?;
+
+    println!("writer-bench baseline");
+    println!("  action: prepare_ipc_dataset");
+    println!("  path: {}", host_path.display());
+    println!("  rows: {}", summary.rows);
+    println!("  batches: {}", summary.batches);
+
+    Ok(ManagedIpcDataset {
+        host_path,
+        container_path: None,
+    })
+}
+
+async fn run_baseline_repeat_from_ipc(
+    client: &mut BenchClient,
     mappings: &[arrow_tiberius::SchemaMapping],
     table: &TableName,
+    ipc_path: &Path,
+) -> Result<BaselineBenchReport, WriterBenchError> {
+    let batches =
+        dataset::ipc_dataset_reader(ipc_path)?.map(|batch| batch.map_err(WriterBenchError::Arrow));
+
+    run_baseline_repeat_with_batches(client, mappings, table, batches).await
+}
+
+async fn run_baseline_repeat_with_batches(
+    client: &mut BenchClient,
+    mappings: &[arrow_tiberius::SchemaMapping],
+    table: &TableName,
+    batches: impl IntoIterator<Item = Result<RecordBatch, WriterBenchError>>,
 ) -> Result<BaselineBenchReport, WriterBenchError> {
     let mut report = BaselineBenchReport::default();
     let setup_start = Instant::now();
@@ -547,7 +1583,7 @@ async fn run_baseline_repeat(
     report.timings.setup += setup_start.elapsed();
 
     let write_start = Instant::now();
-    for batch in GeneratedBatchReader::new_with_schema(&options.benchmark, Arc::clone(schema)) {
+    for batch in batches {
         let batch = batch?;
         report.stats = writer
             .write_batch(&batch)
@@ -1341,6 +2377,7 @@ pub(super) enum WriterBenchError {
     ArrowTiberius(arrow_tiberius::Error),
     Tiberius(tiberius::error::Error),
     SqlServer(sqlserver::SqlServerError),
+    OdbcRunner(odbc_runner::OdbcRunnerError),
     Io(std::io::Error),
     Validation(String),
     RowCountMismatch { expected: u64, actual: u64 },
@@ -1370,6 +2407,7 @@ impl fmt::Display for WriterBenchError {
             Self::ArrowTiberius(source) => write!(f, "arrow-tiberius benchmark failed: {source}"),
             Self::Tiberius(source) => write!(f, "SQL Server benchmark operation failed: {source}"),
             Self::SqlServer(source) => write!(f, "{source}"),
+            Self::OdbcRunner(source) => write!(f, "{source}"),
             Self::Io(source) => write!(f, "benchmark I/O failed: {source}"),
             Self::Validation(reason) => write!(f, "benchmark validation failed: {reason}"),
             Self::RowCountMismatch { expected, actual } => write!(
@@ -1398,6 +2436,9 @@ mod tests {
     use arrow_schema::{DataType, TimeUnit};
     use std::ffi::OsString;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn parses_writer_bench_defaults() {
@@ -1503,6 +2544,247 @@ mod tests {
     }
 
     #[test]
+    fn parses_arrow_odbc_runner_image_options() {
+        let args = [
+            OsString::from("--runner-image"),
+            OsString::from("custom-arrow-odbc-runner:test"),
+            OsString::from("--keep-runner-image"),
+            OsString::from("--container-runtime"),
+            OsString::from("podman"),
+        ];
+
+        let options = super::ArrowOdbcBenchOptions::parse(&args).unwrap();
+
+        assert_eq!(options.runner_image, "custom-arrow-odbc-runner:test");
+        assert!(options.keep_runner_image);
+        assert_eq!(
+            options.sql_server.container_runtime,
+            Some(PathBuf::from("podman"))
+        );
+    }
+
+    #[test]
+    fn parses_compare_command_with_backend_selection() {
+        let args = [
+            OsString::from("--rows"),
+            OsString::from("25"),
+            OsString::from("--batch-size"),
+            OsString::from("5"),
+            OsString::from("--scenario"),
+            OsString::from("mixed_nullable"),
+            OsString::from("--repeat"),
+            OsString::from("3"),
+            OsString::from("--backends"),
+            OsString::from("baseline,arrow-odbc"),
+            OsString::from("--runner-image"),
+            OsString::from("custom-arrow-odbc-runner:test"),
+            OsString::from("--keep-runner-image"),
+            OsString::from("--connection-string"),
+            OsString::from("server=tcp:127.0.0.1,1433;password=secret"),
+            OsString::from("--database"),
+            OsString::from("bench_db"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+
+        assert_eq!(options.benchmark.rows, 25);
+        assert_eq!(options.benchmark.batch_size, 5);
+        assert_eq!(options.benchmark.scenario.name, "mixed_nullable");
+        assert_eq!(options.benchmark.repeat, 3);
+        assert_eq!(
+            options.backends,
+            [
+                super::BenchmarkBackend::Baseline,
+                super::BenchmarkBackend::ArrowOdbc
+            ]
+        );
+        assert_eq!(options.runner_image, "custom-arrow-odbc-runner:test");
+        assert!(options.keep_runner_image);
+        assert_eq!(options.sql_server.database, "bench_db");
+        assert!(options.sql_server.connection_string.is_some());
+    }
+
+    #[test]
+    fn compare_defaults_to_both_initial_backends() {
+        let options = super::CompareBenchOptions::parse(&[]).unwrap();
+
+        assert_eq!(
+            options.backends,
+            [
+                super::BenchmarkBackend::Baseline,
+                super::BenchmarkBackend::ArrowOdbc
+            ]
+        );
+        assert_eq!(options.benchmark.scenario.name, "narrow_numeric");
+    }
+
+    #[test]
+    fn compare_allows_all_backends_for_decimal_temporal() {
+        let args = [
+            OsString::from("--scenario"),
+            OsString::from("decimal_temporal"),
+            OsString::from("--backends"),
+            OsString::from("baseline,arrow-odbc"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+
+        assert_eq!(
+            options.backends,
+            [
+                super::BenchmarkBackend::Baseline,
+                super::BenchmarkBackend::ArrowOdbc
+            ]
+        );
+        assert_eq!(options.benchmark.scenario.name, "decimal_temporal");
+    }
+
+    #[test]
+    fn compare_rejects_duplicate_backend_names() {
+        let args = [
+            OsString::from("--backends"),
+            OsString::from("baseline,baseline"),
+        ];
+
+        let err = super::CompareBenchOptions::parse(&args).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message) if message.contains("more than once")
+        ));
+    }
+
+    #[test]
+    fn compare_rejects_empty_backend_names() {
+        let args = [OsString::from("--backends"), OsString::from("baseline,")];
+
+        let err = super::CompareBenchOptions::parse(&args).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message) if message.contains("empty backend")
+        ));
+    }
+
+    #[test]
+    fn compare_rejects_unknown_backend_names() {
+        let args = [OsString::from("--backends"), OsString::from("baseline,raw")];
+
+        let err = super::CompareBenchOptions::parse(&args).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message) if message.contains("unknown writer-bench compare backend `raw`")
+        ));
+    }
+
+    #[test]
+    fn parses_ipc_dataset_command_options() {
+        let args = [
+            OsString::from("--path"),
+            OsString::from("/tmp/bench.arrow"),
+            OsString::from("--rows"),
+            OsString::from("25"),
+            OsString::from("--batch-size"),
+            OsString::from("5"),
+            OsString::from("--scenario"),
+            OsString::from("mixed_nullable"),
+        ];
+
+        let options = super::IpcDatasetOptions::parse(&args).unwrap();
+
+        assert_eq!(options.path, PathBuf::from("/tmp/bench.arrow"));
+        assert_eq!(options.benchmark.rows, 25);
+        assert_eq!(options.benchmark.batch_size, 5);
+        assert_eq!(options.benchmark.scenario.name, "mixed_nullable");
+    }
+
+    #[test]
+    fn ipc_dataset_command_requires_path() {
+        let args = [OsString::from("--rows"), OsString::from("25")];
+        let err = super::IpcDatasetOptions::parse(&args).unwrap_err();
+
+        assert!(matches!(err, WriterBenchError::Validation(message) if message.contains("--path")));
+    }
+
+    #[test]
+    fn ipc_dataset_command_writes_replayable_file() {
+        let path = temp_test_file("writer-bench-ipc");
+        let args = [
+            OsString::from("ipc"),
+            OsString::from("--path"),
+            OsString::from(&path),
+            OsString::from("--rows"),
+            OsString::from("17"),
+            OsString::from("--batch-size"),
+            OsString::from("6"),
+            OsString::from("--scenario"),
+            OsString::from("mixed_nullable"),
+        ];
+
+        super::run(&args).unwrap();
+        let summary = super::dataset::summarize_ipc_dataset(&path).unwrap();
+
+        assert_eq!(summary.rows, 17);
+        assert_eq!(summary.batches, 3);
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn baseline_prepares_replayable_ipc_dataset_and_cleans_it_up() {
+        let options = super::BaselineBenchOptions {
+            benchmark: WriterBenchOptions {
+                rows: 17,
+                batch_size: 6,
+                scenario: super::scenario_by_name("mixed_nullable").unwrap(),
+                repeat: 2,
+                output: BenchmarkOutput::Human,
+            },
+            sql_server: crate::sqlserver::SqlServerConnectionOptions::benchmark_default(),
+        };
+
+        let dataset = super::prepare_baseline_ipc_dataset(&options).unwrap();
+
+        assert!(dataset.container_path.is_none());
+        assert!(dataset.host_path.exists());
+        let summary = super::dataset::summarize_ipc_dataset(&dataset.host_path).unwrap();
+        assert_eq!(summary.rows, 17);
+        assert_eq!(summary.batches, 3);
+
+        dataset.cleanup().unwrap();
+        assert!(!dataset.host_path.exists());
+    }
+
+    #[test]
+    fn compare_prepares_replayable_ipc_dataset_and_cleans_it_up() {
+        let options = super::CompareBenchOptions {
+            benchmark: WriterBenchOptions {
+                rows: 19,
+                batch_size: 7,
+                scenario: super::scenario_by_name("mixed_nullable").unwrap(),
+                repeat: 2,
+                output: BenchmarkOutput::Human,
+            },
+            sql_server: crate::sqlserver::SqlServerConnectionOptions::benchmark_default(),
+            backends: vec![super::BenchmarkBackend::Baseline],
+            runner_image: crate::odbc_runner::DEFAULT_RUNNER_IMAGE_TAG.to_owned(),
+            keep_runner_image: false,
+        };
+
+        let dataset = super::prepare_compare_ipc_dataset(&options).unwrap();
+
+        assert!(dataset.container_path.is_some());
+        assert!(dataset.host_path.exists());
+        let summary = super::dataset::summarize_ipc_dataset(&dataset.host_path).unwrap();
+        assert_eq!(summary.rows, 19);
+        assert_eq!(summary.batches, 3);
+
+        dataset.cleanup().unwrap();
+        assert!(!dataset.host_path.exists());
+    }
+
+    #[test]
     fn parses_baseline_sql_server_options_without_leaking_connection_string() {
         let args = [
             OsString::from("--rows"),
@@ -1595,11 +2877,193 @@ mod tests {
     }
 
     #[test]
+    fn compare_help_does_not_parse_generation_options() {
+        let args = [OsString::from("compare"), OsString::from("--help")];
+
+        super::run(&args).unwrap();
+    }
+
+    #[test]
     fn rejects_unknown_writer_bench_command() {
         let args = [OsString::from("direct")];
         let err = super::run(&args).unwrap_err();
 
         assert!(matches!(err, WriterBenchError::UnknownCommand(command) if command == "direct"));
+    }
+
+    #[test]
+    fn parses_arrow_odbc_command_with_shared_generation_options() {
+        let args = [
+            OsString::from("--rows"),
+            OsString::from("25"),
+            OsString::from("--batch-size"),
+            OsString::from("5"),
+            OsString::from("--scenario"),
+            OsString::from("mixed_nullable"),
+            OsString::from("--connection-string"),
+            OsString::from("server=tcp:127.0.0.1,1433;password=secret"),
+            OsString::from("--database"),
+            OsString::from("bench_db"),
+        ];
+
+        let options = super::ArrowOdbcBenchOptions::parse(&args).unwrap();
+
+        assert_eq!(options.benchmark.rows, 25);
+        assert_eq!(options.benchmark.batch_size, 5);
+        assert_eq!(options.benchmark.scenario.name, "mixed_nullable");
+        assert_eq!(options.sql_server.database, "bench_db");
+        assert!(options.sql_server.connection_string.is_some());
+        assert!(!options.keep_runner_image);
+        assert_eq!(
+            options.runner_image,
+            crate::odbc_runner::DEFAULT_RUNNER_IMAGE_TAG
+        );
+    }
+
+    #[test]
+    fn arrow_odbc_runner_args_include_input_ipc_dataset() {
+        let options = super::ArrowOdbcBenchOptions {
+            benchmark: WriterBenchOptions {
+                rows: 25,
+                batch_size: 5,
+                scenario: super::scenario_by_name("mixed_nullable").unwrap(),
+                repeat: 3,
+                output: BenchmarkOutput::Human,
+            },
+            sql_server: crate::sqlserver::SqlServerConnectionOptions::benchmark_default(),
+            runner_image: crate::odbc_runner::DEFAULT_RUNNER_IMAGE_TAG.to_owned(),
+            keep_runner_image: false,
+        };
+
+        let args =
+            super::arrow_odbc_runner_args(&options.benchmark, "/workspace/target/bench.arrow")
+                .unwrap();
+
+        assert!(args.windows(2).any(|pair| pair == ["--rows", "25"]));
+        assert!(args.windows(2).any(|pair| pair == ["--batch-size", "5"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--scenario", "mixed_nullable"])
+        );
+        assert!(args.windows(2).any(|pair| pair == ["--repeat", "3"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--input-ipc", "/workspace/target/bench.arrow"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--create-table-sql-template"
+                    && pair[1].contains(super::ODBC_TABLE_PLACEHOLDER)
+                    && pair[1].contains("[category] nvarchar(max) NULL"))
+        );
+    }
+
+    #[test]
+    fn parses_arrow_odbc_runner_report_from_noisy_output() {
+        let output = "\
+Compiling unrelated crate
+arrow-odbc runner
+  database: arrow_tiberius_benchmark
+  rows written: 25
+  write seconds: 0.067
+  write rows/sec: 375.43
+";
+
+        let report = super::parse_arrow_odbc_runner_report(output).unwrap();
+
+        assert_eq!(report.rows_written, 25);
+        assert_eq!(report.write_elapsed, std::time::Duration::from_millis(67));
+    }
+
+    #[test]
+    fn rejects_arrow_odbc_runner_report_missing_rows() {
+        let err = super::parse_arrow_odbc_runner_report("write seconds: 0.1").unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message) if message.contains("missing `rows written`")
+        ));
+    }
+
+    #[test]
+    fn rejects_arrow_odbc_runner_report_negative_seconds() {
+        let output = "rows written: 25\nwrite seconds: -1";
+
+        let err = super::parse_arrow_odbc_runner_report(output).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message) if message.contains("invalid write seconds")
+        ));
+    }
+
+    #[test]
+    fn arrow_odbc_network_is_not_created_for_existing_connection_string() {
+        let args = [
+            OsString::from("--connection-string"),
+            OsString::from("server=tcp:127.0.0.1,1433;password=secret"),
+        ];
+        let options = super::ArrowOdbcBenchOptions::parse(&args).unwrap();
+
+        let network = super::create_arrow_odbc_network(&options).unwrap();
+
+        assert!(network.is_none());
+    }
+
+    #[test]
+    fn arrow_odbc_connection_string_is_derived_from_sql_server_connection() {
+        let odbc = super::odbc_connection_string_from_parts(
+            "server=tcp:sqlserver,1433;user id=sa;password=secret;TrustServerCertificate=true",
+            "bench_db",
+        )
+        .unwrap();
+
+        assert_eq!(
+            odbc,
+            "Driver={ODBC Driver 18 for SQL Server};Server=tcp:sqlserver,1433;UID=sa;PWD=secret;Database=bench_db;TrustServerCertificate=yes;"
+        );
+    }
+
+    #[test]
+    fn arrow_odbc_connection_string_rejects_missing_password() {
+        let err = super::odbc_connection_string_from_parts(
+            "server=tcp:sqlserver,1433;user id=sa",
+            "bench_db",
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, WriterBenchError::Validation(message) if message.contains("password"))
+        );
+    }
+
+    #[test]
+    fn arrow_odbc_command_accepts_decimal_temporal() {
+        let args = [
+            OsString::from("--scenario"),
+            OsString::from("decimal_temporal"),
+        ];
+
+        let options = super::ArrowOdbcBenchOptions::parse(&args).unwrap();
+
+        assert_eq!(options.benchmark.scenario.name, "decimal_temporal");
+    }
+
+    #[test]
+    fn arrow_odbc_command_rejects_standalone_runner_image_build_flag() {
+        let args = [OsString::from("--build-runner-image")];
+        let err = super::ArrowOdbcBenchOptions::parse(&args).unwrap_err();
+
+        assert!(
+            matches!(err, WriterBenchError::UnknownOption(option) if option == "--build-runner-image")
+        );
+    }
+
+    #[test]
+    fn arrow_odbc_help_is_command_specific() {
+        let args = [OsString::from("arrow-odbc"), OsString::from("--help")];
+
+        super::run(&args).unwrap();
     }
 
     #[test]
@@ -2108,5 +3572,13 @@ mod tests {
         super::GeneratedBatchReader::new(options)
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
+    }
+
+    fn temp_test_file(name: &str) -> PathBuf {
+        let counter = TEST_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "arrow-tiberius-{name}-{}-{counter}.arrow",
+            std::process::id()
+        ))
     }
 }

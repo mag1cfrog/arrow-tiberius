@@ -1,0 +1,12 @@
+[package]
+name = "arrow-tiberius-arrow-odbc-runner"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+arrow-ipc = "58.3.0"
+arrow-odbc = { version = "23.2.0", features = ["narrow"] }
