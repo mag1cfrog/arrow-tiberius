@@ -255,7 +255,7 @@ fn print_baseline_help() {
 
 fn print_arrow_odbc_help() {
     println!(
-        "Usage:\n  cargo xtask writer-bench arrow-odbc [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Supported scenarios: narrow_numeric, mixed_nullable [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>      Managed arrow-odbc runner image tag\n  --keep-runner-image         Keep the managed arrow-odbc runner image after the task exits\n  -h, --help                  Print help\n\nThis is a SQL Server write-path comparison only. The arrow-odbc runner image contains unixODBC, Microsoft ODBC Driver 18 for SQL Server, and Rust."
+        "Usage:\n  cargo xtask writer-bench arrow-odbc [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>      Managed arrow-odbc runner image tag\n  --keep-runner-image         Keep the managed arrow-odbc runner image after the task exits\n  -h, --help                  Print help\n\nThis is a SQL Server write-path comparison only. The arrow-odbc runner image contains unixODBC, Microsoft ODBC Driver 18 for SQL Server, and Rust."
     );
 }
 
@@ -581,15 +581,7 @@ struct ArrowOdbcBenchOptions {
 
 impl ArrowOdbcBenchOptions {
     fn parse(args: &[OsString]) -> Result<Self, WriterBenchError> {
-        let options = parse_writer_sqlserver_options(args, print_arrow_odbc_help)?;
-
-        if !is_arrow_odbc_supported_scenario(options.benchmark.scenario) {
-            return Err(WriterBenchError::UnsupportedArrowOdbcScenario {
-                scenario: options.benchmark.scenario.name.to_owned(),
-            });
-        }
-
-        Ok(options)
+        parse_writer_sqlserver_options(args, print_arrow_odbc_help)
     }
 }
 
@@ -681,14 +673,6 @@ impl CompareBenchOptions {
             }
 
             index += 1;
-        }
-
-        if options.backends.contains(&BenchmarkBackend::ArrowOdbc)
-            && !is_arrow_odbc_supported_scenario(options.benchmark.scenario)
-        {
-            return Err(WriterBenchError::UnsupportedArrowOdbcScenario {
-                scenario: options.benchmark.scenario.name.to_owned(),
-            });
         }
 
         Ok(options)
@@ -833,10 +817,6 @@ fn parse_writer_sqlserver_options(
     }
 
     Ok(options)
-}
-
-fn is_arrow_odbc_supported_scenario(scenario: &BenchmarkScenarioDefinition) -> bool {
-    matches!(scenario.name, "narrow_numeric" | "mixed_nullable")
 }
 
 fn create_arrow_odbc_network(
@@ -2401,7 +2381,6 @@ pub(super) enum WriterBenchError {
     Io(std::io::Error),
     Validation(String),
     RowCountMismatch { expected: u64, actual: u64 },
-    UnsupportedArrowOdbcScenario { scenario: String },
 }
 
 impl fmt::Display for WriterBenchError {
@@ -2434,10 +2413,6 @@ impl fmt::Display for WriterBenchError {
             Self::RowCountMismatch { expected, actual } => write!(
                 f,
                 "benchmark row-count validation failed: expected {expected}, got {actual}"
-            ),
-            Self::UnsupportedArrowOdbcScenario { scenario } => write!(
-                f,
-                "arrow-odbc benchmark scenario `{scenario}` is not supported yet; expected narrow_numeric or mixed_nullable"
             ),
         }
     }
@@ -2644,22 +2619,7 @@ mod tests {
     }
 
     #[test]
-    fn compare_allows_baseline_only_for_non_odbc_scenario() {
-        let args = [
-            OsString::from("--scenario"),
-            OsString::from("decimal_temporal"),
-            OsString::from("--backends"),
-            OsString::from("baseline"),
-        ];
-
-        let options = super::CompareBenchOptions::parse(&args).unwrap();
-
-        assert_eq!(options.backends, [super::BenchmarkBackend::Baseline]);
-        assert_eq!(options.benchmark.scenario.name, "decimal_temporal");
-    }
-
-    #[test]
-    fn compare_rejects_arrow_odbc_for_unsupported_scenario() {
+    fn compare_allows_all_backends_for_decimal_temporal() {
         let args = [
             OsString::from("--scenario"),
             OsString::from("decimal_temporal"),
@@ -2667,13 +2627,16 @@ mod tests {
             OsString::from("baseline,arrow-odbc"),
         ];
 
-        let err = super::CompareBenchOptions::parse(&args).unwrap_err();
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
 
-        assert!(matches!(
-            err,
-            WriterBenchError::UnsupportedArrowOdbcScenario { scenario }
-                if scenario == "decimal_temporal"
-        ));
+        assert_eq!(
+            options.backends,
+            [
+                super::BenchmarkBackend::Baseline,
+                super::BenchmarkBackend::ArrowOdbc
+            ]
+        );
+        assert_eq!(options.benchmark.scenario.name, "decimal_temporal");
     }
 
     #[test]
@@ -3075,19 +3038,15 @@ arrow-odbc runner
     }
 
     #[test]
-    fn arrow_odbc_command_rejects_non_overlap_scenarios() {
+    fn arrow_odbc_command_accepts_decimal_temporal() {
         let args = [
             OsString::from("--scenario"),
             OsString::from("decimal_temporal"),
         ];
 
-        let err = super::ArrowOdbcBenchOptions::parse(&args).unwrap_err();
+        let options = super::ArrowOdbcBenchOptions::parse(&args).unwrap();
 
-        assert!(matches!(
-            err,
-            WriterBenchError::UnsupportedArrowOdbcScenario { scenario }
-                if scenario == "decimal_temporal"
-        ));
+        assert_eq!(options.benchmark.scenario.name, "decimal_temporal");
     }
 
     #[test]

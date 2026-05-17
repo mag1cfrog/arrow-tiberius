@@ -38,13 +38,6 @@ fn validate() -> Result<(), Box<dyn Error>> {
 
 fn bench(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     let options = BenchOptions::parse(args)?;
-    if !is_supported_scenario(&options.scenario) {
-        return Err(format!(
-            "arrow-odbc runner only supports narrow_numeric and mixed_nullable, got {}",
-            options.scenario
-        )
-        .into());
-    }
 
     let connection_string = required_env(CONNECTION_STRING_ENV)?;
     let database = required_env(DATABASE_ENV)?;
@@ -147,10 +140,6 @@ fn ipc_batches(path: &Path, expected_rows: usize) -> Result<InputBatches, Box<dy
         batches,
         rows,
     })
-}
-
-fn is_supported_scenario(scenario: &str) -> bool {
-    matches!(scenario, "narrow_numeric" | "mixed_nullable")
 }
 
 fn execute_sql(connection: &Connection<'_>, sql: &str) -> Result<(), Box<dyn Error>> {
@@ -303,7 +292,7 @@ fn required_arg<'a>(option: &str, value: Option<&'a String>) -> Result<&'a str, 
 
 #[cfg(test)]
 mod tests {
-    use super::{BenchOptions, TABLE_PLACEHOLDER, ipc_batches, is_supported_scenario, rows_per_second};
+    use super::{BenchOptions, TABLE_PLACEHOLDER, ipc_batches, rows_per_second};
     use arrow_ipc::writer::FileWriter;
     use arrow_odbc::arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
     use arrow_odbc::arrow::datatypes::{DataType, Field, Schema};
@@ -399,13 +388,6 @@ mod tests {
             .expect_err("unknown option should be rejected");
 
         assert!(err.to_string().contains("--unexpected"));
-    }
-
-    #[test]
-    fn recognizes_supported_scenarios() {
-        assert!(is_supported_scenario("narrow_numeric"));
-        assert!(is_supported_scenario("mixed_nullable"));
-        assert!(!is_supported_scenario("decimal_temporal"));
     }
 
     #[test]
