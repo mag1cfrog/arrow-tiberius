@@ -36,6 +36,10 @@ pub(super) fn run(args: &[OsString]) -> Result<(), WriterBenchError> {
             return run_baseline(&args[1..]);
         }
 
+        if command == "arrow-odbc" {
+            return run_arrow_odbc(&args[1..]);
+        }
+
         if !command.starts_with('-') {
             return Err(WriterBenchError::UnknownCommand(command.to_owned()));
         }
@@ -72,9 +76,22 @@ fn run_baseline(args: &[OsString]) -> Result<(), WriterBenchError> {
     Ok(())
 }
 
+fn run_arrow_odbc(args: &[OsString]) -> Result<(), WriterBenchError> {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print_arrow_odbc_help();
+        return Ok(());
+    }
+
+    let _options = ArrowOdbcBenchOptions::parse(args)?;
+
+    Err(WriterBenchError::ArrowOdbcUnavailable {
+        reason: "arrow-odbc runner container is not wired yet".to_owned(),
+    })
+}
+
 fn print_help() {
     println!(
-        "Usage:\n  cargo xtask writer-bench [OPTIONS]\n  cargo xtask writer-bench baseline [OPTIONS]\n\nCommands:\n  baseline    Run the baseline TokenRow SQL Server writer benchmark\n\nOptions:\n  --rows <COUNT>          Total rows to generate [default: 100000]\n  --batch-size <COUNT>    Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>       Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>        Number of benchmark repeats [default: 1]\n  --output <FORMAT>       Output format: human [default: human]\n  -h, --help              Print help\n\nScenarios:"
+        "Usage:\n  cargo xtask writer-bench [OPTIONS]\n  cargo xtask writer-bench baseline [OPTIONS]\n  cargo xtask writer-bench arrow-odbc [OPTIONS]\n\nCommands:\n  baseline      Run the baseline TokenRow SQL Server writer benchmark\n  arrow-odbc    Run the optional arrow-odbc SQL Server writer benchmark\n\nOptions:\n  --rows <COUNT>          Total rows to generate [default: 100000]\n  --batch-size <COUNT>    Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>       Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>        Number of benchmark repeats [default: 1]\n  --output <FORMAT>       Output format: human [default: human]\n  -h, --help              Print help\n\nScenarios:"
     );
     for scenario in SCENARIOS {
         println!("  {:<16}  {}", scenario.name, scenario.description);
@@ -84,6 +101,12 @@ fn print_help() {
 fn print_baseline_help() {
     println!(
         "Usage:\n  cargo xtask writer-bench baseline [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep the container after the task exits\n  -h, --help                  Print help"
+    );
+}
+
+fn print_arrow_odbc_help() {
+    println!(
+        "Usage:\n  cargo xtask writer-bench arrow-odbc [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Supported scenarios: narrow_numeric, mixed_nullable [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep managed containers after the task exits\n  -h, --help                  Print help\n\nThis is a SQL Server write-path comparison only. The arrow-odbc runner is optional and requires the managed ODBC runner container implementation."
     );
 }
 
@@ -285,6 +308,102 @@ impl BaselineBenchOptions {
 
         Ok(options)
     }
+}
+
+#[derive(Debug, Clone)]
+struct ArrowOdbcBenchOptions {
+    benchmark: WriterBenchOptions,
+    sql_server: sqlserver::SqlServerConnectionOptions,
+}
+
+impl ArrowOdbcBenchOptions {
+    fn parse(args: &[OsString]) -> Result<Self, WriterBenchError> {
+        let options = parse_writer_sqlserver_options(args, print_arrow_odbc_help)?;
+
+        if !is_arrow_odbc_supported_scenario(options.benchmark.scenario) {
+            return Err(WriterBenchError::UnsupportedArrowOdbcScenario {
+                scenario: options.benchmark.scenario.name.to_owned(),
+            });
+        }
+
+        Ok(options)
+    }
+}
+
+fn parse_writer_sqlserver_options(
+    args: &[OsString],
+    print_command_help: fn(),
+) -> Result<ArrowOdbcBenchOptions, WriterBenchError> {
+    let mut options = ArrowOdbcBenchOptions {
+        benchmark: WriterBenchOptions::default(),
+        sql_server: sqlserver::SqlServerConnectionOptions::benchmark_default(),
+    };
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = args[index]
+            .to_str()
+            .ok_or_else(|| WriterBenchError::InvalidUtf8Argument(args[index].clone()))?;
+
+        match arg {
+            "-h" | "--help" => {
+                print_command_help();
+                return Ok(options);
+            }
+            "--rows" => {
+                options.benchmark.rows =
+                    parse_positive_usize("--rows", &required_value(args, index)?)?;
+                index += 1;
+            }
+            "--batch-size" => {
+                options.benchmark.batch_size =
+                    parse_positive_usize("--batch-size", &required_value(args, index)?)?;
+                index += 1;
+            }
+            "--scenario" => {
+                options.benchmark.scenario = parse_scenario(&required_value(args, index)?)?;
+                index += 1;
+            }
+            "--repeat" => {
+                options.benchmark.repeat =
+                    parse_positive_usize("--repeat", &required_value(args, index)?)?;
+                index += 1;
+            }
+            "--output" => {
+                options.benchmark.output = required_value(args, index)?.parse()?;
+                index += 1;
+            }
+            "--container-runtime" => {
+                options.sql_server.container_runtime =
+                    Some(PathBuf::from(required_value(args, index)?));
+                index += 1;
+            }
+            "--connection-string" => {
+                options.sql_server.connection_string = Some(required_value(args, index)?);
+                index += 1;
+            }
+            "--image" => {
+                options.sql_server.image = required_value(args, index)?;
+                index += 1;
+            }
+            "--database" => {
+                options.sql_server.database = required_value(args, index)?;
+                index += 1;
+            }
+            "--keep-container" => {
+                options.sql_server.keep_container = true;
+            }
+            other => return Err(WriterBenchError::UnknownOption(other.to_owned())),
+        }
+
+        index += 1;
+    }
+
+    Ok(options)
+}
+
+fn is_arrow_odbc_supported_scenario(scenario: &BenchmarkScenarioDefinition) -> bool {
+    matches!(scenario.name, "narrow_numeric" | "mixed_nullable")
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1344,6 +1463,8 @@ pub(super) enum WriterBenchError {
     Io(std::io::Error),
     Validation(String),
     RowCountMismatch { expected: u64, actual: u64 },
+    UnsupportedArrowOdbcScenario { scenario: String },
+    ArrowOdbcUnavailable { reason: String },
 }
 
 impl fmt::Display for WriterBenchError {
@@ -1376,6 +1497,13 @@ impl fmt::Display for WriterBenchError {
                 f,
                 "benchmark row-count validation failed: expected {expected}, got {actual}"
             ),
+            Self::UnsupportedArrowOdbcScenario { scenario } => write!(
+                f,
+                "arrow-odbc benchmark scenario `{scenario}` is not supported yet; expected narrow_numeric or mixed_nullable"
+            ),
+            Self::ArrowOdbcUnavailable { reason } => {
+                write!(f, "arrow-odbc benchmark is unavailable: {reason}")
+            }
         }
     }
 }
@@ -1600,6 +1728,70 @@ mod tests {
         let err = super::run(&args).unwrap_err();
 
         assert!(matches!(err, WriterBenchError::UnknownCommand(command) if command == "direct"));
+    }
+
+    #[test]
+    fn parses_arrow_odbc_command_with_shared_generation_options() {
+        let args = [
+            OsString::from("--rows"),
+            OsString::from("25"),
+            OsString::from("--batch-size"),
+            OsString::from("5"),
+            OsString::from("--scenario"),
+            OsString::from("mixed_nullable"),
+            OsString::from("--connection-string"),
+            OsString::from("server=tcp:127.0.0.1,1433;password=secret"),
+            OsString::from("--database"),
+            OsString::from("bench_db"),
+        ];
+
+        let options = super::ArrowOdbcBenchOptions::parse(&args).unwrap();
+
+        assert_eq!(options.benchmark.rows, 25);
+        assert_eq!(options.benchmark.batch_size, 5);
+        assert_eq!(options.benchmark.scenario.name, "mixed_nullable");
+        assert_eq!(options.sql_server.database, "bench_db");
+        assert!(options.sql_server.connection_string.is_some());
+    }
+
+    #[test]
+    fn arrow_odbc_command_rejects_non_overlap_scenarios() {
+        let args = [
+            OsString::from("--scenario"),
+            OsString::from("decimal_temporal"),
+        ];
+
+        let err = super::ArrowOdbcBenchOptions::parse(&args).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::UnsupportedArrowOdbcScenario { scenario }
+                if scenario == "decimal_temporal"
+        ));
+    }
+
+    #[test]
+    fn arrow_odbc_command_reports_disabled_runner_before_odbc_dependency_exists() {
+        let args = [
+            OsString::from("arrow-odbc"),
+            OsString::from("--rows"),
+            OsString::from("10"),
+            OsString::from("--scenario"),
+            OsString::from("narrow_numeric"),
+        ];
+
+        let err = super::run(&args).unwrap_err();
+
+        assert!(
+            matches!(err, WriterBenchError::ArrowOdbcUnavailable { reason } if reason.contains("runner container"))
+        );
+    }
+
+    #[test]
+    fn arrow_odbc_help_is_command_specific() {
+        let args = [OsString::from("arrow-odbc"), OsString::from("--help")];
+
+        super::run(&args).unwrap();
     }
 
     #[test]
