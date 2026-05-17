@@ -255,13 +255,13 @@ fn print_baseline_help() {
 
 fn print_arrow_odbc_help() {
     println!(
-        "Usage:\n  cargo xtask writer-bench arrow-odbc [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>      Managed arrow-odbc runner image tag\n  --keep-runner-image         Keep the managed arrow-odbc runner image after the task exits\n  -h, --help                  Print help\n\nThis is a SQL Server write-path comparison only. The arrow-odbc runner image contains unixODBC, Microsoft ODBC Driver 18 for SQL Server, and Rust."
+        "Usage:\n  cargo xtask writer-bench arrow-odbc [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>      Managed ODBC runner image tag\n  --keep-runner-image         Keep the managed ODBC runner image after the task exits\n  -h, --help                  Print help\n\nThis is a SQL Server write-path comparison only. The ODBC runner image contains unixODBC, Microsoft ODBC Driver 18 for SQL Server, and Rust."
     );
 }
 
 fn print_compare_help() {
     println!(
-        "Usage:\n  cargo xtask writer-bench compare [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --backends <LIST>           Comma-separated backends: baseline,arrow-odbc [default: baseline,arrow-odbc]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>      Managed arrow-odbc runner image tag\n  --keep-runner-image         Keep the managed arrow-odbc runner image after the task exits\n  -h, --help                  Print help\n\nCompare runs use one shared Arrow IPC dataset as the fairness boundary."
+        "Usage:\n  cargo xtask writer-bench compare [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --backends <LIST>           Comma-separated backends: baseline,arrow-odbc,odbc-bcp [default: baseline,arrow-odbc]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>      Managed ODBC runner image tag\n  --keep-runner-image         Keep the managed ODBC runner image after the task exits\n  -h, --help                  Print help\n\nCompare runs use one shared Arrow IPC dataset as the fairness boundary."
     );
 }
 
@@ -358,6 +358,15 @@ fn print_compare_summary(options: &CompareBenchOptions, report: &CompareBenchRep
                 println!("    total: {}", format_duration(report.timings.total));
             }
             CompareBackendBenchReport::ArrowOdbc { report } => {
+                println!("    rows written: {}", report.rows_written);
+                println!(
+                    "    write rows/sec: {}",
+                    format_rows_per_second(report.rows_written, report.write_elapsed)
+                );
+                println!("    validated rows: {}", report.rows_written);
+                println!("    write: {}", format_duration(report.write_elapsed));
+            }
+            CompareBackendBenchReport::OdbcBcp { report } => {
                 println!("    rows written: {}", report.rows_written);
                 println!(
                     "    write rows/sec: {}",
@@ -683,6 +692,7 @@ impl CompareBenchOptions {
 enum BenchmarkBackend {
     Baseline,
     ArrowOdbc,
+    OdbcBcp,
 }
 
 impl fmt::Display for BenchmarkBackend {
@@ -690,6 +700,7 @@ impl fmt::Display for BenchmarkBackend {
         match self {
             Self::Baseline => f.write_str("baseline"),
             Self::ArrowOdbc => f.write_str("arrow-odbc"),
+            Self::OdbcBcp => f.write_str("odbc-bcp"),
         }
     }
 }
@@ -701,8 +712,9 @@ impl FromStr for BenchmarkBackend {
         match value {
             "baseline" => Ok(Self::Baseline),
             "arrow-odbc" => Ok(Self::ArrowOdbc),
+            "odbc-bcp" => Ok(Self::OdbcBcp),
             other => Err(WriterBenchError::Validation(format!(
-                "unknown writer-bench compare backend `{other}`; expected baseline or arrow-odbc"
+                "unknown writer-bench compare backend `{other}`; expected baseline, arrow-odbc, or odbc-bcp"
             ))),
         }
     }
@@ -828,7 +840,9 @@ fn create_arrow_odbc_network(
 fn create_compare_network(
     options: &CompareBenchOptions,
 ) -> Result<Option<sqlserver::ManagedNetwork>, WriterBenchError> {
-    if options.backends.contains(&BenchmarkBackend::ArrowOdbc) {
+    if options.backends.contains(&BenchmarkBackend::ArrowOdbc)
+        || options.backends.contains(&BenchmarkBackend::OdbcBcp)
+    {
         create_odbc_runner_network(&options.sql_server)
     } else {
         Ok(None)
@@ -848,7 +862,7 @@ fn create_odbc_runner_network(
     let network = sqlserver::ManagedNetwork::create(container_runtime, sql_server.keep_container)
         .map_err(WriterBenchError::SqlServer)?;
 
-    println!("writer-bench arrow-odbc");
+    println!("writer-bench odbc-runner");
     println!("  action: prepare_container_network");
     println!("  network: {}", network.name());
     println!("  keep network: {}", sql_server.keep_container);
@@ -890,7 +904,7 @@ fn build_odbc_runner_image(
         manifest_dir: repository_root()?,
     };
 
-    println!("writer-bench arrow-odbc");
+    println!("writer-bench odbc-runner");
     println!("  action: prepare_runner_image");
     println!("  image: {}", image_options.image_tag);
     println!("  dockerfile: {}", image_options.dockerfile().display());
@@ -941,7 +955,7 @@ fn run_arrow_odbc_runner_for_benchmark_capture(
     network: Option<&sqlserver::ManagedNetwork>,
     connection: &sqlserver::SqlServerConnection,
     ipc_dataset: &ManagedIpcDataset,
-) -> Result<ArrowOdbcBenchReport, WriterBenchError> {
+) -> Result<OdbcRunnerBenchReport, WriterBenchError> {
     println!("  action: run_arrow_odbc_runner");
     let command_options = arrow_odbc_runner_command_options(
         benchmark,
@@ -957,6 +971,25 @@ fn run_arrow_odbc_runner_for_benchmark_capture(
     eprint!("{}", output.stderr);
 
     parse_arrow_odbc_runner_report(&format!("{}\n{}", output.stdout, output.stderr))
+}
+
+fn run_odbc_bcp_runner_for_benchmark_capture(
+    benchmark: &WriterBenchOptions,
+    runner_image: &odbc_runner::ManagedRunnerImage,
+    network: Option<&sqlserver::ManagedNetwork>,
+    connection: &sqlserver::SqlServerConnection,
+    ipc_dataset: &ManagedIpcDataset,
+) -> Result<OdbcRunnerBenchReport, WriterBenchError> {
+    println!("  action: run_odbc_bcp_runner");
+    let command_options =
+        odbc_bcp_runner_command_options(benchmark, runner_image, network, connection, ipc_dataset)?;
+    let output = odbc_runner::run_runner_command_capture(&command_options)
+        .map_err(WriterBenchError::OdbcRunner)?;
+
+    print!("{}", output.stdout);
+    eprint!("{}", output.stderr);
+
+    parse_odbc_bcp_runner_report(&format!("{}\n{}", output.stdout, output.stderr))
 }
 
 fn arrow_odbc_runner_command_options(
@@ -1024,6 +1057,67 @@ fn arrow_odbc_runner_args(
     ])
 }
 
+fn odbc_bcp_runner_command_options(
+    benchmark: &WriterBenchOptions,
+    runner_image: &odbc_runner::ManagedRunnerImage,
+    network: Option<&sqlserver::ManagedNetwork>,
+    connection: &sqlserver::SqlServerConnection,
+    ipc_dataset: &ManagedIpcDataset,
+) -> Result<odbc_runner::RunnerCommandOptions, WriterBenchError> {
+    let container_path = ipc_dataset.container_path.as_deref().ok_or_else(|| {
+        WriterBenchError::Validation(
+            "odbc-bcp benchmark requires an IPC dataset container path".to_owned(),
+        )
+    })?;
+
+    Ok(runner_image.command_options(
+        network.map(|network| network.name().to_owned()),
+        vec![
+            (
+                "ARROW_TIBERIUS_BENCH_ODBC_CONNECTION_STRING".to_owned(),
+                odbc_connection_string(connection)?,
+            ),
+            (
+                "ARROW_TIBERIUS_BENCH_DATABASE".to_owned(),
+                connection.database.clone(),
+            ),
+        ],
+        Some(repository_root()?),
+        Some("/workspace".to_owned()),
+        odbc_bcp_runner_args(benchmark, container_path)?,
+    ))
+}
+
+fn odbc_bcp_runner_args(
+    benchmark: &WriterBenchOptions,
+    input_ipc: &str,
+) -> Result<Vec<String>, WriterBenchError> {
+    let create_table_sql_template = arrow_odbc_create_table_sql_template(benchmark)?;
+
+    Ok(vec![
+        "cargo".to_owned(),
+        "run".to_owned(),
+        "--manifest-path".to_owned(),
+        "xtask/odbc-bcp-runner/Cargo.toml".to_owned(),
+        "--target-dir".to_owned(),
+        "/tmp/arrow-tiberius-odbc-bcp-runner-target".to_owned(),
+        "--".to_owned(),
+        "bench".to_owned(),
+        "--rows".to_owned(),
+        benchmark.rows.to_string(),
+        "--batch-size".to_owned(),
+        benchmark.batch_size.to_string(),
+        "--scenario".to_owned(),
+        benchmark.scenario.name.to_owned(),
+        "--repeat".to_owned(),
+        benchmark.repeat.to_string(),
+        "--input-ipc".to_owned(),
+        input_ipc.to_owned(),
+        "--create-table-sql-template".to_owned(),
+        create_table_sql_template,
+    ])
+}
+
 fn arrow_odbc_create_table_sql_template(
     benchmark: &WriterBenchOptions,
 ) -> Result<String, WriterBenchError> {
@@ -1037,52 +1131,74 @@ fn arrow_odbc_create_table_sql_template(
     Ok(sql.replace(&quoted_placeholder, ODBC_TABLE_PLACEHOLDER))
 }
 
-fn parse_arrow_odbc_runner_report(output: &str) -> Result<ArrowOdbcBenchReport, WriterBenchError> {
-    let rows_written = parse_arrow_odbc_runner_u64(output, "rows written")?;
-    let write_seconds = parse_arrow_odbc_runner_f64(output, "write seconds")?;
+fn parse_arrow_odbc_runner_report(output: &str) -> Result<OdbcRunnerBenchReport, WriterBenchError> {
+    parse_odbc_runner_report(output, "arrow-odbc")
+}
+
+fn parse_odbc_bcp_runner_report(output: &str) -> Result<OdbcRunnerBenchReport, WriterBenchError> {
+    parse_odbc_runner_report(output, "odbc-bcp")
+}
+
+fn parse_odbc_runner_report(
+    output: &str,
+    runner_name: &str,
+) -> Result<OdbcRunnerBenchReport, WriterBenchError> {
+    let rows_written = parse_odbc_runner_u64(output, "rows written", runner_name)?;
+    let write_seconds = parse_odbc_runner_f64(output, "write seconds", runner_name)?;
 
     if !write_seconds.is_finite() || write_seconds < 0.0 {
         return Err(WriterBenchError::Validation(format!(
-            "arrow-odbc runner reported invalid write seconds `{write_seconds}`"
+            "{runner_name} runner reported invalid write seconds `{write_seconds}`"
         )));
     }
 
-    Ok(ArrowOdbcBenchReport {
+    Ok(OdbcRunnerBenchReport {
         rows_written,
         write_elapsed: Duration::from_secs_f64(write_seconds),
     })
 }
 
-fn parse_arrow_odbc_runner_u64(output: &str, label: &str) -> Result<u64, WriterBenchError> {
-    parse_arrow_odbc_runner_value(output, label)?
+fn parse_odbc_runner_u64(
+    output: &str,
+    label: &str,
+    runner_name: &str,
+) -> Result<u64, WriterBenchError> {
+    parse_odbc_runner_value(output, label, runner_name)?
         .parse::<u64>()
         .map_err(|source| {
             WriterBenchError::Validation(format!(
-                "arrow-odbc runner reported invalid {label}: {source}"
+                "{runner_name} runner reported invalid {label}: {source}"
             ))
         })
 }
 
-fn parse_arrow_odbc_runner_f64(output: &str, label: &str) -> Result<f64, WriterBenchError> {
-    parse_arrow_odbc_runner_value(output, label)?
+fn parse_odbc_runner_f64(
+    output: &str,
+    label: &str,
+    runner_name: &str,
+) -> Result<f64, WriterBenchError> {
+    parse_odbc_runner_value(output, label, runner_name)?
         .parse::<f64>()
         .map_err(|source| {
             WriterBenchError::Validation(format!(
-                "arrow-odbc runner reported invalid {label}: {source}"
+                "{runner_name} runner reported invalid {label}: {source}"
             ))
         })
 }
 
-fn parse_arrow_odbc_runner_value<'a>(
+fn parse_odbc_runner_value<'a>(
     output: &'a str,
     label: &str,
+    runner_name: &str,
 ) -> Result<&'a str, WriterBenchError> {
     let prefix = format!("{label}:");
     output
         .lines()
         .find_map(|line| line.trim().strip_prefix(&prefix).map(str::trim))
         .ok_or_else(|| {
-            WriterBenchError::Validation(format!("arrow-odbc runner output is missing `{label}`"))
+            WriterBenchError::Validation(format!(
+                "{runner_name} runner output is missing `{label}`"
+            ))
         })
 }
 
@@ -1344,7 +1460,8 @@ struct CompareBenchReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompareBackendBenchReport {
     Baseline { report: BaselineBenchReport },
-    ArrowOdbc { report: ArrowOdbcBenchReport },
+    ArrowOdbc { report: OdbcRunnerBenchReport },
+    OdbcBcp { report: OdbcRunnerBenchReport },
 }
 
 impl CompareBackendBenchReport {
@@ -1352,12 +1469,13 @@ impl CompareBackendBenchReport {
         match self {
             Self::Baseline { .. } => BenchmarkBackend::Baseline,
             Self::ArrowOdbc { .. } => BenchmarkBackend::ArrowOdbc,
+            Self::OdbcBcp { .. } => BenchmarkBackend::OdbcBcp,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ArrowOdbcBenchReport {
+struct OdbcRunnerBenchReport {
     rows_written: u64,
     write_elapsed: Duration,
 }
@@ -1392,7 +1510,9 @@ fn run_compare_benchmark(
         .sql_server
         .connect_or_start_with_network(network.as_ref())
         .map_err(WriterBenchError::SqlServer)?;
-    let mut runner_image = if options.backends.contains(&BenchmarkBackend::ArrowOdbc) {
+    let mut runner_image = if options.backends.contains(&BenchmarkBackend::ArrowOdbc)
+        || options.backends.contains(&BenchmarkBackend::OdbcBcp)
+    {
         Some(build_compare_odbc_runner_image(options)?)
     } else {
         None
@@ -1423,7 +1543,7 @@ fn run_compare_benchmark(
         if options.backends.contains(&BenchmarkBackend::ArrowOdbc) {
             let runner_image = runner_image.as_ref().ok_or_else(|| {
                 WriterBenchError::Validation(
-                    "arrow-odbc runner image was not prepared for compare".to_owned(),
+                    "ODBC runner image was not prepared for arrow-odbc compare".to_owned(),
                 )
             })?;
             let report = run_arrow_odbc_runner_for_benchmark_capture(
@@ -1434,6 +1554,22 @@ fn run_compare_benchmark(
                 &ipc_dataset,
             )?;
             backends.push(CompareBackendBenchReport::ArrowOdbc { report });
+        }
+
+        if options.backends.contains(&BenchmarkBackend::OdbcBcp) {
+            let runner_image = runner_image.as_ref().ok_or_else(|| {
+                WriterBenchError::Validation(
+                    "ODBC runner image was not prepared for odbc-bcp compare".to_owned(),
+                )
+            })?;
+            let report = run_odbc_bcp_runner_for_benchmark_capture(
+                &options.benchmark,
+                runner_image,
+                network.as_ref(),
+                &connection,
+                &ipc_dataset,
+            )?;
+            backends.push(CompareBackendBenchReport::OdbcBcp { report });
         }
 
         Ok(CompareBenchReport {
@@ -2547,7 +2683,7 @@ mod tests {
     fn parses_arrow_odbc_runner_image_options() {
         let args = [
             OsString::from("--runner-image"),
-            OsString::from("custom-arrow-odbc-runner:test"),
+            OsString::from("custom-odbc-runner:test"),
             OsString::from("--keep-runner-image"),
             OsString::from("--container-runtime"),
             OsString::from("podman"),
@@ -2555,7 +2691,7 @@ mod tests {
 
         let options = super::ArrowOdbcBenchOptions::parse(&args).unwrap();
 
-        assert_eq!(options.runner_image, "custom-arrow-odbc-runner:test");
+        assert_eq!(options.runner_image, "custom-odbc-runner:test");
         assert!(options.keep_runner_image);
         assert_eq!(
             options.sql_server.container_runtime,
@@ -2577,7 +2713,7 @@ mod tests {
             OsString::from("--backends"),
             OsString::from("baseline,arrow-odbc"),
             OsString::from("--runner-image"),
-            OsString::from("custom-arrow-odbc-runner:test"),
+            OsString::from("custom-odbc-runner:test"),
             OsString::from("--keep-runner-image"),
             OsString::from("--connection-string"),
             OsString::from("server=tcp:127.0.0.1,1433;password=secret"),
@@ -2598,10 +2734,31 @@ mod tests {
                 super::BenchmarkBackend::ArrowOdbc
             ]
         );
-        assert_eq!(options.runner_image, "custom-arrow-odbc-runner:test");
+        assert_eq!(options.runner_image, "custom-odbc-runner:test");
         assert!(options.keep_runner_image);
         assert_eq!(options.sql_server.database, "bench_db");
         assert!(options.sql_server.connection_string.is_some());
+    }
+
+    #[test]
+    fn parses_compare_command_with_odbc_bcp_backend() {
+        let args = [
+            OsString::from("--scenario"),
+            OsString::from("narrow_numeric"),
+            OsString::from("--backends"),
+            OsString::from("baseline,arrow-odbc,odbc-bcp"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+
+        assert_eq!(
+            options.backends,
+            [
+                super::BenchmarkBackend::Baseline,
+                super::BenchmarkBackend::ArrowOdbc,
+                super::BenchmarkBackend::OdbcBcp
+            ]
+        );
     }
 
     #[test]
@@ -2624,7 +2781,7 @@ mod tests {
             OsString::from("--scenario"),
             OsString::from("decimal_temporal"),
             OsString::from("--backends"),
-            OsString::from("baseline,arrow-odbc"),
+            OsString::from("baseline,arrow-odbc,odbc-bcp"),
         ];
 
         let options = super::CompareBenchOptions::parse(&args).unwrap();
@@ -2633,7 +2790,8 @@ mod tests {
             options.backends,
             [
                 super::BenchmarkBackend::Baseline,
-                super::BenchmarkBackend::ArrowOdbc
+                super::BenchmarkBackend::ArrowOdbc,
+                super::BenchmarkBackend::OdbcBcp
             ]
         );
         assert_eq!(options.benchmark.scenario.name, "decimal_temporal");
@@ -2959,6 +3117,55 @@ mod tests {
     }
 
     #[test]
+    fn odbc_bcp_runner_args_include_shared_ipc_dataset() {
+        let benchmark = WriterBenchOptions {
+            rows: 25,
+            batch_size: 5,
+            scenario: super::scenario_by_name("narrow_numeric").unwrap(),
+            repeat: 3,
+            output: BenchmarkOutput::Human,
+        };
+
+        let args =
+            super::odbc_bcp_runner_args(&benchmark, "/workspace/target/bench.arrow").unwrap();
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--manifest-path", "xtask/odbc-bcp-runner/Cargo.toml"])
+        );
+        assert!(args.windows(2).any(|pair| pair == ["--rows", "25"]));
+        assert!(args.windows(2).any(|pair| pair == ["--batch-size", "5"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--scenario", "narrow_numeric"])
+        );
+        assert!(args.windows(2).any(|pair| pair == ["--repeat", "3"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--input-ipc", "/workspace/target/bench.arrow"])
+        );
+    }
+
+    #[test]
+    fn odbc_bcp_runner_args_accept_mixed_nullable_scenario() {
+        let benchmark = WriterBenchOptions {
+            rows: 25,
+            batch_size: 5,
+            scenario: super::scenario_by_name("mixed_nullable").unwrap(),
+            repeat: 3,
+            output: BenchmarkOutput::Human,
+        };
+
+        let args =
+            super::odbc_bcp_runner_args(&benchmark, "/workspace/target/bench.arrow").unwrap();
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--scenario", "mixed_nullable"])
+        );
+    }
+
+    #[test]
     fn parses_arrow_odbc_runner_report_from_noisy_output() {
         let output = "\
 Compiling unrelated crate
@@ -2973,6 +3180,63 @@ arrow-odbc runner
 
         assert_eq!(report.rows_written, 25);
         assert_eq!(report.write_elapsed, std::time::Duration::from_millis(67));
+    }
+
+    #[test]
+    fn parses_odbc_bcp_runner_report_from_noisy_output() {
+        let output = "\
+Compiling unrelated crate
+odbc-bcp runner
+  database: arrow_tiberius_benchmark
+  rows written: 25
+  write seconds: 0.067
+  write rows/sec: 375.43
+";
+
+        let report = super::parse_odbc_bcp_runner_report(output).unwrap();
+
+        assert_eq!(report.rows_written, 25);
+        assert_eq!(report.write_elapsed, std::time::Duration::from_millis(67));
+    }
+
+    #[test]
+    fn rejects_odbc_bcp_runner_report_negative_seconds() {
+        let output = "rows written: 25\nwrite seconds: -1";
+
+        let err = super::parse_odbc_bcp_runner_report(output).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message) if message.contains("invalid write seconds")
+        ));
+    }
+
+    #[test]
+    fn rejects_odbc_bcp_runner_report_missing_rows_with_bcp_label() {
+        let err = super::parse_odbc_bcp_runner_report("write seconds: 0.1").unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("odbc-bcp")
+                    && message.contains("missing `rows written`")
+                    && !message.contains("arrow-odbc")
+        ));
+    }
+
+    #[test]
+    fn rejects_odbc_bcp_runner_report_invalid_rows_with_bcp_label() {
+        let output = "rows written: not-a-number\nwrite seconds: 0.1";
+
+        let err = super::parse_odbc_bcp_runner_report(output).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("odbc-bcp")
+                    && message.contains("invalid rows written")
+                    && !message.contains("arrow-odbc")
+        ));
     }
 
     #[test]

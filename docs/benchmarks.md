@@ -16,9 +16,9 @@ interpretable.
 - Rust toolchain for this workspace.
 - A container runtime such as `podman` or `docker`, or an existing SQL Server
   connection string.
-- For `arrow-odbc`, the managed runner image contains unixODBC, Microsoft ODBC
-  Driver 18 for SQL Server, and Rust. The normal xtask path does not require the
-  host to have unixODBC development libraries installed.
+- For ODBC-backed comparisons, the managed runner image contains unixODBC,
+  Microsoft ODBC Driver 18 for SQL Server, and Rust. The normal xtask path does
+  not require the host to have unixODBC development libraries installed.
 
 The examples below use `podman`. Replace it with `docker` when needed.
 
@@ -76,6 +76,33 @@ This path builds and runs a managed runner image. The runner reads an Arrow IPC
 dataset and writes it through `arrow-odbc`. Use `--keep-runner-image` only when
 you want to keep that image for repeated local experiments.
 
+## Native ODBC BCP Backend
+
+Use `odbc-bcp` through `compare` to benchmark SQL Server's native ODBC bulk-copy
+extension:
+
+```sh
+cargo xtask writer-bench compare \
+  --container-runtime podman \
+  --backends baseline,arrow-odbc,odbc-bcp \
+  --scenario narrow_numeric \
+  --rows 10000 \
+  --batch-size 8192 \
+  --repeat 3
+```
+
+This path uses the Microsoft ODBC Driver 18 SQL Server-specific BCP extension.
+It is not the same as `arrow-odbc`, which writes through generic ODBC parameter
+arrays. The BCP runner is contained under `xtask` and is a benchmark-only
+reference point for native SQL Server bulk copy. It does not add an ODBC
+dependency or public API to the main crate.
+
+Current `odbc-bcp` support covers every shared benchmark scenario. The runner
+uses the shared IPC file and binds supported Arrow columns into SQL Server BCP
+program variables. Arrow `Utf8` values are encoded as UTF-16LE for
+`nvarchar(max)` targets; decimal, date, and timestamp values are formatted as
+text for SQL Server conversion; binary values are sent as `varbinary(max)`.
+
 ## Backend Compare
 
 Use `compare` for the fairest backend comparison. The command generates one
@@ -84,7 +111,7 @@ Arrow IPC dataset and has each selected backend write that same file:
 ```sh
 cargo xtask writer-bench compare \
   --container-runtime podman \
-  --backends baseline,arrow-odbc \
+  --backends baseline,arrow-odbc,odbc-bcp \
   --scenario narrow_numeric \
   --rows 10000 \
   --batch-size 8192 \
@@ -176,7 +203,11 @@ compare runs.
 
 ## Current Backend Scope
 
-The current production writer backend is the baseline TokenRow path. The direct
-raw TDS encoder is not benchmarked until that backend exists. When it is added,
-the compare command should be extended so baseline, `arrow-odbc`, and direct TDS
-can all consume the same IPC dataset.
+The current production writer backend is the baseline TokenRow path.
+`arrow-odbc` and `odbc-bcp` are benchmark references only. `odbc-bcp` is SQL
+Server-specific and exists to measure Microsoft's native BCP extension against
+this crate's writer paths.
+
+The direct raw TDS encoder is not benchmarked until that backend exists. When it
+is added, the compare command should be extended so baseline, `arrow-odbc`,
+`odbc-bcp`, and direct TDS can all consume the same IPC dataset.

@@ -2,8 +2,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-pub(crate) const DEFAULT_RUNNER_IMAGE_TAG: &str = "arrow-tiberius-arrow-odbc-runner:local";
-const RUNNER_DOCKERFILE: &str = "xtask/containers/arrow-odbc-runner/Dockerfile";
+pub(crate) const DEFAULT_RUNNER_IMAGE_TAG: &str = "arrow-tiberius-odbc-runner:local";
+const RUNNER_DOCKERFILE: &str = "xtask/containers/odbc-runner/Dockerfile";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunnerImageOptions {
@@ -39,7 +39,7 @@ impl RunnerCommandOptions {
             "run".to_owned(),
             "--rm".to_owned(),
             "--label".to_owned(),
-            "org.arrow-tiberius.xtask=arrow-odbc-runner".to_owned(),
+            "org.arrow-tiberius.xtask=odbc-runner".to_owned(),
         ];
 
         if let Some(network) = &self.network {
@@ -83,7 +83,7 @@ pub(crate) fn build_runner_image(options: &RunnerImageOptions) -> Result<(), Odb
     let status = command
         .status()
         .map_err(|source| OdbcRunnerError::CommandSpawn {
-            description: "build arrow-odbc runner image",
+            description: "build ODBC runner image",
             source,
         })?;
 
@@ -91,7 +91,7 @@ pub(crate) fn build_runner_image(options: &RunnerImageOptions) -> Result<(), Odb
         Ok(())
     } else {
         Err(OdbcRunnerError::CommandStatus {
-            description: "build arrow-odbc runner image",
+            description: "build ODBC runner image",
             status,
         })
     }
@@ -107,7 +107,7 @@ pub(crate) fn run_runner_command(options: &RunnerCommandOptions) -> Result<(), O
     let status = command
         .status()
         .map_err(|source| OdbcRunnerError::CommandSpawn {
-            description: "run arrow-odbc runner command",
+            description: "run ODBC runner command",
             source,
         })?;
 
@@ -115,7 +115,7 @@ pub(crate) fn run_runner_command(options: &RunnerCommandOptions) -> Result<(), O
         Ok(())
     } else {
         Err(OdbcRunnerError::CommandStatus {
-            description: "run arrow-odbc runner command",
+            description: "run ODBC runner command",
             status,
         })
     }
@@ -134,7 +134,7 @@ pub(crate) fn run_runner_command_capture(
         .args(options.container_args())
         .output()
         .map_err(|source| OdbcRunnerError::CommandSpawn {
-            description: "run arrow-odbc runner command",
+            description: "run ODBC runner command",
             source,
         })?;
 
@@ -147,7 +147,7 @@ pub(crate) fn run_runner_command_capture(
         print!("{stdout}");
         eprint!("{stderr}");
         Err(OdbcRunnerError::CommandStatus {
-            description: "run arrow-odbc runner command",
+            description: "run ODBC runner command",
             status: output.status,
         })
     }
@@ -166,7 +166,7 @@ pub(crate) fn remove_runner_image(options: &RunnerImageOptions) -> Result<(), Od
     let status = command
         .status()
         .map_err(|source| OdbcRunnerError::CommandSpawn {
-            description: "remove arrow-odbc runner image",
+            description: "remove ODBC runner image",
             source,
         })?;
 
@@ -174,7 +174,7 @@ pub(crate) fn remove_runner_image(options: &RunnerImageOptions) -> Result<(), Od
         Ok(())
     } else {
         Err(OdbcRunnerError::CommandStatus {
-            description: "remove arrow-odbc runner image",
+            description: "remove ODBC runner image",
             status,
         })
     }
@@ -234,7 +234,7 @@ impl ManagedRunnerImage {
 impl Drop for ManagedRunnerImage {
     fn drop(&mut self) {
         if let Err(error) = self.cleanup() {
-            eprintln!("warning: failed to clean up arrow-odbc runner image: {error}");
+            eprintln!("warning: failed to clean up ODBC runner image: {error}");
         }
     }
 }
@@ -308,7 +308,7 @@ mod tests {
                 "run",
                 "--rm",
                 "--label",
-                "org.arrow-tiberius.xtask=arrow-odbc-runner",
+                "org.arrow-tiberius.xtask=odbc-runner",
                 DEFAULT_RUNNER_IMAGE_TAG,
                 "odbcinst",
                 "-q",
@@ -335,7 +335,7 @@ mod tests {
                 "run",
                 "--rm",
                 "--label",
-                "org.arrow-tiberius.xtask=arrow-odbc-runner",
+                "org.arrow-tiberius.xtask=odbc-runner",
                 "--network",
                 "bench-network",
                 DEFAULT_RUNNER_IMAGE_TAG,
@@ -372,7 +372,7 @@ mod tests {
                 "run",
                 "--rm",
                 "--label",
-                "org.arrow-tiberius.xtask=arrow-odbc-runner",
+                "org.arrow-tiberius.xtask=odbc-runner",
                 "--env",
                 "ARROW_TIBERIUS_BENCH_DATABASE=bench",
                 "--env",
