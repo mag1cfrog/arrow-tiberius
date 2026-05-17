@@ -13,6 +13,63 @@ pub(crate) struct SqlServerConnection {
     _container: Option<SqlServerContainer>,
 }
 
+#[derive(Debug)]
+pub(crate) struct ManagedNetwork {
+    runtime: PathBuf,
+    name: String,
+    keep_network: bool,
+}
+
+impl ManagedNetwork {
+    #[allow(dead_code)]
+    pub(crate) fn create(runtime: PathBuf, keep_network: bool) -> Result<Self, SqlServerError> {
+        let name = format!("arrow-tiberius-bench-network-{}", unique_suffix());
+        let mut command = Command::new(&runtime);
+        command
+            .arg("network")
+            .arg("create")
+            .arg("--label")
+            .arg("org.arrow-tiberius.xtask=sqlserver")
+            .arg(&name);
+
+        run_command_capture(&mut command)?;
+
+        Ok(Self {
+            runtime,
+            name,
+            keep_network,
+        })
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl Drop for ManagedNetwork {
+    fn drop(&mut self) {
+        if self.keep_network {
+            eprintln!("keeping benchmark container network `{}`", self.name);
+            return;
+        }
+
+        let status = Command::new(&self.runtime)
+            .arg("network")
+            .arg("rm")
+            .arg(&self.name)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+
+        if let Err(err) = status {
+            eprintln!(
+                "failed to clean up benchmark container network `{}`: {err}",
+                self.name
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SqlServerConnectionOptions {
     pub(crate) container_runtime: Option<PathBuf>,
@@ -41,6 +98,13 @@ impl SqlServerConnectionOptions {
     }
 
     pub(crate) fn connect_or_start(&self) -> Result<SqlServerConnection, SqlServerError> {
+        self.connect_or_start_with_network(None)
+    }
+
+    pub(crate) fn connect_or_start_with_network(
+        &self,
+        network: Option<&ManagedNetwork>,
+    ) -> Result<SqlServerConnection, SqlServerError> {
         if let Some(connection_string) = &self.connection_string {
             return Ok(SqlServerConnection {
                 connection_string: connection_string.clone(),
@@ -50,8 +114,12 @@ impl SqlServerConnectionOptions {
         }
 
         let runtime = self.resolve_container_runtime()?;
-        let container = SqlServerContainer::start(self, runtime)?;
-        let connection = container.connection();
+        let container = SqlServerContainer::start(self, runtime, network)?;
+        let connection = if network.is_some() {
+            container.container_connection()
+        } else {
+            container.host_connection()
+        };
         container.wait_until_ready()?;
         container.initialize_database(&self.database)?;
 
@@ -75,6 +143,11 @@ impl SqlServerConnectionOptions {
             .or_else(|| find_on_path("podman"))
             .ok_or(SqlServerError::ContainerRuntimeNotFound)
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn resolve_runtime(&self) -> Result<PathBuf, SqlServerError> {
+        self.resolve_container_runtime()
+    }
 }
 
 #[derive(Debug)]
@@ -90,6 +163,7 @@ impl SqlServerContainer {
     fn start(
         options: &SqlServerConnectionOptions,
         runtime: PathBuf,
+        network: Option<&ManagedNetwork>,
     ) -> Result<Self, SqlServerError> {
         let host_port = find_free_port()?;
         let name = format!("arrow-tiberius-sqlserver-{}", unique_suffix());
@@ -108,8 +182,13 @@ impl SqlServerContainer {
             .arg("--env")
             .arg(format!("MSSQL_SA_PASSWORD={password}"))
             .arg("--publish")
-            .arg(format!("127.0.0.1:{host_port}:1433"))
-            .arg(&options.image);
+            .arg(format!("127.0.0.1:{host_port}:1433"));
+
+        if let Some(network) = network {
+            command.arg("--network").arg(network.name());
+        }
+
+        command.arg(&options.image);
 
         run_command_capture(&mut command)?;
 
@@ -122,10 +201,17 @@ impl SqlServerContainer {
         })
     }
 
-    fn connection(&self) -> String {
+    fn host_connection(&self) -> String {
         format!(
             "server=tcp:127.0.0.1,{};user id=sa;password={};TrustServerCertificate=true",
             self.host_port, self.password
+        )
+    }
+
+    pub(crate) fn container_connection(&self) -> String {
+        format!(
+            "server=tcp:{},1433;user id=sa;password={};TrustServerCertificate=true",
+            self.name, self.password
         )
     }
 
@@ -377,7 +463,7 @@ const SQLSERVER_READY_TIMEOUT_SECS: u64 = 120;
 
 #[cfg(test)]
 mod tests {
-    use super::{SqlServerConnectionOptions, SqlServerError};
+    use super::{ManagedNetwork, SqlServerConnectionOptions, SqlServerContainer, SqlServerError};
 
     #[test]
     fn benchmark_default_uses_separate_database_from_integration_default() {
@@ -408,6 +494,37 @@ mod tests {
         assert_eq!(
             connection.connection_string,
             "server=tcp:127.0.0.1,1433;password=secret"
+        );
+    }
+
+    #[test]
+    fn managed_network_exposes_container_network_name() {
+        let network = ManagedNetwork {
+            runtime: "podman".into(),
+            name: "arrow-tiberius-bench-network-test".to_owned(),
+            keep_network: true,
+        };
+
+        assert_eq!(network.name(), "arrow-tiberius-bench-network-test");
+    }
+
+    #[test]
+    fn container_connection_uses_container_name_and_default_sqlserver_port() {
+        let container = SqlServerContainer {
+            runtime: "podman".into(),
+            name: "arrow-tiberius-sqlserver-test".to_owned(),
+            password: "secret".to_owned(),
+            host_port: 14331,
+            keep_container: true,
+        };
+
+        assert_eq!(
+            container.host_connection(),
+            "server=tcp:127.0.0.1,14331;user id=sa;password=secret;TrustServerCertificate=true"
+        );
+        assert_eq!(
+            container.container_connection(),
+            "server=tcp:arrow-tiberius-sqlserver-test,1433;user id=sa;password=secret;TrustServerCertificate=true"
         );
     }
 
