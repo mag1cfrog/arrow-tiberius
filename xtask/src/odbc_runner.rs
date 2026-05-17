@@ -27,6 +27,9 @@ pub(crate) struct RunnerCommandOptions {
     pub(crate) container_runtime: PathBuf,
     pub(crate) image_tag: String,
     pub(crate) network: Option<String>,
+    pub(crate) env: Vec<(String, String)>,
+    pub(crate) workspace: Option<PathBuf>,
+    pub(crate) workdir: Option<String>,
     pub(crate) args: Vec<String>,
 }
 
@@ -42,6 +45,21 @@ impl RunnerCommandOptions {
         if let Some(network) = &self.network {
             args.push("--network".to_owned());
             args.push(network.clone());
+        }
+
+        for (name, value) in &self.env {
+            args.push("--env".to_owned());
+            args.push(format!("{name}={value}"));
+        }
+
+        if let Some(workspace) = &self.workspace {
+            args.push("--volume".to_owned());
+            args.push(format!("{}:/workspace:Z", workspace.display()));
+        }
+
+        if let Some(workdir) = &self.workdir {
+            args.push("--workdir".to_owned());
+            args.push(workdir.clone());
         }
 
         args.push(self.image_tag.clone());
@@ -154,12 +172,18 @@ impl ManagedRunnerImage {
     pub(crate) fn command_options(
         &self,
         network: Option<String>,
+        env: Vec<(String, String)>,
+        workspace: Option<PathBuf>,
+        workdir: Option<String>,
         args: Vec<String>,
     ) -> RunnerCommandOptions {
         RunnerCommandOptions {
             container_runtime: self.options.container_runtime.clone(),
             image_tag: self.options.image_tag.clone(),
             network,
+            env,
+            workspace,
+            workdir,
             args,
         }
     }
@@ -240,6 +264,9 @@ mod tests {
             container_runtime: "podman".into(),
             image_tag: DEFAULT_RUNNER_IMAGE_TAG.to_owned(),
             network: None,
+            env: Vec::new(),
+            workspace: None,
+            workdir: None,
             args: vec!["odbcinst".to_owned(), "-q".to_owned(), "-d".to_owned()],
         };
 
@@ -264,6 +291,9 @@ mod tests {
             container_runtime: "podman".into(),
             image_tag: DEFAULT_RUNNER_IMAGE_TAG.to_owned(),
             network: Some("bench-network".to_owned()),
+            env: Vec::new(),
+            workspace: None,
+            workdir: None,
             args: vec!["cargo".to_owned(), "test".to_owned()],
         };
 
@@ -279,6 +309,49 @@ mod tests {
                 DEFAULT_RUNNER_IMAGE_TAG,
                 "cargo",
                 "test",
+            ]
+        );
+    }
+
+    #[test]
+    fn runner_command_options_build_container_args_with_env_and_workspace() {
+        let options = RunnerCommandOptions {
+            container_runtime: "podman".into(),
+            image_tag: DEFAULT_RUNNER_IMAGE_TAG.to_owned(),
+            network: None,
+            env: vec![
+                (
+                    "ARROW_TIBERIUS_BENCH_DATABASE".to_owned(),
+                    "bench".to_owned(),
+                ),
+                (
+                    "ARROW_TIBERIUS_BENCH_CONNECTION_STRING".to_owned(),
+                    "server=tcp:sqlserver,1433".to_owned(),
+                ),
+            ],
+            workspace: Some("/home/hanbo/repo/arrow-tiberius".into()),
+            workdir: Some("/workspace".to_owned()),
+            args: vec!["cargo".to_owned(), "metadata".to_owned()],
+        };
+
+        assert_eq!(
+            options.container_args(),
+            [
+                "run",
+                "--rm",
+                "--label",
+                "org.arrow-tiberius.xtask=arrow-odbc-runner",
+                "--env",
+                "ARROW_TIBERIUS_BENCH_DATABASE=bench",
+                "--env",
+                "ARROW_TIBERIUS_BENCH_CONNECTION_STRING=server=tcp:sqlserver,1433",
+                "--volume",
+                "/home/hanbo/repo/arrow-tiberius:/workspace:Z",
+                "--workdir",
+                "/workspace",
+                DEFAULT_RUNNER_IMAGE_TAG,
+                "cargo",
+                "metadata",
             ]
         );
     }

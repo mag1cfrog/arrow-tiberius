@@ -90,7 +90,7 @@ fn run_arrow_odbc(args: &[OsString]) -> Result<(), WriterBenchError> {
         .map_err(WriterBenchError::SqlServer)?;
     let mut runner_image = build_arrow_odbc_runner_image(&options)?;
     let runner_image_tag = runner_image.image_tag().to_owned();
-    validate_arrow_odbc_runner(&runner_image, network.as_ref())?;
+    validate_arrow_odbc_runner(&runner_image, network.as_ref(), &connection)?;
     runner_image
         .cleanup()
         .map_err(WriterBenchError::OdbcRunner)?;
@@ -480,11 +480,30 @@ fn build_arrow_odbc_runner_image(
 fn validate_arrow_odbc_runner(
     runner_image: &odbc_runner::ManagedRunnerImage,
     network: Option<&sqlserver::ManagedNetwork>,
+    connection: &sqlserver::SqlServerConnection,
 ) -> Result<(), WriterBenchError> {
     println!("  action: validate_runner_odbc_driver");
+    let script = "\
+        odbcinst -q -d | grep -F '[ODBC Driver 18 for SQL Server]' && \
+        test -f Cargo.toml && \
+        test -f xtask/Cargo.toml && \
+        test -n \"$ARROW_TIBERIUS_BENCH_CONNECTION_STRING\" && \
+        test -n \"$ARROW_TIBERIUS_BENCH_DATABASE\"";
     let command_options = runner_image.command_options(
         network.map(|network| network.name().to_owned()),
-        vec!["odbcinst".to_owned(), "-q".to_owned(), "-d".to_owned()],
+        vec![
+            (
+                "ARROW_TIBERIUS_BENCH_CONNECTION_STRING".to_owned(),
+                connection.connection_string.clone(),
+            ),
+            (
+                "ARROW_TIBERIUS_BENCH_DATABASE".to_owned(),
+                connection.database.clone(),
+            ),
+        ],
+        Some(repository_root()?),
+        Some("/workspace".to_owned()),
+        vec!["sh".to_owned(), "-lc".to_owned(), script.to_owned()],
     );
 
     odbc_runner::run_runner_command(&command_options).map_err(WriterBenchError::OdbcRunner)
