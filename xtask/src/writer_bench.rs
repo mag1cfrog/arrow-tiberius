@@ -255,7 +255,7 @@ fn print_baseline_help() {
 
 fn print_arrow_odbc_help() {
     println!(
-        "Usage:\n  cargo xtask writer-bench arrow-odbc [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>      Managed arrow-odbc runner image tag\n  --keep-runner-image         Keep the managed arrow-odbc runner image after the task exits\n  -h, --help                  Print help\n\nThis is a SQL Server write-path comparison only. The arrow-odbc runner image contains unixODBC, Microsoft ODBC Driver 18 for SQL Server, and Rust."
+        "Usage:\n  cargo xtask writer-bench arrow-odbc [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>      Managed ODBC runner image tag\n  --keep-runner-image         Keep the managed ODBC runner image after the task exits\n  -h, --help                  Print help\n\nThis is a SQL Server write-path comparison only. The ODBC runner image contains unixODBC, Microsoft ODBC Driver 18 for SQL Server, and Rust."
     );
 }
 
@@ -1567,7 +1567,7 @@ fn run_compare_benchmark(
         if options.backends.contains(&BenchmarkBackend::ArrowOdbc) {
             let runner_image = runner_image.as_ref().ok_or_else(|| {
                 WriterBenchError::Validation(
-                    "arrow-odbc runner image was not prepared for compare".to_owned(),
+                    "ODBC runner image was not prepared for arrow-odbc compare".to_owned(),
                 )
             })?;
             let report = run_arrow_odbc_runner_for_benchmark_capture(
@@ -2707,7 +2707,7 @@ mod tests {
     fn parses_arrow_odbc_runner_image_options() {
         let args = [
             OsString::from("--runner-image"),
-            OsString::from("custom-arrow-odbc-runner:test"),
+            OsString::from("custom-odbc-runner:test"),
             OsString::from("--keep-runner-image"),
             OsString::from("--container-runtime"),
             OsString::from("podman"),
@@ -2715,7 +2715,7 @@ mod tests {
 
         let options = super::ArrowOdbcBenchOptions::parse(&args).unwrap();
 
-        assert_eq!(options.runner_image, "custom-arrow-odbc-runner:test");
+        assert_eq!(options.runner_image, "custom-odbc-runner:test");
         assert!(options.keep_runner_image);
         assert_eq!(
             options.sql_server.container_runtime,
@@ -2737,7 +2737,7 @@ mod tests {
             OsString::from("--backends"),
             OsString::from("baseline,arrow-odbc"),
             OsString::from("--runner-image"),
-            OsString::from("custom-arrow-odbc-runner:test"),
+            OsString::from("custom-odbc-runner:test"),
             OsString::from("--keep-runner-image"),
             OsString::from("--connection-string"),
             OsString::from("server=tcp:127.0.0.1,1433;password=secret"),
@@ -2758,7 +2758,7 @@ mod tests {
                 super::BenchmarkBackend::ArrowOdbc
             ]
         );
-        assert_eq!(options.runner_image, "custom-arrow-odbc-runner:test");
+        assert_eq!(options.runner_image, "custom-odbc-runner:test");
         assert!(options.keep_runner_image);
         assert_eq!(options.sql_server.database, "bench_db");
         assert!(options.sql_server.connection_string.is_some());
