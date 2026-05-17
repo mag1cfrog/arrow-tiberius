@@ -6,6 +6,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
+mod odbc_runner;
 mod sqlserver;
 mod writer_bench;
 

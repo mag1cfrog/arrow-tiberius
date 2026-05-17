@@ -144,7 +144,6 @@ impl SqlServerConnectionOptions {
             .ok_or(SqlServerError::ContainerRuntimeNotFound)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn resolve_runtime(&self) -> Result<PathBuf, SqlServerError> {
         self.resolve_container_runtime()
     }
