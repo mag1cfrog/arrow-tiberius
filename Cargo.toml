@@ -1,6 +1,6 @@
 [workspace]
 members = ["xtask"]
-exclude = ["xtask/arrow-odbc-runner"]
+exclude = ["xtask/arrow-odbc-runner", "xtask/odbc-bcp-runner"]
 resolver = "3"
 
 [workspace.lints.rust]

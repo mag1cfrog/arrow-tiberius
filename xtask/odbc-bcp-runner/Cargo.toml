@@ -1,0 +1,14 @@
+[package]
+name = "arrow-tiberius-odbc-bcp-runner"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+arrow-array = "58.3.0"
+arrow-ipc = "58.3.0"
+arrow-schema = "58.3.0"
+libloading = "0.8.9"
