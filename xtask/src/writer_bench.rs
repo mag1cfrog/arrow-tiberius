@@ -83,17 +83,22 @@ fn run_arrow_odbc(args: &[OsString]) -> Result<(), WriterBenchError> {
     }
 
     let options = ArrowOdbcBenchOptions::parse(args)?;
+    let network = create_arrow_odbc_network(&options)?;
+    let connection = options
+        .sql_server
+        .connect_or_start_with_network(network.as_ref())
+        .map_err(WriterBenchError::SqlServer)?;
     let mut runner_image = build_arrow_odbc_runner_image(&options)?;
     let runner_image_tag = runner_image.image_tag().to_owned();
-    validate_arrow_odbc_runner(&runner_image)?;
+    validate_arrow_odbc_runner(&runner_image, network.as_ref())?;
     runner_image
         .cleanup()
         .map_err(WriterBenchError::OdbcRunner)?;
 
     Err(WriterBenchError::ArrowOdbcUnavailable {
         reason: format!(
-            "arrow-odbc runner container is not wired yet after preparing {}",
-            runner_image_tag
+            "arrow-odbc runner container is not wired yet after preparing {} for {}",
+            runner_image_tag, connection.database
         ),
     })
 }
@@ -426,6 +431,29 @@ fn is_arrow_odbc_supported_scenario(scenario: &BenchmarkScenarioDefinition) -> b
     matches!(scenario.name, "narrow_numeric" | "mixed_nullable")
 }
 
+fn create_arrow_odbc_network(
+    options: &ArrowOdbcBenchOptions,
+) -> Result<Option<sqlserver::ManagedNetwork>, WriterBenchError> {
+    if options.sql_server.connection_string.is_some() {
+        return Ok(None);
+    }
+
+    let container_runtime = options
+        .sql_server
+        .resolve_runtime()
+        .map_err(WriterBenchError::SqlServer)?;
+    let network =
+        sqlserver::ManagedNetwork::create(container_runtime, options.sql_server.keep_container)
+            .map_err(WriterBenchError::SqlServer)?;
+
+    println!("writer-bench arrow-odbc");
+    println!("  action: prepare_container_network");
+    println!("  network: {}", network.name());
+    println!("  keep network: {}", options.sql_server.keep_container);
+
+    Ok(Some(network))
+}
+
 fn build_arrow_odbc_runner_image(
     options: &ArrowOdbcBenchOptions,
 ) -> Result<odbc_runner::ManagedRunnerImage, WriterBenchError> {
@@ -451,10 +479,11 @@ fn build_arrow_odbc_runner_image(
 
 fn validate_arrow_odbc_runner(
     runner_image: &odbc_runner::ManagedRunnerImage,
+    network: Option<&sqlserver::ManagedNetwork>,
 ) -> Result<(), WriterBenchError> {
     println!("  action: validate_runner_odbc_driver");
     let command_options = runner_image.command_options(
-        None,
+        network.map(|network| network.name().to_owned()),
         vec!["odbcinst".to_owned(), "-q".to_owned(), "-d".to_owned()],
     );
 
@@ -1843,6 +1872,19 @@ mod tests {
             options.runner_image,
             crate::odbc_runner::DEFAULT_RUNNER_IMAGE_TAG
         );
+    }
+
+    #[test]
+    fn arrow_odbc_network_is_not_created_for_existing_connection_string() {
+        let args = [
+            OsString::from("--connection-string"),
+            OsString::from("server=tcp:127.0.0.1,1433;password=secret"),
+        ];
+        let options = super::ArrowOdbcBenchOptions::parse(&args).unwrap();
+
+        let network = super::create_arrow_odbc_network(&options).unwrap();
+
+        assert!(network.is_none());
     }
 
     #[test]

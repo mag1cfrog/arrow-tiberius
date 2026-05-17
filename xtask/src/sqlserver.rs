@@ -21,7 +21,6 @@ pub(crate) struct ManagedNetwork {
 }
 
 impl ManagedNetwork {
-    #[allow(dead_code)]
     pub(crate) fn create(runtime: PathBuf, keep_network: bool) -> Result<Self, SqlServerError> {
         let name = format!("arrow-tiberius-bench-network-{}", unique_suffix());
         let mut command = Command::new(&runtime);
