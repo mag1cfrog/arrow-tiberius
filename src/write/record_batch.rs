@@ -1,1 +1,1746 @@
-//! Runtime Arrow record batch conversion into semantic SQL Server cells.
+//! Runtime record batch view and Arrow-to-MSSQL semantic conversion.
+
+#![allow(dead_code)]
+
+use arrow_array::{
+    Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
+    Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, timezone::Tz,
+};
+use arrow_schema::{DataType, TimeUnit};
+use chrono::{Offset, TimeZone};
+
+use crate::{
+    Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, MssqlType, MssqlTypeLength,
+    NanosecondPolicy, PlanOptions, Result, SchemaMapping,
+};
+
+use super::cell::{
+    ArrowCell, ArrowToMssqlRuntimeMapping, MssqlCell, MssqlDate, MssqlDateTime2,
+    MssqlDateTimeOffset, MssqlDecimal, MssqlTime,
+};
+
+const SQL_SERVER_DATE_UNIX_EPOCH_DAYS: i64 = 719_162;
+const SQL_SERVER_DATE_MAX_DAYS: i64 = 3_652_058;
+const MILLISECONDS_PER_DAY: i64 = 86_400_000;
+const SQL_SERVER_DATETIME2_DATE64_SCALE: u8 = 3;
+const SQL_SERVER_DATETIME2_TIMESTAMP_SCALE: u8 = 7;
+const TICKS_100NS_PER_SECOND: i128 = 10_000_000;
+const TICKS_100NS_PER_MILLISECOND: i128 = 10_000;
+const TICKS_100NS_PER_MICROSECOND: i128 = 10;
+const TICKS_100NS_PER_DAY: i128 = 864_000_000_000;
+const NANOSECONDS_PER_100NS_TICK: i64 = 100;
+/// SQL Server accepts datetimeoffset offsets from -14:00 through +14:00.
+const SQL_SERVER_DATETIMEOFFSET_MAX_OFFSET_MINUTES: i16 = 14 * 60;
+
+/// Borrowed conversion view over one Arrow record batch and schema mappings.
+#[derive(Debug)]
+pub(crate) struct RecordBatchView<'a> {
+    batch: &'a RecordBatch,
+    mappings: &'a [SchemaMapping],
+    plan_options: PlanOptions,
+}
+
+impl<'a> RecordBatchView<'a> {
+    /// Creates a conversion view after validating batch columns against mappings.
+    pub(crate) fn new(batch: &'a RecordBatch, mappings: &'a [SchemaMapping]) -> Result<Self> {
+        Self::new_with_options(batch, mappings, &PlanOptions::default())
+    }
+
+    /// Creates a conversion view with explicit write conversion policies.
+    pub(crate) fn new_with_options(
+        batch: &'a RecordBatch,
+        mappings: &'a [SchemaMapping],
+        plan_options: &PlanOptions,
+    ) -> Result<Self> {
+        validate_runtime_columns(batch, mappings)?;
+
+        Ok(Self {
+            batch,
+            mappings,
+            plan_options: *plan_options,
+        })
+    }
+
+    /// Returns the number of rows in the runtime batch.
+    pub(crate) fn row_count(&self) -> usize {
+        self.batch.num_rows()
+    }
+
+    /// Returns the planned mappings in conversion order.
+    pub(crate) const fn mappings(&self) -> &[SchemaMapping] {
+        self.mappings
+    }
+
+    /// Checks that a row index is inside the runtime batch.
+    pub(crate) fn check_row_index(&self, row_index: usize) -> Result<()> {
+        if row_index < self.row_count() {
+            return Ok(());
+        }
+
+        let message = format!(
+            "row index {row_index} is outside runtime batch with {} row(s)",
+            self.row_count()
+        );
+        Err(value_conversion_error(
+            Diagnostic::error(DiagnosticCode::RowIndexOutOfBounds, message).with_row(row_index),
+        ))
+    }
+
+    /// Extracts one borrowed Arrow cell from a planned mapping and row index.
+    pub(crate) fn arrow_cell(
+        &self,
+        mapping: &SchemaMapping,
+        row_index: usize,
+    ) -> Result<ArrowCell<'_>> {
+        self.check_row_index(row_index)?;
+
+        let Some(array) = self
+            .batch
+            .columns()
+            .get(mapping.arrow().index())
+            .map(AsRef::as_ref)
+        else {
+            return Err(value_conversion_error(row_mapping_diagnostic(
+                mapping,
+                row_index,
+                DiagnosticCode::ValueTypeMismatch,
+                "planned column index is outside the runtime batch",
+            )));
+        };
+
+        extract_arrow_cell(array, mapping, row_index)
+    }
+
+    /// Converts one planned cell into a semantic SQL Server cell.
+    pub(crate) fn mssql_cell(
+        &self,
+        mapping: &SchemaMapping,
+        row_index: usize,
+    ) -> Result<MssqlCell<'_>> {
+        let cell = self.arrow_cell(mapping, row_index)?;
+        let runtime_mapping = ArrowToMssqlRuntimeMapping::new(mapping, &self.plan_options);
+        mssql_cell_from_arrow_cell(runtime_mapping, cell, row_index)
+    }
+
+    /// Converts one runtime row into semantic SQL Server cells in mapping order.
+    pub(crate) fn mssql_row(&self, row_index: usize) -> Result<Vec<MssqlCell<'_>>> {
+        self.check_row_index(row_index)?;
+
+        let mut cells = Vec::with_capacity(self.mappings.len());
+        for mapping in self.mappings {
+            cells.push(self.mssql_cell(mapping, row_index)?);
+        }
+
+        Ok(cells)
+    }
+}
+
+fn extract_arrow_cell<'a>(
+    array: &'a dyn Array,
+    mapping: &SchemaMapping,
+    row_index: usize,
+) -> Result<ArrowCell<'a>> {
+    if array.is_null(row_index) {
+        return Ok(ArrowCell::Null);
+    }
+
+    match mapping.arrow().data_type() {
+        DataType::Boolean => {
+            let array = downcast_array::<BooleanArray>(array, mapping, row_index)?;
+            Ok(ArrowCell::Boolean(array.value(row_index)))
+        }
+        DataType::Int8 => {
+            let array = downcast_array::<Int8Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Int8(array.value(row_index)))
+        }
+        DataType::Int16 => {
+            let array = downcast_array::<Int16Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Int16(array.value(row_index)))
+        }
+        DataType::Int32 => {
+            let array = downcast_array::<Int32Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Int32(array.value(row_index)))
+        }
+        DataType::Int64 => {
+            let array = downcast_array::<Int64Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Int64(array.value(row_index)))
+        }
+        DataType::UInt8 => {
+            let array = downcast_array::<UInt8Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::UInt8(array.value(row_index)))
+        }
+        DataType::UInt16 => {
+            let array = downcast_array::<UInt16Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::UInt16(array.value(row_index)))
+        }
+        DataType::UInt32 => {
+            let array = downcast_array::<UInt32Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::UInt32(array.value(row_index)))
+        }
+        DataType::UInt64 => {
+            let array = downcast_array::<UInt64Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::UInt64(array.value(row_index)))
+        }
+        DataType::Decimal32(_, _) => {
+            let array = downcast_array::<Decimal32Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Decimal32(array.value(row_index)))
+        }
+        DataType::Decimal64(_, _) => {
+            let array = downcast_array::<Decimal64Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Decimal64(array.value(row_index)))
+        }
+        DataType::Decimal128(_, _) => {
+            let array = downcast_array::<Decimal128Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Decimal128(array.value(row_index)))
+        }
+        DataType::Decimal256(_, _) => {
+            let array = downcast_array::<Decimal256Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Decimal256(array.value(row_index)))
+        }
+        DataType::Date32 => {
+            let array = downcast_array::<Date32Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Date32(array.value(row_index)))
+        }
+        DataType::Date64 => {
+            let array = downcast_array::<Date64Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Date64(array.value(row_index)))
+        }
+        DataType::Timestamp(time_unit, _) => match time_unit {
+            TimeUnit::Second => {
+                let array = downcast_array::<TimestampSecondArray>(array, mapping, row_index)?;
+                Ok(ArrowCell::TimestampSecond(array.value(row_index)))
+            }
+            TimeUnit::Millisecond => {
+                let array = downcast_array::<TimestampMillisecondArray>(array, mapping, row_index)?;
+                Ok(ArrowCell::TimestampMillisecond(array.value(row_index)))
+            }
+            TimeUnit::Microsecond => {
+                let array = downcast_array::<TimestampMicrosecondArray>(array, mapping, row_index)?;
+                Ok(ArrowCell::TimestampMicrosecond(array.value(row_index)))
+            }
+            TimeUnit::Nanosecond => {
+                let array = downcast_array::<TimestampNanosecondArray>(array, mapping, row_index)?;
+                Ok(ArrowCell::TimestampNanosecond(array.value(row_index)))
+            }
+        },
+        DataType::Float32 => {
+            let array = downcast_array::<Float32Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Float32(array.value(row_index)))
+        }
+        DataType::Float64 => {
+            let array = downcast_array::<Float64Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Float64(array.value(row_index)))
+        }
+        DataType::Utf8 => {
+            let array = downcast_array::<StringArray>(array, mapping, row_index)?;
+            Ok(ArrowCell::Utf8(array.value(row_index)))
+        }
+        DataType::LargeUtf8 => {
+            let array = downcast_array::<LargeStringArray>(array, mapping, row_index)?;
+            Ok(ArrowCell::Utf8(array.value(row_index)))
+        }
+        DataType::Binary => {
+            let array = downcast_array::<BinaryArray>(array, mapping, row_index)?;
+            Ok(ArrowCell::Binary(array.value(row_index)))
+        }
+        DataType::LargeBinary => {
+            let array = downcast_array::<LargeBinaryArray>(array, mapping, row_index)?;
+            Ok(ArrowCell::Binary(array.value(row_index)))
+        }
+        other => Err(unsupported_value_conversion(
+            mapping,
+            row_index,
+            format!("Arrow value extraction for {other} is not supported yet"),
+        )),
+    }
+}
+
+fn mssql_bit_value(mapping: &SchemaMapping, row_index: usize, cell: ArrowCell<'_>) -> Result<bool> {
+    match cell {
+        ArrowCell::Boolean(value) => Ok(value),
+        other => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!("expected Arrow boolean payload, got {other:?}"),
+        ))),
+    }
+}
+
+fn mssql_tinyint_value(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    cell: ArrowCell<'_>,
+) -> Result<u8> {
+    match cell {
+        ArrowCell::UInt8(value) => Ok(value),
+        other => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!("expected Arrow UInt8 payload, got {other:?}"),
+        ))),
+    }
+}
+
+fn mssql_smallint_value(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    cell: ArrowCell<'_>,
+) -> Result<i16> {
+    match cell {
+        ArrowCell::Int8(value) => Ok(i16::from(value)),
+        ArrowCell::Int16(value) => Ok(value),
+        other => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!("expected Arrow Int8 or Int16 payload, got {other:?}"),
+        ))),
+    }
+}
+
+fn mssql_int_value(mapping: &SchemaMapping, row_index: usize, cell: ArrowCell<'_>) -> Result<i32> {
+    match cell {
+        ArrowCell::Int32(value) => Ok(value),
+        ArrowCell::UInt16(value) => Ok(i32::from(value)),
+        other => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!("expected Arrow Int32 or UInt16 payload, got {other:?}"),
+        ))),
+    }
+}
+
+fn mssql_bigint_value(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    cell: ArrowCell<'_>,
+) -> Result<i64> {
+    match cell {
+        ArrowCell::Int64(value) => Ok(value),
+        ArrowCell::UInt32(value) => Ok(i64::from(value)),
+        ArrowCell::UInt64(value) => i64::try_from(value).map_err(|_| {
+            value_conversion_error(row_mapping_diagnostic(
+                mapping,
+                row_index,
+                DiagnosticCode::IntegerOutOfRange,
+                format!("Arrow UInt64 value {value} does not fit planned SQL Server bigint"),
+            ))
+        }),
+        other => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!("expected Arrow Int64, UInt32, or UInt64 payload, got {other:?}"),
+        ))),
+    }
+}
+
+fn mssql_decimal_value(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    cell: ArrowCell<'_>,
+) -> Result<MssqlDecimal> {
+    let scale = decimal_scale(mapping, row_index)?;
+    validate_decimal_scale_compatibility(mapping, row_index, scale)?;
+
+    match (cell, mapping.arrow().data_type()) {
+        (ArrowCell::UInt64(value), DataType::UInt64) if is_uint64_decimal20_0_mapping(mapping) => {
+            mssql_decimal(mapping, row_index, i128::from(value), scale)
+        }
+        (ArrowCell::Decimal32(value), DataType::Decimal32(_, arrow_scale)) if *arrow_scale >= 0 => {
+            mssql_decimal(mapping, row_index, i128::from(value), scale)
+        }
+        (ArrowCell::Decimal32(value), DataType::Decimal32(_, arrow_scale)) => {
+            let value =
+                normalize_negative_scale(mapping, row_index, i128::from(value), *arrow_scale)?;
+            mssql_decimal(mapping, row_index, value, scale)
+        }
+        (ArrowCell::Decimal64(value), DataType::Decimal64(_, arrow_scale)) if *arrow_scale >= 0 => {
+            mssql_decimal(mapping, row_index, i128::from(value), scale)
+        }
+        (ArrowCell::Decimal64(value), DataType::Decimal64(_, arrow_scale)) => {
+            let value =
+                normalize_negative_scale(mapping, row_index, i128::from(value), *arrow_scale)?;
+            mssql_decimal(mapping, row_index, value, scale)
+        }
+        (ArrowCell::Decimal128(value), DataType::Decimal128(_, arrow_scale))
+            if *arrow_scale >= 0 =>
+        {
+            mssql_decimal(mapping, row_index, value, scale)
+        }
+        (ArrowCell::Decimal128(value), DataType::Decimal128(_, arrow_scale)) => {
+            let value = normalize_negative_scale(mapping, row_index, value, *arrow_scale)?;
+            mssql_decimal(mapping, row_index, value, scale)
+        }
+        (ArrowCell::Decimal256(value), DataType::Decimal256(_, arrow_scale))
+            if *arrow_scale >= 0 =>
+        {
+            let value = value.to_i128().ok_or_else(|| {
+                value_conversion_error(row_mapping_diagnostic(
+                    mapping,
+                    row_index,
+                    DiagnosticCode::DecimalOutOfRange,
+                    "Arrow Decimal256 value does not fit runtime i128 decimal representation",
+                ))
+            })?;
+            mssql_decimal(mapping, row_index, value, scale)
+        }
+        (ArrowCell::Decimal256(value), DataType::Decimal256(_, arrow_scale)) => {
+            let value = value.to_i128().ok_or_else(|| {
+                value_conversion_error(row_mapping_diagnostic(
+                    mapping,
+                    row_index,
+                    DiagnosticCode::DecimalOutOfRange,
+                    "Arrow Decimal256 value does not fit runtime i128 decimal representation",
+                ))
+            })?;
+            let value = normalize_negative_scale(mapping, row_index, value, *arrow_scale)?;
+            mssql_decimal(mapping, row_index, value, scale)
+        }
+        other => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!("expected Arrow decimal-compatible payload, got {other:?}"),
+        ))),
+    }
+}
+
+fn mssql_date_value(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    cell: ArrowCell<'_>,
+) -> Result<MssqlDate> {
+    match (cell, mapping.arrow().data_type()) {
+        (ArrowCell::Date32(value), DataType::Date32) => {
+            mssql_date_from_arrow_date32(mapping, row_index, value)
+        }
+        other => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!("expected Arrow Date32 payload, got {other:?}"),
+        ))),
+    }
+}
+
+fn mssql_datetime2_value(
+    runtime_mapping: ArrowToMssqlRuntimeMapping<'_>,
+    row_index: usize,
+    cell: ArrowCell<'_>,
+) -> Result<MssqlDateTime2> {
+    let mapping = runtime_mapping.mapping();
+
+    match (cell, mapping.arrow().data_type(), mapping.mssql().ty()) {
+        (
+            ArrowCell::Date64(value),
+            DataType::Date64,
+            MssqlType::DateTime2 {
+                precision: SQL_SERVER_DATETIME2_DATE64_SCALE,
+            },
+        ) => mssql_datetime2_from_arrow_date64(mapping, row_index, value),
+        (
+            ArrowCell::TimestampSecond(value),
+            DataType::Timestamp(TimeUnit::Second, timezone),
+            MssqlType::DateTime2 {
+                precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
+            },
+        ) => {
+            validate_timestamp_timezone_metadata(mapping, row_index, timezone.as_deref())?;
+            mssql_datetime2_from_arrow_timestamp_second(mapping, row_index, value)
+        }
+        (
+            ArrowCell::TimestampMillisecond(value),
+            DataType::Timestamp(TimeUnit::Millisecond, timezone),
+            MssqlType::DateTime2 {
+                precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
+            },
+        ) => {
+            validate_timestamp_timezone_metadata(mapping, row_index, timezone.as_deref())?;
+            mssql_datetime2_from_arrow_timestamp_millisecond(mapping, row_index, value)
+        }
+        (
+            ArrowCell::TimestampMicrosecond(value),
+            DataType::Timestamp(TimeUnit::Microsecond, timezone),
+            MssqlType::DateTime2 {
+                precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
+            },
+        ) => {
+            validate_timestamp_timezone_metadata(mapping, row_index, timezone.as_deref())?;
+            mssql_datetime2_from_arrow_timestamp_microsecond(mapping, row_index, value)
+        }
+        (
+            ArrowCell::TimestampNanosecond(value),
+            DataType::Timestamp(TimeUnit::Nanosecond, timezone),
+            MssqlType::DateTime2 {
+                precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
+            },
+        ) => {
+            validate_timestamp_timezone_metadata(mapping, row_index, timezone.as_deref())?;
+            mssql_datetime2_from_arrow_timestamp_nanosecond(
+                mapping,
+                row_index,
+                value,
+                runtime_mapping.nanosecond_policy(),
+            )
+        }
+        other => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!(
+                "expected Arrow Date64 or timestamp payload planned as datetime2, got {other:?}"
+            ),
+        ))),
+    }
+}
+
+fn mssql_datetimeoffset_value(
+    runtime_mapping: ArrowToMssqlRuntimeMapping<'_>,
+    row_index: usize,
+    cell: ArrowCell<'_>,
+) -> Result<MssqlDateTimeOffset> {
+    let mapping = runtime_mapping.mapping();
+
+    match (cell, mapping.arrow().data_type(), mapping.mssql().ty()) {
+        (
+            ArrowCell::TimestampSecond(value),
+            DataType::Timestamp(TimeUnit::Second, Some(timezone)),
+            MssqlType::DateTimeOffset {
+                precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
+            },
+        ) => {
+            let resolution = timezone_resolution_from_metadata(mapping, row_index, timezone)?;
+            let offset_minutes = resolution.offset_for_instant(mapping, row_index, value, 0)?;
+            let utc_ticks = i128::from(value) * TICKS_100NS_PER_SECOND;
+            mssql_datetimeoffset_from_utc_100ns_ticks(
+                mapping,
+                row_index,
+                utc_ticks,
+                offset_minutes,
+                "second",
+                value,
+            )
+        }
+        (
+            ArrowCell::TimestampMillisecond(value),
+            DataType::Timestamp(TimeUnit::Millisecond, Some(timezone)),
+            MssqlType::DateTimeOffset {
+                precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
+            },
+        ) => {
+            let (seconds, nanoseconds) = epoch_parts_from_milliseconds(mapping, row_index, value)?;
+            let resolution = timezone_resolution_from_metadata(mapping, row_index, timezone)?;
+            let offset_minutes =
+                resolution.offset_for_instant(mapping, row_index, seconds, nanoseconds)?;
+            let utc_ticks = i128::from(value) * TICKS_100NS_PER_MILLISECOND;
+            mssql_datetimeoffset_from_utc_100ns_ticks(
+                mapping,
+                row_index,
+                utc_ticks,
+                offset_minutes,
+                "millisecond",
+                value,
+            )
+        }
+        (
+            ArrowCell::TimestampMicrosecond(value),
+            DataType::Timestamp(TimeUnit::Microsecond, Some(timezone)),
+            MssqlType::DateTimeOffset {
+                precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
+            },
+        ) => {
+            let (seconds, nanoseconds) = epoch_parts_from_microseconds(mapping, row_index, value)?;
+            let resolution = timezone_resolution_from_metadata(mapping, row_index, timezone)?;
+            let offset_minutes =
+                resolution.offset_for_instant(mapping, row_index, seconds, nanoseconds)?;
+            let utc_ticks = i128::from(value) * TICKS_100NS_PER_MICROSECOND;
+            mssql_datetimeoffset_from_utc_100ns_ticks(
+                mapping,
+                row_index,
+                utc_ticks,
+                offset_minutes,
+                "microsecond",
+                value,
+            )
+        }
+        (
+            ArrowCell::TimestampNanosecond(value),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone)),
+            MssqlType::DateTimeOffset {
+                precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
+            },
+        ) => {
+            let (seconds, nanoseconds) = epoch_parts_from_nanoseconds(mapping, row_index, value)?;
+            let resolution = timezone_resolution_from_metadata(mapping, row_index, timezone)?;
+            let offset_minutes =
+                resolution.offset_for_instant(mapping, row_index, seconds, nanoseconds)?;
+            let utc_ticks = nanoseconds_to_100ns_ticks(
+                mapping,
+                row_index,
+                value,
+                runtime_mapping.nanosecond_policy(),
+            )?;
+            mssql_datetimeoffset_from_utc_100ns_ticks(
+                mapping,
+                row_index,
+                utc_ticks,
+                offset_minutes,
+                "nanosecond",
+                value,
+            )
+        }
+        other => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!(
+                "expected timezone-aware Arrow timestamp payload planned as datetimeoffset, got {other:?}"
+            ),
+        ))),
+    }
+}
+
+fn mssql_real_value(mapping: &SchemaMapping, row_index: usize, cell: ArrowCell<'_>) -> Result<f32> {
+    match cell {
+        ArrowCell::Float32(value) if value.is_finite() => Ok(value),
+        ArrowCell::Float32(value) => Err(non_finite_float_error(mapping, row_index, value)),
+        other => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!("expected Arrow Float32 payload, got {other:?}"),
+        ))),
+    }
+}
+
+fn mssql_float_value(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    cell: ArrowCell<'_>,
+) -> Result<f64> {
+    match cell {
+        ArrowCell::Float64(value) if value.is_finite() => Ok(value),
+        ArrowCell::Float64(value) => Err(non_finite_float_error(mapping, row_index, value)),
+        other => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!("expected Arrow Float64 payload, got {other:?}"),
+        ))),
+    }
+}
+
+fn mssql_nvarchar_value<'a>(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    cell: ArrowCell<'a>,
+) -> Result<&'a str> {
+    match cell {
+        ArrowCell::Utf8(value) => Ok(value),
+        other => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!("expected Arrow UTF-8 payload, got {other:?}"),
+        ))),
+    }
+}
+
+fn mssql_varbinary_value<'a>(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    cell: ArrowCell<'a>,
+) -> Result<&'a [u8]> {
+    match cell {
+        ArrowCell::Binary(value) => Ok(value),
+        other => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!("expected Arrow binary payload, got {other:?}"),
+        ))),
+    }
+}
+
+fn mssql_cell_from_arrow_cell<'a>(
+    runtime_mapping: ArrowToMssqlRuntimeMapping<'_>,
+    cell: ArrowCell<'a>,
+    row_index: usize,
+) -> Result<MssqlCell<'a>> {
+    let mapping = runtime_mapping.mapping();
+
+    if matches!(cell, ArrowCell::Null) {
+        if !mapping.mssql().nullable() {
+            return Err(value_conversion_error(row_mapping_diagnostic(
+                mapping,
+                row_index,
+                DiagnosticCode::NullInNonNullableColumn,
+                "null value in non-nullable planned column",
+            )));
+        }
+
+        return null_mssql_cell(mapping, row_index);
+    }
+
+    match mapping.mssql().ty() {
+        MssqlType::Bit => Ok(MssqlCell::Bit(Some(mssql_bit_value(
+            mapping, row_index, cell,
+        )?))),
+        MssqlType::TinyInt => Ok(MssqlCell::TinyInt(Some(mssql_tinyint_value(
+            mapping, row_index, cell,
+        )?))),
+        MssqlType::SmallInt => Ok(MssqlCell::SmallInt(Some(mssql_smallint_value(
+            mapping, row_index, cell,
+        )?))),
+        MssqlType::Int => Ok(MssqlCell::Int(Some(mssql_int_value(
+            mapping, row_index, cell,
+        )?))),
+        MssqlType::BigInt => Ok(MssqlCell::BigInt(Some(mssql_bigint_value(
+            mapping, row_index, cell,
+        )?))),
+        MssqlType::Decimal { .. } => Ok(MssqlCell::Decimal(Some(mssql_decimal_value(
+            mapping, row_index, cell,
+        )?))),
+        MssqlType::Date => Ok(MssqlCell::Date(Some(mssql_date_value(
+            mapping, row_index, cell,
+        )?))),
+        MssqlType::DateTime2 { .. } => Ok(MssqlCell::DateTime2(Some(mssql_datetime2_value(
+            runtime_mapping,
+            row_index,
+            cell,
+        )?))),
+        MssqlType::DateTimeOffset { .. } => Ok(MssqlCell::DateTimeOffset(Some(
+            mssql_datetimeoffset_value(runtime_mapping, row_index, cell)?,
+        ))),
+        MssqlType::Real => Ok(MssqlCell::Real(Some(mssql_real_value(
+            mapping, row_index, cell,
+        )?))),
+        MssqlType::Float { .. } => Ok(MssqlCell::Float(Some(mssql_float_value(
+            mapping, row_index, cell,
+        )?))),
+        MssqlType::NVarChar(length) => nvar_char_cell(mapping, row_index, *length, cell),
+        MssqlType::VarBinary(length) => var_binary_cell(mapping, row_index, *length, cell),
+    }
+}
+
+fn null_mssql_cell<'a>(mapping: &SchemaMapping, row_index: usize) -> Result<MssqlCell<'a>> {
+    match mapping.mssql().ty() {
+        MssqlType::Bit => Ok(MssqlCell::Bit(None)),
+        MssqlType::TinyInt => Ok(MssqlCell::TinyInt(None)),
+        MssqlType::SmallInt => Ok(MssqlCell::SmallInt(None)),
+        MssqlType::Int => Ok(MssqlCell::Int(None)),
+        MssqlType::BigInt => Ok(MssqlCell::BigInt(None)),
+        MssqlType::Decimal { .. } if supports_null_decimal_cell(mapping) => {
+            Ok(MssqlCell::Decimal(None))
+        }
+        MssqlType::Date => Ok(MssqlCell::Date(None)),
+        MssqlType::DateTime2 { .. } => null_datetime2_cell(mapping, row_index),
+        MssqlType::DateTimeOffset { .. } => null_datetimeoffset_cell(mapping, row_index),
+        MssqlType::Real => Ok(MssqlCell::Real(None)),
+        MssqlType::Float { .. } => Ok(MssqlCell::Float(None)),
+        MssqlType::NVarChar(_) => Ok(MssqlCell::NVarChar(None)),
+        MssqlType::VarBinary(_) => Ok(MssqlCell::VarBinary(None)),
+        ty => Err(unsupported_value_conversion(
+            mapping,
+            row_index,
+            format!(
+                "planned SQL Server type {} is not supported yet",
+                ty.to_sql()
+            ),
+        )),
+    }
+}
+
+fn is_uint64_decimal20_0_mapping(mapping: &SchemaMapping) -> bool {
+    matches!(
+        (mapping.arrow().data_type(), mapping.mssql().ty()),
+        (
+            DataType::UInt64,
+            MssqlType::Decimal {
+                precision: 20,
+                scale: 0
+            }
+        )
+    )
+}
+
+fn supports_null_decimal_cell(mapping: &SchemaMapping) -> bool {
+    matches!(
+        mapping.arrow().data_type(),
+        DataType::UInt64
+            | DataType::Decimal32(_, _)
+            | DataType::Decimal64(_, _)
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+    ) && matches!(mapping.mssql().ty(), MssqlType::Decimal { .. })
+}
+
+fn null_datetime2_cell<'a>(mapping: &SchemaMapping, row_index: usize) -> Result<MssqlCell<'a>> {
+    if !supports_null_datetime2_cell(mapping) {
+        return Err(unsupported_value_conversion(
+            mapping,
+            row_index,
+            format!(
+                "planned SQL Server type {} is not supported yet",
+                mapping.mssql().ty().to_sql()
+            ),
+        ));
+    }
+
+    validate_null_timestamp_timezone_metadata(mapping, row_index)?;
+    Ok(MssqlCell::DateTime2(None))
+}
+
+fn supports_null_datetime2_cell(mapping: &SchemaMapping) -> bool {
+    matches!(
+        (mapping.arrow().data_type(), mapping.mssql().ty()),
+        (
+            DataType::Date64,
+            MssqlType::DateTime2 {
+                precision: SQL_SERVER_DATETIME2_DATE64_SCALE,
+            },
+        ) | (
+            DataType::Timestamp(
+                TimeUnit::Second
+                    | TimeUnit::Millisecond
+                    | TimeUnit::Microsecond
+                    | TimeUnit::Nanosecond,
+                _,
+            ),
+            MssqlType::DateTime2 {
+                precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
+            },
+        )
+    )
+}
+
+fn null_datetimeoffset_cell<'a>(
+    mapping: &SchemaMapping,
+    row_index: usize,
+) -> Result<MssqlCell<'a>> {
+    if !supports_null_datetimeoffset_cell(mapping) {
+        return Err(unsupported_value_conversion(
+            mapping,
+            row_index,
+            format!(
+                "planned SQL Server type {} is not supported yet",
+                mapping.mssql().ty().to_sql()
+            ),
+        ));
+    }
+
+    validate_null_timestamp_timezone_metadata(mapping, row_index)?;
+    Ok(MssqlCell::DateTimeOffset(None))
+}
+
+fn supports_null_datetimeoffset_cell(mapping: &SchemaMapping) -> bool {
+    matches!(
+        (mapping.arrow().data_type(), mapping.mssql().ty()),
+        (
+            DataType::Timestamp(
+                TimeUnit::Second
+                    | TimeUnit::Millisecond
+                    | TimeUnit::Microsecond
+                    | TimeUnit::Nanosecond,
+                Some(_)
+            ),
+            MssqlType::DateTimeOffset {
+                precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
+            }
+        )
+    )
+}
+
+fn validate_null_timestamp_timezone_metadata(
+    mapping: &SchemaMapping,
+    row_index: usize,
+) -> Result<()> {
+    if let DataType::Timestamp(_, timezone) = mapping.arrow().data_type() {
+        validate_timestamp_timezone_metadata(mapping, row_index, timezone.as_deref())?;
+    }
+
+    Ok(())
+}
+
+fn decimal_scale(mapping: &SchemaMapping, row_index: usize) -> Result<u8> {
+    let MssqlType::Decimal { scale, .. } = mapping.mssql().ty() else {
+        return Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            "planned SQL Server type is not decimal",
+        )));
+    };
+
+    let scale = u8::try_from(*scale).map_err(|_| {
+        value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::DecimalOutOfRange,
+            format!(
+                "planned SQL Server decimal scale {scale} cannot be represented by Tiberius Numeric"
+            ),
+        ))
+    })?;
+
+    if scale >= 38 {
+        return Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::DecimalOutOfRange,
+            format!(
+                "planned SQL Server decimal scale {scale} cannot be represented by Tiberius Numeric"
+            ),
+        )));
+    }
+
+    Ok(scale)
+}
+
+fn validate_decimal_scale_compatibility(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    planned_scale: u8,
+) -> Result<()> {
+    let expected_scale = match mapping.arrow().data_type() {
+        DataType::UInt64 if is_uint64_decimal20_0_mapping(mapping) => 0,
+        DataType::Decimal32(_, arrow_scale)
+        | DataType::Decimal64(_, arrow_scale)
+        | DataType::Decimal128(_, arrow_scale)
+        | DataType::Decimal256(_, arrow_scale)
+            if *arrow_scale < 0 =>
+        {
+            0
+        }
+        DataType::Decimal32(_, arrow_scale)
+        | DataType::Decimal64(_, arrow_scale)
+        | DataType::Decimal128(_, arrow_scale)
+        | DataType::Decimal256(_, arrow_scale) => u8::try_from(*arrow_scale).map_err(|_| {
+            value_conversion_error(row_mapping_diagnostic(
+                mapping,
+                row_index,
+                DiagnosticCode::DecimalOutOfRange,
+                format!("Arrow decimal scale {arrow_scale} cannot be represented at runtime"),
+            ))
+        })?,
+        _ => return Ok(()),
+    };
+
+    if planned_scale == expected_scale {
+        return Ok(());
+    }
+
+    Err(value_conversion_error(row_mapping_diagnostic(
+        mapping,
+        row_index,
+        DiagnosticCode::SchemaMismatch,
+        format!(
+            "planned SQL Server decimal scale {planned_scale} is incompatible with Arrow decimal scale {expected_scale}"
+        ),
+    )))
+}
+
+fn mssql_decimal(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    unscaled: i128,
+    scale: u8,
+) -> Result<MssqlDecimal> {
+    let MssqlType::Decimal { precision, .. } = mapping.mssql().ty() else {
+        return Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            "planned SQL Server type is not decimal",
+        )));
+    };
+
+    if decimal_unscaled_fits_precision(unscaled, *precision) {
+        return Ok(MssqlDecimal::new(unscaled, scale));
+    }
+
+    Err(value_conversion_error(row_mapping_diagnostic(
+        mapping,
+        row_index,
+        DiagnosticCode::DecimalOutOfRange,
+        format!("decimal value {unscaled} does not fit planned precision {precision}"),
+    )))
+}
+
+fn normalize_negative_scale(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    unscaled: i128,
+    arrow_scale: i8,
+) -> Result<i128> {
+    if arrow_scale >= 0 {
+        return Ok(unscaled);
+    }
+
+    let factor = 10_i128
+        .checked_pow(u32::from(arrow_scale.unsigned_abs()))
+        .ok_or_else(|| {
+            value_conversion_error(row_mapping_diagnostic(
+                mapping,
+                row_index,
+                DiagnosticCode::DecimalOutOfRange,
+                format!("negative decimal scale {arrow_scale} normalization factor overflows"),
+            ))
+        })?;
+
+    unscaled.checked_mul(factor).ok_or_else(|| {
+        value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::DecimalOutOfRange,
+            format!("decimal value {unscaled} overflows while normalizing scale {arrow_scale}"),
+        ))
+    })
+}
+
+fn decimal_unscaled_fits_precision(value: i128, precision: u8) -> bool {
+    if precision == 0 {
+        return false;
+    }
+
+    let Some(max) = decimal_max_unscaled(precision) else {
+        return false;
+    };
+
+    value <= max && value >= -max
+}
+
+fn decimal_max_unscaled(precision: u8) -> Option<i128> {
+    10_i128.checked_pow(u32::from(precision))?.checked_sub(1)
+}
+
+fn mssql_date_from_arrow_date32(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    days_from_unix_epoch: i32,
+) -> Result<MssqlDate> {
+    let days = i64::from(days_from_unix_epoch) + SQL_SERVER_DATE_UNIX_EPOCH_DAYS;
+
+    if (0..=SQL_SERVER_DATE_MAX_DAYS).contains(&days) {
+        return Ok(MssqlDate::new(days as u32));
+    }
+
+    Err(value_conversion_error(row_mapping_diagnostic(
+        mapping,
+        row_index,
+        DiagnosticCode::TimestampOutOfRange,
+        format!("Arrow Date32 day offset {days_from_unix_epoch} is outside SQL Server date range"),
+    )))
+}
+
+fn mssql_datetime2_from_arrow_date64(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    milliseconds_from_unix_epoch: i64,
+) -> Result<MssqlDateTime2> {
+    let days_from_unix_epoch = milliseconds_from_unix_epoch.div_euclid(MILLISECONDS_PER_DAY);
+    let milliseconds_since_midnight = milliseconds_from_unix_epoch.rem_euclid(MILLISECONDS_PER_DAY);
+    let days = days_from_unix_epoch + SQL_SERVER_DATE_UNIX_EPOCH_DAYS;
+
+    if !(0..=SQL_SERVER_DATE_MAX_DAYS).contains(&days) {
+        return Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::TimestampOutOfRange,
+            format!(
+                "Arrow Date64 millisecond value {milliseconds_from_unix_epoch} is outside SQL Server datetime2 range"
+            ),
+        )));
+    }
+
+    Ok(MssqlDateTime2::new(
+        MssqlDate::new(days as u32),
+        MssqlTime::new(
+            milliseconds_since_midnight as u64,
+            SQL_SERVER_DATETIME2_DATE64_SCALE,
+        ),
+    ))
+}
+
+fn nanoseconds_to_100ns_ticks(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    nanoseconds_from_unix_epoch: i64,
+    policy: NanosecondPolicy,
+) -> Result<i128> {
+    let base_ticks = nanoseconds_from_unix_epoch.div_euclid(NANOSECONDS_PER_100NS_TICK);
+    let remainder = nanoseconds_from_unix_epoch.rem_euclid(NANOSECONDS_PER_100NS_TICK);
+
+    match policy {
+        NanosecondPolicy::RejectNon100ns if remainder == 0 => Ok(i128::from(base_ticks)),
+        NanosecondPolicy::RejectNon100ns => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::LossyConversionRequiresPolicy,
+            format!(
+                "Arrow timestamp nanosecond value {nanoseconds_from_unix_epoch} is not divisible by 100ns"
+            ),
+        ))),
+        NanosecondPolicy::TruncateTo100ns => Ok(i128::from(base_ticks)),
+        NanosecondPolicy::RoundTo100ns => {
+            let rounded_ticks = if remainder >= 50 {
+                base_ticks.checked_add(1).ok_or_else(|| {
+                    value_conversion_error(row_mapping_diagnostic(
+                        mapping,
+                        row_index,
+                        DiagnosticCode::TimestampOutOfRange,
+                        format!(
+                            "Arrow timestamp nanosecond value {nanoseconds_from_unix_epoch} overflows while rounding to 100ns"
+                        ),
+                    ))
+                })?
+            } else {
+                base_ticks
+            };
+            Ok(i128::from(rounded_ticks))
+        }
+    }
+}
+
+fn validate_timestamp_timezone_metadata(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    timezone: Option<&str>,
+) -> Result<()> {
+    let Some(timezone) = timezone.filter(|timezone| !timezone.is_empty()) else {
+        return Ok(());
+    };
+
+    timezone_resolution_from_metadata(mapping, row_index, timezone).map(|_| ())
+}
+
+/// Resolved timezone metadata for a planned Arrow timestamp column.
+///
+/// Arrow timestamp timezone metadata can contain either a fixed offset or a
+/// timezone database name. Fixed offsets are row-independent, while named
+/// timezones need the row timestamp instant to account for historical and DST
+/// offset rules.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TimezoneResolution {
+    FixedOffset { offset_minutes: i16 },
+    Named { timezone: Tz },
+}
+
+impl TimezoneResolution {
+    /// Returns the SQL Server offset for one timestamp instant.
+    pub(crate) fn offset_for_instant(
+        self,
+        mapping: &SchemaMapping,
+        row_index: usize,
+        seconds_from_unix_epoch: i64,
+        nanoseconds: u32,
+    ) -> Result<i16> {
+        match self {
+            Self::FixedOffset { offset_minutes } => Ok(offset_minutes),
+            Self::Named { timezone } => {
+                let datetime = timezone
+                    .timestamp_opt(seconds_from_unix_epoch, nanoseconds)
+                    .single()
+                    .ok_or_else(|| {
+                        timezone_instant_error(mapping, row_index, seconds_from_unix_epoch)
+                    })?;
+                let offset_seconds = datetime.offset().fix().local_minus_utc();
+                sql_server_offset_minutes(mapping, row_index, offset_seconds)
+            }
+        }
+    }
+}
+
+/// Resolves Arrow timestamp timezone metadata once for a planned column.
+pub(crate) fn timezone_resolution_from_metadata(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    timezone: &str,
+) -> Result<TimezoneResolution> {
+    if timezone.eq_ignore_ascii_case("Z") || timezone.eq_ignore_ascii_case("UTC") {
+        return Ok(TimezoneResolution::FixedOffset { offset_minutes: 0 });
+    }
+
+    if let Some(offset) = parse_sql_server_fixed_timezone_offset(mapping, row_index, timezone) {
+        return offset.map(|offset_minutes| TimezoneResolution::FixedOffset { offset_minutes });
+    }
+
+    let timezone = timezone
+        .parse::<Tz>()
+        .map_err(|_| unsupported_timezone_error(mapping, row_index, timezone))?;
+
+    Ok(TimezoneResolution::Named { timezone })
+}
+
+fn sql_server_offset_minutes(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    offset_seconds: i32,
+) -> Result<i16> {
+    if offset_seconds % 60 != 0 {
+        return Err(unsupported_timezone_offset_error(
+            mapping,
+            row_index,
+            offset_seconds,
+        ));
+    }
+
+    let offset_minutes = i16::try_from(offset_seconds / 60)
+        .map_err(|_| unsupported_timezone_offset_error(mapping, row_index, offset_seconds))?;
+
+    if offset_minutes.unsigned_abs() > SQL_SERVER_DATETIMEOFFSET_MAX_OFFSET_MINUTES as u16 {
+        return Err(unsupported_timezone_offset_error(
+            mapping,
+            row_index,
+            offset_seconds,
+        ));
+    }
+
+    Ok(offset_minutes)
+}
+
+fn parse_sql_server_fixed_timezone_offset(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    timezone: &str,
+) -> Option<Result<i16>> {
+    let timezone_bytes = timezone.as_bytes();
+    if !matches!(timezone_bytes.first(), Some(b'+' | b'-')) {
+        return None;
+    }
+
+    // Arrow accepts some offset spellings that SQL Server would not accept as
+    // written, such as `+12:60`. Validate fixed offsets ourselves before
+    // falling back to the Arrow timezone database parser for named zones.
+    let digits = match timezone_bytes.len() {
+        3 => [timezone_bytes[1], timezone_bytes[2], b'0', b'0'],
+        5 => [
+            timezone_bytes[1],
+            timezone_bytes[2],
+            timezone_bytes[3],
+            timezone_bytes[4],
+        ],
+        6 if timezone_bytes[3] == b':' => [
+            timezone_bytes[1],
+            timezone_bytes[2],
+            timezone_bytes[4],
+            timezone_bytes[5],
+        ],
+        _ => {
+            return Some(Err(unsupported_timezone_error(
+                mapping, row_index, timezone,
+            )));
+        }
+    };
+
+    if digits.iter().any(|digit| !digit.is_ascii_digit()) {
+        return Some(Err(unsupported_timezone_error(
+            mapping, row_index, timezone,
+        )));
+    }
+
+    let hours = i16::from((digits[0] - b'0') * 10 + (digits[1] - b'0'));
+    let minutes = i16::from((digits[2] - b'0') * 10 + (digits[3] - b'0'));
+
+    if minutes >= 60 {
+        return Some(Err(unsupported_timezone_error(
+            mapping, row_index, timezone,
+        )));
+    }
+
+    let Some(total_minutes) = hours
+        .checked_mul(60)
+        .and_then(|value| value.checked_add(minutes))
+    else {
+        return Some(Err(unsupported_timezone_error(
+            mapping, row_index, timezone,
+        )));
+    };
+
+    if total_minutes > SQL_SERVER_DATETIMEOFFSET_MAX_OFFSET_MINUTES {
+        return Some(Err(unsupported_timezone_error(
+            mapping, row_index, timezone,
+        )));
+    }
+
+    if timezone_bytes[0] == b'-' {
+        Some(Ok(-total_minutes))
+    } else {
+        Some(Ok(total_minutes))
+    }
+}
+
+fn mssql_datetime2_from_unix_epoch_100ns_ticks(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    ticks_from_unix_epoch: i128,
+    unit_name: &str,
+    source_value: i64,
+) -> Result<MssqlDateTime2> {
+    let days_from_unix_epoch = ticks_from_unix_epoch.div_euclid(TICKS_100NS_PER_DAY);
+    let ticks_since_midnight = ticks_from_unix_epoch.rem_euclid(TICKS_100NS_PER_DAY);
+    let days = days_from_unix_epoch + i128::from(SQL_SERVER_DATE_UNIX_EPOCH_DAYS);
+
+    if !(0..=i128::from(SQL_SERVER_DATE_MAX_DAYS)).contains(&days) {
+        return Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::TimestampOutOfRange,
+            format!(
+                "Arrow timestamp {unit_name} value {source_value} is outside SQL Server datetime2 range"
+            ),
+        )));
+    }
+
+    let days = u32::try_from(days).map_err(|_| {
+        value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::TimestampOutOfRange,
+            format!(
+                "Arrow timestamp {unit_name} value {source_value} has an invalid SQL Server date component"
+            ),
+        ))
+    })?;
+    let ticks_since_midnight = u64::try_from(ticks_since_midnight).map_err(|_| {
+        value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::TimestampOutOfRange,
+            format!(
+                "Arrow timestamp {unit_name} value {source_value} has an invalid SQL Server time component"
+            ),
+        ))
+    })?;
+
+    Ok(MssqlDateTime2::new(
+        MssqlDate::new(days),
+        MssqlTime::new(ticks_since_midnight, SQL_SERVER_DATETIME2_TIMESTAMP_SCALE),
+    ))
+}
+
+fn mssql_datetime2_from_arrow_timestamp_second(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    seconds_from_unix_epoch: i64,
+) -> Result<MssqlDateTime2> {
+    let ticks = i128::from(seconds_from_unix_epoch) * TICKS_100NS_PER_SECOND;
+    mssql_datetime2_from_unix_epoch_100ns_ticks(
+        mapping,
+        row_index,
+        ticks,
+        "second",
+        seconds_from_unix_epoch,
+    )
+}
+
+fn mssql_datetime2_from_arrow_timestamp_millisecond(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    milliseconds_from_unix_epoch: i64,
+) -> Result<MssqlDateTime2> {
+    let ticks = i128::from(milliseconds_from_unix_epoch) * TICKS_100NS_PER_MILLISECOND;
+    mssql_datetime2_from_unix_epoch_100ns_ticks(
+        mapping,
+        row_index,
+        ticks,
+        "millisecond",
+        milliseconds_from_unix_epoch,
+    )
+}
+
+fn mssql_datetime2_from_arrow_timestamp_microsecond(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    microseconds_from_unix_epoch: i64,
+) -> Result<MssqlDateTime2> {
+    let ticks = i128::from(microseconds_from_unix_epoch) * TICKS_100NS_PER_MICROSECOND;
+    mssql_datetime2_from_unix_epoch_100ns_ticks(
+        mapping,
+        row_index,
+        ticks,
+        "microsecond",
+        microseconds_from_unix_epoch,
+    )
+}
+
+fn mssql_datetime2_from_arrow_timestamp_nanosecond(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    nanoseconds_from_unix_epoch: i64,
+    policy: NanosecondPolicy,
+) -> Result<MssqlDateTime2> {
+    let ticks =
+        nanoseconds_to_100ns_ticks(mapping, row_index, nanoseconds_from_unix_epoch, policy)?;
+    mssql_datetime2_from_unix_epoch_100ns_ticks(
+        mapping,
+        row_index,
+        ticks,
+        "nanosecond",
+        nanoseconds_from_unix_epoch,
+    )
+}
+
+fn validate_datetimeoffset_local_range(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    local_ticks_from_unix_epoch: i128,
+    unit_name: &str,
+    source_value: i64,
+) -> Result<()> {
+    mssql_datetime2_from_unix_epoch_100ns_ticks(
+        mapping,
+        row_index,
+        local_ticks_from_unix_epoch,
+        unit_name,
+        source_value,
+    )
+    .map(|_| ())
+}
+
+fn mssql_datetimeoffset_from_utc_100ns_ticks(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    utc_ticks_from_unix_epoch: i128,
+    offset_minutes: i16,
+    unit_name: &str,
+    source_value: i64,
+) -> Result<MssqlDateTimeOffset> {
+    let offset_ticks = i128::from(offset_minutes) * 60 * TICKS_100NS_PER_SECOND;
+    let local_ticks = utc_ticks_from_unix_epoch
+        .checked_add(offset_ticks)
+        .ok_or_else(|| {
+            value_conversion_error(row_mapping_diagnostic(
+                mapping,
+                row_index,
+                DiagnosticCode::TimestampOutOfRange,
+                format!(
+                    "Arrow timestamp {unit_name} value {source_value} overflows while applying timezone offset {offset_minutes} minute(s)"
+                ),
+            ))
+        })?;
+    validate_datetimeoffset_local_range(mapping, row_index, local_ticks, unit_name, source_value)?;
+    let utc_datetime2 = mssql_datetime2_from_unix_epoch_100ns_ticks(
+        mapping,
+        row_index,
+        utc_ticks_from_unix_epoch,
+        unit_name,
+        source_value,
+    )?;
+
+    Ok(MssqlDateTimeOffset::new(utc_datetime2, offset_minutes))
+}
+
+fn epoch_parts_from_milliseconds(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    milliseconds_from_unix_epoch: i64,
+) -> Result<(i64, u32)> {
+    let seconds = milliseconds_from_unix_epoch.div_euclid(1_000);
+    let nanoseconds = milliseconds_from_unix_epoch.rem_euclid(1_000) * 1_000_000;
+    epoch_parts(mapping, row_index, seconds, nanoseconds)
+}
+
+fn epoch_parts_from_microseconds(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    microseconds_from_unix_epoch: i64,
+) -> Result<(i64, u32)> {
+    let seconds = microseconds_from_unix_epoch.div_euclid(1_000_000);
+    let nanoseconds = microseconds_from_unix_epoch.rem_euclid(1_000_000) * 1_000;
+    epoch_parts(mapping, row_index, seconds, nanoseconds)
+}
+
+fn epoch_parts_from_nanoseconds(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    nanoseconds_from_unix_epoch: i64,
+) -> Result<(i64, u32)> {
+    let seconds = nanoseconds_from_unix_epoch.div_euclid(1_000_000_000);
+    let nanoseconds = nanoseconds_from_unix_epoch.rem_euclid(1_000_000_000);
+    epoch_parts(mapping, row_index, seconds, nanoseconds)
+}
+
+fn epoch_parts(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    seconds_from_unix_epoch: i64,
+    nanoseconds: i64,
+) -> Result<(i64, u32)> {
+    let nanoseconds = u32::try_from(nanoseconds).map_err(|_| {
+        value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::TimestampOutOfRange,
+            format!("timestamp nanosecond component {nanoseconds} is outside valid range"),
+        ))
+    })?;
+
+    Ok((seconds_from_unix_epoch, nanoseconds))
+}
+
+fn nvar_char_cell<'a>(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    length: MssqlTypeLength,
+    cell: ArrowCell<'a>,
+) -> Result<MssqlCell<'a>> {
+    let value = mssql_nvarchar_value(mapping, row_index, cell)?;
+    let code_units = value.encode_utf16().count();
+
+    if exceeds_length(length, code_units) {
+        return Err(value_too_long_error(
+            mapping,
+            row_index,
+            format!(
+                "string value has {code_units} UTF-16 code unit(s), exceeding planned {}",
+                mapping.mssql().ty().to_sql()
+            ),
+        ));
+    }
+
+    Ok(MssqlCell::NVarChar(Some(value)))
+}
+
+fn var_binary_cell<'a>(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    length: MssqlTypeLength,
+    cell: ArrowCell<'a>,
+) -> Result<MssqlCell<'a>> {
+    let value = mssql_varbinary_value(mapping, row_index, cell)?;
+    let bytes = value.len();
+
+    if exceeds_length(length, bytes) {
+        return Err(value_too_long_error(
+            mapping,
+            row_index,
+            format!(
+                "binary value has {bytes} byte(s), exceeding planned {}",
+                mapping.mssql().ty().to_sql()
+            ),
+        ));
+    }
+
+    Ok(MssqlCell::VarBinary(Some(value)))
+}
+
+fn exceeds_length(length: MssqlTypeLength, actual: usize) -> bool {
+    match length {
+        MssqlTypeLength::Bounded(limit) => actual > limit,
+        MssqlTypeLength::Max => false,
+    }
+}
+
+fn downcast_array<'a, T: Array + 'static>(
+    array: &'a dyn Array,
+    mapping: &SchemaMapping,
+    row_index: usize,
+) -> Result<&'a T> {
+    array.as_any().downcast_ref::<T>().ok_or_else(|| {
+        value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!(
+                "runtime Arrow type {} does not match planned Arrow type {}",
+                array.data_type(),
+                mapping.arrow().data_type()
+            ),
+        ))
+    })
+}
+
+fn unsupported_timezone_error(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    timezone: &str,
+) -> crate::Error {
+    value_conversion_error(row_mapping_diagnostic(
+        mapping,
+        row_index,
+        DiagnosticCode::TimezoneUnsupported,
+        format!(
+            "Arrow timestamp timezone {timezone:?} is not a valid Arrow timezone name or fixed offset"
+        ),
+    ))
+}
+
+fn timezone_instant_error(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    seconds_from_unix_epoch: i64,
+) -> crate::Error {
+    value_conversion_error(row_mapping_diagnostic(
+        mapping,
+        row_index,
+        DiagnosticCode::TimestampOutOfRange,
+        format!(
+            "Arrow timestamp second value {seconds_from_unix_epoch} cannot be represented in the planned timezone"
+        ),
+    ))
+}
+
+fn unsupported_timezone_offset_error(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    offset_seconds: i32,
+) -> crate::Error {
+    value_conversion_error(row_mapping_diagnostic(
+        mapping,
+        row_index,
+        DiagnosticCode::TimezoneUnsupported,
+        format!(
+            "resolved timezone offset {offset_seconds} second(s) cannot be represented as a SQL Server datetimeoffset minute offset"
+        ),
+    ))
+}
+
+fn unsupported_value_conversion(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    message: impl Into<String>,
+) -> crate::Error {
+    value_conversion_error(row_mapping_diagnostic(
+        mapping,
+        row_index,
+        DiagnosticCode::ValueConversionUnsupported,
+        message,
+    ))
+}
+
+fn non_finite_float_error(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    value: impl std::fmt::Display,
+) -> crate::Error {
+    value_conversion_error(row_mapping_diagnostic(
+        mapping,
+        row_index,
+        DiagnosticCode::NonFiniteFloat,
+        format!("non-finite floating point value {value} is not supported"),
+    ))
+}
+
+fn value_too_long_error(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    message: impl Into<String>,
+) -> crate::Error {
+    value_conversion_error(row_mapping_diagnostic(
+        mapping,
+        row_index,
+        DiagnosticCode::ValueTooLong,
+        message,
+    ))
+}
+
+fn validate_runtime_columns(batch: &RecordBatch, mappings: &[SchemaMapping]) -> Result<()> {
+    if batch.num_columns() < mappings.len() {
+        let mapping = &mappings[batch.num_columns()];
+        return Err(value_conversion_error(mapping_diagnostic(
+            mapping,
+            DiagnosticCode::SchemaMismatch,
+            format!(
+                "planned column index {} is outside runtime batch with {} column(s)",
+                mapping.arrow().index(),
+                batch.num_columns()
+            ),
+        )));
+    }
+
+    if batch.num_columns() > mappings.len() {
+        return Err(value_conversion_error(Diagnostic::error(
+            DiagnosticCode::SchemaMismatch,
+            format!(
+                "runtime batch has {} column(s) but mappings contain {} column(s)",
+                batch.num_columns(),
+                mappings.len()
+            ),
+        )));
+    }
+
+    for (position, (field, (array, mapping))) in batch
+        .schema()
+        .fields()
+        .iter()
+        .zip(batch.columns().iter().zip(mappings))
+        .enumerate()
+    {
+        if mapping.arrow().index() != position {
+            return Err(value_conversion_error(mapping_diagnostic(
+                mapping,
+                DiagnosticCode::SchemaMismatch,
+                format!(
+                    "mapping position {position} does not match planned Arrow field index {}",
+                    mapping.arrow().index()
+                ),
+            )));
+        }
+
+        if field.name() != mapping.arrow().name() {
+            return Err(value_conversion_error(mapping_diagnostic(
+                mapping,
+                DiagnosticCode::SchemaMismatch,
+                format!(
+                    "runtime Arrow field name {} does not match planned Arrow field name {}",
+                    field.name(),
+                    mapping.arrow().name()
+                ),
+            )));
+        }
+
+        validate_runtime_column(array.as_ref(), mapping)?;
+    }
+
+    Ok(())
+}
+
+fn validate_runtime_column(array: &dyn Array, mapping: &SchemaMapping) -> Result<()> {
+    if array.data_type() != mapping.arrow().data_type() {
+        return Err(value_conversion_error(mapping_diagnostic(
+            mapping,
+            DiagnosticCode::SchemaMismatch,
+            format!(
+                "runtime Arrow type {} does not match planned Arrow type {}",
+                array.data_type(),
+                mapping.arrow().data_type()
+            ),
+        )));
+    }
+
+    Ok(())
+}
+
+fn mapping_diagnostic(
+    mapping: &SchemaMapping,
+    code: DiagnosticCode,
+    message: impl Into<String>,
+) -> Diagnostic {
+    Diagnostic::error(code, message).with_field(FieldRef::new(
+        mapping.arrow().index(),
+        mapping.arrow().name(),
+    ))
+}
+
+fn row_mapping_diagnostic(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    code: DiagnosticCode,
+    message: impl Into<String>,
+) -> Diagnostic {
+    mapping_diagnostic(mapping, code, message).with_row(row_index)
+}
+
+fn value_conversion_error(diagnostic: Diagnostic) -> crate::Error {
+    crate::Error::ValueConversion {
+        diagnostics: DiagnosticSet::from(vec![diagnostic]),
+    }
+}

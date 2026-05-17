@@ -8,7 +8,7 @@ use crate::{
     TableName,
 };
 
-use super::{SchemaCheck, convert::RecordBatchView};
+use super::{SchemaCheck, convert::tiberius_row_owned, record_batch::RecordBatchView};
 
 /// Write backend selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -306,7 +306,7 @@ where
     let rows_written = usize_to_u64_saturating(view.row_count());
 
     for row_index in 0..view.row_count() {
-        let row = view.tiberius_row_owned(row_index)?;
+        let row = tiberius_row_owned(&view, row_index)?;
         sink.send_token_row(row).await?;
     }
 
@@ -365,7 +365,7 @@ mod tests {
 
     use super::{
         BulkTargetColumnMetadata, TokenRowSink, WriteBackend, WriteOptions, WriteStats,
-        WriterState, bulk_insert_table_sql, record_batch_view, resolve_backend,
+        WriterState, bulk_insert_table_sql, record_batch_view, resolve_backend, tiberius_row_owned,
         validate_batch_rows, validate_bulk_target_columns, write_batch_to_sink,
     };
     use crate::{
@@ -508,7 +508,7 @@ mod tests {
 
         validate_batch_rows(&view).unwrap();
 
-        let row = view.tiberius_row_owned(1).unwrap();
+        let row = tiberius_row_owned(&view, 1).unwrap();
         assert_eq!(row.get(0), Some(&tiberius::ColumnData::I32(Some(2))));
     }
 
