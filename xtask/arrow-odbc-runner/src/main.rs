@@ -5,7 +5,6 @@ use std::path::Path;
 use std::time::Instant;
 
 use arrow_ipc::reader::FileReader;
-use arrow_odbc::arrow::datatypes::{DataType, Field, Schema};
 use arrow_odbc::arrow::record_batch::{RecordBatch, RecordBatchIterator};
 use arrow_odbc::insert_into_table;
 use arrow_odbc::odbc_api::buffers::TextRowSet;
@@ -13,6 +12,7 @@ use arrow_odbc::odbc_api::{Connection, Cursor, Environment};
 
 const CONNECTION_STRING_ENV: &str = "ARROW_TIBERIUS_BENCH_ODBC_CONNECTION_STRING";
 const DATABASE_ENV: &str = "ARROW_TIBERIUS_BENCH_DATABASE";
+const TABLE_PLACEHOLDER: &str = "__ARROW_TIBERIUS_ODBC_TABLE__";
 
 fn main() -> Result<(), Box<dyn Error>> {
     let command = env::args().nth(1);
@@ -57,7 +57,7 @@ fn bench(args: Vec<String>) -> Result<(), Box<dyn Error>> {
 
     for repeat in 0..options.repeat {
         let table = format!(
-            "dbo.arrow_tiberius_odbc_bench_{}_{}",
+            "[dbo].[arrow_tiberius_odbc_bench_{}_{}]",
             std::process::id(),
             repeat
         );
@@ -99,9 +99,9 @@ fn run_repeat(
     options: &BenchOptions,
 ) -> Result<u64, Box<dyn Error>> {
     execute_sql(connection, &format!("DROP TABLE IF EXISTS {table}"))?;
-    execute_sql(connection, &create_table_sql(table, &options.scenario)?)?;
+    execute_sql(connection, &options.create_table_sql(&table)?)?;
 
-    let input = ipc_batches_for_scenario(&options.input_ipc, &options.scenario, options.rows)?;
+    let input = ipc_batches(&options.input_ipc, options.rows)?;
     let mut reader = RecordBatchIterator::new(input.batches.into_iter().map(Ok), input.schema);
     insert_into_table(connection, &mut reader, table, options.batch_size)?;
 
@@ -119,29 +119,15 @@ fn run_repeat(
 
 #[derive(Debug)]
 struct InputBatches {
-    schema: std::sync::Arc<Schema>,
+    schema: std::sync::Arc<arrow_odbc::arrow::datatypes::Schema>,
     batches: Vec<RecordBatch>,
     rows: usize,
 }
 
-fn ipc_batches_for_scenario(
-    path: &Path,
-    scenario: &str,
-    expected_rows: usize,
-) -> Result<InputBatches, Box<dyn Error>> {
-    let expected_schema = schema_for_scenario(scenario)?;
+fn ipc_batches(path: &Path, expected_rows: usize) -> Result<InputBatches, Box<dyn Error>> {
     let file = File::open(path)?;
     let reader = FileReader::try_new(file, None)?;
     let schema = reader.schema();
-
-    if schema.as_ref() != expected_schema.as_ref() {
-        return Err(format!(
-            "Arrow IPC schema does not match scenario `{scenario}`: expected {:?}, got {:?}",
-            expected_schema.fields(),
-            schema.fields()
-        )
-        .into());
-    }
 
     let batches = reader.collect::<Result<Vec<_>, _>>()?;
     let rows = batches
@@ -165,18 +151,6 @@ fn ipc_batches_for_scenario(
 
 fn is_supported_scenario(scenario: &str) -> bool {
     matches!(scenario, "narrow_numeric" | "mixed_nullable")
-}
-
-fn create_table_sql(table: &str, scenario: &str) -> Result<String, Box<dyn Error>> {
-    match scenario {
-        "narrow_numeric" => Ok(format!(
-            "CREATE TABLE {table} (id32 int NOT NULL, id64 bigint NOT NULL, score float(53) NOT NULL)"
-        )),
-        "mixed_nullable" => Ok(format!(
-            "CREATE TABLE {table} (id32 int NOT NULL, maybe_id64 bigint NULL, maybe_score float(53) NULL, category nvarchar(max) NULL)"
-        )),
-        other => Err(format!("unsupported scenario `{other}`").into()),
-    }
 }
 
 fn execute_sql(connection: &Connection<'_>, sql: &str) -> Result<(), Box<dyn Error>> {
@@ -207,31 +181,6 @@ fn cursor_to_string(mut cursor: impl Cursor) -> Result<String, Box<dyn Error>> {
     Ok(value)
 }
 
-fn schema_for_scenario(scenario: &str) -> Result<std::sync::Arc<Schema>, Box<dyn Error>> {
-    match scenario {
-        "narrow_numeric" => Ok(narrow_numeric_schema()),
-        "mixed_nullable" => Ok(mixed_nullable_schema()),
-        other => Err(format!("unsupported scenario `{other}`").into()),
-    }
-}
-
-fn narrow_numeric_schema() -> std::sync::Arc<Schema> {
-    std::sync::Arc::new(Schema::new(vec![
-        Field::new("id32", DataType::Int32, false),
-        Field::new("id64", DataType::Int64, false),
-        Field::new("score", DataType::Float64, false),
-    ]))
-}
-
-fn mixed_nullable_schema() -> std::sync::Arc<Schema> {
-    std::sync::Arc::new(Schema::new(vec![
-        Field::new("id32", DataType::Int32, false),
-        Field::new("maybe_id64", DataType::Int64, true),
-        Field::new("maybe_score", DataType::Float64, true),
-        Field::new("category", DataType::Utf8, true),
-    ]))
-}
-
 fn rows_per_second(rows: u64, elapsed: std::time::Duration) -> f64 {
     if elapsed.is_zero() {
         return 0.0;
@@ -258,6 +207,7 @@ struct BenchOptions {
     scenario: String,
     repeat: usize,
     input_ipc: std::path::PathBuf,
+    create_table_sql_template: String,
 }
 
 impl BenchOptions {
@@ -268,8 +218,10 @@ impl BenchOptions {
             scenario: "narrow_numeric".to_owned(),
             repeat: 1,
             input_ipc: std::path::PathBuf::new(),
+            create_table_sql_template: String::new(),
         };
         let mut input_ipc = None;
+        let mut create_table_sql_template = None;
         let mut index = 0;
 
         while index < args.len() {
@@ -297,6 +249,12 @@ impl BenchOptions {
                         args.get(index),
                     )?));
                 }
+                "--create-table-sql-template" => {
+                    index += 1;
+                    create_table_sql_template = Some(
+                        required_arg("--create-table-sql-template", args.get(index))?.to_owned(),
+                    );
+                }
                 other => return Err(format!("unknown arrow-odbc runner option `{other}`").into()),
             }
 
@@ -305,8 +263,25 @@ impl BenchOptions {
 
         options.input_ipc =
             input_ipc.ok_or("missing required arrow-odbc runner option `--input-ipc <FILE>`")?;
+        options.create_table_sql_template = create_table_sql_template.ok_or(
+            "missing required arrow-odbc runner option `--create-table-sql-template <SQL>`",
+        )?;
+        if !options.create_table_sql_template.contains(TABLE_PLACEHOLDER) {
+            return Err(format!(
+                "--create-table-sql-template must contain `{TABLE_PLACEHOLDER}`"
+            )
+            .into());
+        }
 
         Ok(options)
+    }
+
+    fn create_table_sql(&self, table: &str) -> Result<String, Box<dyn Error>> {
+        if table.contains(TABLE_PLACEHOLDER) {
+            return Err("benchmark table name unexpectedly contains template placeholder".into());
+        }
+
+        Ok(self.create_table_sql_template.replace(TABLE_PLACEHOLDER, table))
     }
 }
 
@@ -328,13 +303,10 @@ fn required_arg<'a>(option: &str, value: Option<&'a String>) -> Result<&'a str, 
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BenchOptions, create_table_sql, ipc_batches_for_scenario, is_supported_scenario,
-        mixed_nullable_schema, narrow_numeric_schema, rows_per_second,
-    };
+    use super::{BenchOptions, TABLE_PLACEHOLDER, ipc_batches, is_supported_scenario, rows_per_second};
     use arrow_ipc::writer::FileWriter;
     use arrow_odbc::arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
-    use arrow_odbc::arrow::datatypes::Schema;
+    use arrow_odbc::arrow::datatypes::{DataType, Field, Schema};
     use arrow_odbc::arrow::record_batch::RecordBatch;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -355,6 +327,8 @@ mod tests {
             "3".to_owned(),
             "--input-ipc".to_owned(),
             "/workspace/bench.arrow".to_owned(),
+            "--create-table-sql-template".to_owned(),
+            create_table_sql_template(),
         ])
         .expect("valid options should parse");
 
@@ -366,6 +340,7 @@ mod tests {
             options.input_ipc.as_path(),
             std::path::Path::new("/workspace/bench.arrow")
         );
+        assert_eq!(options.create_table_sql_template, create_table_sql_template());
     }
 
     #[test]
@@ -375,6 +350,8 @@ mod tests {
             "25".to_owned(),
             "--input-ipc".to_owned(),
             "/workspace/bench.arrow".to_owned(),
+            "--create-table-sql-template".to_owned(),
+            create_table_sql_template(),
         ])
         .expect("valid options should parse");
 
@@ -392,6 +369,8 @@ mod tests {
             "25".to_owned(),
             "--scenario".to_owned(),
             "mixed_nullable".to_owned(),
+            "--create-table-sql-template".to_owned(),
+            create_table_sql_template(),
         ])
         .expect_err("input IPC should be required");
 
@@ -430,14 +409,35 @@ mod tests {
     }
 
     #[test]
-    fn renders_mixed_nullable_table_sql() {
-        let sql = create_table_sql("dbo.target", "mixed_nullable")
-            .expect("mixed nullable DDL should render");
+    fn renders_table_sql_from_template() {
+        let options = BenchOptions::parse(vec![
+            "--input-ipc".to_owned(),
+            "/workspace/bench.arrow".to_owned(),
+            "--create-table-sql-template".to_owned(),
+            create_table_sql_template(),
+        ])
+        .expect("valid options should parse");
+        let sql = options
+            .create_table_sql("[dbo].[target]")
+            .expect("template should render");
 
         assert_eq!(
             sql,
-            "CREATE TABLE dbo.target (id32 int NOT NULL, maybe_id64 bigint NULL, maybe_score float(53) NULL, category nvarchar(max) NULL)"
+            "CREATE TABLE [dbo].[target] ([id32] int NOT NULL)"
         );
+    }
+
+    #[test]
+    fn rejects_table_sql_template_without_placeholder() {
+        let err = BenchOptions::parse(vec![
+            "--input-ipc".to_owned(),
+            "/workspace/bench.arrow".to_owned(),
+            "--create-table-sql-template".to_owned(),
+            "CREATE TABLE [dbo].[target] ([id32] int NOT NULL)".to_owned(),
+        ])
+        .expect_err("template without placeholder should be rejected");
+
+        assert!(err.to_string().contains(TABLE_PLACEHOLDER));
     }
 
     #[test]
@@ -447,27 +447,11 @@ mod tests {
         let path = temp_ipc_path("mixed");
         write_ipc_file(&path, schema.as_ref(), &batches);
 
-        let input = ipc_batches_for_scenario(&path, "mixed_nullable", 25)
-            .expect("matching IPC file should load");
+        let input = ipc_batches(&path, 25).expect("matching IPC file should load");
 
         assert_eq!(input.schema.as_ref(), schema.as_ref());
         assert_eq!(input.batches, batches);
         assert_eq!(input.rows, 25);
-
-        std::fs::remove_file(path).expect("test IPC file should be removed");
-    }
-
-    #[test]
-    fn rejects_input_ipc_schema_mismatch() {
-        let schema = narrow_numeric_schema();
-        let batches = narrow_numeric_test_batches(schema.clone());
-        let path = temp_ipc_path("schema-mismatch");
-        write_ipc_file(&path, schema.as_ref(), &batches);
-
-        let err = ipc_batches_for_scenario(&path, "mixed_nullable", 4)
-            .expect_err("schema mismatch should be rejected");
-
-        assert!(err.to_string().contains("schema"));
 
         std::fs::remove_file(path).expect("test IPC file should be removed");
     }
@@ -479,8 +463,7 @@ mod tests {
         let path = temp_ipc_path("row-mismatch");
         write_ipc_file(&path, schema.as_ref(), &batches);
 
-        let err = ipc_batches_for_scenario(&path, "mixed_nullable", 24)
-            .expect_err("row count mismatch should be rejected");
+        let err = ipc_batches(&path, 24).expect_err("row count mismatch should be rejected");
 
         assert!(err.to_string().contains("row count"));
 
@@ -494,8 +477,7 @@ mod tests {
         let path = temp_ipc_path("options");
         write_ipc_file(&path, schema.as_ref(), &batches);
 
-        let input = ipc_batches_for_scenario(&path, "mixed_nullable", 25)
-            .expect("input IPC batches should load");
+        let input = ipc_batches(&path, 25).expect("input IPC batches should load");
         let lengths = input
             .batches
             .iter()
@@ -522,20 +504,6 @@ mod tests {
         }
 
         writer.finish().expect("IPC file should finish");
-    }
-
-    fn narrow_numeric_test_batches(schema: Arc<Schema>) -> Vec<RecordBatch> {
-        vec![
-            RecordBatch::try_new(
-                schema,
-                vec![
-                    Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
-                    Arc::new(Int64Array::from(vec![10_i64, 20, 30, 40])),
-                    Arc::new(Float64Array::from(vec![1.25, 2.5, 3.75, 5.0])),
-                ],
-            )
-            .expect("narrow numeric test batch should build"),
-        ]
     }
 
     fn mixed_nullable_test_batches(schema: Arc<Schema>, lengths: &[usize]) -> Vec<RecordBatch> {
@@ -602,5 +570,18 @@ mod tests {
             "arrow-tiberius-odbc-runner-{name}-{}-{counter}.arrow",
             std::process::id()
         ))
+    }
+
+    fn create_table_sql_template() -> String {
+        format!("CREATE TABLE {TABLE_PLACEHOLDER} ([id32] int NOT NULL)")
+    }
+
+    fn mixed_nullable_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id32", DataType::Int32, false),
+            Field::new("maybe_id64", DataType::Int64, true),
+            Field::new("maybe_score", DataType::Float64, true),
+            Field::new("category", DataType::Utf8, true),
+        ]))
     }
 }

@@ -23,6 +23,7 @@ mod dataset;
 
 static BENCH_TABLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static BENCH_IPC_COUNTER: AtomicU64 = AtomicU64::new(0);
+const ODBC_TABLE_PLACEHOLDER: &str = "__ARROW_TIBERIUS_ODBC_TABLE__";
 
 pub(super) fn run(args: &[OsString]) -> Result<(), WriterBenchError> {
     if args.is_empty()
@@ -1009,12 +1010,17 @@ fn arrow_odbc_runner_command_options(
         ],
         Some(repository_root()?),
         Some("/workspace".to_owned()),
-        arrow_odbc_runner_args(benchmark, container_path),
+        arrow_odbc_runner_args(benchmark, container_path)?,
     ))
 }
 
-fn arrow_odbc_runner_args(benchmark: &WriterBenchOptions, input_ipc: &str) -> Vec<String> {
-    vec![
+fn arrow_odbc_runner_args(
+    benchmark: &WriterBenchOptions,
+    input_ipc: &str,
+) -> Result<Vec<String>, WriterBenchError> {
+    let create_table_sql_template = arrow_odbc_create_table_sql_template(benchmark)?;
+
+    Ok(vec![
         "cargo".to_owned(),
         "run".to_owned(),
         "--manifest-path".to_owned(),
@@ -1033,7 +1039,22 @@ fn arrow_odbc_runner_args(benchmark: &WriterBenchOptions, input_ipc: &str) -> Ve
         benchmark.repeat.to_string(),
         "--input-ipc".to_owned(),
         input_ipc.to_owned(),
-    ]
+        "--create-table-sql-template".to_owned(),
+        create_table_sql_template,
+    ])
+}
+
+fn arrow_odbc_create_table_sql_template(
+    benchmark: &WriterBenchOptions,
+) -> Result<String, WriterBenchError> {
+    let placeholder_table =
+        TableName::new("dbo", ODBC_TABLE_PLACEHOLDER).map_err(WriterBenchError::ArrowTiberius)?;
+    let schema = (benchmark.scenario.schema)();
+    let mappings = benchmark_mappings_for_schema(schema)?;
+    let sql = benchmark_table_sql(&placeholder_table, &mappings);
+    let quoted_placeholder = placeholder_table.quoted_sql();
+
+    Ok(sql.replace(&quoted_placeholder, ODBC_TABLE_PLACEHOLDER))
 }
 
 fn parse_arrow_odbc_runner_report(output: &str) -> Result<ArrowOdbcBenchReport, WriterBenchError> {
@@ -2952,7 +2973,8 @@ mod tests {
         };
 
         let args =
-            super::arrow_odbc_runner_args(&options.benchmark, "/workspace/target/bench.arrow");
+            super::arrow_odbc_runner_args(&options.benchmark, "/workspace/target/bench.arrow")
+                .unwrap();
 
         assert!(args.windows(2).any(|pair| pair == ["--rows", "25"]));
         assert!(args.windows(2).any(|pair| pair == ["--batch-size", "5"]));
@@ -2964,6 +2986,12 @@ mod tests {
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--input-ipc", "/workspace/target/bench.arrow"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--create-table-sql-template"
+                    && pair[1].contains(super::ODBC_TABLE_PLACEHOLDER)
+                    && pair[1].contains("[category] nvarchar(max) NULL"))
         );
     }
 
