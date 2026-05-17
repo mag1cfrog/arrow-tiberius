@@ -684,8 +684,6 @@ impl CompareBenchOptions {
             index += 1;
         }
 
-        validate_compare_backend_scenario_support(&options)?;
-
         Ok(options)
     }
 }
@@ -750,21 +748,6 @@ fn parse_benchmark_backends(value: &str) -> Result<Vec<BenchmarkBackend>, Writer
     }
 
     Ok(backends)
-}
-
-fn validate_compare_backend_scenario_support(
-    options: &CompareBenchOptions,
-) -> Result<(), WriterBenchError> {
-    if options.backends.contains(&BenchmarkBackend::OdbcBcp)
-        && options.benchmark.scenario.name != "narrow_numeric"
-    {
-        return Err(WriterBenchError::Validation(format!(
-            "writer-bench compare backend `odbc-bcp` currently supports only `narrow_numeric`, got `{}`",
-            options.benchmark.scenario.name
-        )));
-    }
-
-    Ok(())
 }
 
 fn parse_writer_sqlserver_options(
@@ -1109,13 +1092,6 @@ fn odbc_bcp_runner_args(
     benchmark: &WriterBenchOptions,
     input_ipc: &str,
 ) -> Result<Vec<String>, WriterBenchError> {
-    if benchmark.scenario.name != "narrow_numeric" {
-        return Err(WriterBenchError::Validation(format!(
-            "odbc-bcp runner currently supports only `narrow_numeric`, got `{}`",
-            benchmark.scenario.name
-        )));
-    }
-
     let create_table_sql_template = arrow_odbc_create_table_sql_template(benchmark)?;
 
     Ok(vec![
@@ -2800,12 +2776,12 @@ mod tests {
     }
 
     #[test]
-    fn compare_allows_initial_backends_for_decimal_temporal() {
+    fn compare_allows_all_backends_for_decimal_temporal() {
         let args = [
             OsString::from("--scenario"),
             OsString::from("decimal_temporal"),
             OsString::from("--backends"),
-            OsString::from("baseline,arrow-odbc"),
+            OsString::from("baseline,arrow-odbc,odbc-bcp"),
         ];
 
         let options = super::CompareBenchOptions::parse(&args).unwrap();
@@ -2814,30 +2790,11 @@ mod tests {
             options.backends,
             [
                 super::BenchmarkBackend::Baseline,
-                super::BenchmarkBackend::ArrowOdbc
+                super::BenchmarkBackend::ArrowOdbc,
+                super::BenchmarkBackend::OdbcBcp
             ]
         );
         assert_eq!(options.benchmark.scenario.name, "decimal_temporal");
-    }
-
-    #[test]
-    fn compare_rejects_odbc_bcp_for_unsupported_scenarios() {
-        let args = [
-            OsString::from("--scenario"),
-            OsString::from("mixed_nullable"),
-            OsString::from("--backends"),
-            OsString::from("odbc-bcp"),
-        ];
-
-        let err = super::CompareBenchOptions::parse(&args).unwrap_err();
-
-        assert!(matches!(
-            err,
-            WriterBenchError::Validation(message)
-                if message.contains("odbc-bcp")
-                    && message.contains("narrow_numeric")
-                    && message.contains("mixed_nullable")
-        ));
     }
 
     #[test]
@@ -3190,7 +3147,7 @@ mod tests {
     }
 
     #[test]
-    fn odbc_bcp_runner_args_reject_unsupported_scenario() {
+    fn odbc_bcp_runner_args_accept_mixed_nullable_scenario() {
         let benchmark = WriterBenchOptions {
             rows: 25,
             batch_size: 5,
@@ -3199,16 +3156,13 @@ mod tests {
             output: BenchmarkOutput::Human,
         };
 
-        let err =
-            super::odbc_bcp_runner_args(&benchmark, "/workspace/target/bench.arrow").unwrap_err();
+        let args =
+            super::odbc_bcp_runner_args(&benchmark, "/workspace/target/bench.arrow").unwrap();
 
-        assert!(matches!(
-            err,
-            WriterBenchError::Validation(message)
-                if message.contains("odbc-bcp")
-                    && message.contains("narrow_numeric")
-                    && message.contains("mixed_nullable")
-        ));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--scenario", "mixed_nullable"])
+        );
     }
 
     #[test]

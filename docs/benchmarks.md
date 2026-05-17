@@ -97,10 +97,11 @@ arrays. The BCP runner is contained under `xtask` and is a benchmark-only
 reference point for native SQL Server bulk copy. It does not add an ODBC
 dependency or public API to the main crate.
 
-Current `odbc-bcp` support is intentionally narrow: it supports
-`narrow_numeric` only. Other scenarios should be added in later slices after
-the type bindings and SQL Server row-count validation are proven for each
-scenario.
+Current `odbc-bcp` support covers every shared benchmark scenario. The runner
+uses the shared IPC file and binds supported Arrow columns into SQL Server BCP
+program variables. Arrow `Utf8` values are encoded as UTF-16LE for
+`nvarchar(max)` targets; decimal, date, and timestamp values are formatted as
+text for SQL Server conversion; binary values are sent as `varbinary(max)`.
 
 ## Backend Compare
 
@@ -204,7 +205,8 @@ compare runs.
 
 The current production writer backend is the baseline TokenRow path.
 `arrow-odbc` and `odbc-bcp` are benchmark references only. `odbc-bcp` is SQL
-Server-specific and currently limited to `narrow_numeric`.
+Server-specific and exists to measure Microsoft's native BCP extension against
+this crate's writer paths.
 
 The direct raw TDS encoder is not benchmarked until that backend exists. When it
 is added, the compare command should be extended so baseline, `arrow-odbc`,
