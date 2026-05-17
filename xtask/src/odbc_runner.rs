@@ -51,6 +51,73 @@ pub(crate) fn build_runner_image(options: &RunnerImageOptions) -> Result<(), Odb
     }
 }
 
+pub(crate) fn remove_runner_image(options: &RunnerImageOptions) -> Result<(), OdbcRunnerError> {
+    let mut command = Command::new(&options.container_runtime);
+    command
+        .arg("image")
+        .arg("rm")
+        .arg("--force")
+        .arg(&options.image_tag)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    let status = command
+        .status()
+        .map_err(|source| OdbcRunnerError::CommandSpawn {
+            description: "remove arrow-odbc runner image",
+            source,
+        })?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(OdbcRunnerError::CommandStatus {
+            description: "remove arrow-odbc runner image",
+            status,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ManagedRunnerImage {
+    options: RunnerImageOptions,
+    keep: bool,
+    built: bool,
+}
+
+impl ManagedRunnerImage {
+    pub(crate) fn build(options: RunnerImageOptions, keep: bool) -> Result<Self, OdbcRunnerError> {
+        build_runner_image(&options)?;
+        Ok(Self {
+            options,
+            keep,
+            built: true,
+        })
+    }
+
+    pub(crate) fn image_tag(&self) -> &str {
+        &self.options.image_tag
+    }
+
+    pub(crate) fn cleanup(&mut self) -> Result<(), OdbcRunnerError> {
+        if self.keep || !self.built {
+            return Ok(());
+        }
+
+        remove_runner_image(&self.options)?;
+        self.built = false;
+        Ok(())
+    }
+}
+
+impl Drop for ManagedRunnerImage {
+    fn drop(&mut self) {
+        if let Err(error) = self.cleanup() {
+            eprintln!("warning: failed to clean up arrow-odbc runner image: {error}");
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum OdbcRunnerError {
     CommandSpawn {

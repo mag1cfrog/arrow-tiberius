@@ -83,14 +83,17 @@ fn run_arrow_odbc(args: &[OsString]) -> Result<(), WriterBenchError> {
     }
 
     let options = ArrowOdbcBenchOptions::parse(args)?;
-
-    if options.build_runner_image {
-        build_arrow_odbc_runner_image(&options)?;
-        return Ok(());
-    }
+    let mut runner_image = build_arrow_odbc_runner_image(&options)?;
+    let runner_image_tag = runner_image.image_tag().to_owned();
+    runner_image
+        .cleanup()
+        .map_err(WriterBenchError::OdbcRunner)?;
 
     Err(WriterBenchError::ArrowOdbcUnavailable {
-        reason: "arrow-odbc runner container is not wired yet".to_owned(),
+        reason: format!(
+            "arrow-odbc runner container is not wired yet after preparing {}",
+            runner_image_tag
+        ),
     })
 }
 
@@ -111,7 +114,7 @@ fn print_baseline_help() {
 
 fn print_arrow_odbc_help() {
     println!(
-        "Usage:\n  cargo xtask writer-bench arrow-odbc [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Supported scenarios: narrow_numeric, mixed_nullable [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --build-runner-image        Build the managed arrow-odbc runner image and exit\n  --runner-image <IMAGE>      Managed arrow-odbc runner image tag\n  -h, --help                  Print help\n\nThis is a SQL Server write-path comparison only. The arrow-odbc runner image contains unixODBC, Microsoft ODBC Driver 18 for SQL Server, and Rust."
+        "Usage:\n  cargo xtask writer-bench arrow-odbc [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Supported scenarios: narrow_numeric, mixed_nullable [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>      Managed arrow-odbc runner image tag\n  --keep-runner-image         Keep the managed arrow-odbc runner image after the task exits\n  -h, --help                  Print help\n\nThis is a SQL Server write-path comparison only. The arrow-odbc runner image contains unixODBC, Microsoft ODBC Driver 18 for SQL Server, and Rust."
     );
 }
 
@@ -319,8 +322,8 @@ impl BaselineBenchOptions {
 struct ArrowOdbcBenchOptions {
     benchmark: WriterBenchOptions,
     sql_server: sqlserver::SqlServerConnectionOptions,
-    build_runner_image: bool,
     runner_image: String,
+    keep_runner_image: bool,
 }
 
 impl ArrowOdbcBenchOptions {
@@ -344,8 +347,8 @@ fn parse_writer_sqlserver_options(
     let mut options = ArrowOdbcBenchOptions {
         benchmark: WriterBenchOptions::default(),
         sql_server: sqlserver::SqlServerConnectionOptions::benchmark_default(),
-        build_runner_image: false,
         runner_image: odbc_runner::DEFAULT_RUNNER_IMAGE_TAG.to_owned(),
+        keep_runner_image: false,
     };
     let mut index = 0;
 
@@ -402,12 +405,12 @@ fn parse_writer_sqlserver_options(
             "--keep-container" => {
                 options.sql_server.keep_container = true;
             }
-            "--build-runner-image" => {
-                options.build_runner_image = true;
-            }
             "--runner-image" => {
                 options.runner_image = required_value(args, index)?;
                 index += 1;
+            }
+            "--keep-runner-image" => {
+                options.keep_runner_image = true;
             }
             other => return Err(WriterBenchError::UnknownOption(other.to_owned())),
         }
@@ -422,7 +425,9 @@ fn is_arrow_odbc_supported_scenario(scenario: &BenchmarkScenarioDefinition) -> b
     matches!(scenario.name, "narrow_numeric" | "mixed_nullable")
 }
 
-fn build_arrow_odbc_runner_image(options: &ArrowOdbcBenchOptions) -> Result<(), WriterBenchError> {
+fn build_arrow_odbc_runner_image(
+    options: &ArrowOdbcBenchOptions,
+) -> Result<odbc_runner::ManagedRunnerImage, WriterBenchError> {
     let container_runtime = options
         .sql_server
         .resolve_runtime()
@@ -434,11 +439,13 @@ fn build_arrow_odbc_runner_image(options: &ArrowOdbcBenchOptions) -> Result<(), 
     };
 
     println!("writer-bench arrow-odbc");
-    println!("  action: build_runner_image");
+    println!("  action: prepare_runner_image");
     println!("  image: {}", image_options.image_tag);
     println!("  dockerfile: {}", image_options.dockerfile().display());
+    println!("  keep image: {}", options.keep_runner_image);
 
-    odbc_runner::build_runner_image(&image_options).map_err(WriterBenchError::OdbcRunner)
+    odbc_runner::ManagedRunnerImage::build(image_options, options.keep_runner_image)
+        .map_err(WriterBenchError::OdbcRunner)
 }
 
 fn repository_root() -> Result<PathBuf, WriterBenchError> {
@@ -1677,19 +1684,19 @@ mod tests {
     }
 
     #[test]
-    fn parses_arrow_odbc_runner_image_build_options() {
+    fn parses_arrow_odbc_runner_image_options() {
         let args = [
-            OsString::from("--build-runner-image"),
             OsString::from("--runner-image"),
             OsString::from("custom-arrow-odbc-runner:test"),
+            OsString::from("--keep-runner-image"),
             OsString::from("--container-runtime"),
             OsString::from("podman"),
         ];
 
         let options = super::ArrowOdbcBenchOptions::parse(&args).unwrap();
 
-        assert!(options.build_runner_image);
         assert_eq!(options.runner_image, "custom-arrow-odbc-runner:test");
+        assert!(options.keep_runner_image);
         assert_eq!(
             options.sql_server.container_runtime,
             Some(PathBuf::from("podman"))
@@ -1818,7 +1825,7 @@ mod tests {
         assert_eq!(options.benchmark.scenario.name, "mixed_nullable");
         assert_eq!(options.sql_server.database, "bench_db");
         assert!(options.sql_server.connection_string.is_some());
-        assert!(!options.build_runner_image);
+        assert!(!options.keep_runner_image);
         assert_eq!(
             options.runner_image,
             crate::odbc_runner::DEFAULT_RUNNER_IMAGE_TAG
@@ -1842,19 +1849,12 @@ mod tests {
     }
 
     #[test]
-    fn arrow_odbc_command_reports_disabled_runner_before_odbc_dependency_exists() {
-        let args = [
-            OsString::from("arrow-odbc"),
-            OsString::from("--rows"),
-            OsString::from("10"),
-            OsString::from("--scenario"),
-            OsString::from("narrow_numeric"),
-        ];
-
-        let err = super::run(&args).unwrap_err();
+    fn arrow_odbc_command_rejects_standalone_runner_image_build_flag() {
+        let args = [OsString::from("--build-runner-image")];
+        let err = super::ArrowOdbcBenchOptions::parse(&args).unwrap_err();
 
         assert!(
-            matches!(err, WriterBenchError::ArrowOdbcUnavailable { reason } if reason.contains("runner container"))
+            matches!(err, WriterBenchError::UnknownOption(option) if option == "--build-runner-image")
         );
     }
 
