@@ -5,9 +5,11 @@ SQL Server write-path comparisons only. It does not benchmark reads, exports,
 object storage, or general database query performance.
 
 Benchmark results are local to the machine, container runtime, SQL Server image,
-network path, row count, batch size, and scenario used for the run. Do not check
-machine-specific result files into the repo, and do not treat one local run as a
-general claim that one backend is always faster than another.
+network path, row count, batch size, and scenario used for the run. Do not treat
+one local run as a general claim that one backend is always faster than another.
+Selected local result notes live under `docs/benchmark-results/` when they are
+useful for development decisions and include enough environment detail to be
+interpretable.
 
 ## Prerequisites
 

@@ -44,9 +44,37 @@ fn bench(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     let environment = Environment::new()?;
     let connection =
         environment.connect_with_connection_string(&connection_string, Default::default())?;
+    connection.set_autocommit(false)?;
 
-    let mut total_rows = 0_u64;
     let write_start = Instant::now();
+    let total_rows_result = run_repeats(&connection, &options);
+    if total_rows_result.is_ok() {
+        connection.commit()?;
+    } else if let Err(error) = connection.rollback() {
+        eprintln!("warning: failed to roll back arrow-odbc benchmark transaction: {error}");
+    }
+    let write_elapsed = write_start.elapsed();
+    let total_rows = total_rows_result?;
+
+    println!("arrow-odbc runner");
+    println!("  database: {database}");
+    println!("  scenario: {}", options.scenario);
+    println!("  repeat: {}", options.repeat);
+    println!("  rows written: {total_rows}");
+    println!("  write seconds: {:.3}", write_elapsed.as_secs_f64());
+    println!(
+        "  write rows/sec: {:.2}",
+        rows_per_second(total_rows, write_elapsed)
+    );
+
+    Ok(())
+}
+
+fn run_repeats(
+    connection: &Connection<'_>,
+    options: &BenchOptions,
+) -> Result<u64, Box<dyn Error>> {
+    let mut total_rows = 0_u64;
 
     for repeat in 0..options.repeat {
         let table = format!(
@@ -54,8 +82,8 @@ fn bench(args: Vec<String>) -> Result<(), Box<dyn Error>> {
             std::process::id(),
             repeat
         );
-        let repeat_result = run_repeat(&connection, &table, &options);
-        let cleanup_result = execute_sql(&connection, &format!("DROP TABLE IF EXISTS {table}"));
+        let repeat_result = run_repeat(connection, &table, options);
+        let cleanup_result = execute_sql(connection, &format!("DROP TABLE IF EXISTS {table}"));
 
         if let Err(error) = cleanup_result {
             if repeat_result.is_err() {
@@ -70,20 +98,7 @@ fn bench(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         total_rows = total_rows.saturating_add(repeat_result?);
     }
 
-    let write_elapsed = write_start.elapsed();
-
-    println!("arrow-odbc runner");
-    println!("  database: {database}");
-    println!("  scenario: {}", options.scenario);
-    println!("  repeat: {}", options.repeat);
-    println!("  rows written: {total_rows}");
-    println!("  write seconds: {:.3}", write_elapsed.as_secs_f64());
-    println!(
-        "  write rows/sec: {:.2}",
-        rows_per_second(total_rows, write_elapsed)
-    );
-
-    Ok(())
+    Ok(total_rows)
 }
 
 fn run_repeat(
