@@ -8,4 +8,5 @@ publish = false
 resolver = "3"
 
 [dependencies]
+arrow-ipc = "58.3.0"
 arrow-odbc = { version = "23.2.0", features = ["narrow"] }

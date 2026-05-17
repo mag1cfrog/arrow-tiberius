@@ -1,7 +1,10 @@
 use std::env;
 use std::error::Error;
+use std::fs::File;
+use std::path::Path;
 use std::time::Instant;
 
+use arrow_ipc::reader::FileReader;
 use arrow_odbc::arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
 use arrow_odbc::arrow::datatypes::{DataType, Field, Schema};
 use arrow_odbc::arrow::record_batch::{RecordBatch, RecordBatchIterator};
@@ -99,18 +102,12 @@ fn run_repeat(
     execute_sql(connection, &format!("DROP TABLE IF EXISTS {table}"))?;
     execute_sql(connection, &create_table_sql(table, &options.scenario)?)?;
 
-    let schema = schema_for_scenario(&options.scenario)?;
-    let batches = batches_for_scenario(
-        &options.scenario,
-        schema.clone(),
-        options.rows,
-        options.batch_size,
-    )?;
-    let mut reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+    let input = batches_for_options(options)?;
+    let mut reader = RecordBatchIterator::new(input.batches.into_iter().map(Ok), input.schema);
     insert_into_table(connection, &mut reader, table, options.batch_size)?;
 
     let actual = select_count(connection, table)?;
-    let expected = u64::try_from(options.rows)?;
+    let expected = u64::try_from(input.rows)?;
     if actual != expected {
         return Err(format!(
             "arrow-odbc row-count validation failed: expected {expected}, got {actual}"
@@ -119,6 +116,72 @@ fn run_repeat(
     }
 
     Ok(actual)
+}
+
+#[derive(Debug)]
+struct InputBatches {
+    schema: std::sync::Arc<Schema>,
+    batches: Vec<RecordBatch>,
+    rows: usize,
+}
+
+fn batches_for_options(options: &BenchOptions) -> Result<InputBatches, Box<dyn Error>> {
+    if let Some(path) = &options.input_ipc {
+        return ipc_batches_for_scenario(path, &options.scenario, options.rows);
+    }
+
+    let schema = schema_for_scenario(&options.scenario)?;
+    let batches = batches_for_scenario(
+        &options.scenario,
+        schema.clone(),
+        options.rows,
+        options.batch_size,
+    )?;
+
+    Ok(InputBatches {
+        schema,
+        batches,
+        rows: options.rows,
+    })
+}
+
+fn ipc_batches_for_scenario(
+    path: &Path,
+    scenario: &str,
+    expected_rows: usize,
+) -> Result<InputBatches, Box<dyn Error>> {
+    let expected_schema = schema_for_scenario(scenario)?;
+    let file = File::open(path)?;
+    let reader = FileReader::try_new(file, None)?;
+    let schema = reader.schema();
+
+    if schema.as_ref() != expected_schema.as_ref() {
+        return Err(format!(
+            "Arrow IPC schema does not match scenario `{scenario}`: expected {:?}, got {:?}",
+            expected_schema.fields(),
+            schema.fields()
+        )
+        .into());
+    }
+
+    let batches = reader.collect::<Result<Vec<_>, _>>()?;
+    let rows = batches
+        .iter()
+        .map(arrow_odbc::arrow::record_batch::RecordBatch::num_rows)
+        .sum::<usize>();
+
+    if rows != expected_rows {
+        return Err(format!(
+            "Arrow IPC row count does not match --rows: expected {expected_rows}, got {rows}"
+        )
+        .into());
+    }
+
+    Ok(InputBatches {
+        schema,
+        batches,
+        rows,
+    })
 }
 
 fn is_supported_scenario(scenario: &str) -> bool {
@@ -332,6 +395,7 @@ struct BenchOptions {
     batch_size: usize,
     scenario: String,
     repeat: usize,
+    input_ipc: Option<std::path::PathBuf>,
 }
 
 impl BenchOptions {
@@ -341,6 +405,7 @@ impl BenchOptions {
             batch_size: 8_192,
             scenario: "narrow_numeric".to_owned(),
             repeat: 1,
+            input_ipc: None,
         };
         let mut index = 0;
 
@@ -361,6 +426,13 @@ impl BenchOptions {
                 "--repeat" => {
                     index += 1;
                     options.repeat = parse_positive_usize("--repeat", args.get(index))?;
+                }
+                "--input-ipc" => {
+                    index += 1;
+                    options.input_ipc = Some(std::path::PathBuf::from(required_arg(
+                        "--input-ipc",
+                        args.get(index),
+                    )?));
                 }
                 other => return Err(format!("unknown arrow-odbc runner option `{other}`").into()),
             }
@@ -391,10 +463,18 @@ fn required_arg<'a>(option: &str, value: Option<&'a String>) -> Result<&'a str, 
 #[cfg(test)]
 mod tests {
     use super::{
-        BenchOptions, create_table_sql, is_supported_scenario, mixed_nullable_batches,
-        mixed_nullable_schema, narrow_numeric_batches, narrow_numeric_schema, rows_per_second,
+        BenchOptions, batches_for_options, create_table_sql, ipc_batches_for_scenario,
+        is_supported_scenario, mixed_nullable_batches, mixed_nullable_schema,
+        narrow_numeric_batches, narrow_numeric_schema, rows_per_second,
     };
+    use arrow_ipc::writer::FileWriter;
     use arrow_odbc::arrow::array::Array;
+    use arrow_odbc::arrow::datatypes::Schema;
+    use arrow_odbc::arrow::record_batch::RecordBatch;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn parses_bench_options() {
@@ -414,6 +494,24 @@ mod tests {
         assert_eq!(options.batch_size, 8);
         assert_eq!(options.scenario, "narrow_numeric");
         assert_eq!(options.repeat, 3);
+        assert!(options.input_ipc.is_none());
+    }
+
+    #[test]
+    fn parses_input_ipc_option() {
+        let options = BenchOptions::parse(vec![
+            "--rows".to_owned(),
+            "25".to_owned(),
+            "--input-ipc".to_owned(),
+            "/workspace/bench.arrow".to_owned(),
+        ])
+        .expect("valid options should parse");
+
+        assert_eq!(options.rows, 25);
+        assert_eq!(
+            options.input_ipc.as_deref(),
+            Some(std::path::Path::new("/workspace/bench.arrow"))
+        );
     }
 
     #[test]
@@ -490,7 +588,100 @@ mod tests {
     }
 
     #[test]
+    fn reads_input_ipc_batches_for_matching_scenario() {
+        let schema = mixed_nullable_schema();
+        let batches = mixed_nullable_batches(schema.clone(), 25, 8).expect("batches should build");
+        let path = temp_ipc_path("mixed");
+        write_ipc_file(&path, schema.as_ref(), &batches);
+
+        let input = ipc_batches_for_scenario(&path, "mixed_nullable", 25)
+            .expect("matching IPC file should load");
+
+        assert_eq!(input.schema.as_ref(), schema.as_ref());
+        assert_eq!(input.batches, batches);
+        assert_eq!(input.rows, 25);
+
+        std::fs::remove_file(path).expect("test IPC file should be removed");
+    }
+
+    #[test]
+    fn rejects_input_ipc_schema_mismatch() {
+        let schema = narrow_numeric_schema();
+        let batches = narrow_numeric_batches(schema.clone(), 4, 4).expect("batches should build");
+        let path = temp_ipc_path("schema-mismatch");
+        write_ipc_file(&path, schema.as_ref(), &batches);
+
+        let err = ipc_batches_for_scenario(&path, "mixed_nullable", 4)
+            .expect_err("schema mismatch should be rejected");
+
+        assert!(err.to_string().contains("schema"));
+
+        std::fs::remove_file(path).expect("test IPC file should be removed");
+    }
+
+    #[test]
+    fn rejects_input_ipc_row_count_mismatch() {
+        let schema = mixed_nullable_schema();
+        let batches = mixed_nullable_batches(schema.clone(), 25, 8).expect("batches should build");
+        let path = temp_ipc_path("row-mismatch");
+        write_ipc_file(&path, schema.as_ref(), &batches);
+
+        let err = ipc_batches_for_scenario(&path, "mixed_nullable", 24)
+            .expect_err("row count mismatch should be rejected");
+
+        assert!(err.to_string().contains("row count"));
+
+        std::fs::remove_file(path).expect("test IPC file should be removed");
+    }
+
+    #[test]
+    fn input_ipc_options_use_file_batches_instead_of_generating() {
+        let schema = mixed_nullable_schema();
+        let batches = mixed_nullable_batches(schema.clone(), 25, 8).expect("batches should build");
+        let path = temp_ipc_path("options");
+        write_ipc_file(&path, schema.as_ref(), &batches);
+        let options = BenchOptions {
+            rows: 25,
+            batch_size: 2,
+            scenario: "mixed_nullable".to_owned(),
+            repeat: 1,
+            input_ipc: Some(path.clone()),
+        };
+
+        let input = batches_for_options(&options).expect("input IPC batches should load");
+        let lengths = input
+            .batches
+            .iter()
+            .map(arrow_odbc::arrow::record_batch::RecordBatch::num_rows)
+            .collect::<Vec<_>>();
+
+        assert_eq!(input.rows, 25);
+        assert_eq!(lengths, vec![8, 8, 8, 1]);
+
+        std::fs::remove_file(path).expect("test IPC file should be removed");
+    }
+
+    #[test]
     fn rows_per_second_handles_zero_elapsed() {
         assert_eq!(rows_per_second(25, std::time::Duration::ZERO), 0.0);
+    }
+
+    fn write_ipc_file(path: &std::path::Path, schema: &Schema, batches: &[RecordBatch]) {
+        let file = std::fs::File::create(path).expect("test IPC file should be created");
+        let mut writer = FileWriter::try_new(file, schema).expect("IPC writer should be created");
+
+        for batch in batches {
+            writer.write(batch).expect("batch should be written");
+        }
+
+        writer.finish().expect("IPC file should finish");
+    }
+
+    fn temp_ipc_path(name: &str) -> PathBuf {
+        let counter = TEST_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "arrow-tiberius-odbc-runner-{name}-{}-{counter}.arrow",
+            std::process::id()
+        ))
     }
 }
