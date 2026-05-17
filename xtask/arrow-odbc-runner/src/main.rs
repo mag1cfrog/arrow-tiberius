@@ -2,7 +2,7 @@ use std::env;
 use std::error::Error;
 use std::time::Instant;
 
-use arrow_odbc::arrow::array::{Float64Array, Int32Array, Int64Array};
+use arrow_odbc::arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
 use arrow_odbc::arrow::datatypes::{DataType, Field, Schema};
 use arrow_odbc::arrow::record_batch::{RecordBatch, RecordBatchIterator};
 use arrow_odbc::insert_into_table;
@@ -36,9 +36,9 @@ fn validate() -> Result<(), Box<dyn Error>> {
 
 fn bench(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     let options = BenchOptions::parse(args)?;
-    if options.scenario != "narrow_numeric" {
+    if !is_supported_scenario(&options.scenario) {
         return Err(format!(
-            "arrow-odbc runner only supports narrow_numeric in this slice, got {}",
+            "arrow-odbc runner only supports narrow_numeric and mixed_nullable, got {}",
             options.scenario
         )
         .into());
@@ -97,15 +97,15 @@ fn run_repeat(
     options: &BenchOptions,
 ) -> Result<u64, Box<dyn Error>> {
     execute_sql(connection, &format!("DROP TABLE IF EXISTS {table}"))?;
-    execute_sql(
-        connection,
-        &format!(
-            "CREATE TABLE {table} (id32 int NOT NULL, id64 bigint NOT NULL, score float(53) NOT NULL)"
-        ),
-    )?;
+    execute_sql(connection, &create_table_sql(table, &options.scenario)?)?;
 
-    let schema = narrow_numeric_schema();
-    let batches = narrow_numeric_batches(schema.clone(), options.rows, options.batch_size)?;
+    let schema = schema_for_scenario(&options.scenario)?;
+    let batches = batches_for_scenario(
+        &options.scenario,
+        schema.clone(),
+        options.rows,
+        options.batch_size,
+    )?;
     let mut reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
     insert_into_table(connection, &mut reader, table, options.batch_size)?;
 
@@ -119,6 +119,22 @@ fn run_repeat(
     }
 
     Ok(actual)
+}
+
+fn is_supported_scenario(scenario: &str) -> bool {
+    matches!(scenario, "narrow_numeric" | "mixed_nullable")
+}
+
+fn create_table_sql(table: &str, scenario: &str) -> Result<String, Box<dyn Error>> {
+    match scenario {
+        "narrow_numeric" => Ok(format!(
+            "CREATE TABLE {table} (id32 int NOT NULL, id64 bigint NOT NULL, score float(53) NOT NULL)"
+        )),
+        "mixed_nullable" => Ok(format!(
+            "CREATE TABLE {table} (id32 int NOT NULL, maybe_id64 bigint NULL, maybe_score float(53) NULL, category nvarchar(max) NULL)"
+        )),
+        other => Err(format!("unsupported scenario `{other}`").into()),
+    }
 }
 
 fn execute_sql(connection: &Connection<'_>, sql: &str) -> Result<(), Box<dyn Error>> {
@@ -149,12 +165,42 @@ fn cursor_to_string(mut cursor: impl Cursor) -> Result<String, Box<dyn Error>> {
     Ok(value)
 }
 
+fn schema_for_scenario(scenario: &str) -> Result<std::sync::Arc<Schema>, Box<dyn Error>> {
+    match scenario {
+        "narrow_numeric" => Ok(narrow_numeric_schema()),
+        "mixed_nullable" => Ok(mixed_nullable_schema()),
+        other => Err(format!("unsupported scenario `{other}`").into()),
+    }
+}
+
 fn narrow_numeric_schema() -> std::sync::Arc<Schema> {
     std::sync::Arc::new(Schema::new(vec![
         Field::new("id32", DataType::Int32, false),
         Field::new("id64", DataType::Int64, false),
         Field::new("score", DataType::Float64, false),
     ]))
+}
+
+fn mixed_nullable_schema() -> std::sync::Arc<Schema> {
+    std::sync::Arc::new(Schema::new(vec![
+        Field::new("id32", DataType::Int32, false),
+        Field::new("maybe_id64", DataType::Int64, true),
+        Field::new("maybe_score", DataType::Float64, true),
+        Field::new("category", DataType::Utf8, true),
+    ]))
+}
+
+fn batches_for_scenario(
+    scenario: &str,
+    schema: std::sync::Arc<Schema>,
+    rows: usize,
+    batch_size: usize,
+) -> Result<Vec<RecordBatch>, Box<dyn Error>> {
+    match scenario {
+        "narrow_numeric" => narrow_numeric_batches(schema, rows, batch_size),
+        "mixed_nullable" => mixed_nullable_batches(schema, rows, batch_size),
+        other => Err(format!("unsupported scenario `{other}`").into()),
+    }
 }
 
 fn narrow_numeric_batches(
@@ -182,6 +228,64 @@ fn narrow_numeric_batches(
                 std::sync::Arc::new(id32),
                 std::sync::Arc::new(id64),
                 std::sync::Arc::new(score),
+            ],
+        )?;
+
+        batches.push(batch);
+        offset += len;
+    }
+
+    Ok(batches)
+}
+
+fn mixed_nullable_batches(
+    schema: std::sync::Arc<Schema>,
+    rows: usize,
+    batch_size: usize,
+) -> Result<Vec<RecordBatch>, Box<dyn Error>> {
+    let mut batches = Vec::new();
+    let mut offset = 0;
+
+    while offset < rows {
+        let len = batch_size.min(rows - offset);
+        let id32 = (offset..offset + len)
+            .map(deterministic_i32)
+            .collect::<Int32Array>();
+        let maybe_id64 = (offset..offset + len)
+            .map(|row| {
+                if row % 7 == 0 {
+                    None
+                } else {
+                    Some(i64::from(deterministic_i32(row)) * 10)
+                }
+            })
+            .collect::<Int64Array>();
+        let maybe_score = (offset..offset + len)
+            .map(|row| {
+                if row % 11 == 0 {
+                    None
+                } else {
+                    Some(deterministic_score(row))
+                }
+            })
+            .collect::<Float64Array>();
+        let category_values = ["alpha", "beta", "gamma", "delta", "epsilon"];
+        let category = (offset..offset + len)
+            .map(|row| {
+                if row % 5 == 0 {
+                    None
+                } else {
+                    Some(category_values[row % category_values.len()])
+                }
+            })
+            .collect::<StringArray>();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                std::sync::Arc::new(id32),
+                std::sync::Arc::new(maybe_id64),
+                std::sync::Arc::new(maybe_score),
+                std::sync::Arc::new(category),
             ],
         )?;
 
@@ -286,7 +390,11 @@ fn required_arg<'a>(option: &str, value: Option<&'a String>) -> Result<&'a str, 
 
 #[cfg(test)]
 mod tests {
-    use super::{BenchOptions, narrow_numeric_batches, narrow_numeric_schema, rows_per_second};
+    use super::{
+        BenchOptions, create_table_sql, is_supported_scenario, mixed_nullable_batches,
+        mixed_nullable_schema, narrow_numeric_batches, narrow_numeric_schema, rows_per_second,
+    };
+    use arrow_odbc::arrow::array::Array;
 
     #[test]
     fn parses_bench_options() {
@@ -333,6 +441,24 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_supported_scenarios() {
+        assert!(is_supported_scenario("narrow_numeric"));
+        assert!(is_supported_scenario("mixed_nullable"));
+        assert!(!is_supported_scenario("decimal_temporal"));
+    }
+
+    #[test]
+    fn renders_mixed_nullable_table_sql() {
+        let sql = create_table_sql("dbo.target", "mixed_nullable")
+            .expect("mixed nullable DDL should render");
+
+        assert_eq!(
+            sql,
+            "CREATE TABLE dbo.target (id32 int NOT NULL, maybe_id64 bigint NULL, maybe_score float(53) NULL, category nvarchar(max) NULL)"
+        );
+    }
+
+    #[test]
     fn narrow_numeric_batches_cover_tail_rows() {
         let schema = narrow_numeric_schema();
         let batches = narrow_numeric_batches(schema, 25, 8).expect("batches should build");
@@ -342,6 +468,25 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(lengths, vec![8, 8, 8, 1]);
+    }
+
+    #[test]
+    fn mixed_nullable_batches_cover_tail_rows_and_nulls() {
+        let schema = mixed_nullable_schema();
+        let batches = mixed_nullable_batches(schema, 25, 8).expect("batches should build");
+        let lengths = batches
+            .iter()
+            .map(arrow_odbc::arrow::record_batch::RecordBatch::num_rows)
+            .collect::<Vec<_>>();
+        let first = &batches[0];
+
+        assert_eq!(lengths, vec![8, 8, 8, 1]);
+        assert!(first.column(1).is_null(0));
+        assert!(first.column(1).is_valid(1));
+        assert!(first.column(2).is_null(0));
+        assert!(first.column(2).is_valid(1));
+        assert!(first.column(3).is_null(0));
+        assert!(first.column(3).is_valid(1));
     }
 
     #[test]

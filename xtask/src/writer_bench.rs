@@ -119,7 +119,7 @@ fn print_baseline_help() {
 
 fn print_arrow_odbc_help() {
     println!(
-        "Usage:\n  cargo xtask writer-bench arrow-odbc [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Supported scenarios: narrow_numeric [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>      Managed arrow-odbc runner image tag\n  --keep-runner-image         Keep the managed arrow-odbc runner image after the task exits\n  -h, --help                  Print help\n\nThis is a SQL Server write-path comparison only. The arrow-odbc runner image contains unixODBC, Microsoft ODBC Driver 18 for SQL Server, and Rust."
+        "Usage:\n  cargo xtask writer-bench arrow-odbc [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Supported scenarios: narrow_numeric, mixed_nullable [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>      Managed arrow-odbc runner image tag\n  --keep-runner-image         Keep the managed arrow-odbc runner image after the task exits\n  -h, --help                  Print help\n\nThis is a SQL Server write-path comparison only. The arrow-odbc runner image contains unixODBC, Microsoft ODBC Driver 18 for SQL Server, and Rust."
     );
 }
 
@@ -427,7 +427,7 @@ fn parse_writer_sqlserver_options(
 }
 
 fn is_arrow_odbc_supported_scenario(scenario: &BenchmarkScenarioDefinition) -> bool {
-    matches!(scenario.name, "narrow_numeric")
+    matches!(scenario.name, "narrow_numeric" | "mixed_nullable")
 }
 
 fn create_arrow_odbc_network(
@@ -1688,7 +1688,7 @@ impl fmt::Display for WriterBenchError {
             ),
             Self::UnsupportedArrowOdbcScenario { scenario } => write!(
                 f,
-                "arrow-odbc benchmark scenario `{scenario}` is not supported yet; expected narrow_numeric"
+                "arrow-odbc benchmark scenario `{scenario}` is not supported yet; expected narrow_numeric or mixed_nullable"
             ),
         }
     }
@@ -1944,7 +1944,7 @@ mod tests {
             OsString::from("--batch-size"),
             OsString::from("5"),
             OsString::from("--scenario"),
-            OsString::from("narrow_numeric"),
+            OsString::from("mixed_nullable"),
             OsString::from("--connection-string"),
             OsString::from("server=tcp:127.0.0.1,1433;password=secret"),
             OsString::from("--database"),
@@ -1955,7 +1955,7 @@ mod tests {
 
         assert_eq!(options.benchmark.rows, 25);
         assert_eq!(options.benchmark.batch_size, 5);
-        assert_eq!(options.benchmark.scenario.name, "narrow_numeric");
+        assert_eq!(options.benchmark.scenario.name, "mixed_nullable");
         assert_eq!(options.sql_server.database, "bench_db");
         assert!(options.sql_server.connection_string.is_some());
         assert!(!options.keep_runner_image);
