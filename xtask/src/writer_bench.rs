@@ -22,6 +22,7 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 mod dataset;
 
 static BENCH_TABLE_COUNTER: AtomicU64 = AtomicU64::new(0);
+static BENCH_IPC_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn run(args: &[OsString]) -> Result<(), WriterBenchError> {
     if args.is_empty()
@@ -96,16 +97,72 @@ fn run_arrow_odbc(args: &[OsString]) -> Result<(), WriterBenchError> {
         .map_err(WriterBenchError::SqlServer)?;
     let mut runner_image = build_arrow_odbc_runner_image(&options)?;
     let runner_image_tag = runner_image.image_tag().to_owned();
-    run_arrow_odbc_runner(&options, &runner_image, network.as_ref(), &connection)?;
+    let ipc_dataset = prepare_arrow_odbc_ipc_dataset(&options)?;
+    let runner_result = run_arrow_odbc_runner(
+        &options,
+        &runner_image,
+        network.as_ref(),
+        &connection,
+        &ipc_dataset,
+    );
+    let dataset_cleanup_result = ipc_dataset.cleanup();
     runner_image
         .cleanup()
         .map_err(WriterBenchError::OdbcRunner)?;
+    runner_result?;
+    dataset_cleanup_result?;
 
     println!("writer-bench arrow-odbc");
     println!("  backend: arrow_odbc");
     println!("  runner image: {}", runner_image_tag);
     println!("  database: {}", connection.database);
     Ok(())
+}
+
+#[derive(Debug)]
+struct ManagedIpcDataset {
+    host_path: PathBuf,
+    container_path: String,
+}
+
+impl ManagedIpcDataset {
+    fn cleanup(&self) -> Result<(), WriterBenchError> {
+        if self.host_path.exists() {
+            std::fs::remove_file(&self.host_path).map_err(WriterBenchError::Io)?;
+        }
+
+        Ok(())
+    }
+}
+
+fn prepare_arrow_odbc_ipc_dataset(
+    options: &ArrowOdbcBenchOptions,
+) -> Result<ManagedIpcDataset, WriterBenchError> {
+    let root = repository_root()?;
+    let dataset_dir = root.join("target").join("arrow-tiberius-writer-bench");
+    std::fs::create_dir_all(&dataset_dir).map_err(WriterBenchError::Io)?;
+
+    let counter = BENCH_IPC_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let filename = format!(
+        "arrow-odbc-{}-{}-{counter}.arrow",
+        std::process::id(),
+        options.benchmark.scenario.name
+    );
+    let host_path = dataset_dir.join(&filename);
+    let container_path = format!("/workspace/target/arrow-tiberius-writer-bench/{filename}");
+    let summary = dataset::write_ipc_dataset(&options.benchmark, &host_path)?;
+
+    println!("writer-bench arrow-odbc");
+    println!("  action: prepare_ipc_dataset");
+    println!("  path: {}", host_path.display());
+    println!("  container path: {container_path}");
+    println!("  rows: {}", summary.rows);
+    println!("  batches: {}", summary.batches);
+
+    Ok(ManagedIpcDataset {
+        host_path,
+        container_path,
+    })
 }
 
 fn run_ipc_dataset(args: &[OsString]) -> Result<(), WriterBenchError> {
@@ -574,6 +631,7 @@ fn run_arrow_odbc_runner(
     runner_image: &odbc_runner::ManagedRunnerImage,
     network: Option<&sqlserver::ManagedNetwork>,
     connection: &sqlserver::SqlServerConnection,
+    ipc_dataset: &ManagedIpcDataset,
 ) -> Result<(), WriterBenchError> {
     println!("  action: run_arrow_odbc_runner");
     let command_options = runner_image.command_options(
@@ -594,27 +652,33 @@ fn run_arrow_odbc_runner(
         ],
         Some(repository_root()?),
         Some("/workspace".to_owned()),
-        vec![
-            "cargo".to_owned(),
-            "run".to_owned(),
-            "--manifest-path".to_owned(),
-            "xtask/arrow-odbc-runner/Cargo.toml".to_owned(),
-            "--target-dir".to_owned(),
-            "/tmp/arrow-tiberius-odbc-runner-target".to_owned(),
-            "--".to_owned(),
-            "bench".to_owned(),
-            "--rows".to_owned(),
-            options.benchmark.rows.to_string(),
-            "--batch-size".to_owned(),
-            options.benchmark.batch_size.to_string(),
-            "--scenario".to_owned(),
-            options.benchmark.scenario.name.to_owned(),
-            "--repeat".to_owned(),
-            options.benchmark.repeat.to_string(),
-        ],
+        arrow_odbc_runner_args(options, &ipc_dataset.container_path),
     );
 
     odbc_runner::run_runner_command(&command_options).map_err(WriterBenchError::OdbcRunner)
+}
+
+fn arrow_odbc_runner_args(options: &ArrowOdbcBenchOptions, input_ipc: &str) -> Vec<String> {
+    vec![
+        "cargo".to_owned(),
+        "run".to_owned(),
+        "--manifest-path".to_owned(),
+        "xtask/arrow-odbc-runner/Cargo.toml".to_owned(),
+        "--target-dir".to_owned(),
+        "/tmp/arrow-tiberius-odbc-runner-target".to_owned(),
+        "--".to_owned(),
+        "bench".to_owned(),
+        "--rows".to_owned(),
+        options.benchmark.rows.to_string(),
+        "--batch-size".to_owned(),
+        options.benchmark.batch_size.to_string(),
+        "--scenario".to_owned(),
+        options.benchmark.scenario.name.to_owned(),
+        "--repeat".to_owned(),
+        options.benchmark.repeat.to_string(),
+        "--input-ipc".to_owned(),
+        input_ipc.to_owned(),
+    ]
 }
 
 fn odbc_connection_string(
@@ -2111,6 +2175,36 @@ mod tests {
         assert_eq!(
             options.runner_image,
             crate::odbc_runner::DEFAULT_RUNNER_IMAGE_TAG
+        );
+    }
+
+    #[test]
+    fn arrow_odbc_runner_args_include_input_ipc_dataset() {
+        let options = super::ArrowOdbcBenchOptions {
+            benchmark: WriterBenchOptions {
+                rows: 25,
+                batch_size: 5,
+                scenario: super::scenario_by_name("mixed_nullable").unwrap(),
+                repeat: 3,
+                output: BenchmarkOutput::Human,
+            },
+            sql_server: crate::sqlserver::SqlServerConnectionOptions::benchmark_default(),
+            runner_image: crate::odbc_runner::DEFAULT_RUNNER_IMAGE_TAG.to_owned(),
+            keep_runner_image: false,
+        };
+
+        let args = super::arrow_odbc_runner_args(&options, "/workspace/target/bench.arrow");
+
+        assert!(args.windows(2).any(|pair| pair == ["--rows", "25"]));
+        assert!(args.windows(2).any(|pair| pair == ["--batch-size", "5"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--scenario", "mixed_nullable"])
+        );
+        assert!(args.windows(2).any(|pair| pair == ["--repeat", "3"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--input-ipc", "/workspace/target/bench.arrow"])
         );
     }
 
