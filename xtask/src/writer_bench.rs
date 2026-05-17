@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -122,7 +122,7 @@ fn run_arrow_odbc(args: &[OsString]) -> Result<(), WriterBenchError> {
 #[derive(Debug)]
 struct ManagedIpcDataset {
     host_path: PathBuf,
-    container_path: String,
+    container_path: Option<String>,
 }
 
 impl ManagedIpcDataset {
@@ -161,7 +161,7 @@ fn prepare_arrow_odbc_ipc_dataset(
 
     Ok(ManagedIpcDataset {
         host_path,
-        container_path,
+        container_path: Some(container_path),
     })
 }
 
@@ -634,6 +634,11 @@ fn run_arrow_odbc_runner(
     ipc_dataset: &ManagedIpcDataset,
 ) -> Result<(), WriterBenchError> {
     println!("  action: run_arrow_odbc_runner");
+    let container_path = ipc_dataset.container_path.as_deref().ok_or_else(|| {
+        WriterBenchError::Validation(
+            "arrow-odbc benchmark requires an IPC dataset container path".to_owned(),
+        )
+    })?;
     let command_options = runner_image.command_options(
         network.map(|network| network.name().to_owned()),
         vec![
@@ -652,7 +657,7 @@ fn run_arrow_odbc_runner(
         ],
         Some(repository_root()?),
         Some("/workspace".to_owned()),
-        arrow_odbc_runner_args(options, &ipc_dataset.container_path),
+        arrow_odbc_runner_args(options, container_path),
     );
 
     odbc_runner::run_runner_command(&command_options).map_err(WriterBenchError::OdbcRunner)
@@ -938,55 +943,104 @@ async fn run_baseline_async(
     let mut client = connect(&connection.connection_string, &connection.database).await?;
     let schema = (options.benchmark.scenario.schema)();
     let mappings = benchmark_mappings_for_schema(Arc::clone(&schema))?;
+    let ipc_dataset = prepare_baseline_ipc_dataset(options)?;
     report.timings.setup += setup_start.elapsed();
 
-    for _repeat_index in 0..options.benchmark.repeat {
-        let table = unique_benchmark_table_name()?;
-        let repeat_report =
-            run_baseline_repeat(&mut client, options, &schema, &mappings, &table).await;
-        let cleanup_start = Instant::now();
-        let cleanup_result = drop_table(&mut client, &table).await;
-        report.timings.cleanup += cleanup_start.elapsed();
+    let run_result = async {
+        for _repeat_index in 0..options.benchmark.repeat {
+            let table = unique_benchmark_table_name()?;
+            let repeat_report =
+                run_baseline_repeat_from_ipc(&mut client, &mappings, &table, &ipc_dataset.host_path)
+                    .await;
+            let cleanup_start = Instant::now();
+            let cleanup_result = drop_table(&mut client, &table).await;
+            report.timings.cleanup += cleanup_start.elapsed();
 
-        if let Err(source) = cleanup_result {
-            if repeat_report.is_err() {
-                eprintln!(
-                    "warning: failed to clean up benchmark table {} after benchmark failure: {source}",
-                    table.quoted_sql()
-                );
-            } else {
-                return Err(WriterBenchError::Tiberius(source));
+            if let Err(source) = cleanup_result {
+                if repeat_report.is_err() {
+                    eprintln!(
+                        "warning: failed to clean up benchmark table {} after benchmark failure: {source}",
+                        table.quoted_sql()
+                    );
+                } else {
+                    return Err(WriterBenchError::Tiberius(source));
+                }
             }
+
+            let repeat_report = repeat_report?;
+            report.stats.rows_written = report
+                .stats
+                .rows_written
+                .saturating_add(repeat_report.stats.rows_written);
+            report.stats.batches_written = report
+                .stats
+                .batches_written
+                .saturating_add(repeat_report.stats.batches_written);
+            report.validated_rows = report
+                .validated_rows
+                .saturating_add(repeat_report.validated_rows);
+            report.timings.setup += repeat_report.timings.setup;
+            report.timings.write += repeat_report.timings.write;
+            report.timings.finish += repeat_report.timings.finish;
+            report.timings.validate += repeat_report.timings.validate;
         }
 
-        let repeat_report = repeat_report?;
-        report.stats.rows_written = report
-            .stats
-            .rows_written
-            .saturating_add(repeat_report.stats.rows_written);
-        report.stats.batches_written = report
-            .stats
-            .batches_written
-            .saturating_add(repeat_report.stats.batches_written);
-        report.validated_rows = report
-            .validated_rows
-            .saturating_add(repeat_report.validated_rows);
-        report.timings.setup += repeat_report.timings.setup;
-        report.timings.write += repeat_report.timings.write;
-        report.timings.finish += repeat_report.timings.finish;
-        report.timings.validate += repeat_report.timings.validate;
+        Ok(())
     }
+    .await;
 
+    let dataset_cleanup_result = ipc_dataset.cleanup();
+    run_result?;
+    dataset_cleanup_result?;
     report.timings.total = total_start.elapsed();
     Ok(report)
 }
 
-async fn run_baseline_repeat(
-    client: &mut BenchClient,
+fn prepare_baseline_ipc_dataset(
     options: &BaselineBenchOptions,
-    schema: &SchemaRef,
+) -> Result<ManagedIpcDataset, WriterBenchError> {
+    let root = repository_root()?;
+    let dataset_dir = root.join("target").join("arrow-tiberius-writer-bench");
+    std::fs::create_dir_all(&dataset_dir).map_err(WriterBenchError::Io)?;
+
+    let counter = BENCH_IPC_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let filename = format!(
+        "baseline-{}-{}-{counter}.arrow",
+        std::process::id(),
+        options.benchmark.scenario.name
+    );
+    let host_path = dataset_dir.join(&filename);
+    let summary = dataset::write_ipc_dataset(&options.benchmark, &host_path)?;
+
+    println!("writer-bench baseline");
+    println!("  action: prepare_ipc_dataset");
+    println!("  path: {}", host_path.display());
+    println!("  rows: {}", summary.rows);
+    println!("  batches: {}", summary.batches);
+
+    Ok(ManagedIpcDataset {
+        host_path,
+        container_path: None,
+    })
+}
+
+async fn run_baseline_repeat_from_ipc(
+    client: &mut BenchClient,
     mappings: &[arrow_tiberius::SchemaMapping],
     table: &TableName,
+    ipc_path: &Path,
+) -> Result<BaselineBenchReport, WriterBenchError> {
+    let batches =
+        dataset::ipc_dataset_reader(ipc_path)?.map(|batch| batch.map_err(WriterBenchError::Arrow));
+
+    run_baseline_repeat_with_batches(client, mappings, table, batches).await
+}
+
+async fn run_baseline_repeat_with_batches(
+    client: &mut BenchClient,
+    mappings: &[arrow_tiberius::SchemaMapping],
+    table: &TableName,
+    batches: impl IntoIterator<Item = Result<RecordBatch, WriterBenchError>>,
 ) -> Result<BaselineBenchReport, WriterBenchError> {
     let mut report = BaselineBenchReport::default();
     let setup_start = Instant::now();
@@ -1011,7 +1065,7 @@ async fn run_baseline_repeat(
     report.timings.setup += setup_start.elapsed();
 
     let write_start = Instant::now();
-    for batch in GeneratedBatchReader::new_with_schema(&options.benchmark, Arc::clone(schema)) {
+    for batch in batches {
         let batch = batch?;
         report.stats = writer
             .write_batch(&batch)
@@ -2047,6 +2101,31 @@ mod tests {
         assert_eq!(summary.batches, 3);
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn baseline_prepares_replayable_ipc_dataset_and_cleans_it_up() {
+        let options = super::BaselineBenchOptions {
+            benchmark: WriterBenchOptions {
+                rows: 17,
+                batch_size: 6,
+                scenario: super::scenario_by_name("mixed_nullable").unwrap(),
+                repeat: 2,
+                output: BenchmarkOutput::Human,
+            },
+            sql_server: crate::sqlserver::SqlServerConnectionOptions::benchmark_default(),
+        };
+
+        let dataset = super::prepare_baseline_ipc_dataset(&options).unwrap();
+
+        assert!(dataset.container_path.is_none());
+        assert!(dataset.host_path.exists());
+        let summary = super::dataset::summarize_ipc_dataset(&dataset.host_path).unwrap();
+        assert_eq!(summary.rows, 17);
+        assert_eq!(summary.batches, 3);
+
+        dataset.cleanup().unwrap();
+        assert!(!dataset.host_path.exists());
     }
 
     #[test]
