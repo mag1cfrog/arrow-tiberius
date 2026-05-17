@@ -22,6 +22,34 @@ impl RunnerImageOptions {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunnerCommandOptions {
+    pub(crate) container_runtime: PathBuf,
+    pub(crate) image_tag: String,
+    pub(crate) network: Option<String>,
+    pub(crate) args: Vec<String>,
+}
+
+impl RunnerCommandOptions {
+    fn container_args(&self) -> Vec<String> {
+        let mut args = vec![
+            "run".to_owned(),
+            "--rm".to_owned(),
+            "--label".to_owned(),
+            "org.arrow-tiberius.xtask=arrow-odbc-runner".to_owned(),
+        ];
+
+        if let Some(network) = &self.network {
+            args.push("--network".to_owned());
+            args.push(network.clone());
+        }
+
+        args.push(self.image_tag.clone());
+        args.extend(self.args.iter().cloned());
+        args
+    }
+}
+
 pub(crate) fn build_runner_image(options: &RunnerImageOptions) -> Result<(), OdbcRunnerError> {
     let mut command = Command::new(&options.container_runtime);
     command
@@ -46,6 +74,30 @@ pub(crate) fn build_runner_image(options: &RunnerImageOptions) -> Result<(), Odb
     } else {
         Err(OdbcRunnerError::CommandStatus {
             description: "build arrow-odbc runner image",
+            status,
+        })
+    }
+}
+
+pub(crate) fn run_runner_command(options: &RunnerCommandOptions) -> Result<(), OdbcRunnerError> {
+    let mut command = Command::new(&options.container_runtime);
+    command
+        .args(options.container_args())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    let status = command
+        .status()
+        .map_err(|source| OdbcRunnerError::CommandSpawn {
+            description: "run arrow-odbc runner command",
+            source,
+        })?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(OdbcRunnerError::CommandStatus {
+            description: "run arrow-odbc runner command",
             status,
         })
     }
@@ -99,6 +151,19 @@ impl ManagedRunnerImage {
         &self.options.image_tag
     }
 
+    pub(crate) fn command_options(
+        &self,
+        network: Option<String>,
+        args: Vec<String>,
+    ) -> RunnerCommandOptions {
+        RunnerCommandOptions {
+            container_runtime: self.options.container_runtime.clone(),
+            image_tag: self.options.image_tag.clone(),
+            network,
+            args,
+        }
+    }
+
     pub(crate) fn cleanup(&mut self) -> Result<(), OdbcRunnerError> {
         if self.keep || !self.built {
             return Ok(());
@@ -147,7 +212,9 @@ impl fmt::Display for OdbcRunnerError {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_RUNNER_IMAGE_TAG, RUNNER_DOCKERFILE, RunnerImageOptions};
+    use super::{
+        DEFAULT_RUNNER_IMAGE_TAG, RUNNER_DOCKERFILE, RunnerCommandOptions, RunnerImageOptions,
+    };
 
     #[test]
     fn runner_image_options_resolve_dockerfile_and_context() {
@@ -164,6 +231,55 @@ mod tests {
         assert_eq!(
             options.build_context(),
             std::path::Path::new("/workspace/arrow-tiberius")
+        );
+    }
+
+    #[test]
+    fn runner_command_options_build_container_args_without_network() {
+        let options = RunnerCommandOptions {
+            container_runtime: "podman".into(),
+            image_tag: DEFAULT_RUNNER_IMAGE_TAG.to_owned(),
+            network: None,
+            args: vec!["odbcinst".to_owned(), "-q".to_owned(), "-d".to_owned()],
+        };
+
+        assert_eq!(
+            options.container_args(),
+            [
+                "run",
+                "--rm",
+                "--label",
+                "org.arrow-tiberius.xtask=arrow-odbc-runner",
+                DEFAULT_RUNNER_IMAGE_TAG,
+                "odbcinst",
+                "-q",
+                "-d",
+            ]
+        );
+    }
+
+    #[test]
+    fn runner_command_options_build_container_args_with_network() {
+        let options = RunnerCommandOptions {
+            container_runtime: "podman".into(),
+            image_tag: DEFAULT_RUNNER_IMAGE_TAG.to_owned(),
+            network: Some("bench-network".to_owned()),
+            args: vec!["cargo".to_owned(), "test".to_owned()],
+        };
+
+        assert_eq!(
+            options.container_args(),
+            [
+                "run",
+                "--rm",
+                "--label",
+                "org.arrow-tiberius.xtask=arrow-odbc-runner",
+                "--network",
+                "bench-network",
+                DEFAULT_RUNNER_IMAGE_TAG,
+                "cargo",
+                "test",
+            ]
         );
     }
 }

@@ -85,6 +85,7 @@ fn run_arrow_odbc(args: &[OsString]) -> Result<(), WriterBenchError> {
     let options = ArrowOdbcBenchOptions::parse(args)?;
     let mut runner_image = build_arrow_odbc_runner_image(&options)?;
     let runner_image_tag = runner_image.image_tag().to_owned();
+    validate_arrow_odbc_runner(&runner_image)?;
     runner_image
         .cleanup()
         .map_err(WriterBenchError::OdbcRunner)?;
@@ -446,6 +447,18 @@ fn build_arrow_odbc_runner_image(
 
     odbc_runner::ManagedRunnerImage::build(image_options, options.keep_runner_image)
         .map_err(WriterBenchError::OdbcRunner)
+}
+
+fn validate_arrow_odbc_runner(
+    runner_image: &odbc_runner::ManagedRunnerImage,
+) -> Result<(), WriterBenchError> {
+    println!("  action: validate_runner_odbc_driver");
+    let command_options = runner_image.command_options(
+        None,
+        vec!["odbcinst".to_owned(), "-q".to_owned(), "-d".to_owned()],
+    );
+
+    odbc_runner::run_runner_command(&command_options).map_err(WriterBenchError::OdbcRunner)
 }
 
 fn repository_root() -> Result<PathBuf, WriterBenchError> {
