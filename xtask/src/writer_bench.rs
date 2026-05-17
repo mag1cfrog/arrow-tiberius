@@ -129,10 +129,11 @@ fn run_compare(args: &[OsString]) -> Result<(), WriterBenchError> {
         return Ok(());
     }
 
-    let _options = CompareBenchOptions::parse(args)?;
-    Err(WriterBenchError::Validation(
-        "writer-bench compare execution is not wired yet".to_owned(),
-    ))
+    let options = CompareBenchOptions::parse(args)?;
+    let report = run_compare_baseline_only(&options)?;
+
+    print_compare_summary(&options, &report);
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -169,6 +170,36 @@ fn prepare_arrow_odbc_ipc_dataset(
     let summary = dataset::write_ipc_dataset(&options.benchmark, &host_path)?;
 
     println!("writer-bench arrow-odbc");
+    println!("  action: prepare_ipc_dataset");
+    println!("  path: {}", host_path.display());
+    println!("  container path: {container_path}");
+    println!("  rows: {}", summary.rows);
+    println!("  batches: {}", summary.batches);
+
+    Ok(ManagedIpcDataset {
+        host_path,
+        container_path: Some(container_path),
+    })
+}
+
+fn prepare_compare_ipc_dataset(
+    options: &CompareBenchOptions,
+) -> Result<ManagedIpcDataset, WriterBenchError> {
+    let root = repository_root()?;
+    let dataset_dir = root.join("target").join("arrow-tiberius-writer-bench");
+    std::fs::create_dir_all(&dataset_dir).map_err(WriterBenchError::Io)?;
+
+    let counter = BENCH_IPC_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let filename = format!(
+        "compare-{}-{}-{counter}.arrow",
+        std::process::id(),
+        options.benchmark.scenario.name
+    );
+    let host_path = dataset_dir.join(&filename);
+    let container_path = format!("/workspace/target/arrow-tiberius-writer-bench/{filename}");
+    let summary = dataset::write_ipc_dataset(&options.benchmark, &host_path)?;
+
+    println!("writer-bench compare");
     println!("  action: prepare_ipc_dataset");
     println!("  path: {}", host_path.display());
     println!("  container path: {container_path}");
@@ -292,6 +323,58 @@ fn print_baseline_summary(
     println!("  validate: {}", format_duration(report.timings.validate));
     println!("  cleanup: {}", format_duration(report.timings.cleanup));
     println!("  total: {}", format_duration(report.timings.total));
+}
+
+fn print_compare_summary(options: &CompareBenchOptions, report: &CompareBenchReport) {
+    println!("writer-bench compare");
+    println!("  rows per repeat: {}", options.benchmark.rows);
+    println!("  batch size: {}", options.benchmark.batch_size);
+    println!("  scenario: {}", options.benchmark.scenario);
+    println!("  repeat: {}", options.benchmark.repeat);
+    println!("  output: {}", options.benchmark.output);
+    println!("  dataset: {}", report.ipc_dataset.display());
+    println!("  database: {}", report.database);
+
+    for backend in &report.backends {
+        println!("  backend: {}", backend.backend);
+        println!(
+            "    batches written: {}",
+            backend.report.stats.batches_written
+        );
+        println!("    rows written: {}", backend.report.stats.rows_written);
+        println!(
+            "    write rows/sec: {}",
+            format_rows_per_second(
+                backend.report.stats.rows_written,
+                backend.report.timings.write + backend.report.timings.finish
+            )
+        );
+        println!("    validated rows: {}", backend.report.validated_rows);
+        println!(
+            "    setup: {}",
+            format_duration(backend.report.timings.setup)
+        );
+        println!(
+            "    write: {}",
+            format_duration(backend.report.timings.write)
+        );
+        println!(
+            "    finish: {}",
+            format_duration(backend.report.timings.finish)
+        );
+        println!(
+            "    validate: {}",
+            format_duration(backend.report.timings.validate)
+        );
+        println!(
+            "    cleanup: {}",
+            format_duration(backend.report.timings.cleanup)
+        );
+        println!(
+            "    total: {}",
+            format_duration(backend.report.timings.total)
+        );
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1113,6 +1196,19 @@ struct BaselineBenchTimings {
     total: Duration,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompareBenchReport {
+    ipc_dataset: PathBuf,
+    database: String,
+    backends: Vec<CompareBackendBenchReport>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompareBackendBenchReport {
+    backend: BenchmarkBackend,
+    report: BaselineBenchReport,
+}
+
 type BenchClient = tiberius::Client<Compat<TcpStream>>;
 
 async fn run_baseline_async(
@@ -1120,21 +1216,89 @@ async fn run_baseline_async(
     connection: &sqlserver::SqlServerConnection,
 ) -> Result<BaselineBenchReport, WriterBenchError> {
     let total_start = Instant::now();
+    let setup_start = Instant::now();
+    let ipc_dataset = prepare_baseline_ipc_dataset(options)?;
+    let ipc_setup = setup_start.elapsed();
+
+    let run_result =
+        run_baseline_benchmark_from_ipc(&options.benchmark, connection, &ipc_dataset.host_path)
+            .await;
+    let dataset_cleanup_result = ipc_dataset.cleanup();
+    let mut report = run_result?;
+    dataset_cleanup_result?;
+    report.timings.setup += ipc_setup;
+    report.timings.total = total_start.elapsed();
+    Ok(report)
+}
+
+fn run_compare_baseline_only(
+    options: &CompareBenchOptions,
+) -> Result<CompareBenchReport, WriterBenchError> {
+    if options.backends.contains(&BenchmarkBackend::ArrowOdbc) {
+        return Err(WriterBenchError::Validation(
+            "writer-bench compare arrow-odbc execution is not wired yet; use --backends baseline"
+                .to_owned(),
+        ));
+    }
+
+    let connection = options
+        .sql_server
+        .connect_or_start()
+        .map_err(WriterBenchError::SqlServer)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .map_err(WriterBenchError::Io)?;
+    let ipc_dataset = prepare_compare_ipc_dataset(options)?;
+    let run_result = runtime.block_on(async {
+        let mut backends = Vec::new();
+
+        if options.backends.contains(&BenchmarkBackend::Baseline) {
+            let backend_start = Instant::now();
+            let mut report = run_baseline_benchmark_from_ipc(
+                &options.benchmark,
+                &connection,
+                &ipc_dataset.host_path,
+            )
+            .await?;
+            report.timings.total = backend_start.elapsed();
+            backends.push(CompareBackendBenchReport {
+                backend: BenchmarkBackend::Baseline,
+                report,
+            });
+        }
+
+        Ok::<_, WriterBenchError>(CompareBenchReport {
+            ipc_dataset: ipc_dataset.host_path.clone(),
+            database: connection.database.clone(),
+            backends,
+        })
+    });
+    let dataset_cleanup_result = ipc_dataset.cleanup();
+    let report = run_result?;
+    dataset_cleanup_result?;
+
+    Ok(report)
+}
+
+async fn run_baseline_benchmark_from_ipc(
+    benchmark: &WriterBenchOptions,
+    connection: &sqlserver::SqlServerConnection,
+    ipc_path: &Path,
+) -> Result<BaselineBenchReport, WriterBenchError> {
     let mut report = BaselineBenchReport::default();
 
     let setup_start = Instant::now();
     let mut client = connect(&connection.connection_string, &connection.database).await?;
-    let schema = (options.benchmark.scenario.schema)();
+    let schema = (benchmark.scenario.schema)();
     let mappings = benchmark_mappings_for_schema(Arc::clone(&schema))?;
-    let ipc_dataset = prepare_baseline_ipc_dataset(options)?;
     report.timings.setup += setup_start.elapsed();
 
-    let run_result = async {
-        for _repeat_index in 0..options.benchmark.repeat {
+    for _repeat_index in 0..benchmark.repeat {
+        let repeat_result = async {
             let table = unique_benchmark_table_name()?;
             let repeat_report =
-                run_baseline_repeat_from_ipc(&mut client, &mappings, &table, &ipc_dataset.host_path)
-                    .await;
+                run_baseline_repeat_from_ipc(&mut client, &mappings, &table, ipc_path).await;
             let cleanup_start = Instant::now();
             let cleanup_result = drop_table(&mut client, &table).await;
             report.timings.cleanup += cleanup_start.elapsed();
@@ -1166,16 +1330,13 @@ async fn run_baseline_async(
             report.timings.write += repeat_report.timings.write;
             report.timings.finish += repeat_report.timings.finish;
             report.timings.validate += repeat_report.timings.validate;
+
+            Ok(())
         }
-
-        Ok(())
+        .await;
+        repeat_result?;
     }
-    .await;
 
-    let dataset_cleanup_result = ipc_dataset.cleanup();
-    run_result?;
-    dataset_cleanup_result?;
-    report.timings.total = total_start.elapsed();
     Ok(report)
 }
 
@@ -2439,6 +2600,34 @@ mod tests {
     }
 
     #[test]
+    fn compare_prepares_replayable_ipc_dataset_and_cleans_it_up() {
+        let options = super::CompareBenchOptions {
+            benchmark: WriterBenchOptions {
+                rows: 19,
+                batch_size: 7,
+                scenario: super::scenario_by_name("mixed_nullable").unwrap(),
+                repeat: 2,
+                output: BenchmarkOutput::Human,
+            },
+            sql_server: crate::sqlserver::SqlServerConnectionOptions::benchmark_default(),
+            backends: vec![super::BenchmarkBackend::Baseline],
+            runner_image: crate::odbc_runner::DEFAULT_RUNNER_IMAGE_TAG.to_owned(),
+            keep_runner_image: false,
+        };
+
+        let dataset = super::prepare_compare_ipc_dataset(&options).unwrap();
+
+        assert!(dataset.container_path.is_some());
+        assert!(dataset.host_path.exists());
+        let summary = super::dataset::summarize_ipc_dataset(&dataset.host_path).unwrap();
+        assert_eq!(summary.rows, 19);
+        assert_eq!(summary.batches, 3);
+
+        dataset.cleanup().unwrap();
+        assert!(!dataset.host_path.exists());
+    }
+
+    #[test]
     fn parses_baseline_sql_server_options_without_leaking_connection_string() {
         let args = [
             OsString::from("--rows"),
@@ -2535,6 +2724,24 @@ mod tests {
         let args = [OsString::from("compare"), OsString::from("--help")];
 
         super::run(&args).unwrap();
+    }
+
+    #[test]
+    fn compare_arrow_odbc_execution_error_is_actionable_before_sql_server_setup() {
+        let args = [
+            OsString::from("compare"),
+            OsString::from("--backends"),
+            OsString::from("arrow-odbc"),
+        ];
+
+        let err = super::run(&args).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("arrow-odbc execution is not wired yet")
+                    && message.contains("--backends baseline")
+        ));
     }
 
     #[test]
