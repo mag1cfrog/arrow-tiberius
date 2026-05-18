@@ -2278,6 +2278,220 @@ mod tests {
     }
 
     #[test]
+    fn converts_timezone_free_timestamp_cells_to_datetime2_7_with_boundaries_and_nulls() {
+        let mappings = mappings_for_schema(Schema::new(vec![
+            Field::new("ts_s", DataType::Timestamp(TimeUnit::Second, None), true),
+            Field::new(
+                "ts_ms",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                true,
+            ),
+            Field::new(
+                "ts_us",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new(
+                "ts_ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ]));
+        let cases = [
+            (
+                0,
+                ArrowCell::TimestampSecond(0),
+                MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                    MssqlDate::new(719_162),
+                    MssqlTime::new(0, 7),
+                ))),
+            ),
+            (
+                0,
+                ArrowCell::TimestampSecond(-1),
+                MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                    MssqlDate::new(719_161),
+                    MssqlTime::new(863_990_000_000, 7),
+                ))),
+            ),
+            (0, ArrowCell::Null, MssqlCell::DateTime2(None)),
+            (
+                1,
+                ArrowCell::TimestampMillisecond(-1),
+                MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                    MssqlDate::new(719_161),
+                    MssqlTime::new(863_999_990_000, 7),
+                ))),
+            ),
+            (
+                2,
+                ArrowCell::TimestampMicrosecond(1_234_567),
+                MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                    MssqlDate::new(719_162),
+                    MssqlTime::new(12_345_670, 7),
+                ))),
+            ),
+            (
+                2,
+                ArrowCell::TimestampMicrosecond(-1),
+                MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                    MssqlDate::new(719_161),
+                    MssqlTime::new(863_999_999_990, 7),
+                ))),
+            ),
+            (
+                3,
+                ArrowCell::TimestampNanosecond(123_456_700),
+                MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                    MssqlDate::new(719_162),
+                    MssqlTime::new(1_234_567, 7),
+                ))),
+            ),
+            (
+                3,
+                ArrowCell::TimestampNanosecond(-100),
+                MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                    MssqlDate::new(719_161),
+                    MssqlTime::new(863_999_999_999, 7),
+                ))),
+            ),
+        ];
+
+        for (mapping_index, cell, expected) in cases {
+            assert_eq!(
+                convert_cell(&mappings[mapping_index], cell, mapping_index).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_nanosecond_timestamp_precision_loss_by_default() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "ts_ns",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        )]));
+
+        let err = convert_cell(&mappings[0], ArrowCell::TimestampNanosecond(101), 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::LossyConversionRequiresPolicy,
+            Some(0),
+            Some((0, "ts_ns")),
+        );
+    }
+
+    #[test]
+    fn applies_nanosecond_round_and_truncate_policies_at_runtime() {
+        let round_options = PlanOptions {
+            nanosecond_policy: NanosecondPolicy::RoundTo100ns,
+            ..PlanOptions::default()
+        };
+        let truncate_options = PlanOptions {
+            nanosecond_policy: NanosecondPolicy::TruncateTo100ns,
+            ..PlanOptions::default()
+        };
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "ts_ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            )]),
+            round_options,
+        );
+
+        let round_cases = [
+            (
+                ArrowCell::TimestampNanosecond(149),
+                MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                    MssqlDate::new(719_162),
+                    MssqlTime::new(1, 7),
+                ))),
+            ),
+            (
+                ArrowCell::TimestampNanosecond(150),
+                MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                    MssqlDate::new(719_162),
+                    MssqlTime::new(2, 7),
+                ))),
+            ),
+            (
+                ArrowCell::TimestampNanosecond(-149),
+                MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                    MssqlDate::new(719_161),
+                    MssqlTime::new(863_999_999_999, 7),
+                ))),
+            ),
+        ];
+        for (row_index, (cell, expected)) in round_cases.into_iter().enumerate() {
+            assert_eq!(
+                convert_cell_with_options(&mappings[0], cell, row_index, &round_options).unwrap(),
+                expected
+            );
+        }
+
+        let truncate_cases = [
+            (
+                ArrowCell::TimestampNanosecond(149),
+                MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                    MssqlDate::new(719_162),
+                    MssqlTime::new(1, 7),
+                ))),
+            ),
+            (
+                ArrowCell::TimestampNanosecond(150),
+                MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                    MssqlDate::new(719_162),
+                    MssqlTime::new(1, 7),
+                ))),
+            ),
+            (
+                ArrowCell::TimestampNanosecond(-149),
+                MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                    MssqlDate::new(719_161),
+                    MssqlTime::new(863_999_999_998, 7),
+                ))),
+            ),
+        ];
+        for (row_index, (cell, expected)) in truncate_cases.into_iter().enumerate() {
+            assert_eq!(
+                convert_cell_with_options(&mappings[0], cell, row_index, &truncate_options)
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_timestamp_values_outside_sql_server_datetime2_range() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "ts_s",
+            DataType::Timestamp(TimeUnit::Second, None),
+            false,
+        )]));
+
+        let below =
+            convert_cell(&mappings[0], ArrowCell::TimestampSecond(i64::MIN), 0).unwrap_err();
+        assert_single_diagnostic(
+            below,
+            DiagnosticCode::TimestampOutOfRange,
+            Some(0),
+            Some((0, "ts_s")),
+        );
+
+        let above =
+            convert_cell(&mappings[0], ArrowCell::TimestampSecond(i64::MAX), 1).unwrap_err();
+        assert_single_diagnostic(
+            above,
+            DiagnosticCode::TimestampOutOfRange,
+            Some(1),
+            Some((0, "ts_s")),
+        );
+    }
+
+    #[test]
     fn resolves_fixed_timezone_offsets_for_datetimeoffset() {
         let mapping = timezone_timestamp_mapping("+00:00", TimezonePolicy::DateTimeOffset);
 
@@ -2360,7 +2574,16 @@ mod tests {
         row_index: usize,
     ) -> crate::Result<MssqlCell<'a>> {
         let options = PlanOptions::default();
-        let runtime_mapping = ArrowToMssqlRuntimeMapping::new(mapping, &options);
+        convert_cell_with_options(mapping, cell, row_index, &options)
+    }
+
+    fn convert_cell_with_options<'a>(
+        mapping: &SchemaMapping,
+        cell: ArrowCell<'a>,
+        row_index: usize,
+        options: &PlanOptions,
+    ) -> crate::Result<MssqlCell<'a>> {
+        let runtime_mapping = ArrowToMssqlRuntimeMapping::new(mapping, options);
         mssql_cell_from_arrow_cell(runtime_mapping, cell, row_index)
     }
 
