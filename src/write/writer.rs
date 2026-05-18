@@ -8,7 +8,7 @@ use crate::{
     TableName,
 };
 
-use super::{SchemaCheck, convert::tiberius_row_owned, record_batch::RecordBatchView};
+use super::{SchemaCheck, record_batch::RecordBatchView, token_row::tiberius_row_owned};
 
 /// Write backend selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
