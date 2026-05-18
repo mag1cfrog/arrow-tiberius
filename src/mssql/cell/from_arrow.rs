@@ -2492,6 +2492,183 @@ mod tests {
     }
 
     #[test]
+    fn converts_timezone_aware_timestamp_cells_to_normalized_utc_datetime2() {
+        let options = PlanOptions {
+            timezone_policy: TimezonePolicy::NormalizeUtcDateTime2,
+            ..PlanOptions::default()
+        };
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![
+                Field::new(
+                    "new_york",
+                    DataType::Timestamp(TimeUnit::Second, Some("America/New_York".into())),
+                    true,
+                ),
+                Field::new(
+                    "offset",
+                    DataType::Timestamp(TimeUnit::Millisecond, Some("+02:30".into())),
+                    true,
+                ),
+                Field::new(
+                    "utc",
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                    true,
+                ),
+            ]),
+            options,
+        );
+
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::TimestampSecond(0), 0).unwrap(),
+            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(719_162),
+                MssqlTime::new(0, 7),
+            )))
+        );
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::Null, 1).unwrap(),
+            MssqlCell::DateTime2(None)
+        );
+        assert_eq!(
+            convert_cell(&mappings[1], ArrowCell::TimestampMillisecond(0), 0).unwrap(),
+            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(719_162),
+                MssqlTime::new(0, 7),
+            )))
+        );
+        assert_eq!(
+            convert_cell(&mappings[1], ArrowCell::Null, 1).unwrap(),
+            MssqlCell::DateTime2(None)
+        );
+        assert_eq!(
+            convert_cell(&mappings[2], ArrowCell::TimestampMicrosecond(1_234_567), 0).unwrap(),
+            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(719_162),
+                MssqlTime::new(12_345_670, 7),
+            )))
+        );
+        assert_eq!(
+            convert_cell(&mappings[2], ArrowCell::Null, 1).unwrap(),
+            MssqlCell::DateTime2(None)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_timezone_metadata_for_normalized_utc_datetime2() {
+        let options = PlanOptions {
+            timezone_policy: TimezonePolicy::NormalizeUtcDateTime2,
+            ..PlanOptions::default()
+        };
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Second, Some("Foobar".into())),
+                false,
+            )]),
+            options,
+        );
+
+        let err = convert_cell(&mappings[0], ArrowCell::TimestampSecond(0), 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::TimezoneUnsupported,
+            Some(0),
+            Some((0, "ts")),
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_timezone_metadata_for_null_normalized_utc_datetime2() {
+        let options = PlanOptions {
+            timezone_policy: TimezonePolicy::NormalizeUtcDateTime2,
+            ..PlanOptions::default()
+        };
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Second, Some("Foobar".into())),
+                true,
+            )]),
+            options,
+        );
+
+        let err = convert_cell(&mappings[0], ArrowCell::Null, 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::TimezoneUnsupported,
+            Some(0),
+            Some((0, "ts")),
+        );
+    }
+
+    #[test]
+    fn applies_nanosecond_policy_to_timezone_aware_normalized_utc_datetime2() {
+        let options = PlanOptions {
+            timezone_policy: TimezonePolicy::NormalizeUtcDateTime2,
+            nanosecond_policy: NanosecondPolicy::RoundTo100ns,
+            ..PlanOptions::default()
+        };
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "ts_ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("America/New_York".into())),
+                false,
+            )]),
+            options,
+        );
+
+        assert_eq!(
+            convert_cell_with_options(
+                &mappings[0],
+                ArrowCell::TimestampNanosecond(150),
+                0,
+                &options,
+            )
+            .unwrap(),
+            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                MssqlDate::new(719_162),
+                MssqlTime::new(2, 7),
+            )))
+        );
+    }
+
+    #[test]
+    fn rejects_timezone_aware_normalized_utc_values_outside_datetime2_range() {
+        let options = PlanOptions {
+            timezone_policy: TimezonePolicy::NormalizeUtcDateTime2,
+            ..PlanOptions::default()
+        };
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "ts_s",
+                DataType::Timestamp(TimeUnit::Second, Some("America/New_York".into())),
+                false,
+            )]),
+            options,
+        );
+
+        let below =
+            convert_cell(&mappings[0], ArrowCell::TimestampSecond(i64::MIN), 0).unwrap_err();
+        assert_single_diagnostic(
+            below,
+            DiagnosticCode::TimestampOutOfRange,
+            Some(0),
+            Some((0, "ts_s")),
+        );
+
+        let above =
+            convert_cell(&mappings[0], ArrowCell::TimestampSecond(i64::MAX), 1).unwrap_err();
+        assert_single_diagnostic(
+            above,
+            DiagnosticCode::TimestampOutOfRange,
+            Some(1),
+            Some((0, "ts_s")),
+        );
+    }
+
+    #[test]
     fn resolves_fixed_timezone_offsets_for_datetimeoffset() {
         let mapping = timezone_timestamp_mapping("+00:00", TimezonePolicy::DateTimeOffset);
 
