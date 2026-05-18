@@ -209,227 +209,49 @@ fn validate_timestamp_timezone_metadata(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use arrow_schema::{DataType, Field, Schema, TimeUnit};
-
-    use super::{MssqlCell, MssqlDateTime2};
-    use crate::{
-        DiagnosticCode, MssqlProfile, NanosecondPolicy, PlanOptions, SchemaMapping, TimezonePolicy,
-        arrow::cell::ArrowCell,
-        mssql::cell::from_arrow::{ArrowToMssqlRuntimeMapping, mssql_cell_from_arrow_cell},
-        mssql::cell::{MssqlDate, MssqlTime},
-        plan_arrow_schema_to_mssql_mappings,
-    };
+    use super::{null_datetime2_cell, null_datetimeoffset_cell};
+    use crate::{DiagnosticCode, Identifier, MssqlColumn, MssqlType, SchemaMapping};
 
     #[test]
-    fn converts_timezone_aware_timestamp_cells_to_normalized_utc_datetime2() {
-        let options = PlanOptions {
-            timezone_policy: TimezonePolicy::NormalizeUtcDateTime2,
-            ..PlanOptions::default()
-        };
-        let mappings = mappings_for_schema_with_options(
-            Schema::new(vec![
-                Field::new(
-                    "new_york",
-                    DataType::Timestamp(TimeUnit::Second, Some("America/New_York".into())),
-                    true,
-                ),
-                Field::new(
-                    "offset",
-                    DataType::Timestamp(TimeUnit::Millisecond, Some("+02:30".into())),
-                    true,
-                ),
-                Field::new(
-                    "utc",
-                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-                    true,
-                ),
-            ]),
-            options,
-        );
-
-        assert_eq!(
-            convert_cell(&mappings[0], ArrowCell::TimestampSecond(0), 0).unwrap(),
-            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
-                MssqlDate::new(719_162),
-                MssqlTime::new(0, 7),
-            )))
-        );
-        assert_eq!(
-            convert_cell(&mappings[0], ArrowCell::Null, 1).unwrap(),
-            MssqlCell::DateTime2(None)
-        );
-        assert_eq!(
-            convert_cell(&mappings[1], ArrowCell::TimestampMillisecond(0), 0).unwrap(),
-            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
-                MssqlDate::new(719_162),
-                MssqlTime::new(0, 7),
-            )))
-        );
-        assert_eq!(
-            convert_cell(&mappings[1], ArrowCell::Null, 1).unwrap(),
-            MssqlCell::DateTime2(None)
-        );
-        assert_eq!(
-            convert_cell(&mappings[2], ArrowCell::TimestampMicrosecond(1_234_567), 0).unwrap(),
-            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
-                MssqlDate::new(719_162),
-                MssqlTime::new(12_345_670, 7),
-            )))
-        );
-        assert_eq!(
-            convert_cell(&mappings[2], ArrowCell::Null, 1).unwrap(),
-            MssqlCell::DateTime2(None)
-        );
-    }
-
-    #[test]
-    fn rejects_invalid_timezone_metadata_for_normalized_utc_datetime2() {
-        let options = PlanOptions {
-            timezone_policy: TimezonePolicy::NormalizeUtcDateTime2,
-            ..PlanOptions::default()
-        };
-        let mappings = mappings_for_schema_with_options(
-            Schema::new(vec![Field::new(
-                "ts",
-                DataType::Timestamp(TimeUnit::Second, Some("Foobar".into())),
-                false,
-            )]),
-            options,
-        );
-
-        let err = convert_cell(&mappings[0], ArrowCell::TimestampSecond(0), 0).unwrap_err();
-
-        assert_single_diagnostic(
-            err,
-            DiagnosticCode::TimezoneUnsupported,
-            Some(0),
-            Some((0, "ts")),
-        );
-    }
-
-    #[test]
-    fn rejects_invalid_timezone_metadata_for_null_normalized_utc_datetime2() {
-        let options = PlanOptions {
-            timezone_policy: TimezonePolicy::NormalizeUtcDateTime2,
-            ..PlanOptions::default()
-        };
-        let mappings = mappings_for_schema_with_options(
-            Schema::new(vec![Field::new(
-                "ts",
-                DataType::Timestamp(TimeUnit::Second, Some("Foobar".into())),
+    fn null_datetime2_cell_rejects_forged_unsupported_temporal_mapping() {
+        let mapping = SchemaMapping::new(
+            crate::ArrowFieldRef::new(0, "ts".to_owned(), true, arrow_schema::DataType::Date32),
+            MssqlColumn::new(
+                Identifier::new("ts").unwrap(),
+                MssqlType::DateTime2 { precision: 7 },
                 true,
-            )]),
-            options,
+            ),
         );
 
-        let err = convert_cell(&mappings[0], ArrowCell::Null, 0).unwrap_err();
+        let err = null_datetime2_cell(&mapping, 3).unwrap_err();
 
         assert_single_diagnostic(
             err,
-            DiagnosticCode::TimezoneUnsupported,
-            Some(0),
+            DiagnosticCode::ValueConversionUnsupported,
+            Some(3),
             Some((0, "ts")),
         );
     }
 
     #[test]
-    fn applies_nanosecond_policy_to_timezone_aware_normalized_utc_datetime2() {
-        let options = PlanOptions {
-            timezone_policy: TimezonePolicy::NormalizeUtcDateTime2,
-            nanosecond_policy: NanosecondPolicy::RoundTo100ns,
-            ..PlanOptions::default()
-        };
-        let mappings = mappings_for_schema_with_options(
-            Schema::new(vec![Field::new(
-                "ts_ns",
-                DataType::Timestamp(TimeUnit::Nanosecond, Some("America/New_York".into())),
-                false,
-            )]),
-            options,
+    fn null_datetimeoffset_cell_rejects_forged_unsupported_temporal_mapping() {
+        let mapping = SchemaMapping::new(
+            crate::ArrowFieldRef::new(0, "ts".to_owned(), true, arrow_schema::DataType::Date32),
+            MssqlColumn::new(
+                Identifier::new("ts").unwrap(),
+                MssqlType::DateTimeOffset { precision: 7 },
+                true,
+            ),
         );
 
-        assert_eq!(
-            convert_cell_with_options(
-                &mappings[0],
-                ArrowCell::TimestampNanosecond(150),
-                0,
-                &options,
-            )
-            .unwrap(),
-            MssqlCell::DateTime2(Some(MssqlDateTime2::new(
-                MssqlDate::new(719_162),
-                MssqlTime::new(2, 7),
-            )))
-        );
-    }
+        let err = null_datetimeoffset_cell(&mapping, 4).unwrap_err();
 
-    #[test]
-    fn rejects_timezone_aware_normalized_utc_values_outside_datetime2_range() {
-        let options = PlanOptions {
-            timezone_policy: TimezonePolicy::NormalizeUtcDateTime2,
-            ..PlanOptions::default()
-        };
-        let mappings = mappings_for_schema_with_options(
-            Schema::new(vec![Field::new(
-                "ts_s",
-                DataType::Timestamp(TimeUnit::Second, Some("America/New_York".into())),
-                false,
-            )]),
-            options,
-        );
-
-        let below =
-            convert_cell(&mappings[0], ArrowCell::TimestampSecond(i64::MIN), 0).unwrap_err();
         assert_single_diagnostic(
-            below,
-            DiagnosticCode::TimestampOutOfRange,
-            Some(0),
-            Some((0, "ts_s")),
+            err,
+            DiagnosticCode::ValueConversionUnsupported,
+            Some(4),
+            Some((0, "ts")),
         );
-
-        let above =
-            convert_cell(&mappings[0], ArrowCell::TimestampSecond(i64::MAX), 1).unwrap_err();
-        assert_single_diagnostic(
-            above,
-            DiagnosticCode::TimestampOutOfRange,
-            Some(1),
-            Some((0, "ts_s")),
-        );
-    }
-
-    fn convert_cell<'a>(
-        mapping: &SchemaMapping,
-        cell: ArrowCell<'a>,
-        row_index: usize,
-    ) -> crate::Result<MssqlCell<'a>> {
-        let options = PlanOptions::default();
-        convert_cell_with_options(mapping, cell, row_index, &options)
-    }
-
-    fn convert_cell_with_options<'a>(
-        mapping: &SchemaMapping,
-        cell: ArrowCell<'a>,
-        row_index: usize,
-        options: &PlanOptions,
-    ) -> crate::Result<MssqlCell<'a>> {
-        let runtime_mapping = ArrowToMssqlRuntimeMapping::new(mapping, options);
-        mssql_cell_from_arrow_cell(runtime_mapping, cell, row_index)
-    }
-
-    fn mappings_for_schema_with_options(
-        schema: Schema,
-        options: PlanOptions,
-    ) -> Vec<SchemaMapping> {
-        plan_arrow_schema_to_mssql_mappings(
-            Arc::new(schema),
-            MssqlProfile::sql_server_2016_compat_100(),
-            options,
-        )
-        .unwrap()
-        .into_parts()
-        .0
     }
 
     fn assert_single_diagnostic(
