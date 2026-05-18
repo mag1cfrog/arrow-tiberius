@@ -1,5 +1,8 @@
 //! MSSQL runtime cell values.
 
+/// Arrow-to-MSSQL runtime cell conversion.
+pub(crate) mod from_arrow;
+
 /// Semantic SQL Server value for one planned cell.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum MssqlCell<'a> {
