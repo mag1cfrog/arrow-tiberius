@@ -1,7 +1,5 @@
 //! Runtime record batch view and Arrow-to-MSSQL semantic conversion.
 
-#![allow(dead_code)]
-
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
     Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array,
@@ -45,6 +43,7 @@ pub(crate) struct RecordBatchView<'a> {
 
 impl<'a> RecordBatchView<'a> {
     /// Creates a conversion view after validating batch columns against mappings.
+    #[cfg(test)]
     pub(crate) fn new(batch: &'a RecordBatch, mappings: &'a [SchemaMapping]) -> Result<Self> {
         Self::new_with_options(batch, mappings, &PlanOptions::default())
     }
@@ -70,6 +69,7 @@ impl<'a> RecordBatchView<'a> {
     }
 
     /// Returns the planned mappings in conversion order.
+    #[cfg(test)]
     pub(crate) const fn mappings(&self) -> &[SchemaMapping] {
         self.mappings
     }
@@ -1747,7 +1747,7 @@ mod tests {
         Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch,
         StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
         TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
-        UInt64Array, new_null_array,
+        UInt64Array,
     };
     use arrow_buffer::i256;
     use arrow_data::ArrayData;
@@ -4821,32 +4821,6 @@ mod tests {
             },
         )
         .remove(0)
-    }
-
-    fn assert_policy_planned_null_runtime_unsupported(
-        name: &str,
-        data_type: DataType,
-        options: PlanOptions,
-    ) {
-        let mappings = mappings_for_schema_with_options(
-            Schema::new(vec![Field::new(name, data_type.clone(), true)]),
-            options,
-        );
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new(name, data_type.clone(), true)])),
-            vec![new_null_array(&data_type, 1)],
-        )
-        .unwrap();
-        let view = RecordBatchView::new(&batch, &mappings).unwrap();
-
-        let err = view.mssql_cell(&mappings[0], 0).unwrap_err();
-
-        assert_single_diagnostic(
-            err,
-            DiagnosticCode::ValueConversionUnsupported,
-            Some(0),
-            Some((0, name)),
-        );
     }
 
     fn unsafe_batch_for_field(

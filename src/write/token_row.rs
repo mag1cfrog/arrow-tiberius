@@ -1,7 +1,5 @@
 //! Tiberius TokenRow conversion adapter.
 
-#![allow(dead_code)]
-
 use std::borrow::Cow;
 
 use crate::Result;
@@ -27,6 +25,7 @@ pub(crate) fn tiberius_row_owned(
 }
 
 /// Converts a semantic SQL Server cell into borrowed Tiberius column data.
+#[cfg(test)]
 pub(crate) fn mssql_cell_to_tiberius_borrowed(cell: MssqlCell<'_>) -> tiberius::ColumnData<'_> {
     match cell {
         MssqlCell::Bit(value) => tiberius::ColumnData::Bit(value),
