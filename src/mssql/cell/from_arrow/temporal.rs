@@ -1,6 +1,7 @@
 //! Temporal Arrow-to-MSSQL runtime cell conversion.
 
 mod date;
+mod date64;
 
 use arrow_array::timezone::Tz;
 use arrow_schema::{DataType, TimeUnit};
@@ -16,6 +17,7 @@ use super::{
 };
 use crate::mssql::cell::{MssqlCell, MssqlDate, MssqlDateTime2, MssqlDateTimeOffset, MssqlTime};
 pub(super) use date::mssql_date_value;
+pub(super) use date64::mssql_datetime2_from_arrow_date64;
 
 const SQL_SERVER_DATE_UNIX_EPOCH_DAYS: i64 = 719_162;
 const SQL_SERVER_DATE_MAX_DAYS: i64 = 3_652_058;
@@ -295,35 +297,6 @@ fn validate_null_timestamp_timezone_metadata(
     }
 
     Ok(())
-}
-
-fn mssql_datetime2_from_arrow_date64(
-    mapping: &SchemaMapping,
-    row_index: usize,
-    milliseconds_from_unix_epoch: i64,
-) -> Result<MssqlDateTime2> {
-    let days_from_unix_epoch = milliseconds_from_unix_epoch.div_euclid(MILLISECONDS_PER_DAY);
-    let milliseconds_since_midnight = milliseconds_from_unix_epoch.rem_euclid(MILLISECONDS_PER_DAY);
-    let days = days_from_unix_epoch + SQL_SERVER_DATE_UNIX_EPOCH_DAYS;
-
-    if !(0..=SQL_SERVER_DATE_MAX_DAYS).contains(&days) {
-        return Err(value_conversion_error(row_mapping_diagnostic(
-            mapping,
-            row_index,
-            DiagnosticCode::TimestampOutOfRange,
-            format!(
-                "Arrow Date64 millisecond value {milliseconds_from_unix_epoch} is outside SQL Server datetime2 range"
-            ),
-        )));
-    }
-
-    Ok(MssqlDateTime2::new(
-        MssqlDate::new(days as u32),
-        MssqlTime::new(
-            milliseconds_since_midnight as u64,
-            SQL_SERVER_DATETIME2_DATE64_SCALE,
-        ),
-    ))
 }
 
 fn nanoseconds_to_100ns_ticks(
@@ -799,143 +772,11 @@ mod tests {
         timezone_resolution_from_metadata,
     };
     use crate::{
-        ArrowFieldRef, Date64Policy, DiagnosticCode, Identifier, MssqlColumn, MssqlProfile,
-        MssqlType, NanosecondPolicy, PlanOptions, SchemaMapping, TimezonePolicy,
+        DiagnosticCode, MssqlProfile, NanosecondPolicy, PlanOptions, SchemaMapping, TimezonePolicy,
         arrow::cell::ArrowCell,
         mssql::cell::from_arrow::{ArrowToMssqlRuntimeMapping, mssql_cell_from_arrow_cell},
         plan_arrow_schema_to_mssql_mappings,
     };
-
-    #[test]
-    fn converts_date64_cells_to_mssql_datetime2_with_boundaries_and_null() {
-        let mappings = mappings_for_schema_with_options(
-            Schema::new(vec![Field::new("date_value", DataType::Date64, true)]),
-            PlanOptions {
-                date64_policy: Date64Policy::TimestampDateTime2,
-                ..PlanOptions::default()
-            },
-        );
-        let cases = [
-            (
-                0,
-                ArrowCell::Date64(0),
-                MssqlCell::DateTime2(Some(MssqlDateTime2::new(
-                    MssqlDate::new(719_162),
-                    MssqlTime::new(0, 3),
-                ))),
-            ),
-            (
-                1,
-                ArrowCell::Date64(-1),
-                MssqlCell::DateTime2(Some(MssqlDateTime2::new(
-                    MssqlDate::new(719_161),
-                    MssqlTime::new(86_399_999, 3),
-                ))),
-            ),
-            (
-                2,
-                ArrowCell::Date64(86_400_123),
-                MssqlCell::DateTime2(Some(MssqlDateTime2::new(
-                    MssqlDate::new(719_163),
-                    MssqlTime::new(123, 3),
-                ))),
-            ),
-            (
-                3,
-                ArrowCell::Date64(-62_135_596_800_000),
-                MssqlCell::DateTime2(Some(MssqlDateTime2::new(
-                    MssqlDate::new(0),
-                    MssqlTime::new(0, 3),
-                ))),
-            ),
-            (
-                4,
-                ArrowCell::Date64(253_402_300_799_999),
-                MssqlCell::DateTime2(Some(MssqlDateTime2::new(
-                    MssqlDate::new(3_652_058),
-                    MssqlTime::new(86_399_999, 3),
-                ))),
-            ),
-            (5, ArrowCell::Null, MssqlCell::DateTime2(None)),
-        ];
-
-        for (row_index, cell, expected) in cases {
-            assert_eq!(
-                convert_cell(&mappings[0], cell, row_index).unwrap(),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_date64_null_in_non_nullable_column() {
-        let mappings = mappings_for_schema_with_options(
-            Schema::new(vec![Field::new("date_value", DataType::Date64, false)]),
-            PlanOptions {
-                date64_policy: Date64Policy::TimestampDateTime2,
-                ..PlanOptions::default()
-            },
-        );
-
-        let err = convert_cell(&mappings[0], ArrowCell::Null, 0).unwrap_err();
-
-        assert_single_diagnostic(
-            err,
-            DiagnosticCode::NullInNonNullableColumn,
-            Some(0),
-            Some((0, "date_value")),
-        );
-    }
-
-    #[test]
-    fn rejects_date64_values_outside_sql_server_datetime2_range() {
-        let mappings = mappings_for_schema_with_options(
-            Schema::new(vec![Field::new("date_value", DataType::Date64, false)]),
-            PlanOptions {
-                date64_policy: Date64Policy::TimestampDateTime2,
-                ..PlanOptions::default()
-            },
-        );
-
-        let below =
-            convert_cell(&mappings[0], ArrowCell::Date64(-62_135_596_800_001), 0).unwrap_err();
-        assert_single_diagnostic(
-            below,
-            DiagnosticCode::TimestampOutOfRange,
-            Some(0),
-            Some((0, "date_value")),
-        );
-
-        let above =
-            convert_cell(&mappings[0], ArrowCell::Date64(253_402_300_800_000), 1).unwrap_err();
-        assert_single_diagnostic(
-            above,
-            DiagnosticCode::TimestampOutOfRange,
-            Some(1),
-            Some((0, "date_value")),
-        );
-    }
-
-    #[test]
-    fn rejects_forged_date64_mapping_with_unsupported_datetime2_precision() {
-        let mapping = SchemaMapping::new(
-            ArrowFieldRef::new(0, "date_value".to_owned(), false, DataType::Date64),
-            MssqlColumn::new(
-                Identifier::new("date_value").unwrap(),
-                MssqlType::DateTime2 { precision: 7 },
-                false,
-            ),
-        );
-
-        let err = convert_cell(&mapping, ArrowCell::Date64(0), 0).unwrap_err();
-
-        assert_single_diagnostic(
-            err,
-            DiagnosticCode::ValueTypeMismatch,
-            Some(0),
-            Some((0, "date_value")),
-        );
-    }
 
     #[test]
     fn converts_timezone_free_timestamp_cells_to_datetime2_7_with_boundaries_and_nulls() {
