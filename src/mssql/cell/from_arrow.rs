@@ -1446,12 +1446,13 @@ fn value_conversion_error(diagnostic: Diagnostic) -> crate::Error {
 mod tests {
     use std::sync::Arc;
 
+    use arrow_buffer::i256;
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
-    use super::{ArrowToMssqlRuntimeMapping, MssqlCell, mssql_cell_from_arrow_cell};
+    use super::{ArrowToMssqlRuntimeMapping, MssqlCell, MssqlDecimal, mssql_cell_from_arrow_cell};
     use crate::{
-        DiagnosticCode, MssqlProfile, MssqlType, NanosecondPolicy, PlanOptions, SchemaMapping,
-        arrow::cell::ArrowCell, plan_arrow_schema_to_mssql_mappings,
+        DecimalPolicy, DiagnosticCode, MssqlProfile, MssqlType, NanosecondPolicy, PlanOptions,
+        SchemaMapping, UInt64Policy, arrow::cell::ArrowCell, plan_arrow_schema_to_mssql_mappings,
     };
 
     #[test]
@@ -1676,6 +1677,381 @@ mod tests {
             DiagnosticCode::ValueTooLong,
             Some(2),
             Some((0, "bytes")),
+        );
+    }
+
+    #[test]
+    fn converts_uint64_decimal20_0_boundary_values() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "unsigned_as_decimal",
+                DataType::UInt64,
+                true,
+            )]),
+            PlanOptions {
+                uint64_policy: UInt64Policy::Decimal20_0,
+                ..PlanOptions::default()
+            },
+        );
+
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::UInt64(0), 0).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(0, 0)))
+        );
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::UInt64(i64::MAX as u64), 1).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(i128::from(i64::MAX), 0)))
+        );
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::UInt64((i64::MAX as u64) + 1), 2).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(i128::from(i64::MAX) + 1, 0)))
+        );
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::UInt64(u64::MAX), 3).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(i128::from(u64::MAX), 0)))
+        );
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::Null, 4).unwrap(),
+            MssqlCell::Decimal(None)
+        );
+    }
+
+    #[test]
+    fn converts_decimal32_64_128_cells_with_sign_zero_scale_and_null() {
+        let mappings = mappings_for_schema(Schema::new(vec![
+            Field::new("decimal32", DataType::Decimal32(9, 2), true),
+            Field::new("decimal64", DataType::Decimal64(18, 4), true),
+            Field::new("decimal128", DataType::Decimal128(38, 9), true),
+        ]));
+
+        let cases = [
+            (
+                0,
+                ArrowCell::Decimal32(12_345),
+                MssqlCell::Decimal(Some(MssqlDecimal::new(12_345, 2))),
+            ),
+            (
+                0,
+                ArrowCell::Decimal32(-12_345),
+                MssqlCell::Decimal(Some(MssqlDecimal::new(-12_345, 2))),
+            ),
+            (
+                0,
+                ArrowCell::Decimal32(0),
+                MssqlCell::Decimal(Some(MssqlDecimal::new(0, 2))),
+            ),
+            (
+                1,
+                ArrowCell::Decimal64(1_234_567_890),
+                MssqlCell::Decimal(Some(MssqlDecimal::new(1_234_567_890, 4))),
+            ),
+            (
+                1,
+                ArrowCell::Decimal64(-1_234_567_890),
+                MssqlCell::Decimal(Some(MssqlDecimal::new(-1_234_567_890, 4))),
+            ),
+            (
+                1,
+                ArrowCell::Decimal64(0),
+                MssqlCell::Decimal(Some(MssqlDecimal::new(0, 4))),
+            ),
+            (
+                2,
+                ArrowCell::Decimal128(123_456_789_012_345_678_901_234_567_890),
+                MssqlCell::Decimal(Some(MssqlDecimal::new(
+                    123_456_789_012_345_678_901_234_567_890,
+                    9,
+                ))),
+            ),
+            (
+                2,
+                ArrowCell::Decimal128(-123_456_789_012_345_678_901_234_567_890),
+                MssqlCell::Decimal(Some(MssqlDecimal::new(
+                    -123_456_789_012_345_678_901_234_567_890,
+                    9,
+                ))),
+            ),
+            (
+                2,
+                ArrowCell::Decimal128(0),
+                MssqlCell::Decimal(Some(MssqlDecimal::new(0, 9))),
+            ),
+        ];
+
+        for (index, cell, expected) in cases {
+            assert_eq!(convert_cell(&mappings[index], cell, 0).unwrap(), expected);
+        }
+
+        for mapping in mappings.iter().take(3) {
+            assert_eq!(
+                convert_cell(mapping, ArrowCell::Null, 3).unwrap(),
+                MssqlCell::Decimal(None)
+            );
+        }
+    }
+
+    #[test]
+    fn normalizes_negative_decimal_scale_at_runtime() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal128(3, -2),
+                true,
+            )]),
+            PlanOptions {
+                decimal_policy: DecimalPolicy::NormalizeNegativeScale,
+                ..PlanOptions::default()
+            },
+        );
+
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::Decimal128(123), 0).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(12_300, 0)))
+        );
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::Decimal128(-123), 1).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(-12_300, 0)))
+        );
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::Decimal128(0), 2).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(0, 0)))
+        );
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::Null, 3).unwrap(),
+            MssqlCell::Decimal(None)
+        );
+    }
+
+    #[test]
+    fn rejects_negative_decimal_scale_normalization_overflow() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal128(37, -1),
+                false,
+            )]),
+            PlanOptions {
+                decimal_policy: DecimalPolicy::NormalizeNegativeScale,
+                ..PlanOptions::default()
+            },
+        );
+
+        let err = convert_cell(&mappings[0], ArrowCell::Decimal128(i128::MAX), 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::DecimalOutOfRange,
+            Some(0),
+            Some((0, "amount")),
+        );
+    }
+
+    #[test]
+    fn rejects_decimal_scale_that_tiberius_numeric_cannot_represent() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(38, 38),
+            true,
+        )]));
+
+        let err = convert_cell(&mappings[0], ArrowCell::Decimal128(1), 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::DecimalOutOfRange,
+            Some(0),
+            Some((0, "amount")),
+        );
+    }
+
+    #[test]
+    fn accepts_decimal_values_at_planned_precision_boundaries() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(5, 2),
+            false,
+        )]));
+
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::Decimal128(99_999), 0).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(99_999, 2)))
+        );
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::Decimal128(-99_999), 1).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(-99_999, 2)))
+        );
+    }
+
+    #[test]
+    fn rejects_decimal_values_outside_planned_precision() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(5, 2),
+            false,
+        )]));
+
+        let positive = convert_cell(&mappings[0], ArrowCell::Decimal128(100_000), 0).unwrap_err();
+        assert_single_diagnostic(
+            positive,
+            DiagnosticCode::DecimalOutOfRange,
+            Some(0),
+            Some((0, "amount")),
+        );
+
+        let negative = convert_cell(&mappings[0], ArrowCell::Decimal128(-100_000), 1).unwrap_err();
+        assert_single_diagnostic(
+            negative,
+            DiagnosticCode::DecimalOutOfRange,
+            Some(1),
+            Some((0, "amount")),
+        );
+    }
+
+    #[test]
+    fn converts_uint64_checked_bigint_boundary_values() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "unsigned_as_bigint",
+                DataType::UInt64,
+                true,
+            )]),
+            PlanOptions {
+                uint64_policy: UInt64Policy::CheckedBigInt,
+                ..PlanOptions::default()
+            },
+        );
+
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::UInt64(0), 0).unwrap(),
+            MssqlCell::BigInt(Some(0))
+        );
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::UInt64(i64::MAX as u64), 1).unwrap(),
+            MssqlCell::BigInt(Some(i64::MAX))
+        );
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::Null, 2).unwrap(),
+            MssqlCell::BigInt(None)
+        );
+    }
+
+    #[test]
+    fn rejects_uint64_checked_bigint_overflow_without_wrapping() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "unsigned_as_bigint",
+                DataType::UInt64,
+                false,
+            )]),
+            PlanOptions {
+                uint64_policy: UInt64Policy::CheckedBigInt,
+                ..PlanOptions::default()
+            },
+        );
+
+        let just_over =
+            convert_cell(&mappings[0], ArrowCell::UInt64((i64::MAX as u64) + 1), 0).unwrap_err();
+        assert_single_diagnostic(
+            just_over,
+            DiagnosticCode::IntegerOutOfRange,
+            Some(0),
+            Some((0, "unsigned_as_bigint")),
+        );
+
+        let max = convert_cell(&mappings[0], ArrowCell::UInt64(u64::MAX), 1).unwrap_err();
+        assert_single_diagnostic(
+            max,
+            DiagnosticCode::IntegerOutOfRange,
+            Some(1),
+            Some((0, "unsigned_as_bigint")),
+        );
+    }
+
+    #[test]
+    fn converts_decimal256_checked_downcast_values() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal256(38, 4),
+            true,
+        )]));
+
+        assert_eq!(
+            convert_cell(
+                &mappings[0],
+                ArrowCell::Decimal256(i256::from_i128(123_456_789_012_345_678_901_234_567_890)),
+                0,
+            )
+            .unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(
+                123_456_789_012_345_678_901_234_567_890,
+                4,
+            )))
+        );
+        assert_eq!(
+            convert_cell(
+                &mappings[0],
+                ArrowCell::Decimal256(i256::from_i128(-123_456_789_012_345_678_901_234_567_890)),
+                1,
+            )
+            .unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(
+                -123_456_789_012_345_678_901_234_567_890,
+                4,
+            )))
+        );
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::Decimal256(i256::ZERO), 2).unwrap(),
+            MssqlCell::Decimal(Some(MssqlDecimal::new(0, 4)))
+        );
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::Null, 3).unwrap(),
+            MssqlCell::Decimal(None)
+        );
+    }
+
+    #[test]
+    fn rejects_decimal256_values_that_do_not_fit_i128_runtime_representation() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal256(38, 0),
+            false,
+        )]));
+
+        let err = convert_cell(
+            &mappings[0],
+            ArrowCell::Decimal256(i256::from_i128(i128::MAX) + i256::ONE),
+            0,
+        )
+        .unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::DecimalOutOfRange,
+            Some(0),
+            Some((0, "amount")),
+        );
+    }
+
+    #[test]
+    fn rejects_decimal256_checked_downcast_values_outside_planned_precision() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal256(5, 2),
+            false,
+        )]));
+
+        let err = convert_cell(
+            &mappings[0],
+            ArrowCell::Decimal256(i256::from_i128(100_000)),
+            0,
+        )
+        .unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::DecimalOutOfRange,
+            Some(0),
+            Some((0, "amount")),
         );
     }
 
