@@ -1449,10 +1449,14 @@ mod tests {
     use arrow_buffer::i256;
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
-    use super::{ArrowToMssqlRuntimeMapping, MssqlCell, MssqlDecimal, mssql_cell_from_arrow_cell};
+    use super::{
+        ArrowToMssqlRuntimeMapping, MssqlCell, MssqlDate, MssqlDateTime2, MssqlDecimal, MssqlTime,
+        mssql_cell_from_arrow_cell,
+    };
     use crate::{
-        DecimalPolicy, DiagnosticCode, MssqlProfile, MssqlType, NanosecondPolicy, PlanOptions,
-        SchemaMapping, UInt64Policy, arrow::cell::ArrowCell, plan_arrow_schema_to_mssql_mappings,
+        ArrowFieldRef, Date64Policy, DecimalPolicy, DiagnosticCode, Identifier, MssqlColumn,
+        MssqlProfile, MssqlType, NanosecondPolicy, PlanOptions, SchemaMapping, UInt64Policy,
+        arrow::cell::ArrowCell, plan_arrow_schema_to_mssql_mappings,
     };
 
     #[test]
@@ -2052,6 +2056,224 @@ mod tests {
             DiagnosticCode::DecimalOutOfRange,
             Some(0),
             Some((0, "amount")),
+        );
+    }
+
+    #[test]
+    fn converts_date32_cells_to_mssql_date_with_boundaries_and_null() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "date_value",
+            DataType::Date32,
+            true,
+        )]));
+        let cases = [
+            (
+                0,
+                ArrowCell::Date32(0),
+                MssqlCell::Date(Some(MssqlDate::new(719_162))),
+            ),
+            (
+                1,
+                ArrowCell::Date32(-1),
+                MssqlCell::Date(Some(MssqlDate::new(719_161))),
+            ),
+            (
+                2,
+                ArrowCell::Date32(1),
+                MssqlCell::Date(Some(MssqlDate::new(719_163))),
+            ),
+            (
+                3,
+                ArrowCell::Date32(-719_162),
+                MssqlCell::Date(Some(MssqlDate::new(0))),
+            ),
+            (
+                4,
+                ArrowCell::Date32(2_932_896),
+                MssqlCell::Date(Some(MssqlDate::new(3_652_058))),
+            ),
+            (5, ArrowCell::Null, MssqlCell::Date(None)),
+        ];
+
+        for (row_index, cell, expected) in cases {
+            assert_eq!(
+                convert_cell(&mappings[0], cell, row_index).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_date32_null_in_non_nullable_column() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "date_value",
+            DataType::Date32,
+            false,
+        )]));
+
+        let err = convert_cell(&mappings[0], ArrowCell::Null, 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::NullInNonNullableColumn,
+            Some(0),
+            Some((0, "date_value")),
+        );
+    }
+
+    #[test]
+    fn rejects_date32_values_outside_sql_server_date_range() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "date_value",
+            DataType::Date32,
+            false,
+        )]));
+
+        let below = convert_cell(&mappings[0], ArrowCell::Date32(-719_163), 0).unwrap_err();
+        assert_single_diagnostic(
+            below,
+            DiagnosticCode::TimestampOutOfRange,
+            Some(0),
+            Some((0, "date_value")),
+        );
+
+        let above = convert_cell(&mappings[0], ArrowCell::Date32(2_932_897), 1).unwrap_err();
+        assert_single_diagnostic(
+            above,
+            DiagnosticCode::TimestampOutOfRange,
+            Some(1),
+            Some((0, "date_value")),
+        );
+    }
+
+    #[test]
+    fn converts_date64_cells_to_mssql_datetime2_with_boundaries_and_null() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new("date_value", DataType::Date64, true)]),
+            PlanOptions {
+                date64_policy: Date64Policy::TimestampDateTime2,
+                ..PlanOptions::default()
+            },
+        );
+        let cases = [
+            (
+                0,
+                ArrowCell::Date64(0),
+                MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                    MssqlDate::new(719_162),
+                    MssqlTime::new(0, 3),
+                ))),
+            ),
+            (
+                1,
+                ArrowCell::Date64(-1),
+                MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                    MssqlDate::new(719_161),
+                    MssqlTime::new(86_399_999, 3),
+                ))),
+            ),
+            (
+                2,
+                ArrowCell::Date64(86_400_123),
+                MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                    MssqlDate::new(719_163),
+                    MssqlTime::new(123, 3),
+                ))),
+            ),
+            (
+                3,
+                ArrowCell::Date64(-62_135_596_800_000),
+                MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                    MssqlDate::new(0),
+                    MssqlTime::new(0, 3),
+                ))),
+            ),
+            (
+                4,
+                ArrowCell::Date64(253_402_300_799_999),
+                MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                    MssqlDate::new(3_652_058),
+                    MssqlTime::new(86_399_999, 3),
+                ))),
+            ),
+            (5, ArrowCell::Null, MssqlCell::DateTime2(None)),
+        ];
+
+        for (row_index, cell, expected) in cases {
+            assert_eq!(
+                convert_cell(&mappings[0], cell, row_index).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_date64_null_in_non_nullable_column() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new("date_value", DataType::Date64, false)]),
+            PlanOptions {
+                date64_policy: Date64Policy::TimestampDateTime2,
+                ..PlanOptions::default()
+            },
+        );
+
+        let err = convert_cell(&mappings[0], ArrowCell::Null, 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::NullInNonNullableColumn,
+            Some(0),
+            Some((0, "date_value")),
+        );
+    }
+
+    #[test]
+    fn rejects_date64_values_outside_sql_server_datetime2_range() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new("date_value", DataType::Date64, false)]),
+            PlanOptions {
+                date64_policy: Date64Policy::TimestampDateTime2,
+                ..PlanOptions::default()
+            },
+        );
+
+        let below =
+            convert_cell(&mappings[0], ArrowCell::Date64(-62_135_596_800_001), 0).unwrap_err();
+        assert_single_diagnostic(
+            below,
+            DiagnosticCode::TimestampOutOfRange,
+            Some(0),
+            Some((0, "date_value")),
+        );
+
+        let above =
+            convert_cell(&mappings[0], ArrowCell::Date64(253_402_300_800_000), 1).unwrap_err();
+        assert_single_diagnostic(
+            above,
+            DiagnosticCode::TimestampOutOfRange,
+            Some(1),
+            Some((0, "date_value")),
+        );
+    }
+
+    #[test]
+    fn rejects_forged_date64_mapping_with_unsupported_datetime2_precision() {
+        let mapping = SchemaMapping::new(
+            ArrowFieldRef::new(0, "date_value".to_owned(), false, DataType::Date64),
+            MssqlColumn::new(
+                Identifier::new("date_value").unwrap(),
+                MssqlType::DateTime2 { precision: 7 },
+                false,
+            ),
+        );
+
+        let err = convert_cell(&mapping, ArrowCell::Date64(0), 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::ValueTypeMismatch,
+            Some(0),
+            Some((0, "date_value")),
         );
     }
 
