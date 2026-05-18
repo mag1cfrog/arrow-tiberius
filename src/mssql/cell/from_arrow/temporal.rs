@@ -1,5 +1,7 @@
 //! Temporal Arrow-to-MSSQL runtime cell conversion.
 
+mod date;
+
 use arrow_array::timezone::Tz;
 use arrow_schema::{DataType, TimeUnit};
 use chrono::{Offset, TimeZone};
@@ -13,6 +15,7 @@ use super::{
     value_conversion_error,
 };
 use crate::mssql::cell::{MssqlCell, MssqlDate, MssqlDateTime2, MssqlDateTimeOffset, MssqlTime};
+pub(super) use date::mssql_date_value;
 
 const SQL_SERVER_DATE_UNIX_EPOCH_DAYS: i64 = 719_162;
 const SQL_SERVER_DATE_MAX_DAYS: i64 = 3_652_058;
@@ -26,24 +29,6 @@ const TICKS_100NS_PER_DAY: i128 = 864_000_000_000;
 const NANOSECONDS_PER_100NS_TICK: i64 = 100;
 /// SQL Server accepts datetimeoffset offsets from -14:00 through +14:00.
 const SQL_SERVER_DATETIMEOFFSET_MAX_OFFSET_MINUTES: i16 = 14 * 60;
-
-pub(super) fn mssql_date_value(
-    mapping: &SchemaMapping,
-    row_index: usize,
-    cell: ArrowCell<'_>,
-) -> Result<MssqlDate> {
-    match (cell, mapping.arrow().data_type()) {
-        (ArrowCell::Date32(value), DataType::Date32) => {
-            mssql_date_from_arrow_date32(mapping, row_index, value)
-        }
-        other => Err(value_conversion_error(row_mapping_diagnostic(
-            mapping,
-            row_index,
-            DiagnosticCode::ValueTypeMismatch,
-            format!("expected Arrow Date32 payload, got {other:?}"),
-        ))),
-    }
-}
 
 pub(super) fn mssql_datetime2_value(
     runtime_mapping: ArrowToMssqlRuntimeMapping<'_>,
@@ -310,25 +295,6 @@ fn validate_null_timestamp_timezone_metadata(
     }
 
     Ok(())
-}
-
-fn mssql_date_from_arrow_date32(
-    mapping: &SchemaMapping,
-    row_index: usize,
-    days_from_unix_epoch: i32,
-) -> Result<MssqlDate> {
-    let days = i64::from(days_from_unix_epoch) + SQL_SERVER_DATE_UNIX_EPOCH_DAYS;
-
-    if (0..=SQL_SERVER_DATE_MAX_DAYS).contains(&days) {
-        return Ok(MssqlDate::new(days as u32));
-    }
-
-    Err(value_conversion_error(row_mapping_diagnostic(
-        mapping,
-        row_index,
-        DiagnosticCode::TimestampOutOfRange,
-        format!("Arrow Date32 day offset {days_from_unix_epoch} is outside SQL Server date range"),
-    )))
 }
 
 fn mssql_datetime2_from_arrow_date64(
@@ -839,93 +805,6 @@ mod tests {
         mssql::cell::from_arrow::{ArrowToMssqlRuntimeMapping, mssql_cell_from_arrow_cell},
         plan_arrow_schema_to_mssql_mappings,
     };
-
-    #[test]
-    fn converts_date32_cells_to_mssql_date_with_boundaries_and_null() {
-        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
-            "date_value",
-            DataType::Date32,
-            true,
-        )]));
-        let cases = [
-            (
-                0,
-                ArrowCell::Date32(0),
-                MssqlCell::Date(Some(MssqlDate::new(719_162))),
-            ),
-            (
-                1,
-                ArrowCell::Date32(-1),
-                MssqlCell::Date(Some(MssqlDate::new(719_161))),
-            ),
-            (
-                2,
-                ArrowCell::Date32(1),
-                MssqlCell::Date(Some(MssqlDate::new(719_163))),
-            ),
-            (
-                3,
-                ArrowCell::Date32(-719_162),
-                MssqlCell::Date(Some(MssqlDate::new(0))),
-            ),
-            (
-                4,
-                ArrowCell::Date32(2_932_896),
-                MssqlCell::Date(Some(MssqlDate::new(3_652_058))),
-            ),
-            (5, ArrowCell::Null, MssqlCell::Date(None)),
-        ];
-
-        for (row_index, cell, expected) in cases {
-            assert_eq!(
-                convert_cell(&mappings[0], cell, row_index).unwrap(),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_date32_null_in_non_nullable_column() {
-        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
-            "date_value",
-            DataType::Date32,
-            false,
-        )]));
-
-        let err = convert_cell(&mappings[0], ArrowCell::Null, 0).unwrap_err();
-
-        assert_single_diagnostic(
-            err,
-            DiagnosticCode::NullInNonNullableColumn,
-            Some(0),
-            Some((0, "date_value")),
-        );
-    }
-
-    #[test]
-    fn rejects_date32_values_outside_sql_server_date_range() {
-        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
-            "date_value",
-            DataType::Date32,
-            false,
-        )]));
-
-        let below = convert_cell(&mappings[0], ArrowCell::Date32(-719_163), 0).unwrap_err();
-        assert_single_diagnostic(
-            below,
-            DiagnosticCode::TimestampOutOfRange,
-            Some(0),
-            Some((0, "date_value")),
-        );
-
-        let above = convert_cell(&mappings[0], ArrowCell::Date32(2_932_897), 1).unwrap_err();
-        assert_single_diagnostic(
-            above,
-            DiagnosticCode::TimestampOutOfRange,
-            Some(1),
-            Some((0, "date_value")),
-        );
-    }
 
     #[test]
     fn converts_date64_cells_to_mssql_datetime2_with_boundaries_and_null() {
