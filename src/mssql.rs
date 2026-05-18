@@ -1,5 +1,7 @@
 //! MSSQL-side schema metadata, identifiers, profile, and DDL helpers.
 
+/// MSSQL runtime cell value model.
+pub(crate) mod cell;
 /// MSSQL column metadata model.
 pub mod column;
 /// Deterministic MSSQL DDL rendering helpers.

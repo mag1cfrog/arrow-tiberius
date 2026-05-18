@@ -2,12 +2,14 @@
 
 use std::borrow::Cow;
 
-use crate::Result;
-
-use super::{
-    cell::{MssqlCell, MssqlDate, MssqlDateTime2, MssqlDateTimeOffset, MssqlDecimal, MssqlTime},
-    record_batch::RecordBatchView,
+use crate::{
+    Result,
+    mssql::cell::{
+        MssqlCell, MssqlDate, MssqlDateTime2, MssqlDateTimeOffset, MssqlDecimal, MssqlTime,
+    },
 };
+
+use super::record_batch::RecordBatchView;
 
 /// Converts one runtime row into an owned Tiberius token row.
 pub(crate) fn tiberius_row_owned(

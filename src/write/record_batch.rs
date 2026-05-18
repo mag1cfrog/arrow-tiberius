@@ -13,11 +13,10 @@ use chrono::{Offset, TimeZone};
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, MssqlType, MssqlTypeLength,
     NanosecondPolicy, PlanOptions, Result, SchemaMapping,
-};
-
-use super::cell::{
-    ArrowCell, ArrowToMssqlRuntimeMapping, MssqlCell, MssqlDate, MssqlDateTime2,
-    MssqlDateTimeOffset, MssqlDecimal, MssqlTime,
+    arrow::cell::ArrowCell,
+    mssql::cell::{
+        MssqlCell, MssqlDate, MssqlDateTime2, MssqlDateTimeOffset, MssqlDecimal, MssqlTime,
+    },
 };
 
 const SQL_SERVER_DATE_UNIX_EPOCH_DAYS: i64 = 719_162;
@@ -32,6 +31,33 @@ const TICKS_100NS_PER_DAY: i128 = 864_000_000_000;
 const NANOSECONDS_PER_100NS_TICK: i64 = 100;
 /// SQL Server accepts datetimeoffset offsets from -14:00 through +14:00.
 const SQL_SERVER_DATETIMEOFFSET_MAX_OFFSET_MINUTES: i16 = 14 * 60;
+
+/// Direction-specific runtime context for Arrow-to-MSSQL value conversion.
+#[derive(Debug, Clone, Copy)]
+struct ArrowToMssqlRuntimeMapping<'a> {
+    mapping: &'a SchemaMapping,
+    nanosecond_policy: NanosecondPolicy,
+}
+
+impl<'a> ArrowToMssqlRuntimeMapping<'a> {
+    /// Creates runtime conversion context from structural mapping and write options.
+    const fn new(mapping: &'a SchemaMapping, options: &PlanOptions) -> Self {
+        Self {
+            mapping,
+            nanosecond_policy: options.nanosecond_policy,
+        }
+    }
+
+    /// Returns the structural Arrow/MSSQL mapping.
+    const fn mapping(self) -> &'a SchemaMapping {
+        self.mapping
+    }
+
+    /// Returns the nanosecond timestamp policy selected for write conversion.
+    const fn nanosecond_policy(self) -> NanosecondPolicy {
+        self.nanosecond_policy
+    }
+}
 
 /// Borrowed conversion view over one Arrow record batch and schema mappings.
 #[derive(Debug)]
