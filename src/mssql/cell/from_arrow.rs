@@ -1451,12 +1451,12 @@ mod tests {
 
     use super::{
         ArrowToMssqlRuntimeMapping, MssqlCell, MssqlDate, MssqlDateTime2, MssqlDecimal, MssqlTime,
-        mssql_cell_from_arrow_cell,
+        mssql_cell_from_arrow_cell, timezone_resolution_from_metadata,
     };
     use crate::{
         ArrowFieldRef, Date64Policy, DecimalPolicy, DiagnosticCode, Identifier, MssqlColumn,
-        MssqlProfile, MssqlType, NanosecondPolicy, PlanOptions, SchemaMapping, UInt64Policy,
-        arrow::cell::ArrowCell, plan_arrow_schema_to_mssql_mappings,
+        MssqlProfile, MssqlType, NanosecondPolicy, PlanOptions, SchemaMapping, TimezonePolicy,
+        UInt64Policy, arrow::cell::ArrowCell, plan_arrow_schema_to_mssql_mappings,
     };
 
     #[test]
@@ -2277,6 +2277,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolves_fixed_timezone_offsets_for_datetimeoffset() {
+        let mapping = timezone_timestamp_mapping("+00:00", TimezonePolicy::DateTimeOffset);
+
+        for (timezone, expected_minutes) in [
+            ("UTC", 0),
+            ("+00:00", 0),
+            ("-00:00", 0),
+            ("+02:30", 150),
+            ("+0230", 150),
+            ("-07", -420),
+            ("-07:45", -465),
+            ("+14:00", 840),
+            ("-14:00", -840),
+        ] {
+            let resolution = timezone_resolution_from_metadata(&mapping, 7, timezone).unwrap();
+
+            assert_eq!(
+                resolution.offset_for_instant(&mapping, 7, 0, 0).unwrap(),
+                expected_minutes
+            );
+            assert_eq!(
+                resolution
+                    .offset_for_instant(&mapping, 7, 1_750_594_400, 0)
+                    .unwrap(),
+                expected_minutes
+            );
+        }
+    }
+
+    #[test]
+    fn resolves_named_timezone_offsets_for_each_instant() {
+        let mapping =
+            timezone_timestamp_mapping("America/New_York", TimezonePolicy::DateTimeOffset);
+        let resolution =
+            timezone_resolution_from_metadata(&mapping, 0, "America/New_York").unwrap();
+
+        let winter_epoch = 1_738_411_200;
+        let summer_epoch = 1_750_594_400;
+
+        assert_eq!(
+            resolution
+                .offset_for_instant(&mapping, 0, winter_epoch, 0)
+                .unwrap(),
+            -300
+        );
+        assert_eq!(
+            resolution
+                .offset_for_instant(&mapping, 1, summer_epoch, 0)
+                .unwrap(),
+            -240
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_timezone_names_and_unrepresentable_offsets() {
+        let mapping = timezone_timestamp_mapping("+00:00", TimezonePolicy::DateTimeOffset);
+
+        for timezone in ["", " ", "Foobar", "+1:00", "+ab:cd", "+02:3x", "+12:60"] {
+            let err = timezone_resolution_from_metadata(&mapping, 7, timezone).unwrap_err();
+            assert_single_diagnostic(
+                err,
+                DiagnosticCode::TimezoneUnsupported,
+                Some(7),
+                Some((0, "ts")),
+            );
+        }
+
+        let err = timezone_resolution_from_metadata(&mapping, 7, "+14:01").unwrap_err();
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::TimezoneUnsupported,
+            Some(7),
+            Some((0, "ts")),
+        );
+    }
+
     fn convert_cell<'a>(
         mapping: &SchemaMapping,
         cell: ArrowCell<'a>,
@@ -2303,6 +2380,24 @@ mod tests {
         .unwrap()
         .into_parts()
         .0
+    }
+
+    fn timezone_timestamp_mapping(
+        timezone: &str,
+        timezone_policy: TimezonePolicy,
+    ) -> SchemaMapping {
+        mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Second, Some(timezone.into())),
+                true,
+            )]),
+            PlanOptions {
+                timezone_policy,
+                ..PlanOptions::default()
+            },
+        )
+        .remove(0)
     }
 
     fn assert_single_diagnostic(

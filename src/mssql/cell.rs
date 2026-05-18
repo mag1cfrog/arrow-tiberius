@@ -171,3 +171,17 @@ impl MssqlTime {
         self.scale
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{MssqlDate, MssqlDateTime2, MssqlDateTimeOffset, MssqlTime};
+
+    #[test]
+    fn datetimeoffset_exposes_datetime_and_offset_components() {
+        let datetime2 = MssqlDateTime2::new(MssqlDate::new(719_163), MssqlTime::new(1, 7));
+        let datetimeoffset = MssqlDateTimeOffset::new(datetime2, -840);
+
+        assert_eq!(datetimeoffset.datetime2(), datetime2);
+        assert_eq!(datetimeoffset.offset_minutes(), -840);
+    }
+}
