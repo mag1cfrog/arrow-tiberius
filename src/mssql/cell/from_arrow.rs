@@ -1450,8 +1450,8 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
     use super::{
-        ArrowToMssqlRuntimeMapping, MssqlCell, MssqlDate, MssqlDateTime2, MssqlDecimal, MssqlTime,
-        mssql_cell_from_arrow_cell, timezone_resolution_from_metadata,
+        ArrowToMssqlRuntimeMapping, MssqlCell, MssqlDate, MssqlDateTime2, MssqlDateTimeOffset,
+        MssqlDecimal, MssqlTime, mssql_cell_from_arrow_cell, timezone_resolution_from_metadata,
     };
     use crate::{
         ArrowFieldRef, Date64Policy, DecimalPolicy, DiagnosticCode, Identifier, MssqlColumn,
@@ -1568,6 +1568,157 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn preserves_integer_boundaries_during_widening() {
+        let mappings = mappings_for_schema(Schema::new(vec![
+            Field::new("tiny", DataType::Int8, false),
+            Field::new("small", DataType::Int16, false),
+            Field::new("unsigned_tiny", DataType::UInt8, false),
+            Field::new("unsigned_medium", DataType::UInt16, false),
+            Field::new("unsigned_large", DataType::UInt32, false),
+        ]));
+        let cases = [
+            (
+                0,
+                ArrowCell::Int8(i8::MIN),
+                MssqlCell::SmallInt(Some(i16::from(i8::MIN))),
+            ),
+            (
+                0,
+                ArrowCell::Int8(i8::MAX),
+                MssqlCell::SmallInt(Some(i16::from(i8::MAX))),
+            ),
+            (
+                1,
+                ArrowCell::Int16(i16::MIN),
+                MssqlCell::SmallInt(Some(i16::MIN)),
+            ),
+            (
+                1,
+                ArrowCell::Int16(i16::MAX),
+                MssqlCell::SmallInt(Some(i16::MAX)),
+            ),
+            (
+                2,
+                ArrowCell::UInt8(u8::MIN),
+                MssqlCell::TinyInt(Some(u8::MIN)),
+            ),
+            (
+                2,
+                ArrowCell::UInt8(u8::MAX),
+                MssqlCell::TinyInt(Some(u8::MAX)),
+            ),
+            (
+                3,
+                ArrowCell::UInt16(u16::MIN),
+                MssqlCell::Int(Some(i32::from(u16::MIN))),
+            ),
+            (
+                3,
+                ArrowCell::UInt16(u16::MAX),
+                MssqlCell::Int(Some(i32::from(u16::MAX))),
+            ),
+            (
+                4,
+                ArrowCell::UInt32(u32::MIN),
+                MssqlCell::BigInt(Some(i64::from(u32::MIN))),
+            ),
+            (
+                4,
+                ArrowCell::UInt32(u32::MAX),
+                MssqlCell::BigInt(Some(i64::from(u32::MAX))),
+            ),
+        ];
+
+        for (mapping_index, cell, expected) in cases {
+            assert_eq!(
+                convert_cell(&mappings[mapping_index], cell, mapping_index).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_null_in_non_nullable_planned_column() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "active",
+            DataType::Boolean,
+            false,
+        )]));
+
+        let err = convert_cell(&mappings[0], ArrowCell::Null, 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::NullInNonNullableColumn,
+            Some(0),
+            Some((0, "active")),
+        );
+    }
+
+    #[test]
+    fn rejects_non_finite_float32_values() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "ratio",
+            DataType::Float32,
+            true,
+        )]));
+
+        for (row_index, value) in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY]
+            .into_iter()
+            .enumerate()
+        {
+            let err = convert_cell(&mappings[0], ArrowCell::Float32(value), row_index).unwrap_err();
+
+            assert_single_diagnostic(
+                err,
+                DiagnosticCode::NonFiniteFloat,
+                Some(row_index),
+                Some((0, "ratio")),
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_finite_float64_values() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "ratio",
+            DataType::Float64,
+            true,
+        )]));
+
+        for (row_index, value) in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY]
+            .into_iter()
+            .enumerate()
+        {
+            let err = convert_cell(&mappings[0], ArrowCell::Float64(value), row_index).unwrap_err();
+
+            assert_single_diagnostic(
+                err,
+                DiagnosticCode::NonFiniteFloat,
+                Some(row_index),
+                Some((0, "ratio")),
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_payload_that_does_not_fit_planned_mssql_type() {
+        let mapping = SchemaMapping::new(
+            ArrowFieldRef::new(0, "id".to_owned(), false, DataType::Int32),
+            MssqlColumn::new(Identifier::new("id").unwrap(), MssqlType::BigInt, false),
+        );
+
+        let err = convert_cell(&mapping, ArrowCell::Int32(7), 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::ValueTypeMismatch,
+            Some(0),
+            Some((0, "id")),
+        );
     }
 
     #[test]
@@ -1863,6 +2014,30 @@ mod tests {
         assert_single_diagnostic(
             err,
             DiagnosticCode::DecimalOutOfRange,
+            Some(0),
+            Some((0, "amount")),
+        );
+    }
+
+    #[test]
+    fn rejects_decimal_mapping_scale_mismatch_before_value_corruption() {
+        let mapping = SchemaMapping::new(
+            ArrowFieldRef::new(0, "amount".to_owned(), false, DataType::Decimal128(5, 2)),
+            MssqlColumn::new(
+                Identifier::new("amount").unwrap(),
+                MssqlType::Decimal {
+                    precision: 5,
+                    scale: 0,
+                },
+                false,
+            ),
+        );
+
+        let err = convert_cell(&mapping, ArrowCell::Decimal128(123), 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::SchemaMismatch,
             Some(0),
             Some((0, "amount")),
         );
@@ -2665,6 +2840,217 @@ mod tests {
             DiagnosticCode::TimestampOutOfRange,
             Some(1),
             Some((0, "ts_s")),
+        );
+    }
+
+    #[test]
+    fn converts_timezone_aware_timestamp_cells_to_datetimeoffset() {
+        let options = PlanOptions {
+            timezone_policy: TimezonePolicy::DateTimeOffset,
+            ..PlanOptions::default()
+        };
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![
+                Field::new(
+                    "fixed_positive",
+                    DataType::Timestamp(TimeUnit::Millisecond, Some("+02:30".into())),
+                    true,
+                ),
+                Field::new(
+                    "fixed_negative",
+                    DataType::Timestamp(TimeUnit::Nanosecond, Some("-07".into())),
+                    true,
+                ),
+                Field::new(
+                    "utc",
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                    true,
+                ),
+            ]),
+            options,
+        );
+
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::TimestampMillisecond(0), 0).unwrap(),
+            MssqlCell::DateTimeOffset(Some(MssqlDateTimeOffset::new(
+                MssqlDateTime2::new(MssqlDate::new(719_162), MssqlTime::new(0, 7)),
+                150,
+            )))
+        );
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::Null, 1).unwrap(),
+            MssqlCell::DateTimeOffset(None)
+        );
+        assert_eq!(
+            convert_cell(&mappings[1], ArrowCell::TimestampNanosecond(0), 0).unwrap(),
+            MssqlCell::DateTimeOffset(Some(MssqlDateTimeOffset::new(
+                MssqlDateTime2::new(MssqlDate::new(719_162), MssqlTime::new(0, 7)),
+                -420,
+            )))
+        );
+        assert_eq!(
+            convert_cell(&mappings[1], ArrowCell::Null, 1).unwrap(),
+            MssqlCell::DateTimeOffset(None)
+        );
+        assert_eq!(
+            convert_cell(&mappings[2], ArrowCell::TimestampMicrosecond(1_234_567), 0).unwrap(),
+            MssqlCell::DateTimeOffset(Some(MssqlDateTimeOffset::new(
+                MssqlDateTime2::new(MssqlDate::new(719_162), MssqlTime::new(12_345_670, 7)),
+                0,
+            )))
+        );
+    }
+
+    #[test]
+    fn resolves_named_timezone_datetimeoffset_per_timestamp_instant() {
+        let options = PlanOptions {
+            timezone_policy: TimezonePolicy::DateTimeOffset,
+            ..PlanOptions::default()
+        };
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "new_york",
+                DataType::Timestamp(TimeUnit::Second, Some("America/New_York".into())),
+                false,
+            )]),
+            options,
+        );
+
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::TimestampSecond(1_738_411_200), 0).unwrap(),
+            MssqlCell::DateTimeOffset(Some(MssqlDateTimeOffset::new(
+                MssqlDateTime2::new(MssqlDate::new(739_282), MssqlTime::new(432_000_000_000, 7)),
+                -300,
+            )))
+        );
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::TimestampSecond(1_750_593_600), 1).unwrap(),
+            MssqlCell::DateTimeOffset(Some(MssqlDateTimeOffset::new(
+                MssqlDateTime2::new(MssqlDate::new(739_423), MssqlTime::new(432_000_000_000, 7)),
+                -240,
+            )))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_timezone_metadata_for_datetimeoffset() {
+        let options = PlanOptions {
+            timezone_policy: TimezonePolicy::DateTimeOffset,
+            ..PlanOptions::default()
+        };
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Second, Some("Foobar".into())),
+                false,
+            )]),
+            options,
+        );
+
+        let err = convert_cell(&mappings[0], ArrowCell::TimestampSecond(0), 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::TimezoneUnsupported,
+            Some(0),
+            Some((0, "ts")),
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_timezone_metadata_for_null_datetimeoffset() {
+        let options = PlanOptions {
+            timezone_policy: TimezonePolicy::DateTimeOffset,
+            ..PlanOptions::default()
+        };
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Second, Some("Foobar".into())),
+                true,
+            )]),
+            options,
+        );
+
+        let err = convert_cell(&mappings[0], ArrowCell::Null, 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::TimezoneUnsupported,
+            Some(0),
+            Some((0, "ts")),
+        );
+    }
+
+    #[test]
+    fn applies_nanosecond_policy_to_datetimeoffset() {
+        let options = PlanOptions {
+            timezone_policy: TimezonePolicy::DateTimeOffset,
+            nanosecond_policy: NanosecondPolicy::RoundTo100ns,
+            ..PlanOptions::default()
+        };
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "ts_ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())),
+                false,
+            )]),
+            options,
+        );
+
+        assert_eq!(
+            convert_cell_with_options(
+                &mappings[0],
+                ArrowCell::TimestampNanosecond(150),
+                0,
+                &options,
+            )
+            .unwrap(),
+            MssqlCell::DateTimeOffset(Some(MssqlDateTimeOffset::new(
+                MssqlDateTime2::new(MssqlDate::new(719_162), MssqlTime::new(2, 7)),
+                0,
+            )))
+        );
+    }
+
+    #[test]
+    fn rejects_datetimeoffset_values_outside_local_sql_server_range_after_offset() {
+        let options = PlanOptions {
+            timezone_policy: TimezonePolicy::DateTimeOffset,
+            ..PlanOptions::default()
+        };
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![
+                Field::new(
+                    "too_early",
+                    DataType::Timestamp(TimeUnit::Second, Some("-14:00".into())),
+                    false,
+                ),
+                Field::new(
+                    "too_late",
+                    DataType::Timestamp(TimeUnit::Second, Some("+14:00".into())),
+                    false,
+                ),
+            ]),
+            options,
+        );
+
+        let below =
+            convert_cell(&mappings[0], ArrowCell::TimestampSecond(-62_135_596_800), 0).unwrap_err();
+        assert_single_diagnostic(
+            below,
+            DiagnosticCode::TimestampOutOfRange,
+            Some(0),
+            Some((0, "too_early")),
+        );
+
+        let above =
+            convert_cell(&mappings[1], ArrowCell::TimestampSecond(253_402_300_799), 0).unwrap_err();
+        assert_single_diagnostic(
+            above,
+            DiagnosticCode::TimestampOutOfRange,
+            Some(0),
+            Some((1, "too_late")),
         );
     }
 
