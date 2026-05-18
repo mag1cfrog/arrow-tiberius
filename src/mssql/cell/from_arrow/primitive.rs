@@ -138,7 +138,7 @@ mod tests {
     use super::super::{ArrowToMssqlRuntimeMapping, mssql_cell_from_arrow_cell};
     use crate::{
         ArrowFieldRef, DiagnosticCode, Identifier, MssqlColumn, MssqlProfile, MssqlType,
-        PlanOptions, SchemaMapping, arrow::cell::ArrowCell, mssql::cell::MssqlCell,
+        PlanOptions, SchemaMapping, UInt64Policy, arrow::cell::ArrowCell, mssql::cell::MssqlCell,
         plan_arrow_schema_to_mssql_mappings,
     };
 
@@ -296,6 +296,66 @@ mod tests {
     }
 
     #[test]
+    fn converts_uint64_checked_bigint_boundary_values() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "unsigned_as_bigint",
+                DataType::UInt64,
+                true,
+            )]),
+            PlanOptions {
+                uint64_policy: UInt64Policy::CheckedBigInt,
+                ..PlanOptions::default()
+            },
+        );
+
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::UInt64(0), 0).unwrap(),
+            MssqlCell::BigInt(Some(0))
+        );
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::UInt64(i64::MAX as u64), 1).unwrap(),
+            MssqlCell::BigInt(Some(i64::MAX))
+        );
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::Null, 2).unwrap(),
+            MssqlCell::BigInt(None)
+        );
+    }
+
+    #[test]
+    fn rejects_uint64_checked_bigint_overflow_without_wrapping() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "unsigned_as_bigint",
+                DataType::UInt64,
+                false,
+            )]),
+            PlanOptions {
+                uint64_policy: UInt64Policy::CheckedBigInt,
+                ..PlanOptions::default()
+            },
+        );
+
+        let just_over =
+            convert_cell(&mappings[0], ArrowCell::UInt64((i64::MAX as u64) + 1), 0).unwrap_err();
+        assert_single_diagnostic(
+            just_over,
+            DiagnosticCode::IntegerOutOfRange,
+            Some(0),
+            Some((0, "unsigned_as_bigint")),
+        );
+
+        let max = convert_cell(&mappings[0], ArrowCell::UInt64(u64::MAX), 1).unwrap_err();
+        assert_single_diagnostic(
+            max,
+            DiagnosticCode::IntegerOutOfRange,
+            Some(1),
+            Some((0, "unsigned_as_bigint")),
+        );
+    }
+
+    #[test]
     fn rejects_null_in_non_nullable_planned_column() {
         let mappings = mappings_for_schema(Schema::new(vec![Field::new(
             "active",
@@ -381,16 +441,31 @@ mod tests {
         cell: ArrowCell<'a>,
         row_index: usize,
     ) -> crate::Result<MssqlCell<'a>> {
-        let options = PlanOptions::default();
-        let runtime_mapping = ArrowToMssqlRuntimeMapping::new(mapping, &options);
+        convert_cell_with_options(mapping, cell, row_index, &PlanOptions::default())
+    }
+
+    fn convert_cell_with_options<'a>(
+        mapping: &SchemaMapping,
+        cell: ArrowCell<'a>,
+        row_index: usize,
+        options: &PlanOptions,
+    ) -> crate::Result<MssqlCell<'a>> {
+        let runtime_mapping = ArrowToMssqlRuntimeMapping::new(mapping, options);
         mssql_cell_from_arrow_cell(runtime_mapping, cell, row_index)
     }
 
     fn mappings_for_schema(schema: Schema) -> Vec<SchemaMapping> {
+        mappings_for_schema_with_options(schema, PlanOptions::default())
+    }
+
+    fn mappings_for_schema_with_options(
+        schema: Schema,
+        options: PlanOptions,
+    ) -> Vec<SchemaMapping> {
         plan_arrow_schema_to_mssql_mappings(
             Arc::new(schema),
             MssqlProfile::sql_server_2016_compat_100(),
-            PlanOptions::default(),
+            options,
         )
         .unwrap()
         .into_parts()
