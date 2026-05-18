@@ -1,6 +1,8 @@
 //! Runtime record batch view and Arrow-to-MSSQL semantic conversion.
 
-use arrow_array::{Array, RecordBatch, timezone::Tz};
+mod validate;
+
+use arrow_array::{RecordBatch, timezone::Tz};
 use arrow_schema::{DataType, TimeUnit};
 use chrono::{Offset, TimeZone};
 
@@ -12,6 +14,7 @@ use crate::{
         MssqlCell, MssqlDate, MssqlDateTime2, MssqlDateTimeOffset, MssqlDecimal, MssqlTime,
     },
 };
+use validate::validate_runtime_columns;
 
 const SQL_SERVER_DATE_UNIX_EPOCH_DAYS: i64 = 719_162;
 const SQL_SERVER_DATE_MAX_DAYS: i64 = 3_652_058;
@@ -1513,83 +1516,6 @@ fn value_too_long_error(
         DiagnosticCode::ValueTooLong,
         message,
     ))
-}
-
-fn validate_runtime_columns(batch: &RecordBatch, mappings: &[SchemaMapping]) -> Result<()> {
-    if batch.num_columns() < mappings.len() {
-        let mapping = &mappings[batch.num_columns()];
-        return Err(value_conversion_error(mapping_diagnostic(
-            mapping,
-            DiagnosticCode::SchemaMismatch,
-            format!(
-                "planned column index {} is outside runtime batch with {} column(s)",
-                mapping.arrow().index(),
-                batch.num_columns()
-            ),
-        )));
-    }
-
-    if batch.num_columns() > mappings.len() {
-        return Err(value_conversion_error(Diagnostic::error(
-            DiagnosticCode::SchemaMismatch,
-            format!(
-                "runtime batch has {} column(s) but mappings contain {} column(s)",
-                batch.num_columns(),
-                mappings.len()
-            ),
-        )));
-    }
-
-    for (position, (field, (array, mapping))) in batch
-        .schema()
-        .fields()
-        .iter()
-        .zip(batch.columns().iter().zip(mappings))
-        .enumerate()
-    {
-        if mapping.arrow().index() != position {
-            return Err(value_conversion_error(mapping_diagnostic(
-                mapping,
-                DiagnosticCode::SchemaMismatch,
-                format!(
-                    "mapping position {position} does not match planned Arrow field index {}",
-                    mapping.arrow().index()
-                ),
-            )));
-        }
-
-        if field.name() != mapping.arrow().name() {
-            return Err(value_conversion_error(mapping_diagnostic(
-                mapping,
-                DiagnosticCode::SchemaMismatch,
-                format!(
-                    "runtime Arrow field name {} does not match planned Arrow field name {}",
-                    field.name(),
-                    mapping.arrow().name()
-                ),
-            )));
-        }
-
-        validate_runtime_column(array.as_ref(), mapping)?;
-    }
-
-    Ok(())
-}
-
-fn validate_runtime_column(array: &dyn Array, mapping: &SchemaMapping) -> Result<()> {
-    if array.data_type() != mapping.arrow().data_type() {
-        return Err(value_conversion_error(mapping_diagnostic(
-            mapping,
-            DiagnosticCode::SchemaMismatch,
-            format!(
-                "runtime Arrow type {} does not match planned Arrow type {}",
-                array.data_type(),
-                mapping.arrow().data_type()
-            ),
-        )));
-    }
-
-    Ok(())
 }
 
 fn mapping_diagnostic(
