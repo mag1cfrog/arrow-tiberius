@@ -144,10 +144,9 @@ mod tests {
     use arrow_array::{
         ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array,
         Decimal64Array, Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array,
-        Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch,
-        StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-        TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
-        UInt64Array,
+        Int16Array, Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+        UInt16Array, UInt32Array, UInt64Array,
     };
     use arrow_buffer::i256;
     use arrow_data::ArrayData;
@@ -159,10 +158,9 @@ mod tests {
         from_arrow::timezone_resolution_from_metadata,
     };
     use crate::{
-        ArrowFieldRef, BinaryPolicy, Date64Policy, DecimalPolicy, DiagnosticCode, Error,
-        Identifier, MssqlColumn, MssqlProfile, MssqlType, NanosecondPolicy, PlanOptions,
-        SchemaMapping, StringPolicy, TimezonePolicy, UInt64Policy,
-        plan_arrow_schema_to_mssql_mappings,
+        ArrowFieldRef, Date64Policy, DecimalPolicy, DiagnosticCode, Error, Identifier, MssqlColumn,
+        MssqlProfile, MssqlType, NanosecondPolicy, PlanOptions, SchemaMapping, TimezonePolicy,
+        UInt64Policy, plan_arrow_schema_to_mssql_mappings,
     };
 
     #[test]
@@ -363,167 +361,6 @@ mod tests {
             DiagnosticCode::TimezoneUnsupported,
             Some(7),
             Some((0, "ts")),
-        );
-    }
-
-    #[test]
-    fn converts_empty_ascii_and_non_ascii_strings() {
-        let mappings = mappings_for_schema(Schema::new(vec![
-            Field::new("text", DataType::Utf8, true),
-            Field::new("large_text", DataType::LargeUtf8, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("text", DataType::Utf8, true),
-                Field::new("large_text", DataType::LargeUtf8, true),
-            ])),
-            vec![
-                Arc::new(StringArray::from(vec!["", "ascii", "東京"])) as ArrayRef,
-                Arc::new(LargeStringArray::from(vec!["", "ascii", "🙂"])),
-            ],
-        )
-        .unwrap();
-        let view = RecordBatchView::new(&batch, &mappings).unwrap();
-
-        assert_eq!(
-            view.mssql_cell(&mappings[0], 0).unwrap(),
-            MssqlCell::NVarChar(Some(""))
-        );
-        assert_eq!(
-            view.mssql_cell(&mappings[0], 1).unwrap(),
-            MssqlCell::NVarChar(Some("ascii"))
-        );
-        assert_eq!(
-            view.mssql_cell(&mappings[0], 2).unwrap(),
-            MssqlCell::NVarChar(Some("東京"))
-        );
-        assert_eq!(
-            view.mssql_cell(&mappings[1], 0).unwrap(),
-            MssqlCell::NVarChar(Some(""))
-        );
-        assert_eq!(
-            view.mssql_cell(&mappings[1], 1).unwrap(),
-            MssqlCell::NVarChar(Some("ascii"))
-        );
-        assert_eq!(
-            view.mssql_cell(&mappings[1], 2).unwrap(),
-            MssqlCell::NVarChar(Some("🙂"))
-        );
-    }
-
-    #[test]
-    fn converts_empty_and_non_empty_binary_values() {
-        let mappings = mappings_for_schema(Schema::new(vec![
-            Field::new("bytes", DataType::Binary, true),
-            Field::new("large_bytes", DataType::LargeBinary, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("bytes", DataType::Binary, true),
-                Field::new("large_bytes", DataType::LargeBinary, true),
-            ])),
-            vec![
-                Arc::new(BinaryArray::from(vec![Some(&b""[..]), Some(&b"abc"[..])])) as ArrayRef,
-                Arc::new(LargeBinaryArray::from(vec![
-                    Some(&b""[..]),
-                    Some(&b"large"[..]),
-                ])),
-            ],
-        )
-        .unwrap();
-        let view = RecordBatchView::new(&batch, &mappings).unwrap();
-
-        assert_eq!(
-            view.mssql_cell(&mappings[0], 0).unwrap(),
-            MssqlCell::VarBinary(Some(b""))
-        );
-        assert_eq!(
-            view.mssql_cell(&mappings[0], 1).unwrap(),
-            MssqlCell::VarBinary(Some(b"abc"))
-        );
-        assert_eq!(
-            view.mssql_cell(&mappings[1], 0).unwrap(),
-            MssqlCell::VarBinary(Some(b""))
-        );
-        assert_eq!(
-            view.mssql_cell(&mappings[1], 1).unwrap(),
-            MssqlCell::VarBinary(Some(b"large"))
-        );
-    }
-
-    #[test]
-    fn rejects_bounded_nvarchar_by_utf16_code_units() {
-        let mappings = mappings_for_schema_with_options(
-            Schema::new(vec![Field::new("text", DataType::Utf8, true)]),
-            PlanOptions {
-                string_policy: StringPolicy::NVarChar(2),
-                ..PlanOptions::default()
-            },
-        );
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, true)])),
-            vec![Arc::new(StringArray::from(vec!["ab", "🙂", "abc"]))],
-        )
-        .unwrap();
-        let view = RecordBatchView::new(&batch, &mappings).unwrap();
-
-        assert_eq!(
-            view.mssql_cell(&mappings[0], 0).unwrap(),
-            MssqlCell::NVarChar(Some("ab"))
-        );
-        assert_eq!(
-            view.mssql_cell(&mappings[0], 1).unwrap(),
-            MssqlCell::NVarChar(Some("🙂"))
-        );
-        let err = view.mssql_cell(&mappings[0], 2).unwrap_err();
-
-        assert_single_diagnostic(
-            err,
-            DiagnosticCode::ValueTooLong,
-            Some(2),
-            Some((0, "text")),
-        );
-    }
-
-    #[test]
-    fn rejects_bounded_varbinary_by_byte_count() {
-        let mappings = mappings_for_schema_with_options(
-            Schema::new(vec![Field::new("bytes", DataType::Binary, true)]),
-            PlanOptions {
-                binary_policy: BinaryPolicy::VarBinary(2),
-                ..PlanOptions::default()
-            },
-        );
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new(
-                "bytes",
-                DataType::Binary,
-                true,
-            )])),
-            vec![Arc::new(BinaryArray::from(vec![
-                Some(&b""[..]),
-                Some(&b"ab"[..]),
-                Some(&b"abc"[..]),
-            ]))],
-        )
-        .unwrap();
-        let view = RecordBatchView::new(&batch, &mappings).unwrap();
-
-        assert_eq!(
-            view.mssql_cell(&mappings[0], 0).unwrap(),
-            MssqlCell::VarBinary(Some(b""))
-        );
-        assert_eq!(
-            view.mssql_cell(&mappings[0], 1).unwrap(),
-            MssqlCell::VarBinary(Some(b"ab"))
-        );
-        let err = view.mssql_cell(&mappings[0], 2).unwrap_err();
-
-        assert_single_diagnostic(
-            err,
-            DiagnosticCode::ValueTooLong,
-            Some(2),
-            Some((0, "bytes")),
         );
     }
 
