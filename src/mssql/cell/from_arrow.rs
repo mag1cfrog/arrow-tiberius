@@ -1441,3 +1441,155 @@ fn value_conversion_error(diagnostic: Diagnostic) -> crate::Error {
         diagnostics: DiagnosticSet::from(vec![diagnostic]),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+
+    use super::{ArrowToMssqlRuntimeMapping, MssqlCell, mssql_cell_from_arrow_cell};
+    use crate::{
+        MssqlProfile, MssqlType, NanosecondPolicy, PlanOptions, SchemaMapping,
+        arrow::cell::ArrowCell, plan_arrow_schema_to_mssql_mappings,
+    };
+
+    #[test]
+    fn runtime_mapping_keeps_write_policy_out_of_schema_mapping() {
+        let options = PlanOptions {
+            nanosecond_policy: NanosecondPolicy::TruncateTo100ns,
+            ..PlanOptions::default()
+        };
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            )]),
+            options,
+        );
+
+        let runtime_mapping = ArrowToMssqlRuntimeMapping::new(&mappings[0], &options);
+
+        assert_eq!(runtime_mapping.mapping(), &mappings[0]);
+        assert_eq!(
+            runtime_mapping.nanosecond_policy(),
+            NanosecondPolicy::TruncateTo100ns
+        );
+        assert_eq!(
+            mappings[0].mssql().ty(),
+            &MssqlType::DateTime2 { precision: 7 }
+        );
+    }
+
+    #[test]
+    fn converts_supported_initial_primitives_to_mssql_cells() {
+        let mappings = mappings_for_schema(Schema::new(vec![
+            Field::new("active", DataType::Boolean, true),
+            Field::new("tiny", DataType::Int8, true),
+            Field::new("small", DataType::Int16, true),
+            Field::new("quantity", DataType::Int32, true),
+            Field::new("total", DataType::Int64, true),
+            Field::new("unsigned_tiny", DataType::UInt8, true),
+            Field::new("unsigned_medium", DataType::UInt16, true),
+            Field::new("unsigned_large", DataType::UInt32, true),
+            Field::new("real_value", DataType::Float32, true),
+            Field::new("float_value", DataType::Float64, true),
+            Field::new("text", DataType::Utf8, true),
+            Field::new("large_text", DataType::LargeUtf8, true),
+            Field::new("bytes", DataType::Binary, true),
+            Field::new("large_bytes", DataType::LargeBinary, true),
+        ]));
+        let cases = [
+            (0, ArrowCell::Boolean(true), MssqlCell::Bit(Some(true))),
+            (1, ArrowCell::Int8(-8), MssqlCell::SmallInt(Some(-8))),
+            (2, ArrowCell::Int16(-16), MssqlCell::SmallInt(Some(-16))),
+            (3, ArrowCell::Int32(12), MssqlCell::Int(Some(12))),
+            (4, ArrowCell::Int64(34), MssqlCell::BigInt(Some(34))),
+            (5, ArrowCell::UInt8(8), MssqlCell::TinyInt(Some(8))),
+            (6, ArrowCell::UInt16(16), MssqlCell::Int(Some(16))),
+            (7, ArrowCell::UInt32(32), MssqlCell::BigInt(Some(32))),
+            (8, ArrowCell::Float32(1.25), MssqlCell::Real(Some(1.25))),
+            (9, ArrowCell::Float64(2.5), MssqlCell::Float(Some(2.5))),
+            (
+                10,
+                ArrowCell::Utf8("hello"),
+                MssqlCell::NVarChar(Some("hello")),
+            ),
+            (
+                11,
+                ArrowCell::Utf8("Tokyo"),
+                MssqlCell::NVarChar(Some("Tokyo")),
+            ),
+            (
+                12,
+                ArrowCell::Binary(b"abc"),
+                MssqlCell::VarBinary(Some(b"abc")),
+            ),
+            (
+                13,
+                ArrowCell::Binary(b"large"),
+                MssqlCell::VarBinary(Some(b"large")),
+            ),
+        ];
+
+        for (index, arrow_cell, expected) in cases {
+            assert_eq!(
+                convert_cell(&mappings[index], arrow_cell, 0).unwrap(),
+                expected
+            );
+        }
+
+        let null_cases = [
+            (0, MssqlCell::Bit(None)),
+            (1, MssqlCell::SmallInt(None)),
+            (2, MssqlCell::SmallInt(None)),
+            (3, MssqlCell::Int(None)),
+            (4, MssqlCell::BigInt(None)),
+            (5, MssqlCell::TinyInt(None)),
+            (6, MssqlCell::Int(None)),
+            (7, MssqlCell::BigInt(None)),
+            (8, MssqlCell::Real(None)),
+            (9, MssqlCell::Float(None)),
+            (10, MssqlCell::NVarChar(None)),
+            (11, MssqlCell::NVarChar(None)),
+            (12, MssqlCell::VarBinary(None)),
+            (13, MssqlCell::VarBinary(None)),
+        ];
+
+        for (index, expected) in null_cases {
+            assert_eq!(
+                convert_cell(&mappings[index], ArrowCell::Null, 1).unwrap(),
+                expected
+            );
+        }
+    }
+
+    fn convert_cell<'a>(
+        mapping: &SchemaMapping,
+        cell: ArrowCell<'a>,
+        row_index: usize,
+    ) -> crate::Result<MssqlCell<'a>> {
+        let options = PlanOptions::default();
+        let runtime_mapping = ArrowToMssqlRuntimeMapping::new(mapping, &options);
+        mssql_cell_from_arrow_cell(runtime_mapping, cell, row_index)
+    }
+
+    fn mappings_for_schema(schema: Schema) -> Vec<SchemaMapping> {
+        mappings_for_schema_with_options(schema, PlanOptions::default())
+    }
+
+    fn mappings_for_schema_with_options(
+        schema: Schema,
+        options: PlanOptions,
+    ) -> Vec<SchemaMapping> {
+        plan_arrow_schema_to_mssql_mappings(
+            Arc::new(schema),
+            MssqlProfile::sql_server_2016_compat_100(),
+            options,
+        )
+        .unwrap()
+        .into_parts()
+        .0
+    }
+}
