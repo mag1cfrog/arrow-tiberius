@@ -90,11 +90,7 @@ impl<'a> RecordBatchView<'a> {
     }
 
     /// Extracts one borrowed Arrow cell from a planned mapping and row index.
-    pub(crate) fn arrow_cell(
-        &self,
-        mapping: &SchemaMapping,
-        row_index: usize,
-    ) -> Result<ArrowCell<'_>> {
+    fn arrow_cell(&self, mapping: &SchemaMapping, row_index: usize) -> Result<ArrowCell<'_>> {
         self.check_row_index(row_index)?;
 
         let Some(array) = self
@@ -115,11 +111,7 @@ impl<'a> RecordBatchView<'a> {
     }
 
     /// Converts one planned cell into a semantic SQL Server cell.
-    pub(crate) fn mssql_cell(
-        &self,
-        mapping: &SchemaMapping,
-        row_index: usize,
-    ) -> Result<MssqlCell<'_>> {
+    fn mssql_cell(&self, mapping: &SchemaMapping, row_index: usize) -> Result<MssqlCell<'_>> {
         let cell = self.arrow_cell(mapping, row_index)?;
         let runtime_mapping = ArrowToMssqlRuntimeMapping::new(mapping, &self.plan_options);
         mssql_cell_from_arrow_cell(runtime_mapping, cell, row_index)
@@ -1128,14 +1120,14 @@ fn validate_timestamp_timezone_metadata(
 /// timezones need the row timestamp instant to account for historical and DST
 /// offset rules.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum TimezoneResolution {
+enum TimezoneResolution {
     FixedOffset { offset_minutes: i16 },
     Named { timezone: Tz },
 }
 
 impl TimezoneResolution {
     /// Returns the SQL Server offset for one timestamp instant.
-    pub(crate) fn offset_for_instant(
+    fn offset_for_instant(
         self,
         mapping: &SchemaMapping,
         row_index: usize,
@@ -1159,7 +1151,7 @@ impl TimezoneResolution {
 }
 
 /// Resolves Arrow timestamp timezone metadata once for a planned column.
-pub(crate) fn timezone_resolution_from_metadata(
+fn timezone_resolution_from_metadata(
     mapping: &SchemaMapping,
     row_index: usize,
     timezone: &str,
