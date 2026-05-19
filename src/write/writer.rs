@@ -8,7 +8,10 @@ use crate::{
     TableName,
 };
 
-use super::{SchemaCheck, record_batch::RecordBatchView, token_row::tiberius_row_owned};
+use super::{
+    SchemaCheck, direct::DirectEncoder, record_batch::RecordBatchView,
+    token_row::tiberius_row_owned,
+};
 
 /// Write backend selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -45,6 +48,7 @@ pub struct WriteStats {
 #[derive(Debug)]
 struct WriterState {
     backend: WriteBackend,
+    direct_encoder: Option<DirectEncoder>,
     schema_check: SchemaCheck,
     plan_options: PlanOptions,
     mappings: Vec<SchemaMapping>,
@@ -59,9 +63,14 @@ impl WriterState {
         mappings: Vec<SchemaMapping>,
     ) -> Result<Self> {
         let backend = resolve_backend(requested_backend)?;
+        let direct_encoder = match backend {
+            WriteBackend::DirectRawBulk => Some(DirectEncoder::new(&mappings)?),
+            WriteBackend::Auto | WriteBackend::BaselineTokenRow => None,
+        };
 
         Ok(Self {
             backend,
+            direct_encoder,
             schema_check,
             plan_options,
             mappings,
@@ -71,6 +80,10 @@ impl WriterState {
 
     fn backend(&self) -> WriteBackend {
         self.backend
+    }
+
+    fn direct_encoder(&self) -> Option<&DirectEncoder> {
+        self.direct_encoder.as_ref()
     }
 
     fn mappings(&self) -> &[SchemaMapping] {
@@ -124,7 +137,7 @@ where
             mappings,
         )?;
         let request = match state.backend() {
-            WriteBackend::BaselineTokenRow => {
+            WriteBackend::BaselineTokenRow | WriteBackend::DirectRawBulk => {
                 let table_sql = bulk_insert_table_sql(&table);
                 let columns = client
                     .bulk_insert_columns(&table_sql)
@@ -136,7 +149,7 @@ where
                     .await
                     .map_err(|source| crate::Error::Tiberius { source })?
             }
-            WriteBackend::Auto | WriteBackend::DirectRawBulk => {
+            WriteBackend::Auto => {
                 return Err(execution_unavailable(state.backend()));
             }
         };
@@ -146,7 +159,15 @@ where
 
     /// Writes one Arrow record batch.
     pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteStats> {
-        write_batch_to_sink(&mut self.state, &mut self.request, batch).await
+        match self.state.backend() {
+            WriteBackend::BaselineTokenRow => {
+                write_batch_to_sink(&mut self.state, &mut self.request, batch).await
+            }
+            WriteBackend::DirectRawBulk => {
+                write_direct_batch_to_sink(&mut self.state, &mut self.request, batch).await
+            }
+            WriteBackend::Auto => Err(execution_unavailable(WriteBackend::Auto)),
+        }
     }
 
     /// Finalizes the bulk writer and returns cumulative write statistics.
@@ -328,6 +349,60 @@ where
     }
 }
 
+async fn write_direct_batch_to_sink<Sink>(
+    state: &mut WriterState,
+    sink: &mut Sink,
+    batch: &RecordBatch,
+) -> Result<WriteStats>
+where
+    Sink: RawRowsSink,
+{
+    match state.schema_check() {
+        SchemaCheck::Strict => {
+            super::record_batch::validate_runtime_columns(batch, state.mappings())?;
+        }
+    }
+
+    let encoder = state
+        .direct_encoder()
+        .ok_or_else(|| crate::Error::BackendUnavailable {
+            backend: WriteBackend::DirectRawBulk,
+            reason: "direct raw bulk encoder is not available for this writer".to_owned(),
+        })?;
+    let payload = encoder.encode_batch(batch)?;
+    let rows_written = usize_to_u64_saturating(payload.row_count());
+
+    if !payload.is_empty() {
+        sink.send_raw_rows_payload_checked(payload.bytes(), payload.row_token_offsets())
+            .await?;
+    }
+
+    Ok(state.record_accepted_batch(rows_written))
+}
+
+trait RawRowsSink {
+    async fn send_raw_rows_payload_checked(
+        &mut self,
+        payload: &[u8],
+        row_token_offsets: &[usize],
+    ) -> Result<()>;
+}
+
+impl<S> RawRowsSink for tiberius::BulkLoadRequest<'_, S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    async fn send_raw_rows_payload_checked(
+        &mut self,
+        payload: &[u8],
+        row_token_offsets: &[usize],
+    ) -> Result<()> {
+        self.send_raw_rows_payload_checked(payload, row_token_offsets)
+            .await
+            .map_err(|source| crate::Error::Tiberius { source })
+    }
+}
+
 fn usize_to_u64_saturating(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
@@ -335,10 +410,7 @@ fn usize_to_u64_saturating(value: usize) -> u64 {
 fn resolve_backend(requested_backend: WriteBackend) -> Result<WriteBackend> {
     match requested_backend {
         WriteBackend::Auto | WriteBackend::BaselineTokenRow => Ok(WriteBackend::BaselineTokenRow),
-        WriteBackend::DirectRawBulk => Err(crate::Error::BackendUnavailable {
-            backend: WriteBackend::DirectRawBulk,
-            reason: "direct raw bulk backend is not implemented yet".to_owned(),
-        }),
+        WriteBackend::DirectRawBulk => Ok(WriteBackend::DirectRawBulk),
     }
 }
 
@@ -364,9 +436,10 @@ mod tests {
     use futures_util::io::{AsyncRead, AsyncWrite};
 
     use super::{
-        BulkTargetColumnMetadata, TokenRowSink, WriteBackend, WriteOptions, WriteStats,
-        WriterState, bulk_insert_table_sql, record_batch_view, resolve_backend, tiberius_row_owned,
-        validate_batch_rows, validate_bulk_target_columns, write_batch_to_sink,
+        BulkTargetColumnMetadata, RawRowsSink, TokenRowSink, WriteBackend, WriteOptions,
+        WriteStats, WriterState, bulk_insert_table_sql, record_batch_view, resolve_backend,
+        tiberius_row_owned, validate_batch_rows, validate_bulk_target_columns, write_batch_to_sink,
+        write_direct_batch_to_sink,
     };
     use crate::{
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, PlanOptions,
@@ -426,13 +499,10 @@ mod tests {
     }
 
     #[test]
-    fn direct_raw_bulk_resolution_fails_until_direct_backend_exists() {
-        let result = resolve_backend(WriteBackend::DirectRawBulk);
-
-        assert_backend_unavailable_reason(
-            result,
-            WriteBackend::DirectRawBulk,
-            "direct raw bulk backend is not implemented yet",
+    fn direct_raw_bulk_resolves_to_direct_backend() {
+        assert_eq!(
+            resolve_backend(WriteBackend::DirectRawBulk).unwrap(),
+            WriteBackend::DirectRawBulk
         );
     }
 
@@ -449,9 +519,62 @@ mod tests {
         .unwrap();
 
         assert_eq!(state.backend(), WriteBackend::BaselineTokenRow);
+        assert!(state.direct_encoder().is_none());
         assert_eq!(state.schema_check(), SchemaCheck::Strict);
         assert_eq!(state.mappings(), mappings.as_slice());
         assert_eq!(state.stats(), WriteStats::default());
+    }
+
+    #[test]
+    fn direct_writer_state_builds_encoder_for_supported_mappings() {
+        let mappings = vec![
+            mapping("id32"),
+            SchemaMapping::new(
+                ArrowFieldRef::new(1, "id64".to_owned(), false, DataType::Int64),
+                MssqlColumn::new(Identifier::new("id64").unwrap(), MssqlType::BigInt, false),
+            ),
+            float_mapping_at(2, "score"),
+        ];
+
+        let state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+
+        assert_eq!(state.backend(), WriteBackend::DirectRawBulk);
+        assert!(state.direct_encoder().is_some());
+    }
+
+    #[test]
+    fn direct_writer_state_rejects_unsupported_mappings() {
+        let mappings = vec![SchemaMapping::new(
+            ArrowFieldRef::new(0, "name".to_owned(), true, DataType::Utf8),
+            MssqlColumn::new(
+                Identifier::new("name").unwrap(),
+                MssqlType::NVarChar(crate::MssqlTypeLength::Max),
+                true,
+            ),
+        )];
+
+        let err = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap_err();
+
+        let Error::DirectEncoding { diagnostics } = err else {
+            panic!("expected direct encoding error");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics.all()[0].code(),
+            DiagnosticCode::DirectEncodingUnsupportedMapping
+        );
     }
 
     #[test]
@@ -768,6 +891,86 @@ mod tests {
     }
 
     #[test]
+    fn write_direct_batch_to_sink_sends_one_checked_payload_per_batch() {
+        let mappings = vec![mapping("id")];
+        let mut state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingRawSink::default();
+        let batch = int32_batch("id", &[10, 20]);
+
+        let stats = poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch)).unwrap();
+
+        assert_eq!(
+            stats,
+            WriteStats {
+                rows_written: 2,
+                batches_written: 1
+            }
+        );
+        assert_eq!(sink.payloads.len(), 1);
+        assert_eq!(sink.payloads[0].row_token_offsets, vec![0, 6]);
+        assert_eq!(
+            sink.payloads[0].bytes,
+            vec![0xD1, 4, 10, 0, 0, 0, 0xD1, 4, 20, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn write_direct_batch_to_sink_skips_send_for_empty_batch_but_records_stats() {
+        let mappings = vec![mapping("id")];
+        let mut state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingRawSink::default();
+        let batch = int32_batch("id", &[]);
+
+        let stats = poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch)).unwrap();
+
+        assert_eq!(
+            stats,
+            WriteStats {
+                rows_written: 0,
+                batches_written: 1
+            }
+        );
+        assert!(sink.payloads.is_empty());
+    }
+
+    #[test]
+    fn write_direct_batch_to_sink_rejects_bad_later_row_before_send() {
+        let mappings = vec![float_mapping("amount")];
+        let mut state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingRawSink::default();
+        let batch = float64_batch("amount", &[Some(1.0), Some(f64::NAN)]);
+
+        let err =
+            poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch)).unwrap_err();
+
+        let Error::ValueConversion { diagnostics } = err else {
+            panic!("expected value conversion error");
+        };
+        assert_eq!(diagnostics.all()[0].code(), DiagnosticCode::NonFiniteFloat);
+        assert_eq!(diagnostics.all()[0].row(), Some(1));
+        assert!(sink.payloads.is_empty());
+        assert_eq!(state.stats(), WriteStats::default());
+    }
+
+    #[test]
     fn writer_types_are_exported_from_crate_root() {
         assert_eq!(crate::WriteBackend::default(), WriteBackend::Auto);
         assert_eq!(crate::WriteOptions::default(), WriteOptions::default());
@@ -790,8 +993,12 @@ mod tests {
     }
 
     fn float_mapping(name: &str) -> SchemaMapping {
+        float_mapping_at(0, name)
+    }
+
+    fn float_mapping_at(index: usize, name: &str) -> SchemaMapping {
         SchemaMapping::new(
-            ArrowFieldRef::new(0, name.to_owned(), false, DataType::Float64),
+            ArrowFieldRef::new(index, name.to_owned(), false, DataType::Float64),
             MssqlColumn::new(
                 Identifier::new(name).unwrap(),
                 MssqlType::Float { precision: 53 },
@@ -826,20 +1033,6 @@ mod tests {
         RecordBatch::try_new(schema, vec![array]).unwrap()
     }
 
-    fn assert_backend_unavailable_reason<T: std::fmt::Debug>(
-        result: crate::Result<T>,
-        expected: WriteBackend,
-        expected_reason: &str,
-    ) {
-        match result {
-            Err(crate::Error::BackendUnavailable { backend, reason }) => {
-                assert_eq!(backend, expected);
-                assert_eq!(reason, expected_reason);
-            }
-            other => panic!("expected backend-unavailable error, got {other:?}"),
-        }
-    }
-
     fn poll_ready<F>(future: F) -> F::Output
     where
         F: Future,
@@ -858,6 +1051,40 @@ mod tests {
     struct RecordingSink {
         fail_on_send: Option<usize>,
         rows: Vec<tiberius::TokenRow<'static>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingRawSink {
+        fail_on_send: bool,
+        payloads: Vec<RecordedRawPayload>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct RecordedRawPayload {
+        bytes: Vec<u8>,
+        row_token_offsets: Vec<usize>,
+    }
+
+    impl RawRowsSink for RecordingRawSink {
+        async fn send_raw_rows_payload_checked(
+            &mut self,
+            payload: &[u8],
+            row_token_offsets: &[usize],
+        ) -> crate::Result<()> {
+            if self.fail_on_send {
+                return Err(Error::Tiberius {
+                    source: tiberius::error::Error::BulkInput(Cow::Borrowed(
+                        "fake raw send failure",
+                    )),
+                });
+            }
+
+            self.payloads.push(RecordedRawPayload {
+                bytes: payload.to_vec(),
+                row_token_offsets: row_token_offsets.to_vec(),
+            });
+            Ok(())
+        }
     }
 
     impl TokenRowSink for RecordingSink {
