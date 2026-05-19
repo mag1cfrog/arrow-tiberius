@@ -9,6 +9,7 @@ use crate::{
 
 use super::{
     layout::{CellPosition, RowLayout},
+    payload::TDS_ROW_TOKEN,
     plan::{DirectColumnEncoding, DirectColumnPlan},
 };
 
@@ -80,6 +81,24 @@ pub(crate) fn build_fixed_width_row_layout(
     RowLayout::new(row_token_offsets, row_lengths, cell_positions, offset)
 }
 
+/// Allocates a complete payload buffer and writes every row token.
+///
+/// The measured layout already knows where each row starts inside the payload.
+/// This function creates a zero-filled buffer of the final payload size and
+/// writes `0xD1` at every absolute row start offset. Later fill steps write
+/// encoded cell bytes into the remaining positions.
+pub(crate) fn allocate_rows_payload_with_tokens(layout: &RowLayout) -> Vec<u8> {
+    let mut bytes = vec![0; layout.payload_len()];
+
+    // One payload can contain many rows. Each row must start with the TDS ROW
+    // token byte, and row_token_offsets gives those absolute byte positions.
+    for &row_offset in layout.row_token_offsets() {
+        bytes[row_offset] = TDS_ROW_TOKEN;
+    }
+
+    bytes
+}
+
 fn primitive_value_len(encoding: DirectColumnEncoding) -> Result<usize> {
     match encoding {
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::BooleanToBit) => Ok(1),
@@ -141,7 +160,11 @@ mod tests {
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, SchemaMapping,
     };
 
-    use super::{build_fixed_width_row_layout, measure_primitive_column_cell_lengths};
+    use super::{
+        allocate_rows_payload_with_tokens, build_fixed_width_row_layout,
+        measure_primitive_column_cell_lengths,
+    };
+    use crate::write::direct::payload::TDS_ROW_TOKEN;
     use crate::write::direct::plan::{DirectEncoderPlan, PrimitiveDirectMappings};
 
     #[test]
@@ -257,6 +280,26 @@ mod tests {
         assert_cell_positions(
             layout.cell_positions(),
             &[(0, 0, 1, 2), (0, 1, 3, 1), (1, 0, 5, 1), (1, 1, 6, 5)],
+        );
+    }
+
+    #[test]
+    fn allocates_payload_and_writes_row_tokens_from_layout() {
+        let layout = build_fixed_width_row_layout(3, 2, &[2, 5, 1, 5, 2, 1]).unwrap();
+
+        let bytes = allocate_rows_payload_with_tokens(&layout);
+
+        assert_eq!(layout.row_token_offsets(), [0, 8, 15]);
+        assert_eq!(bytes.len(), 19);
+        assert_eq!(bytes[0], TDS_ROW_TOKEN);
+        assert_eq!(bytes[8], TDS_ROW_TOKEN);
+        assert_eq!(bytes[15], TDS_ROW_TOKEN);
+        assert!(
+            bytes
+                .iter()
+                .enumerate()
+                .filter(|(_, byte)| **byte == TDS_ROW_TOKEN)
+                .all(|(index, _)| layout.row_token_offsets().contains(&index))
         );
     }
 
