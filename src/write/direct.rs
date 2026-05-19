@@ -11,9 +11,11 @@ use crate::{
 pub(crate) mod layout;
 pub(crate) mod payload;
 pub(crate) mod plan;
+pub(crate) mod primitive;
 
 use payload::EncodedRowsPayload;
 use plan::{DirectEncoderPlan, PrimitiveDirectMappings};
+use primitive::{build_fixed_width_row_layout, measure_primitive_column_cell_lengths};
 
 /// Direct raw TDS encoder facade.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,9 +59,47 @@ impl DirectEncoder {
             return EncodedRowsPayload::new(Vec::new(), Vec::new());
         }
 
+        let _layout = self.measure_layout(batch)?;
+
         Err(unsupported_batch(
             "direct batch encoding requires concrete type encoders from follow-up issues",
         ))
+    }
+
+    fn measure_layout(&self, batch: &RecordBatch) -> Result<layout::RowLayout> {
+        let row_count = batch.num_rows();
+        let column_count = self.plan.column_count();
+
+        if row_count == 0 {
+            return layout::RowLayout::new(Vec::new(), Vec::new(), Vec::new(), 0);
+        }
+
+        let mut cell_lengths = vec![0; row_count * column_count];
+
+        for (column_index, column) in self.plan.columns().iter().enumerate() {
+            let Some(array) = batch
+                .columns()
+                .get(column.source_index())
+                .map(AsRef::as_ref)
+            else {
+                return Err(value_conversion_error(row_column_diagnostic(
+                    column,
+                    0,
+                    DiagnosticCode::ValueTypeMismatch,
+                    "planned direct column index is outside the runtime batch",
+                )));
+            };
+
+            measure_primitive_column_cell_lengths(
+                array,
+                column,
+                column_index,
+                column_count,
+                &mut cell_lengths,
+            )?;
+        }
+
+        build_fixed_width_row_layout(row_count, column_count, &cell_lengths)
     }
 }
 
@@ -72,6 +112,26 @@ fn unsupported_batch(message: impl Into<String>) -> Error {
     }
 }
 
+fn row_column_diagnostic(
+    column: &plan::DirectColumnPlan,
+    row_index: usize,
+    code: DiagnosticCode,
+    message: impl Into<String>,
+) -> Diagnostic {
+    Diagnostic::error(code, message)
+        .with_field(crate::FieldRef::new(
+            column.source_index(),
+            column.source_name(),
+        ))
+        .with_row(row_index)
+}
+
+fn value_conversion_error(diagnostic: Diagnostic) -> Error {
+    Error::ValueConversion {
+        diagnostics: DiagnosticSet::from(vec![diagnostic]),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -81,10 +141,11 @@ mod tests {
 
     use crate::{
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, SchemaMapping,
+        conversion::arrow_to_mssql::primitive::PrimitiveArrowToMssql,
     };
 
     use super::DirectEncoder;
-    use super::plan::{DirectEncoderSupport, DirectMappingSupport};
+    use super::plan::{DirectColumnEncoding, DirectEncoderSupport, DirectMappingSupport};
 
     #[test]
     fn default_direct_encoder_accepts_empty_mapping_set() {
@@ -138,8 +199,12 @@ mod tests {
     struct FixtureSupport;
 
     impl DirectEncoderSupport for FixtureSupport {
-        fn support_mapping(&self, _mapping: &SchemaMapping) -> DirectMappingSupport {
-            DirectMappingSupport::Supported
+        fn support_mapping(&self, mapping: &SchemaMapping) -> DirectMappingSupport {
+            DirectMappingSupport::Supported {
+                encoding: DirectColumnEncoding::Primitive(
+                    PrimitiveArrowToMssql::classify(mapping, 0).unwrap(),
+                ),
+            }
         }
     }
 

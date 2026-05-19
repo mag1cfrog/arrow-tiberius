@@ -11,12 +11,22 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DirectMappingSupport {
     /// The planned mapping is supported by the current direct encoder.
-    Supported,
+    Supported {
+        /// Concrete direct encoding selected for the mapping.
+        encoding: DirectColumnEncoding,
+    },
     /// The planned mapping is not supported by the current direct encoder.
     Unsupported {
         /// Human-readable reason the mapping is unsupported.
         reason: String,
     },
+}
+
+/// Concrete direct encoding selected for one planned column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum DirectColumnEncoding {
+    /// Fixed-width primitive encoding.
+    Primitive(PrimitiveArrowToMssql),
 }
 
 /// Direct encoder support policy.
@@ -48,10 +58,14 @@ pub(crate) struct PrimitiveDirectMappings;
 impl DirectEncoderSupport for PrimitiveDirectMappings {
     fn support_mapping(&self, mapping: &SchemaMapping) -> DirectMappingSupport {
         match PrimitiveArrowToMssql::classify(mapping, 0) {
-            Ok(PrimitiveArrowToMssql::BooleanToBit)
-            | Ok(PrimitiveArrowToMssql::Int32ToInt)
-            | Ok(PrimitiveArrowToMssql::Int64ToBigInt)
-            | Ok(PrimitiveArrowToMssql::Float64ToFloat) => DirectMappingSupport::Supported,
+            Ok(
+                classification @ (PrimitiveArrowToMssql::BooleanToBit
+                | PrimitiveArrowToMssql::Int32ToInt
+                | PrimitiveArrowToMssql::Int64ToBigInt
+                | PrimitiveArrowToMssql::Float64ToFloat),
+            ) => DirectMappingSupport::Supported {
+                encoding: DirectColumnEncoding::Primitive(classification),
+            },
             Ok(classification) => DirectMappingSupport::Unsupported {
                 reason: format!(
                     "direct encoding support for primitive mapping {classification:?} is not implemented yet"
@@ -75,16 +89,18 @@ pub(crate) struct DirectColumnPlan {
     source_name: String,
     target_type: MssqlType,
     nullable: bool,
+    encoding: DirectColumnEncoding,
 }
 
 impl DirectColumnPlan {
     /// Creates a direct encoder column plan from a schema mapping.
-    fn from_mapping(mapping: &SchemaMapping) -> Self {
+    fn from_mapping(mapping: &SchemaMapping, encoding: DirectColumnEncoding) -> Self {
         Self {
             source_index: mapping.arrow().index(),
             source_name: mapping.arrow().name().to_owned(),
             target_type: mapping.mssql().ty().clone(),
             nullable: mapping.mssql().nullable(),
+            encoding,
         }
     }
 
@@ -107,6 +123,11 @@ impl DirectColumnPlan {
     pub(crate) const fn nullable(&self) -> bool {
         self.nullable
     }
+
+    /// Returns the selected direct encoding.
+    pub(crate) const fn encoding(&self) -> DirectColumnEncoding {
+        self.encoding
+    }
 }
 
 /// Direct encoder support-checked plan.
@@ -126,8 +147,8 @@ impl DirectEncoderPlan {
 
         for mapping in mappings {
             match support.support_mapping(mapping) {
-                DirectMappingSupport::Supported => {
-                    columns.push(DirectColumnPlan::from_mapping(mapping));
+                DirectMappingSupport::Supported { encoding } => {
+                    columns.push(DirectColumnPlan::from_mapping(mapping, encoding));
                 }
                 DirectMappingSupport::Unsupported { reason } => {
                     diagnostics.push(unsupported_mapping_diagnostic(mapping, reason));
@@ -177,9 +198,10 @@ mod tests {
     };
 
     use super::{
-        DirectEncoderPlan, DirectEncoderSupport, DirectMappingSupport, NoDirectMappings,
-        PrimitiveDirectMappings,
+        DirectColumnEncoding, DirectEncoderPlan, DirectEncoderSupport, DirectMappingSupport,
+        NoDirectMappings, PrimitiveDirectMappings,
     };
+    use crate::conversion::arrow_to_mssql::primitive::PrimitiveArrowToMssql;
 
     #[test]
     fn empty_mapping_set_is_supported_before_type_encoders_exist() {
@@ -250,10 +272,18 @@ mod tests {
         assert_eq!(plan.columns()[0].source_name(), "is_active");
         assert_eq!(plan.columns()[0].target_type(), &MssqlType::Bit);
         assert!(!plan.columns()[0].nullable());
+        assert_eq!(
+            plan.columns()[0].encoding(),
+            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::BooleanToBit)
+        );
         assert_eq!(plan.columns()[1].source_index(), 1);
         assert_eq!(plan.columns()[1].source_name(), "quantity");
         assert_eq!(plan.columns()[1].target_type(), &MssqlType::Int);
         assert!(!plan.columns()[1].nullable());
+        assert_eq!(
+            plan.columns()[1].encoding(),
+            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int32ToInt)
+        );
     }
 
     #[test]
@@ -280,6 +310,22 @@ mod tests {
         assert_eq!(
             plan.columns()[3].target_type(),
             &MssqlType::Float { precision: 53 }
+        );
+        assert_eq!(
+            plan.columns()[0].encoding(),
+            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::BooleanToBit)
+        );
+        assert_eq!(
+            plan.columns()[1].encoding(),
+            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int32ToInt)
+        );
+        assert_eq!(
+            plan.columns()[2].encoding(),
+            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int64ToBigInt)
+        );
+        assert_eq!(
+            plan.columns()[3].encoding(),
+            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat)
         );
     }
 
@@ -345,8 +391,12 @@ mod tests {
     struct FixtureSupport;
 
     impl DirectEncoderSupport for FixtureSupport {
-        fn support_mapping(&self, _mapping: &SchemaMapping) -> DirectMappingSupport {
-            DirectMappingSupport::Supported
+        fn support_mapping(&self, mapping: &SchemaMapping) -> DirectMappingSupport {
+            DirectMappingSupport::Supported {
+                encoding: DirectColumnEncoding::Primitive(
+                    PrimitiveArrowToMssql::classify(mapping, 0).unwrap(),
+                ),
+            }
         }
     }
 
