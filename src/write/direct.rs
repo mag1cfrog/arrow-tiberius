@@ -247,6 +247,34 @@ mod tests {
     }
 
     #[test]
+    fn direct_encoder_fast_path_returns_empty_payload_for_empty_batch_with_mappings() {
+        let mappings = vec![
+            mapping(0, "quantity", DataType::Int32, MssqlType::Int, true),
+            mapping(1, "total", DataType::Int64, MssqlType::BigInt, false),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("quantity", DataType::Int32, true),
+                Field::new("total", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(Vec::<Option<i32>>::new())) as ArrayRef,
+                Arc::new(Int64Array::from(Vec::<i64>::new())),
+            ],
+        )
+        .unwrap();
+
+        let payload = encoder
+            .encode_batch(&batch)
+            .expect("empty mapped batch should encode as empty payload");
+
+        assert!(payload.is_empty());
+        assert_eq!(payload.bytes(), []);
+        assert_eq!(payload.row_token_offsets(), []);
+    }
+
+    #[test]
     fn default_direct_encoder_rejects_non_empty_row_batch_until_type_encoders_exist() {
         let mapping = SchemaMapping::new(
             ArrowFieldRef::new(0, "is_active".to_owned(), false, DataType::Boolean),
