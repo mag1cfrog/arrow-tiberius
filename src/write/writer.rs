@@ -9,9 +9,15 @@ use crate::{
 };
 
 use super::{
-    SchemaCheck, direct::DirectEncoder, record_batch::RecordBatchView,
+    SchemaCheck,
+    direct::{
+        DirectEncoder,
+        plan::{DirectColumnEncoding, DirectColumnPlan, DirectEncoderPlan},
+    },
+    record_batch::RecordBatchView,
     token_row::tiberius_row_owned,
 };
+use crate::conversion::arrow_to_mssql::primitive::PrimitiveArrowToMssql;
 
 /// Write backend selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -144,6 +150,17 @@ where
                     .await
                     .map_err(|source| crate::Error::Tiberius { source })?;
                 validate_bulk_target_columns(columns.iter(), state.mappings())?;
+                if state.backend() == WriteBackend::DirectRawBulk {
+                    let encoder =
+                        state
+                            .direct_encoder()
+                            .ok_or_else(|| crate::Error::BackendUnavailable {
+                                backend: WriteBackend::DirectRawBulk,
+                                reason: "direct raw bulk encoder is not available for this writer"
+                                    .to_owned(),
+                            })?;
+                    validate_direct_bulk_target_column_types(columns.iter(), encoder.plan())?;
+                }
                 client
                     .bulk_insert_with_columns(&table_sql, columns)
                     .await
@@ -277,6 +294,98 @@ fn validate_bulk_target_column(
     }
 }
 
+fn validate_direct_bulk_target_column_types<Column>(
+    columns: impl ExactSizeIterator<Item = Column>,
+    plan: &DirectEncoderPlan,
+) -> Result<()>
+where
+    Column: BulkTargetColumnMetadata,
+{
+    let column_count = columns.len();
+    let mut diagnostics = DiagnosticSet::new();
+
+    if column_count != plan.column_count() {
+        diagnostics.push(Diagnostic::error(
+            DiagnosticCode::SchemaMismatch,
+            format!(
+                "bulk target has {column_count} updateable column(s) but direct plan contains {} column(s)",
+                plan.column_count()
+            ),
+        ));
+    }
+
+    for (column, plan_column) in columns.zip(plan.columns()) {
+        validate_direct_bulk_target_column_type(column, plan_column, &mut diagnostics);
+    }
+
+    if diagnostics.has_errors() {
+        return Err(crate::Error::ValueConversion { diagnostics });
+    }
+
+    Ok(())
+}
+
+fn validate_direct_bulk_target_column_type(
+    column: impl BulkTargetColumnMetadata,
+    plan_column: &DirectColumnPlan,
+    diagnostics: &mut DiagnosticSet,
+) {
+    let Some(expected) = expected_direct_bulk_column_type(plan_column) else {
+        diagnostics.push(
+            Diagnostic::error(
+                DiagnosticCode::DirectEncodingUnsupportedMapping,
+                format!(
+                    "direct target type validation is not implemented for {:?}",
+                    plan_column.encoding()
+                ),
+            )
+            .with_field(FieldRef::new(
+                plan_column.source_index(),
+                plan_column.source_name(),
+            )),
+        );
+        return;
+    };
+    let actual = column.column_type();
+
+    if actual != expected {
+        diagnostics.push(
+            Diagnostic::error(
+                DiagnosticCode::SchemaMismatch,
+                format!(
+                    "bulk target column type {actual:?} does not match direct encoder type {expected:?}"
+                ),
+            )
+            .with_field(FieldRef::new(
+                plan_column.source_index(),
+                plan_column.source_name(),
+            )),
+        );
+    }
+}
+
+fn expected_direct_bulk_column_type(column: &DirectColumnPlan) -> Option<tiberius::ColumnType> {
+    match column.encoding() {
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::BooleanToBit) => {
+            if column.nullable() {
+                Some(tiberius::ColumnType::Bitn)
+            } else {
+                Some(tiberius::ColumnType::Bit)
+            }
+        }
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int32ToInt) => {
+            Some(tiberius::ColumnType::Int4)
+        }
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int64ToBigInt) => {
+            Some(tiberius::ColumnType::Int8)
+        }
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => {
+            Some(tiberius::ColumnType::Float8)
+        }
+        DirectColumnEncoding::Primitive(_) => None,
+    }
+}
+
 fn bulk_target_column_diagnostic(
     mapping: &SchemaMapping,
     message: impl Into<String>,
@@ -293,6 +402,8 @@ trait BulkTargetColumnMetadata {
     fn name(&self) -> &str;
 
     fn is_nullable(&self) -> bool;
+
+    fn column_type(&self) -> tiberius::ColumnType;
 }
 
 impl BulkTargetColumnMetadata for tiberius::BulkLoadColumn<'_> {
@@ -306,6 +417,10 @@ impl BulkTargetColumnMetadata for tiberius::BulkLoadColumn<'_> {
 
     fn is_nullable(&self) -> bool {
         self.is_nullable()
+    }
+
+    fn column_type(&self) -> tiberius::ColumnType {
+        self.column_type()
     }
 }
 
@@ -438,8 +553,8 @@ mod tests {
     use super::{
         BulkTargetColumnMetadata, RawRowsSink, TokenRowSink, WriteBackend, WriteOptions,
         WriteStats, WriterState, bulk_insert_table_sql, record_batch_view, resolve_backend,
-        tiberius_row_owned, validate_batch_rows, validate_bulk_target_columns, write_batch_to_sink,
-        write_direct_batch_to_sink,
+        tiberius_row_owned, validate_batch_rows, validate_bulk_target_columns,
+        validate_direct_bulk_target_column_types, write_batch_to_sink, write_direct_batch_to_sink,
     };
     use crate::{
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, PlanOptions,
@@ -767,6 +882,67 @@ mod tests {
     }
 
     #[test]
+    fn direct_bulk_target_type_validation_accepts_matching_primitive_metadata() {
+        let mappings = vec![mapping("id")];
+        let state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let columns = vec![bulk_target_column_with_type(
+            0,
+            "id",
+            false,
+            tiberius::ColumnType::Int4,
+        )];
+
+        validate_direct_bulk_target_column_types(
+            columns.into_iter(),
+            state.direct_encoder().unwrap().plan(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn direct_bulk_target_type_validation_rejects_same_name_with_wrong_type() {
+        let mappings = vec![mapping("id")];
+        let state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let columns = vec![bulk_target_column_with_type(
+            0,
+            "id",
+            false,
+            tiberius::ColumnType::Int8,
+        )];
+
+        let err = validate_direct_bulk_target_column_types(
+            columns.into_iter(),
+            state.direct_encoder().unwrap().plan(),
+        )
+        .unwrap_err();
+
+        let Error::ValueConversion { diagnostics } = err else {
+            panic!("expected value conversion error");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics.all()[0];
+        assert_eq!(diagnostic.code(), DiagnosticCode::SchemaMismatch);
+        assert_eq!(diagnostic.field().map(|field| field.name()), Some("id"));
+        assert!(
+            diagnostic
+                .message()
+                .contains("bulk target column type Int8 does not match direct encoder type Int4")
+        );
+    }
+
+    #[test]
     fn write_batch_to_sink_accepts_empty_matching_batch() {
         let mappings = vec![mapping("id")];
         let mut state = WriterState::new(
@@ -1015,10 +1191,20 @@ mod tests {
     }
 
     fn bulk_target_column(ordinal: usize, name: &str, nullable: bool) -> FakeBulkTargetColumn {
+        bulk_target_column_with_type(ordinal, name, nullable, tiberius::ColumnType::Int4)
+    }
+
+    fn bulk_target_column_with_type(
+        ordinal: usize,
+        name: &str,
+        nullable: bool,
+        column_type: tiberius::ColumnType,
+    ) -> FakeBulkTargetColumn {
         FakeBulkTargetColumn {
             ordinal,
             name: name.to_owned(),
             nullable,
+            column_type,
         }
     }
 
@@ -1105,6 +1291,7 @@ mod tests {
         ordinal: usize,
         name: String,
         nullable: bool,
+        column_type: tiberius::ColumnType,
     }
 
     impl BulkTargetColumnMetadata for FakeBulkTargetColumn {
@@ -1118,6 +1305,10 @@ mod tests {
 
         fn is_nullable(&self) -> bool {
             self.nullable
+        }
+
+        fn column_type(&self) -> tiberius::ColumnType {
+            self.column_type
         }
     }
 

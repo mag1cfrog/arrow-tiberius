@@ -361,6 +361,30 @@ mod tests {
     }
 
     #[test]
+    fn primitive_direct_support_rejects_forged_float64_non_53_precision_mapping() {
+        let mappings = vec![mapping(
+            0,
+            "ratio",
+            DataType::Float64,
+            MssqlType::Float { precision: 24 },
+        )];
+
+        let err = DirectEncoderPlan::new(&mappings, &PrimitiveDirectMappings)
+            .expect_err("direct Float64 support requires SQL Server float(53)");
+
+        let Error::DirectEncoding { diagnostics } = err else {
+            panic!("expected direct encoding error");
+        };
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics.all()[0].code(),
+            DiagnosticCode::DirectEncodingUnsupportedMapping
+        );
+        assert_eq!(diagnostics.all()[0].field().unwrap().name(), "ratio");
+    }
+
+    #[test]
     fn primitive_direct_support_rejects_non_primitive_mapping_with_type_reason() {
         let mappings = vec![mapping(
             0,

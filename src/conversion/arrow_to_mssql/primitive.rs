@@ -47,7 +47,7 @@ impl PrimitiveArrowToMssql {
             (DataType::UInt32, MssqlType::BigInt) => Self::UInt32ToBigInt,
             (DataType::UInt64, MssqlType::BigInt) => Self::UInt64ToCheckedBigInt,
             (DataType::Float32, MssqlType::Real) => Self::Float32ToReal,
-            (DataType::Float64, MssqlType::Float { .. }) => Self::Float64ToFloat,
+            (DataType::Float64, MssqlType::Float { precision: 53 }) => Self::Float64ToFloat,
             _ => {
                 return Err(value_conversion_error(row_mapping_diagnostic(
                     mapping,
@@ -175,6 +175,25 @@ mod tests {
             DiagnosticCode::ValueConversionUnsupported,
             Some(9),
             Some((3, "id")),
+        );
+    }
+
+    #[test]
+    fn classifier_rejects_float64_to_non_53_bit_float() {
+        let mapping = mapping(
+            1,
+            "ratio",
+            DataType::Float64,
+            MssqlType::Float { precision: 24 },
+        );
+
+        let err = PrimitiveArrowToMssql::classify(&mapping, 7).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::ValueConversionUnsupported,
+            Some(7),
+            Some((1, "ratio")),
         );
     }
 
