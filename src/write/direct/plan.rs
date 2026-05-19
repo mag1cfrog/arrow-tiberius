@@ -4,6 +4,7 @@ use arrow_schema::DataType;
 
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, MssqlType, Result, SchemaMapping,
+    conversion::arrow_to_mssql::primitive::PrimitiveArrowToMssql,
 };
 
 /// Support status for one planned mapping in the direct encoder.
@@ -36,6 +37,33 @@ impl DirectEncoderSupport for NoDirectMappings {
                 arrow_type_name(mapping.arrow().data_type()),
                 mapping.mssql().ty().to_sql()
             ),
+        }
+    }
+}
+
+/// Direct encoder support policy for the first fixed-width primitive slice.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub(crate) struct PrimitiveDirectMappings;
+
+impl DirectEncoderSupport for PrimitiveDirectMappings {
+    fn support_mapping(&self, mapping: &SchemaMapping) -> DirectMappingSupport {
+        match PrimitiveArrowToMssql::classify(mapping, 0) {
+            Ok(PrimitiveArrowToMssql::BooleanToBit)
+            | Ok(PrimitiveArrowToMssql::Int32ToInt)
+            | Ok(PrimitiveArrowToMssql::Int64ToBigInt)
+            | Ok(PrimitiveArrowToMssql::Float64ToFloat) => DirectMappingSupport::Supported,
+            Ok(classification) => DirectMappingSupport::Unsupported {
+                reason: format!(
+                    "direct encoding support for primitive mapping {classification:?} is not implemented yet"
+                ),
+            },
+            Err(_) => DirectMappingSupport::Unsupported {
+                reason: format!(
+                    "direct encoding is not implemented yet for Arrow {} to SQL Server {}",
+                    arrow_type_name(mapping.arrow().data_type()),
+                    mapping.mssql().ty().to_sql()
+                ),
+            },
         }
     }
 }
@@ -148,7 +176,10 @@ mod tests {
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, SchemaMapping,
     };
 
-    use super::{DirectEncoderPlan, DirectEncoderSupport, DirectMappingSupport, NoDirectMappings};
+    use super::{
+        DirectEncoderPlan, DirectEncoderSupport, DirectMappingSupport, NoDirectMappings,
+        PrimitiveDirectMappings,
+    };
 
     #[test]
     fn empty_mapping_set_is_supported_before_type_encoders_exist() {
@@ -223,6 +254,91 @@ mod tests {
         assert_eq!(plan.columns()[1].source_name(), "quantity");
         assert_eq!(plan.columns()[1].target_type(), &MssqlType::Int);
         assert!(!plan.columns()[1].nullable());
+    }
+
+    #[test]
+    fn primitive_direct_support_accepts_only_issue_66_mappings() {
+        let mappings = vec![
+            mapping(0, "is_active", DataType::Boolean, MssqlType::Bit),
+            mapping(1, "quantity", DataType::Int32, MssqlType::Int),
+            mapping(2, "total", DataType::Int64, MssqlType::BigInt),
+            mapping(
+                3,
+                "ratio",
+                DataType::Float64,
+                MssqlType::Float { precision: 53 },
+            ),
+        ];
+
+        let plan = DirectEncoderPlan::new(&mappings, &PrimitiveDirectMappings)
+            .expect("issue 66 primitive mappings should be supported");
+
+        assert_eq!(plan.column_count(), 4);
+        assert_eq!(plan.columns()[0].target_type(), &MssqlType::Bit);
+        assert_eq!(plan.columns()[1].target_type(), &MssqlType::Int);
+        assert_eq!(plan.columns()[2].target_type(), &MssqlType::BigInt);
+        assert_eq!(
+            plan.columns()[3].target_type(),
+            &MssqlType::Float { precision: 53 }
+        );
+    }
+
+    #[test]
+    fn primitive_direct_support_rejects_scalar_primitives_outside_issue_66() {
+        let mappings = vec![
+            mapping(0, "tiny", DataType::UInt8, MssqlType::TinyInt),
+            mapping(1, "small", DataType::Int16, MssqlType::SmallInt),
+            mapping(2, "unsigned", DataType::UInt32, MssqlType::BigInt),
+            mapping(3, "real_value", DataType::Float32, MssqlType::Real),
+        ];
+
+        let err = DirectEncoderPlan::new(&mappings, &PrimitiveDirectMappings)
+            .expect_err("non-issue-66 primitives are still unsupported");
+
+        let Error::DirectEncoding { diagnostics } = err else {
+            panic!("expected direct encoding error");
+        };
+
+        assert_eq!(diagnostics.len(), 4);
+        for (index, diagnostic) in diagnostics.all().iter().enumerate() {
+            assert_eq!(
+                diagnostic.code(),
+                DiagnosticCode::DirectEncodingUnsupportedMapping
+            );
+            assert_eq!(diagnostic.field().unwrap().index(), index);
+            assert!(
+                diagnostic
+                    .message()
+                    .contains("direct encoding support for primitive mapping")
+            );
+        }
+    }
+
+    #[test]
+    fn primitive_direct_support_rejects_non_primitive_mapping_with_type_reason() {
+        let mappings = vec![mapping(
+            0,
+            "name",
+            DataType::Utf8,
+            MssqlType::NVarChar(crate::MssqlTypeLength::Max),
+        )];
+
+        let err = DirectEncoderPlan::new(&mappings, &PrimitiveDirectMappings)
+            .expect_err("string direct encoding is not in issue 66 scope");
+
+        let Error::DirectEncoding { diagnostics } = err else {
+            panic!("expected direct encoding error");
+        };
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics.all()[0].code(),
+            DiagnosticCode::DirectEncodingUnsupportedMapping
+        );
+        assert_eq!(
+            diagnostics.all()[0].message(),
+            "direct encoding is not implemented yet for Arrow Utf8 to SQL Server nvarchar(max)"
+        );
     }
 
     #[derive(Debug, Clone, Copy)]

@@ -13,7 +13,7 @@ pub(crate) mod payload;
 pub(crate) mod plan;
 
 use payload::EncodedRowsPayload;
-use plan::{DirectEncoderPlan, NoDirectMappings};
+use plan::{DirectEncoderPlan, PrimitiveDirectMappings};
 
 /// Direct raw TDS encoder facade.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,7 +25,7 @@ pub(crate) struct DirectEncoder {
 impl DirectEncoder {
     /// Creates a direct encoder using the current supported direct mappings.
     pub(crate) fn new(mappings: &[SchemaMapping]) -> Result<Self> {
-        Self::new_with_support(mappings, &NoDirectMappings)
+        Self::new_with_support(mappings, &PrimitiveDirectMappings)
     }
 
     /// Creates a direct encoder using an explicit support checker.
