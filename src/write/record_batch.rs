@@ -12,7 +12,7 @@ use crate::{
         from_arrow::{ArrowToMssqlRuntimeMapping, mssql_cell_from_arrow_cell},
     },
 };
-use validate::validate_runtime_columns;
+pub(crate) use validate::validate_runtime_columns;
 
 /// Borrowed conversion view over one Arrow record batch and schema mappings.
 #[derive(Debug)]

@@ -4,7 +4,7 @@ use arrow_array::{Array, RecordBatch};
 
 use crate::{Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, Result, SchemaMapping};
 
-pub(super) fn validate_runtime_columns(
+pub(crate) fn validate_runtime_columns(
     batch: &RecordBatch,
     mappings: &[SchemaMapping],
 ) -> Result<()> {
