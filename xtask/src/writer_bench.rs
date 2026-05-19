@@ -261,7 +261,7 @@ fn print_arrow_odbc_help() {
 
 fn print_compare_help() {
     println!(
-        "Usage:\n  cargo xtask writer-bench compare [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --backends <LIST>           Comma-separated backends: baseline,arrow-odbc,odbc-bcp [default: baseline,arrow-odbc]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>      Managed ODBC runner image tag\n  --keep-runner-image         Keep the managed ODBC runner image after the task exits\n  -h, --help                  Print help\n\nCompare runs use one shared Arrow IPC dataset as the fairness boundary."
+        "Usage:\n  cargo xtask writer-bench compare [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --backends <LIST>           Comma-separated backends: baseline,direct-raw,arrow-odbc,odbc-bcp [default: baseline,arrow-odbc]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>      Managed ODBC runner image tag\n  --keep-runner-image         Keep the managed ODBC runner image after the task exits\n  -h, --help                  Print help\n\nCompare runs use one shared Arrow IPC dataset as the fairness boundary."
     );
 }
 
@@ -284,7 +284,7 @@ fn print_summary(options: &WriterBenchOptions, summary: &GeneratedBatchSummary) 
 
 fn print_baseline_summary(
     options: &BaselineBenchOptions,
-    report: &BaselineBenchReport,
+    report: &TiberiusBenchReport,
     connection: &sqlserver::SqlServerConnection,
 ) {
     println!("writer-bench baseline");
@@ -324,6 +324,27 @@ fn print_baseline_summary(
     println!("  validate: {}", format_duration(report.timings.validate));
     println!("  cleanup: {}", format_duration(report.timings.cleanup));
     println!("  total: {}", format_duration(report.timings.total));
+    print_peak_rss("  ", report.peak_rss_kib);
+}
+
+fn print_tiberius_backend_summary(report: &TiberiusBenchReport) {
+    println!("    batches written: {}", report.stats.batches_written);
+    println!("    rows written: {}", report.stats.rows_written);
+    println!(
+        "    write rows/sec: {}",
+        format_rows_per_second(
+            report.stats.rows_written,
+            report.timings.write + report.timings.finish
+        )
+    );
+    println!("    validated rows: {}", report.validated_rows);
+    println!("    setup: {}", format_duration(report.timings.setup));
+    println!("    write: {}", format_duration(report.timings.write));
+    println!("    finish: {}", format_duration(report.timings.finish));
+    println!("    validate: {}", format_duration(report.timings.validate));
+    println!("    cleanup: {}", format_duration(report.timings.cleanup));
+    println!("    total: {}", format_duration(report.timings.total));
+    print_peak_rss("    ", report.peak_rss_kib);
 }
 
 fn print_compare_summary(options: &CompareBenchOptions, report: &CompareBenchReport) {
@@ -339,23 +360,9 @@ fn print_compare_summary(options: &CompareBenchOptions, report: &CompareBenchRep
     for backend in &report.backends {
         println!("  backend: {}", backend.backend());
         match backend {
-            CompareBackendBenchReport::Baseline { report } => {
-                println!("    batches written: {}", report.stats.batches_written);
-                println!("    rows written: {}", report.stats.rows_written);
-                println!(
-                    "    write rows/sec: {}",
-                    format_rows_per_second(
-                        report.stats.rows_written,
-                        report.timings.write + report.timings.finish
-                    )
-                );
-                println!("    validated rows: {}", report.validated_rows);
-                println!("    setup: {}", format_duration(report.timings.setup));
-                println!("    write: {}", format_duration(report.timings.write));
-                println!("    finish: {}", format_duration(report.timings.finish));
-                println!("    validate: {}", format_duration(report.timings.validate));
-                println!("    cleanup: {}", format_duration(report.timings.cleanup));
-                println!("    total: {}", format_duration(report.timings.total));
+            CompareBackendBenchReport::Baseline { report }
+            | CompareBackendBenchReport::DirectRaw { report } => {
+                print_tiberius_backend_summary(report);
             }
             CompareBackendBenchReport::ArrowOdbc { report } => {
                 println!("    rows written: {}", report.rows_written);
@@ -365,6 +372,7 @@ fn print_compare_summary(options: &CompareBenchOptions, report: &CompareBenchRep
                 );
                 println!("    validated rows: {}", report.rows_written);
                 println!("    write: {}", format_duration(report.write_elapsed));
+                print_peak_rss("    ", report.peak_rss_kib);
             }
             CompareBackendBenchReport::OdbcBcp { report } => {
                 println!("    rows written: {}", report.rows_written);
@@ -374,8 +382,15 @@ fn print_compare_summary(options: &CompareBenchOptions, report: &CompareBenchRep
                 );
                 println!("    validated rows: {}", report.rows_written);
                 println!("    write: {}", format_duration(report.write_elapsed));
+                print_peak_rss("    ", report.peak_rss_kib);
             }
         }
+    }
+}
+
+fn print_peak_rss(prefix: &str, peak_rss_kib: Option<u64>) {
+    if let Some(peak_rss_kib) = peak_rss_kib {
+        println!("{prefix}peak rss KiB: {peak_rss_kib}");
     }
 }
 
@@ -691,6 +706,7 @@ impl CompareBenchOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BenchmarkBackend {
     Baseline,
+    DirectRaw,
     ArrowOdbc,
     OdbcBcp,
 }
@@ -699,6 +715,7 @@ impl fmt::Display for BenchmarkBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Baseline => f.write_str("baseline"),
+            Self::DirectRaw => f.write_str("direct-raw"),
             Self::ArrowOdbc => f.write_str("arrow-odbc"),
             Self::OdbcBcp => f.write_str("odbc-bcp"),
         }
@@ -711,10 +728,11 @@ impl FromStr for BenchmarkBackend {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "baseline" => Ok(Self::Baseline),
+            "direct-raw" => Ok(Self::DirectRaw),
             "arrow-odbc" => Ok(Self::ArrowOdbc),
             "odbc-bcp" => Ok(Self::OdbcBcp),
             other => Err(WriterBenchError::Validation(format!(
-                "unknown writer-bench compare backend `{other}`; expected baseline, arrow-odbc, or odbc-bcp"
+                "unknown writer-bench compare backend `{other}`; expected baseline, direct-raw, arrow-odbc, or odbc-bcp"
             ))),
         }
     }
@@ -748,6 +766,19 @@ fn parse_benchmark_backends(value: &str) -> Result<Vec<BenchmarkBackend>, Writer
     }
 
     Ok(backends)
+}
+
+fn ensure_direct_raw_supported_scenario(
+    benchmark: &WriterBenchOptions,
+) -> Result<(), WriterBenchError> {
+    if benchmark.scenario.name == NARROW_NUMERIC_SCENARIO.name {
+        return Ok(());
+    }
+
+    Err(WriterBenchError::Validation(format!(
+        "writer-bench compare backend `direct-raw` currently supports only scenario `{}`; scenario `{}` contains column types that are not implemented by the primitive direct TDS encoder yet",
+        NARROW_NUMERIC_SCENARIO.name, benchmark.scenario.name
+    )))
 }
 
 fn parse_writer_sqlserver_options(
@@ -1145,6 +1176,7 @@ fn parse_odbc_runner_report(
 ) -> Result<OdbcRunnerBenchReport, WriterBenchError> {
     let rows_written = parse_odbc_runner_u64(output, "rows written", runner_name)?;
     let write_seconds = parse_odbc_runner_f64(output, "write seconds", runner_name)?;
+    let peak_rss_kib = parse_odbc_runner_optional_u64(output, "peak rss KiB", runner_name)?;
 
     if !write_seconds.is_finite() || write_seconds < 0.0 {
         return Err(WriterBenchError::Validation(format!(
@@ -1155,6 +1187,7 @@ fn parse_odbc_runner_report(
     Ok(OdbcRunnerBenchReport {
         rows_written,
         write_elapsed: Duration::from_secs_f64(write_seconds),
+        peak_rss_kib,
     })
 }
 
@@ -1186,20 +1219,46 @@ fn parse_odbc_runner_f64(
         })
 }
 
+fn parse_odbc_runner_optional_u64(
+    output: &str,
+    label: &str,
+    runner_name: &str,
+) -> Result<Option<u64>, WriterBenchError> {
+    let Some(value) = parse_odbc_runner_optional_value(output, label) else {
+        return Ok(None);
+    };
+
+    value.parse().map(Some).map_err(|source| {
+        WriterBenchError::Validation(format!(
+            "{runner_name} runner reported invalid {label}: {source}"
+        ))
+    })
+}
+
 fn parse_odbc_runner_value<'a>(
     output: &'a str,
     label: &str,
     runner_name: &str,
 ) -> Result<&'a str, WriterBenchError> {
+    parse_odbc_runner_optional_value(output, label).ok_or_else(|| {
+        WriterBenchError::Validation(format!("{runner_name} runner output is missing `{label}`"))
+    })
+}
+
+fn parse_odbc_runner_optional_value<'a>(output: &'a str, label: &str) -> Option<&'a str> {
     let prefix = format!("{label}:");
     output
         .lines()
         .find_map(|line| line.trim().strip_prefix(&prefix).map(str::trim))
-        .ok_or_else(|| {
-            WriterBenchError::Validation(format!(
-                "{runner_name} runner output is missing `{label}`"
-            ))
-        })
+}
+
+fn current_process_peak_rss_kib() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status.lines().find_map(|line| {
+        let value = line.strip_prefix("VmHWM:")?.trim();
+        let kib = value.strip_suffix("kB")?.trim();
+        kib.parse().ok()
+    })
 }
 
 fn odbc_connection_string(
@@ -1434,14 +1493,15 @@ struct GeneratedBatchSummary {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct BaselineBenchReport {
+struct TiberiusBenchReport {
     stats: arrow_tiberius::WriteStats,
     validated_rows: u64,
-    timings: BaselineBenchTimings,
+    peak_rss_kib: Option<u64>,
+    timings: TiberiusBenchTimings,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct BaselineBenchTimings {
+struct TiberiusBenchTimings {
     setup: Duration,
     write: Duration,
     finish: Duration,
@@ -1459,7 +1519,8 @@ struct CompareBenchReport {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompareBackendBenchReport {
-    Baseline { report: BaselineBenchReport },
+    Baseline { report: TiberiusBenchReport },
+    DirectRaw { report: TiberiusBenchReport },
     ArrowOdbc { report: OdbcRunnerBenchReport },
     OdbcBcp { report: OdbcRunnerBenchReport },
 }
@@ -1468,6 +1529,7 @@ impl CompareBackendBenchReport {
     fn backend(&self) -> BenchmarkBackend {
         match self {
             Self::Baseline { .. } => BenchmarkBackend::Baseline,
+            Self::DirectRaw { .. } => BenchmarkBackend::DirectRaw,
             Self::ArrowOdbc { .. } => BenchmarkBackend::ArrowOdbc,
             Self::OdbcBcp { .. } => BenchmarkBackend::OdbcBcp,
         }
@@ -1478,6 +1540,7 @@ impl CompareBackendBenchReport {
 struct OdbcRunnerBenchReport {
     rows_written: u64,
     write_elapsed: Duration,
+    peak_rss_kib: Option<u64>,
 }
 
 type BenchClient = tiberius::Client<Compat<TcpStream>>;
@@ -1485,15 +1548,19 @@ type BenchClient = tiberius::Client<Compat<TcpStream>>;
 async fn run_baseline_async(
     options: &BaselineBenchOptions,
     connection: &sqlserver::SqlServerConnection,
-) -> Result<BaselineBenchReport, WriterBenchError> {
+) -> Result<TiberiusBenchReport, WriterBenchError> {
     let total_start = Instant::now();
     let setup_start = Instant::now();
     let ipc_dataset = prepare_baseline_ipc_dataset(options)?;
     let ipc_setup = setup_start.elapsed();
 
-    let run_result =
-        run_baseline_benchmark_from_ipc(&options.benchmark, connection, &ipc_dataset.host_path)
-            .await;
+    let run_result = run_tiberius_benchmark_from_ipc(
+        &options.benchmark,
+        connection,
+        &ipc_dataset.host_path,
+        WriteBackend::BaselineTokenRow,
+    )
+    .await;
     let dataset_cleanup_result = ipc_dataset.cleanup();
     let mut report = run_result?;
     dataset_cleanup_result?;
@@ -1505,6 +1572,10 @@ async fn run_baseline_async(
 fn run_compare_benchmark(
     options: &CompareBenchOptions,
 ) -> Result<CompareBenchReport, WriterBenchError> {
+    if options.backends.contains(&BenchmarkBackend::DirectRaw) {
+        ensure_direct_raw_supported_scenario(&options.benchmark)?;
+    }
+
     let network = create_compare_network(options)?;
     let connection = options
         .sql_server
@@ -1528,16 +1599,33 @@ fn run_compare_benchmark(
         if options.backends.contains(&BenchmarkBackend::Baseline) {
             let report = runtime.block_on(async {
                 let backend_start = Instant::now();
-                let mut report = run_baseline_benchmark_from_ipc(
+                let mut report = run_tiberius_benchmark_from_ipc(
                     &options.benchmark,
                     &connection,
                     &ipc_dataset.host_path,
+                    WriteBackend::BaselineTokenRow,
                 )
                 .await?;
                 report.timings.total = backend_start.elapsed();
                 Ok::<_, WriterBenchError>(report)
             })?;
             backends.push(CompareBackendBenchReport::Baseline { report });
+        }
+
+        if options.backends.contains(&BenchmarkBackend::DirectRaw) {
+            let report = runtime.block_on(async {
+                let backend_start = Instant::now();
+                let mut report = run_tiberius_benchmark_from_ipc(
+                    &options.benchmark,
+                    &connection,
+                    &ipc_dataset.host_path,
+                    WriteBackend::DirectRawBulk,
+                )
+                .await?;
+                report.timings.total = backend_start.elapsed();
+                Ok::<_, WriterBenchError>(report)
+            })?;
+            backends.push(CompareBackendBenchReport::DirectRaw { report });
         }
 
         if options.backends.contains(&BenchmarkBackend::ArrowOdbc) {
@@ -1591,12 +1679,13 @@ fn run_compare_benchmark(
     Ok(report)
 }
 
-async fn run_baseline_benchmark_from_ipc(
+async fn run_tiberius_benchmark_from_ipc(
     benchmark: &WriterBenchOptions,
     connection: &sqlserver::SqlServerConnection,
     ipc_path: &Path,
-) -> Result<BaselineBenchReport, WriterBenchError> {
-    let mut report = BaselineBenchReport::default();
+    backend: WriteBackend,
+) -> Result<TiberiusBenchReport, WriterBenchError> {
+    let mut report = TiberiusBenchReport::default();
 
     let setup_start = Instant::now();
     let mut client = connect(&connection.connection_string, &connection.database).await?;
@@ -1608,7 +1697,8 @@ async fn run_baseline_benchmark_from_ipc(
         let repeat_result = async {
             let table = unique_benchmark_table_name()?;
             let repeat_report =
-                run_baseline_repeat_from_ipc(&mut client, &mappings, &table, ipc_path).await;
+                run_tiberius_repeat_from_ipc(&mut client, &mappings, &table, ipc_path, backend)
+                    .await;
             let cleanup_start = Instant::now();
             let cleanup_result = drop_table(&mut client, &table).await;
             report.timings.cleanup += cleanup_start.elapsed();
@@ -1647,6 +1737,8 @@ async fn run_baseline_benchmark_from_ipc(
         repeat_result?;
     }
 
+    report.peak_rss_kib = current_process_peak_rss_kib();
+
     Ok(report)
 }
 
@@ -1678,25 +1770,27 @@ fn prepare_baseline_ipc_dataset(
     })
 }
 
-async fn run_baseline_repeat_from_ipc(
+async fn run_tiberius_repeat_from_ipc(
     client: &mut BenchClient,
     mappings: &[arrow_tiberius::SchemaMapping],
     table: &TableName,
     ipc_path: &Path,
-) -> Result<BaselineBenchReport, WriterBenchError> {
+    backend: WriteBackend,
+) -> Result<TiberiusBenchReport, WriterBenchError> {
     let batches =
         dataset::ipc_dataset_reader(ipc_path)?.map(|batch| batch.map_err(WriterBenchError::Arrow));
 
-    run_baseline_repeat_with_batches(client, mappings, table, batches).await
+    run_tiberius_repeat_with_batches(client, mappings, table, batches, backend).await
 }
 
-async fn run_baseline_repeat_with_batches(
+async fn run_tiberius_repeat_with_batches(
     client: &mut BenchClient,
     mappings: &[arrow_tiberius::SchemaMapping],
     table: &TableName,
     batches: impl IntoIterator<Item = Result<RecordBatch, WriterBenchError>>,
-) -> Result<BaselineBenchReport, WriterBenchError> {
-    let mut report = BaselineBenchReport::default();
+    backend: WriteBackend,
+) -> Result<TiberiusBenchReport, WriterBenchError> {
+    let mut report = TiberiusBenchReport::default();
     let setup_start = Instant::now();
 
     execute_sql(
@@ -1710,7 +1804,7 @@ async fn run_baseline_repeat_with_batches(
         table.clone(),
         mappings.to_vec(),
         WriteOptions {
-            backend: WriteBackend::BaselineTokenRow,
+            backend,
             ..WriteOptions::default()
         },
     )
@@ -2746,7 +2840,7 @@ mod tests {
             OsString::from("--scenario"),
             OsString::from("narrow_numeric"),
             OsString::from("--backends"),
-            OsString::from("baseline,arrow-odbc,odbc-bcp"),
+            OsString::from("baseline,direct-raw,arrow-odbc,odbc-bcp"),
         ];
 
         let options = super::CompareBenchOptions::parse(&args).unwrap();
@@ -2755,6 +2849,7 @@ mod tests {
             options.backends,
             [
                 super::BenchmarkBackend::Baseline,
+                super::BenchmarkBackend::DirectRaw,
                 super::BenchmarkBackend::ArrowOdbc,
                 super::BenchmarkBackend::OdbcBcp
             ]
@@ -2776,7 +2871,7 @@ mod tests {
     }
 
     #[test]
-    fn compare_allows_all_backends_for_decimal_temporal() {
+    fn compare_allows_external_backends_for_decimal_temporal() {
         let args = [
             OsString::from("--scenario"),
             OsString::from("decimal_temporal"),
@@ -2795,6 +2890,42 @@ mod tests {
             ]
         );
         assert_eq!(options.benchmark.scenario.name, "decimal_temporal");
+    }
+
+    #[test]
+    fn compare_allows_direct_raw_for_narrow_numeric() {
+        let args = [
+            OsString::from("--scenario"),
+            OsString::from("narrow_numeric"),
+            OsString::from("--backends"),
+            OsString::from("direct-raw"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+
+        assert_eq!(options.backends, [super::BenchmarkBackend::DirectRaw]);
+        super::ensure_direct_raw_supported_scenario(&options.benchmark).unwrap();
+    }
+
+    #[test]
+    fn compare_rejects_direct_raw_for_unsupported_scenarios() {
+        let args = [
+            OsString::from("--scenario"),
+            OsString::from("mixed_nullable"),
+            OsString::from("--backends"),
+            OsString::from("direct-raw"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+        let err = super::ensure_direct_raw_supported_scenario(&options.benchmark).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("direct-raw")
+                    && message.contains("narrow_numeric")
+                    && message.contains("mixed_nullable")
+        ));
     }
 
     #[test]
@@ -3174,12 +3305,14 @@ arrow-odbc runner
   rows written: 25
   write seconds: 0.067
   write rows/sec: 375.43
+  peak rss KiB: 123456
 ";
 
         let report = super::parse_arrow_odbc_runner_report(output).unwrap();
 
         assert_eq!(report.rows_written, 25);
         assert_eq!(report.write_elapsed, std::time::Duration::from_millis(67));
+        assert_eq!(report.peak_rss_kib, Some(123456));
     }
 
     #[test]
@@ -3191,12 +3324,25 @@ odbc-bcp runner
   rows written: 25
   write seconds: 0.067
   write rows/sec: 375.43
+  peak rss KiB: 654321
 ";
 
         let report = super::parse_odbc_bcp_runner_report(output).unwrap();
 
         assert_eq!(report.rows_written, 25);
         assert_eq!(report.write_elapsed, std::time::Duration::from_millis(67));
+        assert_eq!(report.peak_rss_kib, Some(654321));
+    }
+
+    #[test]
+    fn parses_odbc_runner_report_without_peak_rss_for_backward_compatibility() {
+        let output = "rows written: 25\nwrite seconds: 0.067";
+
+        let report = super::parse_arrow_odbc_runner_report(output).unwrap();
+
+        assert_eq!(report.rows_written, 25);
+        assert_eq!(report.write_elapsed, std::time::Duration::from_millis(67));
+        assert_eq!(report.peak_rss_kib, None);
     }
 
     #[test]

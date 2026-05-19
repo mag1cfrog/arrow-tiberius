@@ -6,6 +6,8 @@
 
 /// Arrow-side schema metadata.
 pub mod arrow;
+/// Directional conversion semantics between Arrow and SQL Server.
+pub(crate) mod conversion;
 /// Structured diagnostics for planning and writing.
 pub mod diagnostic;
 /// Error types for `arrow-tiberius`.

@@ -2,7 +2,10 @@
 
 use crate::{Diagnostic, DiagnosticCode, DiagnosticSet, Error, Result};
 
-/// Byte position for one encoded cell inside an encoded rows payload.
+/// Absolute byte position for one encoded cell inside an encoded rows payload.
+///
+/// A cell position belongs to one row and one column, but its `offset` is
+/// measured from the start of the whole payload buffer, not from the row start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct CellPosition {
     row_index: usize,
@@ -56,14 +59,28 @@ impl CellPosition {
 /// Row-major layout metadata for one direct encoded rows payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RowLayout {
+    /// Absolute byte offsets where each TDS ROW token (`0xD1`) begins.
+    ///
+    /// One payload can contain zero, one, or many rows. For example,
+    /// `[0, 12, 24]` means the payload has three rows and their row token bytes
+    /// start at payload bytes 0, 12, and 24.
     row_token_offsets: Vec<usize>,
+    /// Total byte length for each row, including the row token and all cells.
+    ///
+    /// The validator uses this with `row_token_offsets` to prove rows are
+    /// contiguous and cover the whole payload.
     row_lengths: Vec<usize>,
+    /// Absolute byte positions for every encoded cell.
+    ///
+    /// Positions are row-major: all cells for row 0, then all cells for row 1,
+    /// and so on. Each position is measured from the start of the whole payload.
     cell_positions: Vec<CellPosition>,
+    /// Total byte length of the complete payload buffer.
     payload_len: usize,
 }
 
 impl RowLayout {
-    /// Creates row-major layout metadata.
+    /// Creates row-major layout metadata for one complete payload buffer.
     pub(crate) fn new(
         row_token_offsets: Vec<usize>,
         row_lengths: Vec<usize>,
@@ -81,27 +98,27 @@ impl RowLayout {
         })
     }
 
-    /// Returns the number of encoded rows.
+    /// Returns the number of rows described by this payload layout.
     pub(crate) fn row_count(&self) -> usize {
         self.row_token_offsets.len()
     }
 
-    /// Returns the row-token offsets.
+    /// Returns absolute byte offsets where each `0xD1` row token begins.
     pub(crate) fn row_token_offsets(&self) -> &[usize] {
         &self.row_token_offsets
     }
 
-    /// Returns row lengths in bytes.
+    /// Returns row lengths in bytes, including each row's token byte.
     pub(crate) fn row_lengths(&self) -> &[usize] {
         &self.row_lengths
     }
 
-    /// Returns cell byte positions.
+    /// Returns absolute byte positions for encoded cells in row-major order.
     pub(crate) fn cell_positions(&self) -> &[CellPosition] {
         &self.cell_positions
     }
 
-    /// Returns the total payload length in bytes.
+    /// Returns the total payload buffer length in bytes.
     pub(crate) const fn payload_len(&self) -> usize {
         self.payload_len
     }

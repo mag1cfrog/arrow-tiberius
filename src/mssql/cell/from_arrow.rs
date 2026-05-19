@@ -12,10 +12,7 @@ use crate::{
 
 use super::MssqlCell;
 use decimal::{mssql_decimal_value, supports_null_decimal_cell};
-use primitive::{
-    mssql_bigint_value, mssql_bit_value, mssql_float_value, mssql_int_value, mssql_real_value,
-    mssql_smallint_value, mssql_tinyint_value,
-};
+use primitive::primitive_mssql_cell;
 use temporal::{
     mssql_date_value, mssql_datetime2_value, mssql_datetimeoffset_value, null_datetime2_cell,
     null_datetimeoffset_cell,
@@ -70,21 +67,13 @@ pub(crate) fn mssql_cell_from_arrow_cell<'a>(
     }
 
     match mapping.mssql().ty() {
-        MssqlType::Bit => Ok(MssqlCell::Bit(Some(mssql_bit_value(
-            mapping, row_index, cell,
-        )?))),
-        MssqlType::TinyInt => Ok(MssqlCell::TinyInt(Some(mssql_tinyint_value(
-            mapping, row_index, cell,
-        )?))),
-        MssqlType::SmallInt => Ok(MssqlCell::SmallInt(Some(mssql_smallint_value(
-            mapping, row_index, cell,
-        )?))),
-        MssqlType::Int => Ok(MssqlCell::Int(Some(mssql_int_value(
-            mapping, row_index, cell,
-        )?))),
-        MssqlType::BigInt => Ok(MssqlCell::BigInt(Some(mssql_bigint_value(
-            mapping, row_index, cell,
-        )?))),
+        MssqlType::Bit
+        | MssqlType::TinyInt
+        | MssqlType::SmallInt
+        | MssqlType::Int
+        | MssqlType::BigInt
+        | MssqlType::Real
+        | MssqlType::Float { .. } => primitive_mssql_cell(mapping, row_index, cell),
         MssqlType::Decimal { .. } => Ok(MssqlCell::Decimal(Some(mssql_decimal_value(
             mapping, row_index, cell,
         )?))),
@@ -99,12 +88,6 @@ pub(crate) fn mssql_cell_from_arrow_cell<'a>(
         MssqlType::DateTimeOffset { .. } => Ok(MssqlCell::DateTimeOffset(Some(
             mssql_datetimeoffset_value(runtime_mapping, row_index, cell)?,
         ))),
-        MssqlType::Real => Ok(MssqlCell::Real(Some(mssql_real_value(
-            mapping, row_index, cell,
-        )?))),
-        MssqlType::Float { .. } => Ok(MssqlCell::Float(Some(mssql_float_value(
-            mapping, row_index, cell,
-        )?))),
         MssqlType::NVarChar(length) => nvar_char_cell(mapping, row_index, *length, cell),
         MssqlType::VarBinary(length) => var_binary_cell(mapping, row_index, *length, cell),
     }

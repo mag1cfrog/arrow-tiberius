@@ -1,132 +1,91 @@
 //! Primitive Arrow-to-MSSQL runtime cell conversion.
 
-use crate::{DiagnosticCode, Result, SchemaMapping, arrow::cell::ArrowCell};
+use crate::{
+    DiagnosticCode, Result, SchemaMapping, arrow::cell::ArrowCell,
+    conversion::arrow_to_mssql::primitive::PrimitiveArrowToMssql, mssql::cell::MssqlCell,
+};
 
 use super::{non_finite_float_error, row_mapping_diagnostic, value_conversion_error};
 
-pub(super) fn mssql_bit_value(
+pub(super) fn primitive_mssql_cell<'a>(
     mapping: &SchemaMapping,
     row_index: usize,
-    cell: ArrowCell<'_>,
-) -> Result<bool> {
-    match cell {
-        ArrowCell::Boolean(value) => Ok(value),
-        other => Err(value_conversion_error(row_mapping_diagnostic(
-            mapping,
-            row_index,
-            DiagnosticCode::ValueTypeMismatch,
-            format!("expected Arrow boolean payload, got {other:?}"),
-        ))),
+    cell: ArrowCell<'a>,
+) -> Result<MssqlCell<'a>> {
+    match (classify_for_scalar(mapping, row_index), cell) {
+        (Some(PrimitiveArrowToMssql::BooleanToBit), ArrowCell::Boolean(value)) => {
+            Ok(MssqlCell::Bit(Some(value)))
+        }
+        (Some(PrimitiveArrowToMssql::UInt8ToTinyInt), ArrowCell::UInt8(value)) => {
+            Ok(MssqlCell::TinyInt(Some(value)))
+        }
+        (Some(PrimitiveArrowToMssql::Int8ToSmallInt), ArrowCell::Int8(value)) => {
+            Ok(MssqlCell::SmallInt(Some(i16::from(value))))
+        }
+        (Some(PrimitiveArrowToMssql::Int16ToSmallInt), ArrowCell::Int16(value)) => {
+            Ok(MssqlCell::SmallInt(Some(value)))
+        }
+        (Some(PrimitiveArrowToMssql::Int32ToInt), ArrowCell::Int32(value)) => {
+            Ok(MssqlCell::Int(Some(value)))
+        }
+        (Some(PrimitiveArrowToMssql::UInt16ToInt), ArrowCell::UInt16(value)) => {
+            Ok(MssqlCell::Int(Some(i32::from(value))))
+        }
+        (Some(PrimitiveArrowToMssql::Int64ToBigInt), ArrowCell::Int64(value)) => {
+            Ok(MssqlCell::BigInt(Some(value)))
+        }
+        (Some(PrimitiveArrowToMssql::UInt32ToBigInt), ArrowCell::UInt32(value)) => {
+            Ok(MssqlCell::BigInt(Some(i64::from(value))))
+        }
+        (Some(PrimitiveArrowToMssql::UInt64ToCheckedBigInt), ArrowCell::UInt64(value)) => {
+            i64::try_from(value)
+                .map_err(|_| {
+                    value_conversion_error(row_mapping_diagnostic(
+                        mapping,
+                        row_index,
+                        DiagnosticCode::IntegerOutOfRange,
+                        format!(
+                            "Arrow UInt64 value {value} does not fit planned SQL Server bigint"
+                        ),
+                    ))
+                })
+                .map(|value| MssqlCell::BigInt(Some(value)))
+        }
+        (Some(PrimitiveArrowToMssql::Float32ToReal), ArrowCell::Float32(value))
+            if value.is_finite() =>
+        {
+            Ok(MssqlCell::Real(Some(value)))
+        }
+        (Some(PrimitiveArrowToMssql::Float32ToReal), ArrowCell::Float32(value)) => {
+            Err(non_finite_float_error(mapping, row_index, value))
+        }
+        (Some(PrimitiveArrowToMssql::Float64ToFloat), ArrowCell::Float64(value))
+            if value.is_finite() =>
+        {
+            Ok(MssqlCell::Float(Some(value)))
+        }
+        (Some(PrimitiveArrowToMssql::Float64ToFloat), ArrowCell::Float64(value)) => {
+            Err(non_finite_float_error(mapping, row_index, value))
+        }
+        other => Err(primitive_type_mismatch(mapping, row_index, other)),
     }
 }
 
-pub(super) fn mssql_tinyint_value(
-    mapping: &SchemaMapping,
-    row_index: usize,
-    cell: ArrowCell<'_>,
-) -> Result<u8> {
-    match cell {
-        ArrowCell::UInt8(value) => Ok(value),
-        other => Err(value_conversion_error(row_mapping_diagnostic(
-            mapping,
-            row_index,
-            DiagnosticCode::ValueTypeMismatch,
-            format!("expected Arrow UInt8 payload, got {other:?}"),
-        ))),
-    }
+fn classify_for_scalar(mapping: &SchemaMapping, row_index: usize) -> Option<PrimitiveArrowToMssql> {
+    PrimitiveArrowToMssql::classify(mapping, row_index).ok()
 }
 
-pub(super) fn mssql_smallint_value(
+fn primitive_type_mismatch(
     mapping: &SchemaMapping,
     row_index: usize,
-    cell: ArrowCell<'_>,
-) -> Result<i16> {
-    match cell {
-        ArrowCell::Int8(value) => Ok(i16::from(value)),
-        ArrowCell::Int16(value) => Ok(value),
-        other => Err(value_conversion_error(row_mapping_diagnostic(
-            mapping,
-            row_index,
-            DiagnosticCode::ValueTypeMismatch,
-            format!("expected Arrow Int8 or Int16 payload, got {other:?}"),
-        ))),
-    }
-}
-
-pub(super) fn mssql_int_value(
-    mapping: &SchemaMapping,
-    row_index: usize,
-    cell: ArrowCell<'_>,
-) -> Result<i32> {
-    match cell {
-        ArrowCell::Int32(value) => Ok(value),
-        ArrowCell::UInt16(value) => Ok(i32::from(value)),
-        other => Err(value_conversion_error(row_mapping_diagnostic(
-            mapping,
-            row_index,
-            DiagnosticCode::ValueTypeMismatch,
-            format!("expected Arrow Int32 or UInt16 payload, got {other:?}"),
-        ))),
-    }
-}
-
-pub(super) fn mssql_bigint_value(
-    mapping: &SchemaMapping,
-    row_index: usize,
-    cell: ArrowCell<'_>,
-) -> Result<i64> {
-    match cell {
-        ArrowCell::Int64(value) => Ok(value),
-        ArrowCell::UInt32(value) => Ok(i64::from(value)),
-        ArrowCell::UInt64(value) => i64::try_from(value).map_err(|_| {
-            value_conversion_error(row_mapping_diagnostic(
-                mapping,
-                row_index,
-                DiagnosticCode::IntegerOutOfRange,
-                format!("Arrow UInt64 value {value} does not fit planned SQL Server bigint"),
-            ))
-        }),
-        other => Err(value_conversion_error(row_mapping_diagnostic(
-            mapping,
-            row_index,
-            DiagnosticCode::ValueTypeMismatch,
-            format!("expected Arrow Int64, UInt32, or UInt64 payload, got {other:?}"),
-        ))),
-    }
-}
-
-pub(super) fn mssql_real_value(
-    mapping: &SchemaMapping,
-    row_index: usize,
-    cell: ArrowCell<'_>,
-) -> Result<f32> {
-    match cell {
-        ArrowCell::Float32(value) if value.is_finite() => Ok(value),
-        ArrowCell::Float32(value) => Err(non_finite_float_error(mapping, row_index, value)),
-        other => Err(value_conversion_error(row_mapping_diagnostic(
-            mapping,
-            row_index,
-            DiagnosticCode::ValueTypeMismatch,
-            format!("expected Arrow Float32 payload, got {other:?}"),
-        ))),
-    }
-}
-
-pub(super) fn mssql_float_value(
-    mapping: &SchemaMapping,
-    row_index: usize,
-    cell: ArrowCell<'_>,
-) -> Result<f64> {
-    match cell {
-        ArrowCell::Float64(value) if value.is_finite() => Ok(value),
-        ArrowCell::Float64(value) => Err(non_finite_float_error(mapping, row_index, value)),
-        other => Err(value_conversion_error(row_mapping_diagnostic(
-            mapping,
-            row_index,
-            DiagnosticCode::ValueTypeMismatch,
-            format!("expected Arrow Float64 payload, got {other:?}"),
-        ))),
-    }
+    actual: (Option<PrimitiveArrowToMssql>, ArrowCell<'_>),
+) -> crate::Error {
+    value_conversion_error(row_mapping_diagnostic(
+        mapping,
+        row_index,
+        DiagnosticCode::ValueTypeMismatch,
+        format!("Arrow primitive payload does not match planned primitive conversion: {actual:?}"),
+    ))
 }
 
 #[cfg(test)]
