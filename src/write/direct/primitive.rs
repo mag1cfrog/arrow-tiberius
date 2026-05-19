@@ -1,6 +1,6 @@
 //! Fixed-width primitive direct TDS row layout.
 
-use arrow_array::Array;
+use arrow_array::{Array, BooleanArray};
 
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, Result,
@@ -99,6 +99,101 @@ pub(crate) fn allocate_rows_payload_with_tokens(layout: &RowLayout) -> Vec<u8> {
     bytes
 }
 
+/// Fills one Boolean-to-bit column into an already allocated rows payload.
+pub(crate) fn fill_boolean_column(
+    array: &BooleanArray,
+    column: &DirectColumnPlan,
+    column_index: usize,
+    column_count: usize,
+    layout: &RowLayout,
+    bytes: &mut [u8],
+) -> Result<()> {
+    for row_index in 0..array.len() {
+        let cell = cell_position(layout, row_index, column_index, column_count)?;
+
+        if array.is_null(row_index) {
+            if !column.nullable() {
+                return Err(value_conversion_error(row_column_diagnostic(
+                    column,
+                    row_index,
+                    DiagnosticCode::NullInNonNullableColumn,
+                    "null value in non-nullable direct primitive column",
+                )));
+            }
+
+            write_null_cell(bytes, cell)?;
+        } else {
+            write_fixed_width_cell(bytes, cell, &[u8::from(array.value(row_index))])?;
+        }
+    }
+
+    Ok(())
+}
+
+fn cell_position(
+    layout: &RowLayout,
+    row_index: usize,
+    column_index: usize,
+    column_count: usize,
+) -> Result<&CellPosition> {
+    let index = row_index
+        .checked_mul(column_count)
+        .and_then(|base| base.checked_add(column_index))
+        .ok_or_else(|| invalid_payload("cell position index overflowed usize"))?;
+
+    layout
+        .cell_positions()
+        .get(index)
+        .ok_or_else(|| invalid_payload("cell position is outside measured row layout"))
+}
+
+fn write_null_cell(bytes: &mut [u8], cell: &CellPosition) -> Result<()> {
+    if cell.len() != CELL_LEN_PREFIX_LEN {
+        return Err(invalid_payload(format!(
+            "null cell at row {} column {} has length {}, expected 1",
+            cell.row_index(),
+            cell.column_index(),
+            cell.len()
+        )));
+    }
+
+    let Some(byte) = bytes.get_mut(cell.offset()) else {
+        return Err(invalid_payload("null cell offset is outside payload"));
+    };
+
+    *byte = 0;
+    Ok(())
+}
+
+fn write_fixed_width_cell(bytes: &mut [u8], cell: &CellPosition, value: &[u8]) -> Result<()> {
+    let expected_len = CELL_LEN_PREFIX_LEN
+        .checked_add(value.len())
+        .ok_or_else(|| invalid_payload("fixed-width cell length overflowed usize"))?;
+
+    if cell.len() != expected_len {
+        return Err(invalid_payload(format!(
+            "fixed-width cell at row {} column {} has length {}, expected {expected_len}",
+            cell.row_index(),
+            cell.column_index(),
+            cell.len()
+        )));
+    }
+
+    let start = cell.offset();
+    let end = start
+        .checked_add(cell.len())
+        .ok_or_else(|| invalid_payload("fixed-width cell end overflowed usize"))?;
+    let Some(cell_bytes) = bytes.get_mut(start..end) else {
+        return Err(invalid_payload("fixed-width cell range is outside payload"));
+    };
+
+    cell_bytes[0] = u8::try_from(value.len())
+        .map_err(|_| invalid_payload("fixed-width cell value length does not fit u8"))?;
+    cell_bytes[1..].copy_from_slice(value);
+
+    Ok(())
+}
+
 fn primitive_value_len(encoding: DirectColumnEncoding) -> Result<usize> {
     match encoding {
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::BooleanToBit) => Ok(1),
@@ -161,7 +256,7 @@ mod tests {
     };
 
     use super::{
-        allocate_rows_payload_with_tokens, build_fixed_width_row_layout,
+        allocate_rows_payload_with_tokens, build_fixed_width_row_layout, fill_boolean_column,
         measure_primitive_column_cell_lengths,
     };
     use crate::write::direct::payload::TDS_ROW_TOKEN;
@@ -300,6 +395,85 @@ mod tests {
                 .enumerate()
                 .filter(|(_, byte)| **byte == TDS_ROW_TOKEN)
                 .all(|(index, _)| layout.row_token_offsets().contains(&index))
+        );
+    }
+
+    #[test]
+    fn fills_boolean_column_into_existing_payload_positions() {
+        let mappings = vec![mapping(
+            0,
+            "is_active",
+            DataType::Boolean,
+            MssqlType::Bit,
+            false,
+        )];
+        let plan = plan(&mappings);
+        let array = BooleanArray::from(vec![true, false]);
+        let row_count = 2;
+        let column_count = 1;
+        let mut cell_lengths = vec![0; row_count * column_count];
+        measure_primitive_column_cell_lengths(
+            &array,
+            &plan.columns()[0],
+            0,
+            column_count,
+            &mut cell_lengths,
+        )
+        .unwrap();
+        let layout = build_fixed_width_row_layout(row_count, column_count, &cell_lengths).unwrap();
+        let mut bytes = allocate_rows_payload_with_tokens(&layout);
+
+        fill_boolean_column(
+            &array,
+            &plan.columns()[0],
+            0,
+            column_count,
+            &layout,
+            &mut bytes,
+        )
+        .unwrap();
+
+        assert_eq!(bytes, [TDS_ROW_TOKEN, 1, 1, TDS_ROW_TOKEN, 1, 0]);
+    }
+
+    #[test]
+    fn fills_nullable_boolean_column_with_zero_length_null_cell() {
+        let mappings = vec![mapping(
+            0,
+            "is_active",
+            DataType::Boolean,
+            MssqlType::Bit,
+            true,
+        )];
+        let plan = plan(&mappings);
+        let array = BooleanArray::from(vec![Some(true), None, Some(false)]);
+        let row_count = 3;
+        let column_count = 1;
+        let mut cell_lengths = vec![0; row_count * column_count];
+        measure_primitive_column_cell_lengths(
+            &array,
+            &plan.columns()[0],
+            0,
+            column_count,
+            &mut cell_lengths,
+        )
+        .unwrap();
+        let layout = build_fixed_width_row_layout(row_count, column_count, &cell_lengths).unwrap();
+        let mut bytes = allocate_rows_payload_with_tokens(&layout);
+
+        fill_boolean_column(
+            &array,
+            &plan.columns()[0],
+            0,
+            column_count,
+            &layout,
+            &mut bytes,
+        )
+        .unwrap();
+
+        assert_eq!(
+            bytes,
+            [TDS_ROW_TOKEN, 1, 1, TDS_ROW_TOKEN, 0, TDS_ROW_TOKEN, 1, 0]
         );
     }
 
