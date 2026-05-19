@@ -19,7 +19,7 @@ use plan::{DirectColumnEncoding, DirectEncoderPlan, PrimitiveDirectMappings};
 use primitive::{
     allocate_rows_payload_with_tokens, build_fixed_width_row_layout, fill_boolean_column,
     fill_float64_column, fill_int32_column, fill_int64_column,
-    measure_primitive_column_cell_lengths, try_encode_non_nullable_fixed_width_primitive_rows,
+    measure_primitive_column_cell_lengths, try_encode_fixed_width_primitive_rows,
 };
 
 /// Direct raw TDS encoder facade.
@@ -64,9 +64,7 @@ impl DirectEncoder {
             return EncodedRowsPayload::new(Vec::new(), Vec::new());
         }
 
-        if let Some(payload) =
-            try_encode_non_nullable_fixed_width_primitive_rows(batch, self.plan.columns())?
-        {
+        if let Some(payload) = try_encode_fixed_width_primitive_rows(batch, self.plan.columns())? {
             return Ok(payload);
         }
 
@@ -215,6 +213,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch};
+    use arrow_buffer::{NullBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Schema};
 
     use crate::{
@@ -394,6 +393,121 @@ mod tests {
                 0,
                 0,
                 0
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_encoder_fast_path_encodes_mixed_nullable_and_non_nullable_rows() {
+        let mappings = vec![
+            mapping(0, "quantity", DataType::Int32, MssqlType::Int, true),
+            mapping(1, "total", DataType::Int64, MssqlType::BigInt, false),
+            mapping(2, "active", DataType::Boolean, MssqlType::Bit, true),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("quantity", DataType::Int32, true),
+                Field::new("total", DataType::Int64, false),
+                Field::new("active", DataType::Boolean, true),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![Some(10), None, Some(-1)])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![100, 200, 300])),
+                Arc::new(BooleanArray::from(vec![None, Some(true), Some(false)])),
+            ],
+        );
+
+        let payload = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(payload.row_token_offsets(), [0, 15, 27]);
+        assert_eq!(
+            payload.bytes(),
+            [
+                payload::TDS_ROW_TOKEN,
+                4,
+                10,
+                0,
+                0,
+                0,
+                100,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                payload::TDS_ROW_TOKEN,
+                0,
+                200,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                1,
+                payload::TDS_ROW_TOKEN,
+                4,
+                0xFF,
+                0xFF,
+                0xFF,
+                0xFF,
+                0x2C,
+                0x01,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                0
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_encoder_fast_path_does_not_read_non_finite_float_from_null_slot() {
+        let mappings = vec![mapping(
+            0,
+            "ratio",
+            DataType::Float64,
+            MssqlType::Float { precision: 53 },
+            true,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let array = Float64Array::new(
+            ScalarBuffer::from(vec![f64::NAN, 1.5]),
+            Some(NullBuffer::from(vec![false, true])),
+        );
+        let batch = record_batch(
+            vec![Field::new("ratio", DataType::Float64, true)],
+            vec![Arc::new(array)],
+        );
+
+        let payload = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(payload.row_token_offsets(), [0, 2]);
+        assert_eq!(
+            payload.bytes(),
+            [
+                payload::TDS_ROW_TOKEN,
+                0,
+                payload::TDS_ROW_TOKEN,
+                8,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0xF8,
+                0x3F
             ]
         );
     }

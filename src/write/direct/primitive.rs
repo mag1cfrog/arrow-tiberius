@@ -17,17 +17,16 @@ const ROW_TOKEN_LEN: usize = 1;
 const CELL_LEN_PREFIX_LEN: usize = 1;
 
 #[derive(Debug, Clone, Copy)]
-struct FixedWidthColumnOffset<'a> {
+struct FixedWidthColumn<'a> {
     plan: &'a DirectColumnPlan,
-    offset: usize,
     value_len: usize,
 }
 
-/// Encodes non-nullable fixed-width primitive columns without building a full
-/// per-cell row layout.
+/// Encodes fixed-width primitive columns without building a full per-cell row
+/// layout.
 ///
-/// Returns `Ok(None)` when the columns require the general nullable layout path.
-pub(crate) fn try_encode_non_nullable_fixed_width_primitive_rows(
+/// Returns `Ok(None)` when the columns require the general layout path.
+pub(crate) fn try_encode_fixed_width_primitive_rows(
     batch: &RecordBatch,
     columns: &[DirectColumnPlan],
 ) -> Result<Option<EncodedRowsPayload>> {
@@ -35,30 +34,19 @@ pub(crate) fn try_encode_non_nullable_fixed_width_primitive_rows(
         return Ok(Some(EncodedRowsPayload::new(Vec::new(), Vec::new())?));
     }
 
-    let Some(column_offsets) = non_nullable_fixed_width_column_offsets(columns)? else {
+    let Some(columns) = fixed_width_columns(columns)? else {
         return Ok(None);
     };
 
-    let row_len = column_offsets
-        .last()
-        .map(|column| column.offset + column.value_len)
-        .unwrap_or(ROW_TOKEN_LEN);
-    let payload_len = row_len
-        .checked_mul(batch.num_rows())
-        .ok_or_else(|| invalid_payload("direct primitive payload length overflowed usize"))?;
+    let layout = measure_fixed_width_rows(batch, &columns)?;
+    let mut current_offsets = layout.current_offsets.clone();
+    let mut bytes = vec![0; layout.payload_len];
 
-    let mut bytes = vec![0; payload_len];
-    let mut row_token_offsets = Vec::with_capacity(batch.num_rows());
-
-    for row_index in 0..batch.num_rows() {
-        let row_offset = row_index
-            .checked_mul(row_len)
-            .ok_or_else(|| invalid_payload("direct primitive row offset overflowed usize"))?;
-        row_token_offsets.push(row_offset);
+    for &row_offset in &layout.row_token_offsets {
         bytes[row_offset] = TDS_ROW_TOKEN;
     }
 
-    for column in column_offsets {
+    for column in columns {
         let Some(array) = batch
             .columns()
             .get(column.plan.source_index())
@@ -72,30 +60,30 @@ pub(crate) fn try_encode_non_nullable_fixed_width_primitive_rows(
             )));
         };
 
-        if array.null_count() != 0 {
-            return Err(first_null_error(array, column.plan));
-        }
-
         match column.plan.encoding() {
             DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::BooleanToBit) => {
                 let array = downcast_direct_array::<BooleanArray>(array, column.plan)?;
-                fill_boolean_fixed_width_column(array, column.offset, row_len, &mut bytes);
+                fill_boolean_fixed_width_column(
+                    array,
+                    column.plan,
+                    &mut current_offsets,
+                    &mut bytes,
+                );
             }
             DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int32ToInt) => {
                 let array = downcast_direct_array::<Int32Array>(array, column.plan)?;
-                fill_int32_fixed_width_column(array, column.offset, row_len, &mut bytes);
+                fill_int32_fixed_width_column(array, column.plan, &mut current_offsets, &mut bytes);
             }
             DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int64ToBigInt) => {
                 let array = downcast_direct_array::<Int64Array>(array, column.plan)?;
-                fill_int64_fixed_width_column(array, column.offset, row_len, &mut bytes);
+                fill_int64_fixed_width_column(array, column.plan, &mut current_offsets, &mut bytes);
             }
             DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => {
                 let array = downcast_direct_array::<Float64Array>(array, column.plan)?;
                 fill_float64_fixed_width_column(
                     array,
                     column.plan,
-                    column.offset,
-                    row_len,
+                    &mut current_offsets,
                     &mut bytes,
                 )?;
             }
@@ -105,35 +93,111 @@ pub(crate) fn try_encode_non_nullable_fixed_width_primitive_rows(
         }
     }
 
-    let payload = EncodedRowsPayload::new(bytes, row_token_offsets)?;
+    let payload = EncodedRowsPayload::new(bytes, layout.row_token_offsets)?;
 
     Ok(Some(payload))
 }
 
-fn non_nullable_fixed_width_column_offsets(
-    columns: &[DirectColumnPlan],
-) -> Result<Option<Vec<FixedWidthColumnOffset<'_>>>> {
-    let mut offsets = Vec::with_capacity(columns.len());
-    let mut next_offset = ROW_TOKEN_LEN;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FixedWidthRowsLayout {
+    row_token_offsets: Vec<usize>,
+    current_offsets: Vec<usize>,
+    payload_len: usize,
+}
+
+fn fixed_width_columns(columns: &[DirectColumnPlan]) -> Result<Option<Vec<FixedWidthColumn<'_>>>> {
+    let mut fixed_width_columns = Vec::with_capacity(columns.len());
 
     for column in columns {
-        if column.nullable() {
-            return Ok(None);
-        }
-
         let Some(value_len) = fixed_width_value_len(column.encoding()) else {
             return Ok(None);
         };
 
-        offsets.push(FixedWidthColumnOffset {
+        fixed_width_columns.push(FixedWidthColumn {
             plan: column,
-            offset: next_offset,
             value_len,
         });
-        next_offset = checked_add(next_offset, value_len)?;
     }
 
-    Ok(Some(offsets))
+    Ok(Some(fixed_width_columns))
+}
+
+fn measure_fixed_width_rows(
+    batch: &RecordBatch,
+    columns: &[FixedWidthColumn<'_>],
+) -> Result<FixedWidthRowsLayout> {
+    let row_count = batch.num_rows();
+    let mut row_lengths = vec![ROW_TOKEN_LEN; row_count];
+
+    for column in columns {
+        let Some(array) = batch
+            .columns()
+            .get(column.plan.source_index())
+            .map(AsRef::as_ref)
+        else {
+            return Err(value_conversion_error(row_column_diagnostic(
+                column.plan,
+                0,
+                DiagnosticCode::ValueTypeMismatch,
+                "planned direct column index is outside the runtime batch",
+            )));
+        };
+
+        if column.plan.nullable() {
+            add_nullable_fixed_width_column_lengths(array, column.value_len, &mut row_lengths)?;
+        } else {
+            if array.null_count() != 0 {
+                return Err(first_null_error(array, column.plan));
+            }
+
+            add_non_nullable_fixed_width_column_lengths(column.value_len, &mut row_lengths)?;
+        }
+    }
+
+    let mut row_token_offsets = Vec::with_capacity(row_count);
+    let mut current_offsets = Vec::with_capacity(row_count);
+    let mut payload_len = 0usize;
+
+    for row_length in row_lengths {
+        row_token_offsets.push(payload_len);
+        current_offsets.push(checked_add(payload_len, ROW_TOKEN_LEN)?);
+        payload_len = checked_add(payload_len, row_length)?;
+    }
+
+    Ok(FixedWidthRowsLayout {
+        row_token_offsets,
+        current_offsets,
+        payload_len,
+    })
+}
+
+fn add_non_nullable_fixed_width_column_lengths(
+    value_len: usize,
+    row_lengths: &mut [usize],
+) -> Result<()> {
+    for row_length in row_lengths {
+        *row_length = checked_add(*row_length, value_len)?;
+    }
+
+    Ok(())
+}
+
+fn add_nullable_fixed_width_column_lengths(
+    array: &dyn Array,
+    value_len: usize,
+    row_lengths: &mut [usize],
+) -> Result<()> {
+    for (row_index, row_length) in row_lengths.iter_mut().enumerate() {
+        let cell_len = if array.is_null(row_index) {
+            CELL_LEN_PREFIX_LEN
+        } else {
+            checked_add(CELL_LEN_PREFIX_LEN, value_len)?
+        };
+
+        *row_length = checked_add(*row_length, cell_len)?;
+    }
+
+    Ok(())
 }
 
 fn fixed_width_value_len(encoding: DirectColumnEncoding) -> Option<usize> {
@@ -148,48 +212,80 @@ fn fixed_width_value_len(encoding: DirectColumnEncoding) -> Option<usize> {
 
 fn fill_boolean_fixed_width_column(
     array: &BooleanArray,
-    column_offset: usize,
-    row_len: usize,
+    column: &DirectColumnPlan,
+    current_offsets: &mut [usize],
     bytes: &mut [u8],
 ) {
-    for row_index in 0..array.len() {
-        let offset = row_index * row_len + column_offset;
-        bytes[offset] = u8::from(array.value(row_index));
+    for (row_index, current_offset) in current_offsets.iter_mut().enumerate().take(array.len()) {
+        let offset = *current_offset;
+        if column.nullable() {
+            if array.is_null(row_index) {
+                bytes[offset] = 0;
+                *current_offset += CELL_LEN_PREFIX_LEN;
+            } else {
+                bytes[offset] = 1;
+                bytes[offset + CELL_LEN_PREFIX_LEN] = u8::from(array.value(row_index));
+                *current_offset += CELL_LEN_PREFIX_LEN + 1;
+            }
+        } else {
+            bytes[offset] = u8::from(array.value(row_index));
+            *current_offset += 1;
+        }
     }
 }
 
 fn fill_int32_fixed_width_column(
     array: &Int32Array,
-    column_offset: usize,
-    row_len: usize,
+    column: &DirectColumnPlan,
+    current_offsets: &mut [usize],
     bytes: &mut [u8],
 ) {
     for row_index in 0..array.len() {
-        let offset = row_index * row_len + column_offset;
-        bytes[offset..offset + 4].copy_from_slice(&array.value(row_index).to_le_bytes());
+        write_fixed_width_value(
+            array,
+            column,
+            row_index,
+            4,
+            current_offsets,
+            bytes,
+            |array, row_index| array.value(row_index).to_le_bytes(),
+        );
     }
 }
 
 fn fill_int64_fixed_width_column(
     array: &Int64Array,
-    column_offset: usize,
-    row_len: usize,
+    column: &DirectColumnPlan,
+    current_offsets: &mut [usize],
     bytes: &mut [u8],
 ) {
     for row_index in 0..array.len() {
-        let offset = row_index * row_len + column_offset;
-        bytes[offset..offset + 8].copy_from_slice(&array.value(row_index).to_le_bytes());
+        write_fixed_width_value(
+            array,
+            column,
+            row_index,
+            8,
+            current_offsets,
+            bytes,
+            |array, row_index| array.value(row_index).to_le_bytes(),
+        );
     }
 }
 
 fn fill_float64_fixed_width_column(
     array: &Float64Array,
     column: &DirectColumnPlan,
-    column_offset: usize,
-    row_len: usize,
+    current_offsets: &mut [usize],
     bytes: &mut [u8],
 ) -> Result<()> {
-    for row_index in 0..array.len() {
+    for (row_index, current_offset) in current_offsets.iter_mut().enumerate().take(array.len()) {
+        let offset = *current_offset;
+        if column.nullable() && array.is_null(row_index) {
+            bytes[offset] = 0;
+            *current_offset += CELL_LEN_PREFIX_LEN;
+            continue;
+        }
+
         let value = array.value(row_index);
         if !value.is_finite() {
             return Err(value_conversion_error(row_column_diagnostic(
@@ -200,11 +296,50 @@ fn fill_float64_fixed_width_column(
             )));
         }
 
-        let offset = row_index * row_len + column_offset;
-        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        if column.nullable() {
+            bytes[offset] = 8;
+            bytes[offset + CELL_LEN_PREFIX_LEN..offset + CELL_LEN_PREFIX_LEN + 8]
+                .copy_from_slice(&value.to_le_bytes());
+            *current_offset += CELL_LEN_PREFIX_LEN + 8;
+        } else {
+            bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+            *current_offset += 8;
+        }
     }
 
     Ok(())
+}
+
+fn write_fixed_width_value<Array, ValueBytes>(
+    array: &Array,
+    column: &DirectColumnPlan,
+    row_index: usize,
+    value_len: u8,
+    current_offsets: &mut [usize],
+    bytes: &mut [u8],
+    value_bytes: impl FnOnce(&Array, usize) -> ValueBytes,
+) where
+    Array: arrow_array::Array,
+    ValueBytes: AsRef<[u8]>,
+{
+    let offset = current_offsets[row_index];
+    if column.nullable() {
+        if array.is_null(row_index) {
+            bytes[offset] = 0;
+            current_offsets[row_index] += CELL_LEN_PREFIX_LEN;
+        } else {
+            let value_bytes = value_bytes(array, row_index);
+            bytes[offset] = value_len;
+            bytes[offset + CELL_LEN_PREFIX_LEN
+                ..offset + CELL_LEN_PREFIX_LEN + usize::from(value_len)]
+                .copy_from_slice(value_bytes.as_ref());
+            current_offsets[row_index] += CELL_LEN_PREFIX_LEN + usize::from(value_len);
+        }
+    } else {
+        let value_bytes = value_bytes(array, row_index);
+        bytes[offset..offset + usize::from(value_len)].copy_from_slice(value_bytes.as_ref());
+        current_offsets[row_index] += usize::from(value_len);
+    }
 }
 
 fn first_null_error(array: &dyn Array, column: &DirectColumnPlan) -> Error {
