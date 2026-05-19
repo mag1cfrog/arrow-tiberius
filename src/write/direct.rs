@@ -513,6 +513,36 @@ mod tests {
     }
 
     #[test]
+    fn direct_encoder_fast_path_rejects_non_finite_nullable_float_when_non_null() {
+        let mappings = vec![mapping(
+            0,
+            "ratio",
+            DataType::Float64,
+            MssqlType::Float { precision: 53 },
+            true,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![Field::new("ratio", DataType::Float64, true)],
+            vec![Arc::new(Float64Array::from(vec![
+                Some(1.0),
+                Some(f64::NAN),
+            ]))],
+        );
+
+        let err = encoder
+            .encode_batch(&batch)
+            .expect_err("non-null non-finite float must fail");
+
+        assert_value_conversion_diagnostic(
+            err,
+            DiagnosticCode::NonFiniteFloat,
+            Some(1),
+            Some((0, "ratio")),
+        );
+    }
+
+    #[test]
     fn direct_encoder_fast_path_rejects_null_in_non_nullable_column() {
         let mappings = vec![mapping(
             0,
