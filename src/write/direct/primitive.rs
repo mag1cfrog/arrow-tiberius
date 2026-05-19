@@ -1,6 +1,6 @@
 //! Fixed-width primitive direct TDS row layout.
 
-use arrow_array::{Array, BooleanArray, Int32Array, Int64Array};
+use arrow_array::{Array, BooleanArray, Float64Array, Int32Array, Int64Array};
 
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, Result,
@@ -192,6 +192,47 @@ pub(crate) fn fill_int64_column(
     Ok(())
 }
 
+/// Fills one Float64-to-float column into an already allocated rows payload.
+pub(crate) fn fill_float64_column(
+    array: &Float64Array,
+    column: &DirectColumnPlan,
+    column_index: usize,
+    column_count: usize,
+    layout: &RowLayout,
+    bytes: &mut [u8],
+) -> Result<()> {
+    for row_index in 0..array.len() {
+        let cell = cell_position(layout, row_index, column_index, column_count)?;
+
+        if array.is_null(row_index) {
+            if !column.nullable() {
+                return Err(value_conversion_error(row_column_diagnostic(
+                    column,
+                    row_index,
+                    DiagnosticCode::NullInNonNullableColumn,
+                    "null value in non-nullable direct primitive column",
+                )));
+            }
+
+            write_null_cell(bytes, cell)?;
+        } else {
+            let value = array.value(row_index);
+            if !value.is_finite() {
+                return Err(value_conversion_error(row_column_diagnostic(
+                    column,
+                    row_index,
+                    DiagnosticCode::NonFiniteFloat,
+                    format!("non-finite floating point value {value} is not supported"),
+                )));
+            }
+
+            write_fixed_width_cell(bytes, cell, &value.to_le_bytes())?;
+        }
+    }
+
+    Ok(())
+}
+
 fn cell_position(
     layout: &RowLayout,
     row_index: usize,
@@ -319,7 +360,8 @@ mod tests {
 
     use super::{
         allocate_rows_payload_with_tokens, build_fixed_width_row_layout, fill_boolean_column,
-        fill_int32_column, fill_int64_column, measure_primitive_column_cell_lengths,
+        fill_float64_column, fill_int32_column, fill_int64_column,
+        measure_primitive_column_cell_lengths,
     };
     use crate::write::direct::payload::TDS_ROW_TOKEN;
     use crate::write::direct::plan::{DirectEncoderPlan, PrimitiveDirectMappings};
@@ -764,6 +806,190 @@ mod tests {
             bytes,
             [TDS_ROW_TOKEN, 8, 7, 0, 0, 0, 0, 0, 0, 0, TDS_ROW_TOKEN, 0,]
         );
+    }
+
+    #[test]
+    fn fills_float64_column_as_little_endian_float_values() {
+        let mappings = vec![mapping(
+            0,
+            "ratio",
+            DataType::Float64,
+            MssqlType::Float { precision: 53 },
+            false,
+        )];
+        let plan = plan(&mappings);
+        let array = Float64Array::from(vec![0.0, -0.0, 1.25, -2.5]);
+        let row_count = array.len();
+        let column_count = 1;
+        let mut cell_lengths = vec![0; row_count * column_count];
+        measure_primitive_column_cell_lengths(
+            &array,
+            &plan.columns()[0],
+            0,
+            column_count,
+            &mut cell_lengths,
+        )
+        .unwrap();
+        let layout = build_fixed_width_row_layout(row_count, column_count, &cell_lengths).unwrap();
+        let mut bytes = allocate_rows_payload_with_tokens(&layout);
+
+        fill_float64_column(
+            &array,
+            &plan.columns()[0],
+            0,
+            column_count,
+            &layout,
+            &mut bytes,
+        )
+        .unwrap();
+
+        assert_eq!(
+            bytes,
+            [
+                TDS_ROW_TOKEN,
+                8,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                TDS_ROW_TOKEN,
+                8,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x80,
+                TDS_ROW_TOKEN,
+                8,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0xF4,
+                0x3F,
+                TDS_ROW_TOKEN,
+                8,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x04,
+                0xC0,
+            ]
+        );
+    }
+
+    #[test]
+    fn fills_nullable_float64_column_with_zero_length_null_cell() {
+        let mappings = vec![mapping(
+            0,
+            "ratio",
+            DataType::Float64,
+            MssqlType::Float { precision: 53 },
+            true,
+        )];
+        let plan = plan(&mappings);
+        let array = Float64Array::from(vec![Some(7.0), None]);
+        let row_count = array.len();
+        let column_count = 1;
+        let mut cell_lengths = vec![0; row_count * column_count];
+        measure_primitive_column_cell_lengths(
+            &array,
+            &plan.columns()[0],
+            0,
+            column_count,
+            &mut cell_lengths,
+        )
+        .unwrap();
+        let layout = build_fixed_width_row_layout(row_count, column_count, &cell_lengths).unwrap();
+        let mut bytes = allocate_rows_payload_with_tokens(&layout);
+
+        fill_float64_column(
+            &array,
+            &plan.columns()[0],
+            0,
+            column_count,
+            &layout,
+            &mut bytes,
+        )
+        .unwrap();
+
+        assert_eq!(
+            bytes,
+            [
+                TDS_ROW_TOKEN,
+                8,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0x1C,
+                0x40,
+                TDS_ROW_TOKEN,
+                0,
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_non_finite_float64_values_before_finishing_payload() {
+        let mappings = vec![mapping(
+            0,
+            "ratio",
+            DataType::Float64,
+            MssqlType::Float { precision: 53 },
+            false,
+        )];
+        let plan = plan(&mappings);
+        let cases = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
+
+        for value in cases {
+            let array = Float64Array::from(vec![1.0, value]);
+            let row_count = array.len();
+            let column_count = 1;
+            let mut cell_lengths = vec![0; row_count * column_count];
+            measure_primitive_column_cell_lengths(
+                &array,
+                &plan.columns()[0],
+                0,
+                column_count,
+                &mut cell_lengths,
+            )
+            .unwrap();
+            let layout =
+                build_fixed_width_row_layout(row_count, column_count, &cell_lengths).unwrap();
+            let mut bytes = allocate_rows_payload_with_tokens(&layout);
+
+            let err = fill_float64_column(
+                &array,
+                &plan.columns()[0],
+                0,
+                column_count,
+                &layout,
+                &mut bytes,
+            )
+            .expect_err("non-finite float must fail");
+
+            assert_value_conversion_diagnostic(
+                err,
+                DiagnosticCode::NonFiniteFloat,
+                Some(1),
+                Some((0, "ratio")),
+            );
+        }
     }
 
     #[test]
