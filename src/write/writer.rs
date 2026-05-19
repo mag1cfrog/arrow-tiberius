@@ -472,12 +472,6 @@ async fn write_direct_batch_to_sink<Sink>(
 where
     Sink: RawRowsSink,
 {
-    match state.schema_check() {
-        SchemaCheck::Strict => {
-            super::record_batch::validate_runtime_columns(batch, state.mappings())?;
-        }
-    }
-
     let encoder = state
         .direct_encoder()
         .ok_or_else(|| crate::Error::BackendUnavailable {

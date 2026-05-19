@@ -1,6 +1,6 @@
 //! Fixed-width primitive direct TDS row layout.
 
-use arrow_array::{Array, BooleanArray, Float64Array, Int32Array, Int64Array};
+use arrow_array::{Array, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch};
 
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, Result,
@@ -9,12 +9,233 @@ use crate::{
 
 use super::{
     layout::{CellPosition, RowLayout},
-    payload::TDS_ROW_TOKEN,
+    payload::{EncodedRowsPayload, TDS_ROW_TOKEN},
     plan::{DirectColumnEncoding, DirectColumnPlan},
 };
 
 const ROW_TOKEN_LEN: usize = 1;
 const CELL_LEN_PREFIX_LEN: usize = 1;
+
+#[derive(Debug, Clone, Copy)]
+struct FixedWidthColumnOffset<'a> {
+    plan: &'a DirectColumnPlan,
+    offset: usize,
+    value_len: usize,
+}
+
+/// Encodes non-nullable fixed-width primitive columns without building a full
+/// per-cell row layout.
+///
+/// Returns `Ok(None)` when the columns require the general nullable layout path.
+pub(crate) fn try_encode_non_nullable_fixed_width_primitive_rows(
+    batch: &RecordBatch,
+    columns: &[DirectColumnPlan],
+) -> Result<Option<EncodedRowsPayload>> {
+    if batch.num_rows() == 0 {
+        return Ok(Some(EncodedRowsPayload::new(Vec::new(), Vec::new())?));
+    }
+
+    let Some(column_offsets) = non_nullable_fixed_width_column_offsets(columns)? else {
+        return Ok(None);
+    };
+
+    let row_len = column_offsets
+        .last()
+        .map(|column| column.offset + column.value_len)
+        .unwrap_or(ROW_TOKEN_LEN);
+    let payload_len = row_len
+        .checked_mul(batch.num_rows())
+        .ok_or_else(|| invalid_payload("direct primitive payload length overflowed usize"))?;
+
+    let mut bytes = vec![0; payload_len];
+    let mut row_token_offsets = Vec::with_capacity(batch.num_rows());
+
+    for row_index in 0..batch.num_rows() {
+        let row_offset = row_index
+            .checked_mul(row_len)
+            .ok_or_else(|| invalid_payload("direct primitive row offset overflowed usize"))?;
+        row_token_offsets.push(row_offset);
+        bytes[row_offset] = TDS_ROW_TOKEN;
+    }
+
+    for column in column_offsets {
+        let Some(array) = batch
+            .columns()
+            .get(column.plan.source_index())
+            .map(AsRef::as_ref)
+        else {
+            return Err(value_conversion_error(row_column_diagnostic(
+                column.plan,
+                0,
+                DiagnosticCode::ValueTypeMismatch,
+                "planned direct column index is outside the runtime batch",
+            )));
+        };
+
+        if array.null_count() != 0 {
+            return Err(first_null_error(array, column.plan));
+        }
+
+        match column.plan.encoding() {
+            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::BooleanToBit) => {
+                let array = downcast_direct_array::<BooleanArray>(array, column.plan)?;
+                fill_boolean_fixed_width_column(array, column.offset, row_len, &mut bytes);
+            }
+            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int32ToInt) => {
+                let array = downcast_direct_array::<Int32Array>(array, column.plan)?;
+                fill_int32_fixed_width_column(array, column.offset, row_len, &mut bytes);
+            }
+            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int64ToBigInt) => {
+                let array = downcast_direct_array::<Int64Array>(array, column.plan)?;
+                fill_int64_fixed_width_column(array, column.offset, row_len, &mut bytes);
+            }
+            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => {
+                let array = downcast_direct_array::<Float64Array>(array, column.plan)?;
+                fill_float64_fixed_width_column(
+                    array,
+                    column.plan,
+                    column.offset,
+                    row_len,
+                    &mut bytes,
+                )?;
+            }
+            DirectColumnEncoding::Primitive(_) => {
+                return Ok(None);
+            }
+        }
+    }
+
+    let payload = EncodedRowsPayload::new(bytes, row_token_offsets)?;
+
+    Ok(Some(payload))
+}
+
+fn non_nullable_fixed_width_column_offsets(
+    columns: &[DirectColumnPlan],
+) -> Result<Option<Vec<FixedWidthColumnOffset<'_>>>> {
+    let mut offsets = Vec::with_capacity(columns.len());
+    let mut next_offset = ROW_TOKEN_LEN;
+
+    for column in columns {
+        if column.nullable() {
+            return Ok(None);
+        }
+
+        let Some(value_len) = fixed_width_value_len(column.encoding()) else {
+            return Ok(None);
+        };
+
+        offsets.push(FixedWidthColumnOffset {
+            plan: column,
+            offset: next_offset,
+            value_len,
+        });
+        next_offset = checked_add(next_offset, value_len)?;
+    }
+
+    Ok(Some(offsets))
+}
+
+fn fixed_width_value_len(encoding: DirectColumnEncoding) -> Option<usize> {
+    match encoding {
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::BooleanToBit) => Some(1),
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int32ToInt) => Some(4),
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int64ToBigInt) => Some(8),
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => Some(8),
+        DirectColumnEncoding::Primitive(_) => None,
+    }
+}
+
+fn fill_boolean_fixed_width_column(
+    array: &BooleanArray,
+    column_offset: usize,
+    row_len: usize,
+    bytes: &mut [u8],
+) {
+    for row_index in 0..array.len() {
+        let offset = row_index * row_len + column_offset;
+        bytes[offset] = u8::from(array.value(row_index));
+    }
+}
+
+fn fill_int32_fixed_width_column(
+    array: &Int32Array,
+    column_offset: usize,
+    row_len: usize,
+    bytes: &mut [u8],
+) {
+    for row_index in 0..array.len() {
+        let offset = row_index * row_len + column_offset;
+        bytes[offset..offset + 4].copy_from_slice(&array.value(row_index).to_le_bytes());
+    }
+}
+
+fn fill_int64_fixed_width_column(
+    array: &Int64Array,
+    column_offset: usize,
+    row_len: usize,
+    bytes: &mut [u8],
+) {
+    for row_index in 0..array.len() {
+        let offset = row_index * row_len + column_offset;
+        bytes[offset..offset + 8].copy_from_slice(&array.value(row_index).to_le_bytes());
+    }
+}
+
+fn fill_float64_fixed_width_column(
+    array: &Float64Array,
+    column: &DirectColumnPlan,
+    column_offset: usize,
+    row_len: usize,
+    bytes: &mut [u8],
+) -> Result<()> {
+    for row_index in 0..array.len() {
+        let value = array.value(row_index);
+        if !value.is_finite() {
+            return Err(value_conversion_error(row_column_diagnostic(
+                column,
+                row_index,
+                DiagnosticCode::NonFiniteFloat,
+                format!("non-finite floating point value {value} is not supported"),
+            )));
+        }
+
+        let offset = row_index * row_len + column_offset;
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    Ok(())
+}
+
+fn first_null_error(array: &dyn Array, column: &DirectColumnPlan) -> Error {
+    let row_index = (0..array.len())
+        .find(|row_index| array.is_null(*row_index))
+        .unwrap_or(0);
+
+    value_conversion_error(row_column_diagnostic(
+        column,
+        row_index,
+        DiagnosticCode::NullInNonNullableColumn,
+        "null value in non-nullable direct primitive column",
+    ))
+}
+
+fn downcast_direct_array<'a, T: Array + 'static>(
+    array: &'a dyn Array,
+    column: &DirectColumnPlan,
+) -> Result<&'a T> {
+    array.as_any().downcast_ref::<T>().ok_or_else(|| {
+        value_conversion_error(row_column_diagnostic(
+            column,
+            0,
+            DiagnosticCode::ValueTypeMismatch,
+            format!(
+                "runtime Arrow type {} does not match planned direct column type",
+                array.data_type()
+            ),
+        ))
+    })
+}
 
 /// Measures one primitive Arrow column into a row-major cell length matrix.
 ///

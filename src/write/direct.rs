@@ -19,7 +19,7 @@ use plan::{DirectColumnEncoding, DirectEncoderPlan, PrimitiveDirectMappings};
 use primitive::{
     allocate_rows_payload_with_tokens, build_fixed_width_row_layout, fill_boolean_column,
     fill_float64_column, fill_int32_column, fill_int64_column,
-    measure_primitive_column_cell_lengths,
+    measure_primitive_column_cell_lengths, try_encode_non_nullable_fixed_width_primitive_rows,
 };
 
 /// Direct raw TDS encoder facade.
@@ -62,6 +62,12 @@ impl DirectEncoder {
 
         if self.plan.is_empty() && batch.num_rows() == 0 {
             return EncodedRowsPayload::new(Vec::new(), Vec::new());
+        }
+
+        if let Some(payload) =
+            try_encode_non_nullable_fixed_width_primitive_rows(batch, self.plan.columns())?
+        {
+            return Ok(payload);
         }
 
         let layout = self.measure_layout(batch)?;
@@ -389,6 +395,33 @@ mod tests {
                 0,
                 0
             ]
+        );
+    }
+
+    #[test]
+    fn direct_encoder_fast_path_rejects_null_in_non_nullable_column() {
+        let mappings = vec![mapping(
+            0,
+            "quantity",
+            DataType::Int32,
+            MssqlType::Int,
+            false,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![Field::new("quantity", DataType::Int32, true)],
+            vec![Arc::new(Int32Array::from(vec![Some(1), None]))],
+        );
+
+        let err = encoder
+            .encode_batch(&batch)
+            .expect_err("null in non-nullable direct column must fail");
+
+        assert_value_conversion_diagnostic(
+            err,
+            DiagnosticCode::NullInNonNullableColumn,
+            Some(1),
+            Some((0, "quantity")),
         );
     }
 
