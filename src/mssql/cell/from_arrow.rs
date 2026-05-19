@@ -3,7 +3,7 @@
 mod decimal;
 mod primitive;
 mod temporal;
-mod variable;
+mod variable_width;
 
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, MssqlType, NanosecondPolicy, PlanOptions,
@@ -17,7 +17,7 @@ use temporal::{
     mssql_date_value, mssql_datetime2_value, mssql_datetimeoffset_value, null_datetime2_cell,
     null_datetimeoffset_cell,
 };
-use variable::{nvar_char_cell, var_binary_cell};
+use variable_width::{nvar_char_cell, var_binary_cell};
 
 /// Direction-specific runtime context for Arrow-to-MSSQL value conversion.
 #[derive(Debug, Clone, Copy)]

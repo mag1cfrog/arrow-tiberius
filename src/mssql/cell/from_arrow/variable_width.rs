@@ -2,7 +2,7 @@
 
 use crate::{
     DiagnosticCode, MssqlTypeLength, Result, SchemaMapping, arrow::cell::ArrowCell,
-    conversion::arrow_to_mssql::variable::VariableWidthArrowToMssql, mssql::cell::MssqlCell,
+    conversion::arrow_to_mssql::variable_width::VariableWidthArrowToMssql, mssql::cell::MssqlCell,
 };
 
 use super::{row_mapping_diagnostic, value_conversion_error, value_too_long_error};

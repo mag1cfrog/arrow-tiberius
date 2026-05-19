@@ -3,4 +3,4 @@
 /// Primitive Arrow-to-SQL Server conversion classification.
 pub(crate) mod primitive;
 /// Variable-width Arrow-to-SQL Server conversion classification.
-pub(crate) mod variable;
+pub(crate) mod variable_width;

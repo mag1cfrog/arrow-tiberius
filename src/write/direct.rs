@@ -13,6 +13,7 @@ pub(crate) mod layout;
 pub(crate) mod payload;
 pub(crate) mod plan;
 pub(crate) mod primitive;
+pub(crate) mod variable_width;
 
 use payload::EncodedRowsPayload;
 use plan::{CurrentDirectMappings, DirectColumnEncoding, DirectEncoderPlan};
@@ -21,6 +22,7 @@ use primitive::{
     fill_float64_column, fill_int32_column, fill_int64_column,
     measure_primitive_column_cell_lengths, try_encode_fixed_width_primitive_rows,
 };
+use variable_width::measure_variable_width_column_cell_lengths;
 
 /// Direct raw TDS encoder facade.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,13 +101,26 @@ impl DirectEncoder {
                 )));
             };
 
-            measure_primitive_column_cell_lengths(
-                array,
-                column,
-                column_index,
-                column_count,
-                &mut cell_lengths,
-            )?;
+            match column.encoding() {
+                DirectColumnEncoding::Primitive(_) => {
+                    measure_primitive_column_cell_lengths(
+                        array,
+                        column,
+                        column_index,
+                        column_count,
+                        &mut cell_lengths,
+                    )?;
+                }
+                DirectColumnEncoding::VariableWidth(_) => {
+                    measure_variable_width_column_cell_lengths(
+                        array,
+                        column,
+                        column_index,
+                        column_count,
+                        &mut cell_lengths,
+                    )?;
+                }
+            }
         }
 
         build_fixed_width_row_layout(row_count, column_count, &cell_lengths)

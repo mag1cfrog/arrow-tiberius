@@ -5,7 +5,7 @@ use arrow_schema::DataType;
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, MssqlType, Result, SchemaMapping,
     conversion::arrow_to_mssql::{
-        primitive::PrimitiveArrowToMssql, variable::VariableWidthArrowToMssql,
+        primitive::PrimitiveArrowToMssql, variable_width::VariableWidthArrowToMssql,
     },
 };
 
@@ -224,7 +224,7 @@ mod tests {
         DirectMappingSupport, NoDirectMappings,
     };
     use crate::conversion::arrow_to_mssql::{
-        primitive::PrimitiveArrowToMssql, variable::VariableWidthArrowToMssql,
+        primitive::PrimitiveArrowToMssql, variable_width::VariableWidthArrowToMssql,
     };
 
     #[test]
