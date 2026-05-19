@@ -344,6 +344,174 @@ async fn baseline_writer_round_trips_supported_value_matrix() -> TestResult<()> 
 }
 
 #[tokio::test]
+async fn direct_raw_writer_round_trips_fast_path_primitive_matrix() -> TestResult<()> {
+    let Some((connection_string, database)) = integration_config() else {
+        eprintln!(
+            "skipping SQL Server direct raw primitive matrix integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+        );
+        return Ok(());
+    };
+
+    let mut client = connect(&connection_string, &database).await?;
+    let table = unique_table_name()?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::Int32, false),
+        Field::new("flag_nn", DataType::Boolean, false),
+        Field::new("flag_null", DataType::Boolean, true),
+        Field::new("i32_nn", DataType::Int32, false),
+        Field::new("i32_null", DataType::Int32, true),
+        Field::new("i64_nn", DataType::Int64, false),
+        Field::new("i64_null", DataType::Int64, true),
+        Field::new("f64_nn", DataType::Float64, false),
+        Field::new("f64_null", DataType::Float64, true),
+    ]));
+    let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
+        Arc::clone(&schema),
+        MssqlProfile::sql_server_2016_compat_100(),
+        PlanOptions::default(),
+    )?
+    .into_parts();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1_i32, 2, 3, 4])) as ArrayRef,
+            Arc::new(BooleanArray::from(vec![true, false, true, false])),
+            Arc::new(BooleanArray::from(vec![
+                Some(true),
+                None,
+                Some(false),
+                None,
+            ])),
+            Arc::new(Int32Array::from(vec![i32::MIN, -1, 0, i32::MAX])),
+            Arc::new(Int32Array::from(vec![
+                Some(i32::MIN),
+                None,
+                Some(i32::MAX),
+                Some(0),
+            ])),
+            Arc::new(Int64Array::from(vec![i64::MIN, -1, 0, i64::MAX])),
+            Arc::new(Int64Array::from(vec![
+                Some(i64::MIN),
+                None,
+                Some(i64::MAX),
+                Some(0),
+            ])),
+            Arc::new(Float64Array::from(vec![-123.5, -0.0, 0.0, 42.25])),
+            Arc::new(Float64Array::from(vec![
+                Some(-123.5),
+                None,
+                Some(42.25),
+                Some(0.0),
+            ])),
+        ],
+    )?;
+
+    execute_sql(
+        &mut client,
+        create_table_sql_from_mappings(&table, &mappings),
+    )
+    .await?;
+
+    let result = async {
+        let mut writer = BulkWriter::new(
+            &mut client,
+            table.clone(),
+            mappings,
+            WriteOptions {
+                backend: WriteBackend::DirectRawBulk,
+                ..WriteOptions::default()
+            },
+        )
+        .await?;
+        let stats = writer.write_batch(&batch).await?;
+
+        ensure_eq(stats.rows_written, 4, "rows_written")?;
+        ensure_eq(stats.batches_written, 1, "batches_written")?;
+        ensure_eq(writer.finish().await?, stats, "finish stats")?;
+
+        let rows = client
+            .simple_query(format!(
+                "SELECT [row_id], [flag_nn], [flag_null], [i32_nn], [i32_null], [i64_nn], [i64_null], [f64_nn], [f64_null] FROM {} ORDER BY [row_id]",
+                table.quoted_sql()
+            ))
+            .await?
+            .into_first_result()
+            .await?;
+
+        ensure_eq(rows.len(), 4, "row count")?;
+
+        ensure_eq(rows[0].get::<i32, _>(0), Some(1), "row 0 row_id")?;
+        ensure_eq(rows[0].get::<bool, _>(1), Some(true), "row 0 flag_nn")?;
+        ensure_eq(rows[0].get::<bool, _>(2), Some(true), "row 0 flag_null")?;
+        ensure_eq(rows[0].get::<i32, _>(3), Some(i32::MIN), "row 0 i32_nn")?;
+        ensure_eq(
+            rows[0].get::<i32, _>(4),
+            Some(i32::MIN),
+            "row 0 i32_null",
+        )?;
+        ensure_eq(rows[0].get::<i64, _>(5), Some(i64::MIN), "row 0 i64_nn")?;
+        ensure_eq(
+            rows[0].get::<i64, _>(6),
+            Some(i64::MIN),
+            "row 0 i64_null",
+        )?;
+        ensure_eq(rows[0].get::<f64, _>(7), Some(-123.5), "row 0 f64_nn")?;
+        ensure_eq(
+            rows[0].get::<f64, _>(8),
+            Some(-123.5),
+            "row 0 f64_null",
+        )?;
+
+        ensure_eq(rows[1].get::<i32, _>(0), Some(2), "row 1 row_id")?;
+        ensure_eq(rows[1].get::<bool, _>(1), Some(false), "row 1 flag_nn")?;
+        ensure_eq(rows[1].get::<bool, _>(2), None, "row 1 flag_null")?;
+        ensure_eq(rows[1].get::<i32, _>(3), Some(-1), "row 1 i32_nn")?;
+        ensure_eq(rows[1].get::<i32, _>(4), None, "row 1 i32_null")?;
+        ensure_eq(rows[1].get::<i64, _>(5), Some(-1), "row 1 i64_nn")?;
+        ensure_eq(rows[1].get::<i64, _>(6), None, "row 1 i64_null")?;
+        ensure_eq(rows[1].get::<f64, _>(7), Some(-0.0), "row 1 f64_nn")?;
+        ensure_eq(rows[1].get::<f64, _>(8), None, "row 1 f64_null")?;
+
+        ensure_eq(rows[2].get::<i32, _>(0), Some(3), "row 2 row_id")?;
+        ensure_eq(rows[2].get::<bool, _>(1), Some(true), "row 2 flag_nn")?;
+        ensure_eq(rows[2].get::<bool, _>(2), Some(false), "row 2 flag_null")?;
+        ensure_eq(rows[2].get::<i32, _>(3), Some(0), "row 2 i32_nn")?;
+        ensure_eq(
+            rows[2].get::<i32, _>(4),
+            Some(i32::MAX),
+            "row 2 i32_null",
+        )?;
+        ensure_eq(rows[2].get::<i64, _>(5), Some(0), "row 2 i64_nn")?;
+        ensure_eq(
+            rows[2].get::<i64, _>(6),
+            Some(i64::MAX),
+            "row 2 i64_null",
+        )?;
+        ensure_eq(rows[2].get::<f64, _>(7), Some(0.0), "row 2 f64_nn")?;
+        ensure_eq(rows[2].get::<f64, _>(8), Some(42.25), "row 2 f64_null")?;
+
+        ensure_eq(rows[3].get::<i32, _>(0), Some(4), "row 3 row_id")?;
+        ensure_eq(rows[3].get::<bool, _>(1), Some(false), "row 3 flag_nn")?;
+        ensure_eq(rows[3].get::<bool, _>(2), None, "row 3 flag_null")?;
+        ensure_eq(rows[3].get::<i32, _>(3), Some(i32::MAX), "row 3 i32_nn")?;
+        ensure_eq(rows[3].get::<i32, _>(4), Some(0), "row 3 i32_null")?;
+        ensure_eq(rows[3].get::<i64, _>(5), Some(i64::MAX), "row 3 i64_nn")?;
+        ensure_eq(rows[3].get::<i64, _>(6), Some(0), "row 3 i64_null")?;
+        ensure_eq(rows[3].get::<f64, _>(7), Some(42.25), "row 3 f64_nn")?;
+        ensure_eq(rows[3].get::<f64, _>(8), Some(0.0), "row 3 f64_null")?;
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    let drop_result = drop_table(&mut client, &table).await;
+    result?;
+    drop_result?;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn baseline_writer_round_trips_uint64_policy_values() -> TestResult<()> {
     let Some((connection_string, database)) = integration_config() else {
         eprintln!(

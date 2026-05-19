@@ -222,6 +222,7 @@ mod tests {
     };
 
     use super::plan::{DirectColumnEncoding, DirectEncoderSupport, DirectMappingSupport};
+    use super::primitive::try_encode_fixed_width_primitive_rows;
     use super::{DirectEncoder, payload};
 
     #[test]
@@ -497,6 +498,41 @@ mod tests {
                 0
             ]
         );
+    }
+
+    #[test]
+    fn direct_encoder_fixed_width_fast_path_is_active_for_mixed_nullability() {
+        let mappings = vec![
+            mapping(0, "quantity", DataType::Int32, MssqlType::Int, true),
+            mapping(1, "total", DataType::Int64, MssqlType::BigInt, false),
+            mapping(
+                2,
+                "ratio",
+                DataType::Float64,
+                MssqlType::Float { precision: 53 },
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("quantity", DataType::Int32, true),
+                Field::new("total", DataType::Int64, false),
+                Field::new("ratio", DataType::Float64, true),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![Some(10), None])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![100, 200])),
+                Arc::new(Float64Array::from(vec![None, Some(1.5)])),
+            ],
+        );
+
+        let payload = try_encode_fixed_width_primitive_rows(&batch, encoder.plan().columns())
+            .unwrap()
+            .expect("fixed-width primitive fast path should be active");
+
+        assert_eq!(payload.row_token_offsets(), [0, 15]);
+        assert_eq!(payload.row_count(), 2);
     }
 
     #[test]
