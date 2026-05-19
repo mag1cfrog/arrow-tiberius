@@ -324,6 +324,7 @@ fn print_baseline_summary(
     println!("  validate: {}", format_duration(report.timings.validate));
     println!("  cleanup: {}", format_duration(report.timings.cleanup));
     println!("  total: {}", format_duration(report.timings.total));
+    print_peak_rss("  ", report.peak_rss_kib);
 }
 
 fn print_tiberius_backend_summary(report: &TiberiusBenchReport) {
@@ -343,6 +344,7 @@ fn print_tiberius_backend_summary(report: &TiberiusBenchReport) {
     println!("    validate: {}", format_duration(report.timings.validate));
     println!("    cleanup: {}", format_duration(report.timings.cleanup));
     println!("    total: {}", format_duration(report.timings.total));
+    print_peak_rss("    ", report.peak_rss_kib);
 }
 
 fn print_compare_summary(options: &CompareBenchOptions, report: &CompareBenchReport) {
@@ -370,6 +372,7 @@ fn print_compare_summary(options: &CompareBenchOptions, report: &CompareBenchRep
                 );
                 println!("    validated rows: {}", report.rows_written);
                 println!("    write: {}", format_duration(report.write_elapsed));
+                print_peak_rss("    ", report.peak_rss_kib);
             }
             CompareBackendBenchReport::OdbcBcp { report } => {
                 println!("    rows written: {}", report.rows_written);
@@ -379,8 +382,15 @@ fn print_compare_summary(options: &CompareBenchOptions, report: &CompareBenchRep
                 );
                 println!("    validated rows: {}", report.rows_written);
                 println!("    write: {}", format_duration(report.write_elapsed));
+                print_peak_rss("    ", report.peak_rss_kib);
             }
         }
+    }
+}
+
+fn print_peak_rss(prefix: &str, peak_rss_kib: Option<u64>) {
+    if let Some(peak_rss_kib) = peak_rss_kib {
+        println!("{prefix}peak rss KiB: {peak_rss_kib}");
     }
 }
 
@@ -1166,6 +1176,7 @@ fn parse_odbc_runner_report(
 ) -> Result<OdbcRunnerBenchReport, WriterBenchError> {
     let rows_written = parse_odbc_runner_u64(output, "rows written", runner_name)?;
     let write_seconds = parse_odbc_runner_f64(output, "write seconds", runner_name)?;
+    let peak_rss_kib = parse_odbc_runner_optional_u64(output, "peak rss KiB", runner_name)?;
 
     if !write_seconds.is_finite() || write_seconds < 0.0 {
         return Err(WriterBenchError::Validation(format!(
@@ -1176,6 +1187,7 @@ fn parse_odbc_runner_report(
     Ok(OdbcRunnerBenchReport {
         rows_written,
         write_elapsed: Duration::from_secs_f64(write_seconds),
+        peak_rss_kib,
     })
 }
 
@@ -1207,20 +1219,46 @@ fn parse_odbc_runner_f64(
         })
 }
 
+fn parse_odbc_runner_optional_u64(
+    output: &str,
+    label: &str,
+    runner_name: &str,
+) -> Result<Option<u64>, WriterBenchError> {
+    let Some(value) = parse_odbc_runner_optional_value(output, label) else {
+        return Ok(None);
+    };
+
+    value.parse().map(Some).map_err(|source| {
+        WriterBenchError::Validation(format!(
+            "{runner_name} runner reported invalid {label}: {source}"
+        ))
+    })
+}
+
 fn parse_odbc_runner_value<'a>(
     output: &'a str,
     label: &str,
     runner_name: &str,
 ) -> Result<&'a str, WriterBenchError> {
+    parse_odbc_runner_optional_value(output, label).ok_or_else(|| {
+        WriterBenchError::Validation(format!("{runner_name} runner output is missing `{label}`"))
+    })
+}
+
+fn parse_odbc_runner_optional_value<'a>(output: &'a str, label: &str) -> Option<&'a str> {
     let prefix = format!("{label}:");
     output
         .lines()
         .find_map(|line| line.trim().strip_prefix(&prefix).map(str::trim))
-        .ok_or_else(|| {
-            WriterBenchError::Validation(format!(
-                "{runner_name} runner output is missing `{label}`"
-            ))
-        })
+}
+
+fn current_process_peak_rss_kib() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status.lines().find_map(|line| {
+        let value = line.strip_prefix("VmHWM:")?.trim();
+        let kib = value.strip_suffix("kB")?.trim();
+        kib.parse().ok()
+    })
 }
 
 fn odbc_connection_string(
@@ -1458,6 +1496,7 @@ struct GeneratedBatchSummary {
 struct TiberiusBenchReport {
     stats: arrow_tiberius::WriteStats,
     validated_rows: u64,
+    peak_rss_kib: Option<u64>,
     timings: TiberiusBenchTimings,
 }
 
@@ -1501,6 +1540,7 @@ impl CompareBackendBenchReport {
 struct OdbcRunnerBenchReport {
     rows_written: u64,
     write_elapsed: Duration,
+    peak_rss_kib: Option<u64>,
 }
 
 type BenchClient = tiberius::Client<Compat<TcpStream>>;
@@ -1696,6 +1736,8 @@ async fn run_tiberius_benchmark_from_ipc(
         .await;
         repeat_result?;
     }
+
+    report.peak_rss_kib = current_process_peak_rss_kib();
 
     Ok(report)
 }
@@ -3263,12 +3305,14 @@ arrow-odbc runner
   rows written: 25
   write seconds: 0.067
   write rows/sec: 375.43
+  peak rss KiB: 123456
 ";
 
         let report = super::parse_arrow_odbc_runner_report(output).unwrap();
 
         assert_eq!(report.rows_written, 25);
         assert_eq!(report.write_elapsed, std::time::Duration::from_millis(67));
+        assert_eq!(report.peak_rss_kib, Some(123456));
     }
 
     #[test]
@@ -3280,12 +3324,25 @@ odbc-bcp runner
   rows written: 25
   write seconds: 0.067
   write rows/sec: 375.43
+  peak rss KiB: 654321
 ";
 
         let report = super::parse_odbc_bcp_runner_report(output).unwrap();
 
         assert_eq!(report.rows_written, 25);
         assert_eq!(report.write_elapsed, std::time::Duration::from_millis(67));
+        assert_eq!(report.peak_rss_kib, Some(654321));
+    }
+
+    #[test]
+    fn parses_odbc_runner_report_without_peak_rss_for_backward_compatibility() {
+        let output = "rows written: 25\nwrite seconds: 0.067";
+
+        let report = super::parse_arrow_odbc_runner_report(output).unwrap();
+
+        assert_eq!(report.rows_written, 25);
+        assert_eq!(report.write_elapsed, std::time::Duration::from_millis(67));
+        assert_eq!(report.peak_rss_kib, None);
     }
 
     #[test]

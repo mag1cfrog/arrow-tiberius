@@ -66,6 +66,9 @@ fn bench(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         "  write rows/sec: {:.2}",
         rows_per_second(total_rows, write_elapsed)
     );
+    if let Some(peak_rss_kib) = current_process_peak_rss_kib() {
+        println!("  peak rss KiB: {peak_rss_kib}");
+    }
 
     Ok(())
 }
@@ -191,6 +194,15 @@ fn rows_per_second(rows: u64, elapsed: std::time::Duration) -> f64 {
     }
 
     rows as f64 / elapsed.as_secs_f64()
+}
+
+fn current_process_peak_rss_kib() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status.lines().find_map(|line| {
+        let value = line.strip_prefix("VmHWM:")?.trim();
+        let kib = value.strip_suffix("kB")?.trim();
+        kib.parse().ok()
+    })
 }
 
 fn required_env(name: &str) -> Result<String, Box<dyn Error>> {
