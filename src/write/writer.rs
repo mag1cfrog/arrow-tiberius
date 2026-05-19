@@ -913,10 +913,10 @@ mod tests {
             }
         );
         assert_eq!(sink.payloads.len(), 1);
-        assert_eq!(sink.payloads[0].row_token_offsets, vec![0, 6]);
+        assert_eq!(sink.payloads[0].row_token_offsets, vec![0, 5]);
         assert_eq!(
             sink.payloads[0].bytes,
-            vec![0xD1, 4, 10, 0, 0, 0, 0xD1, 4, 20, 0, 0, 0]
+            vec![0xD1, 10, 0, 0, 0, 0xD1, 20, 0, 0, 0]
         );
     }
 

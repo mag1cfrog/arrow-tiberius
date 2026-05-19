@@ -265,7 +265,7 @@ mod tests {
             .expect("boolean is supported now");
 
         assert_eq!(payload.row_count(), 1);
-        assert_eq!(payload.bytes(), [payload::TDS_ROW_TOKEN, 1, 1]);
+        assert_eq!(payload.bytes(), [payload::TDS_ROW_TOKEN, 1]);
         assert_eq!(payload.row_token_offsets(), [0]);
     }
 
@@ -301,19 +301,16 @@ mod tests {
 
         let payload = encoder.encode_batch(&batch).unwrap();
 
-        assert_eq!(payload.row_token_offsets(), [0, 26]);
+        assert_eq!(payload.row_token_offsets(), [0, 22]);
         assert_eq!(
             payload.bytes(),
             [
                 payload::TDS_ROW_TOKEN,
                 1,
                 1,
-                4,
-                1,
                 0,
                 0,
                 0,
-                8,
                 10,
                 0,
                 0,
@@ -322,7 +319,6 @@ mod tests {
                 0,
                 0,
                 0,
-                8,
                 0x00,
                 0x00,
                 0x00,
@@ -332,14 +328,11 @@ mod tests {
                 0xF4,
                 0x3F,
                 payload::TDS_ROW_TOKEN,
-                1,
                 0,
-                4,
                 0xFE,
                 0xFF,
                 0xFF,
                 0xFF,
-                8,
                 0xEC,
                 0xFF,
                 0xFF,
@@ -348,7 +341,6 @@ mod tests {
                 0xFF,
                 0xFF,
                 0xFF,
-                8,
                 0x00,
                 0x00,
                 0x00,

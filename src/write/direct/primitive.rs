@@ -18,9 +18,10 @@ const CELL_LEN_PREFIX_LEN: usize = 1;
 
 /// Measures one primitive Arrow column into a row-major cell length matrix.
 ///
-/// Cell lengths include the TDS length byte for nullable fixed-width primitive
-/// encodings. Non-null values occupy `1 + value_width` bytes, while null values
-/// occupy only the one zero length byte.
+/// Cell lengths match the TDS metadata shape implied by the mapping
+/// nullability. Non-nullable primitive columns use fixed-width cells with no
+/// length byte. Nullable primitive columns use the nullable TDS form with a
+/// one-byte length prefix, where null values occupy only the zero length byte.
 pub(crate) fn measure_primitive_column_cell_lengths(
     array: &dyn Array,
     column: &DirectColumnPlan,
@@ -42,8 +43,10 @@ pub(crate) fn measure_primitive_column_cell_lengths(
             }
 
             CELL_LEN_PREFIX_LEN
-        } else {
+        } else if column.nullable() {
             CELL_LEN_PREFIX_LEN + value_len
+        } else {
+            value_len
         };
 
         cell_lengths[row_index * column_count + column_index] = cell_len;
@@ -123,7 +126,7 @@ pub(crate) fn fill_boolean_column(
 
             write_null_cell(bytes, cell)?;
         } else {
-            write_fixed_width_cell(bytes, cell, &[u8::from(array.value(row_index))])?;
+            write_primitive_cell(bytes, cell, column, &[u8::from(array.value(row_index))])?;
         }
     }
 
@@ -154,7 +157,7 @@ pub(crate) fn fill_int32_column(
 
             write_null_cell(bytes, cell)?;
         } else {
-            write_fixed_width_cell(bytes, cell, &array.value(row_index).to_le_bytes())?;
+            write_primitive_cell(bytes, cell, column, &array.value(row_index).to_le_bytes())?;
         }
     }
 
@@ -185,7 +188,7 @@ pub(crate) fn fill_int64_column(
 
             write_null_cell(bytes, cell)?;
         } else {
-            write_fixed_width_cell(bytes, cell, &array.value(row_index).to_le_bytes())?;
+            write_primitive_cell(bytes, cell, column, &array.value(row_index).to_le_bytes())?;
         }
     }
 
@@ -226,7 +229,7 @@ pub(crate) fn fill_float64_column(
                 )));
             }
 
-            write_fixed_width_cell(bytes, cell, &value.to_le_bytes())?;
+            write_primitive_cell(bytes, cell, column, &value.to_le_bytes())?;
         }
     }
 
@@ -268,14 +271,31 @@ fn write_null_cell(bytes: &mut [u8], cell: &CellPosition) -> Result<()> {
     Ok(())
 }
 
-fn write_fixed_width_cell(bytes: &mut [u8], cell: &CellPosition, value: &[u8]) -> Result<()> {
+fn write_primitive_cell(
+    bytes: &mut [u8],
+    cell: &CellPosition,
+    column: &DirectColumnPlan,
+    value: &[u8],
+) -> Result<()> {
+    if column.nullable() {
+        return write_nullable_primitive_cell(bytes, cell, value);
+    }
+
+    write_fixed_width_cell(bytes, cell, value)
+}
+
+fn write_nullable_primitive_cell(
+    bytes: &mut [u8],
+    cell: &CellPosition,
+    value: &[u8],
+) -> Result<()> {
     let expected_len = CELL_LEN_PREFIX_LEN
         .checked_add(value.len())
-        .ok_or_else(|| invalid_payload("fixed-width cell length overflowed usize"))?;
+        .ok_or_else(|| invalid_payload("nullable primitive cell length overflowed usize"))?;
 
     if cell.len() != expected_len {
         return Err(invalid_payload(format!(
-            "fixed-width cell at row {} column {} has length {}, expected {expected_len}",
+            "nullable primitive cell at row {} column {} has length {}, expected {expected_len}",
             cell.row_index(),
             cell.column_index(),
             cell.len()
@@ -291,8 +311,32 @@ fn write_fixed_width_cell(bytes: &mut [u8], cell: &CellPosition, value: &[u8]) -
     };
 
     cell_bytes[0] = u8::try_from(value.len())
-        .map_err(|_| invalid_payload("fixed-width cell value length does not fit u8"))?;
+        .map_err(|_| invalid_payload("nullable primitive cell value length does not fit u8"))?;
     cell_bytes[1..].copy_from_slice(value);
+
+    Ok(())
+}
+
+fn write_fixed_width_cell(bytes: &mut [u8], cell: &CellPosition, value: &[u8]) -> Result<()> {
+    if cell.len() != value.len() {
+        return Err(invalid_payload(format!(
+            "fixed-width cell at row {} column {} has length {}, expected {}",
+            cell.row_index(),
+            cell.column_index(),
+            cell.len(),
+            value.len()
+        )));
+    }
+
+    let start = cell.offset();
+    let end = start
+        .checked_add(cell.len())
+        .ok_or_else(|| invalid_payload("fixed-width cell end overflowed usize"))?;
+    let Some(cell_bytes) = bytes.get_mut(start..end) else {
+        return Err(invalid_payload("fixed-width cell range is outside payload"));
+    };
+
+    cell_bytes.copy_from_slice(value);
 
     Ok(())
 }
@@ -421,24 +465,24 @@ mod tests {
             .unwrap();
         }
 
-        assert_eq!(cell_lengths, [2, 5, 9, 9, 2, 5, 9, 9]);
+        assert_eq!(cell_lengths, [1, 4, 8, 8, 1, 4, 8, 8]);
 
         let layout = build_fixed_width_row_layout(row_count, column_count, &cell_lengths).unwrap();
 
-        assert_eq!(layout.row_token_offsets(), [0, 26]);
-        assert_eq!(layout.row_lengths(), [26, 26]);
-        assert_eq!(layout.payload_len(), 52);
+        assert_eq!(layout.row_token_offsets(), [0, 22]);
+        assert_eq!(layout.row_lengths(), [22, 22]);
+        assert_eq!(layout.payload_len(), 44);
         assert_cell_positions(
             layout.cell_positions(),
             &[
-                (0, 0, 1, 2),
-                (0, 1, 3, 5),
-                (0, 2, 8, 9),
-                (0, 3, 17, 9),
-                (1, 0, 27, 2),
-                (1, 1, 29, 5),
-                (1, 2, 34, 9),
-                (1, 3, 43, 9),
+                (0, 0, 1, 1),
+                (0, 1, 2, 4),
+                (0, 2, 6, 8),
+                (0, 3, 14, 8),
+                (1, 0, 23, 1),
+                (1, 1, 24, 4),
+                (1, 2, 28, 8),
+                (1, 3, 36, 8),
             ],
         );
     }
@@ -537,7 +581,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(bytes, [TDS_ROW_TOKEN, 1, 1, TDS_ROW_TOKEN, 1, 0]);
+        assert_eq!(bytes, [TDS_ROW_TOKEN, 1, TDS_ROW_TOKEN, 0]);
     }
 
     #[test]
@@ -620,25 +664,21 @@ mod tests {
             bytes,
             [
                 TDS_ROW_TOKEN,
-                4,
                 0x00,
                 0x00,
                 0x00,
                 0x80,
                 TDS_ROW_TOKEN,
-                4,
                 0xFF,
                 0xFF,
                 0xFF,
                 0xFF,
                 TDS_ROW_TOKEN,
-                4,
                 0x00,
                 0x00,
                 0x00,
                 0x00,
                 TDS_ROW_TOKEN,
-                4,
                 0xFF,
                 0xFF,
                 0xFF,
@@ -724,7 +764,6 @@ mod tests {
             bytes,
             [
                 TDS_ROW_TOKEN,
-                8,
                 0x00,
                 0x00,
                 0x00,
@@ -734,7 +773,6 @@ mod tests {
                 0x00,
                 0x80,
                 TDS_ROW_TOKEN,
-                8,
                 0xFF,
                 0xFF,
                 0xFF,
@@ -744,7 +782,6 @@ mod tests {
                 0xFF,
                 0xFF,
                 TDS_ROW_TOKEN,
-                8,
                 0x00,
                 0x00,
                 0x00,
@@ -754,7 +791,6 @@ mod tests {
                 0x00,
                 0x00,
                 TDS_ROW_TOKEN,
-                8,
                 0xFF,
                 0xFF,
                 0xFF,
@@ -847,7 +883,6 @@ mod tests {
             bytes,
             [
                 TDS_ROW_TOKEN,
-                8,
                 0x00,
                 0x00,
                 0x00,
@@ -857,7 +892,6 @@ mod tests {
                 0x00,
                 0x00,
                 TDS_ROW_TOKEN,
-                8,
                 0x00,
                 0x00,
                 0x00,
@@ -867,7 +901,6 @@ mod tests {
                 0x00,
                 0x80,
                 TDS_ROW_TOKEN,
-                8,
                 0x00,
                 0x00,
                 0x00,
@@ -877,7 +910,6 @@ mod tests {
                 0xF4,
                 0x3F,
                 TDS_ROW_TOKEN,
-                8,
                 0x00,
                 0x00,
                 0x00,
