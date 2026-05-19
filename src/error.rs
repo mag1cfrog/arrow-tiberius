@@ -42,6 +42,16 @@ pub enum Error {
         diagnostics: DiagnosticSet,
     },
 
+    /// Direct raw TDS encoding failed.
+    #[snafu(display(
+        "direct encoding failed with {} diagnostic(s)",
+        diagnostics.len()
+    ))]
+    DirectEncoding {
+        /// Structured direct encoding diagnostics.
+        diagnostics: DiagnosticSet,
+    },
+
     /// A requested write backend is not available.
     #[snafu(display("write backend {backend:?} is unavailable: {reason}"))]
     BackendUnavailable {
@@ -90,6 +100,20 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "value conversion failed with 1 diagnostic(s)"
+        );
+    }
+
+    #[test]
+    fn direct_encoding_error_display_includes_diagnostic_count() {
+        let diagnostics = DiagnosticSet::from(vec![Diagnostic::error(
+            DiagnosticCode::DirectEncodingInvalidPayload,
+            "invalid payload",
+        )]);
+        let err = Error::DirectEncoding { diagnostics };
+
+        assert_eq!(
+            err.to_string(),
+            "direct encoding failed with 1 diagnostic(s)"
         );
     }
 

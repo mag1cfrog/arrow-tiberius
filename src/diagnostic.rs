@@ -54,6 +54,8 @@ pub enum DiagnosticCode {
     ValueTooLong,
     /// A requested row index is outside the runtime batch.
     RowIndexOutOfBounds,
+    /// Direct raw TDS encoding produced or received invalid payload state.
+    DirectEncodingInvalidPayload,
 }
 
 /// Field location for a diagnostic.
