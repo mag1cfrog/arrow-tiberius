@@ -383,6 +383,7 @@ fn expected_direct_bulk_column_type(column: &DirectColumnPlan) -> Option<tiberiu
             Some(tiberius::ColumnType::Float8)
         }
         DirectColumnEncoding::Primitive(_) => None,
+        DirectColumnEncoding::VariableWidth(_) => None,
     }
 }
 
@@ -643,6 +644,14 @@ mod tests {
                 MssqlColumn::new(Identifier::new("id64").unwrap(), MssqlType::BigInt, false),
             ),
             float_mapping_at(2, "score"),
+            SchemaMapping::new(
+                ArrowFieldRef::new(3, "name".to_owned(), true, DataType::Utf8),
+                MssqlColumn::new(
+                    Identifier::new("name").unwrap(),
+                    MssqlType::NVarChar(crate::MssqlTypeLength::Max),
+                    true,
+                ),
+            ),
         ];
 
         let state = WriterState::new(
@@ -660,10 +669,10 @@ mod tests {
     #[test]
     fn direct_writer_state_rejects_unsupported_mappings() {
         let mappings = vec![SchemaMapping::new(
-            ArrowFieldRef::new(0, "name".to_owned(), true, DataType::Utf8),
+            ArrowFieldRef::new(0, "created_on".to_owned(), true, DataType::Date32),
             MssqlColumn::new(
-                Identifier::new("name").unwrap(),
-                MssqlType::NVarChar(crate::MssqlTypeLength::Max),
+                Identifier::new("created_on").unwrap(),
+                MssqlType::Date,
                 true,
             ),
         )];

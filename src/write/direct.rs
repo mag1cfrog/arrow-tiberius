@@ -15,7 +15,7 @@ pub(crate) mod plan;
 pub(crate) mod primitive;
 
 use payload::EncodedRowsPayload;
-use plan::{DirectColumnEncoding, DirectEncoderPlan, PrimitiveDirectMappings};
+use plan::{CurrentDirectMappings, DirectColumnEncoding, DirectEncoderPlan};
 use primitive::{
     allocate_rows_payload_with_tokens, build_fixed_width_row_layout, fill_boolean_column,
     fill_float64_column, fill_int32_column, fill_int64_column,
@@ -32,7 +32,7 @@ pub(crate) struct DirectEncoder {
 impl DirectEncoder {
     /// Creates a direct encoder using the current supported direct mappings.
     pub(crate) fn new(mappings: &[SchemaMapping]) -> Result<Self> {
-        Self::new_with_support(mappings, &PrimitiveDirectMappings)
+        Self::new_with_support(mappings, &CurrentDirectMappings)
     }
 
     /// Creates a direct encoder using an explicit support checker.
@@ -153,6 +153,11 @@ impl DirectEncoder {
                 DirectColumnEncoding::Primitive(other) => {
                     return Err(unsupported_batch(format!(
                         "direct primitive fill is not implemented yet for {other:?}"
+                    )));
+                }
+                DirectColumnEncoding::VariableWidth(other) => {
+                    return Err(unsupported_batch(format!(
+                        "direct variable-width fill is not implemented yet for {other:?}"
                     )));
                 }
             }

@@ -90,6 +90,9 @@ pub(crate) fn try_encode_fixed_width_primitive_rows(
             DirectColumnEncoding::Primitive(_) => {
                 return Ok(None);
             }
+            DirectColumnEncoding::VariableWidth(_) => {
+                return Ok(None);
+            }
         }
     }
 
@@ -207,6 +210,7 @@ fn fixed_width_value_len(encoding: DirectColumnEncoding) -> Option<usize> {
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int64ToBigInt) => Some(8),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => Some(8),
         DirectColumnEncoding::Primitive(_) => None,
+        DirectColumnEncoding::VariableWidth(_) => None,
     }
 }
 
@@ -706,6 +710,9 @@ fn primitive_value_len(encoding: DirectColumnEncoding) -> Result<usize> {
         DirectColumnEncoding::Primitive(other) => Err(unsupported_batch(format!(
             "direct primitive layout is not implemented yet for {other:?}"
         ))),
+        DirectColumnEncoding::VariableWidth(other) => Err(unsupported_batch(format!(
+            "direct primitive layout is not implemented for variable-width mapping {other:?}"
+        ))),
     }
 }
 
@@ -764,7 +771,7 @@ mod tests {
         measure_primitive_column_cell_lengths,
     };
     use crate::write::direct::payload::TDS_ROW_TOKEN;
-    use crate::write::direct::plan::{DirectEncoderPlan, PrimitiveDirectMappings};
+    use crate::write::direct::plan::{CurrentDirectMappings, DirectEncoderPlan};
 
     #[test]
     fn measures_empty_primitive_column_as_empty_layout_input() {
@@ -1411,7 +1418,7 @@ mod tests {
     }
 
     fn plan(mappings: &[SchemaMapping]) -> DirectEncoderPlan {
-        DirectEncoderPlan::new(mappings, &PrimitiveDirectMappings).unwrap()
+        DirectEncoderPlan::new(mappings, &CurrentDirectMappings).unwrap()
     }
 
     fn mapping(
