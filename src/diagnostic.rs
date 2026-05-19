@@ -56,6 +56,8 @@ pub enum DiagnosticCode {
     RowIndexOutOfBounds,
     /// Direct raw TDS encoding produced or received invalid payload state.
     DirectEncodingInvalidPayload,
+    /// A planned mapping is not supported by the direct raw TDS encoder.
+    DirectEncodingUnsupportedMapping,
 }
 
 /// Field location for a diagnostic.
