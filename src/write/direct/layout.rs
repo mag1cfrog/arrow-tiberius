@@ -6,11 +6,23 @@ use crate::{Diagnostic, DiagnosticCode, DiagnosticSet, Error, Result};
 ///
 /// A cell position belongs to one row and one column, but its `offset` is
 /// measured from the start of the whole payload buffer, not from the row start.
+/// The byte range for this cell is `offset..offset + len`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct CellPosition {
+    /// Zero-based row number for this cell.
     row_index: usize,
+    /// Zero-based column number inside the direct encoder mapping order.
     column_index: usize,
+    /// Absolute start byte of this encoded cell inside the whole payload.
+    ///
+    /// This points at the first byte of the cell itself, not at the row token.
+    /// For variable-width cells, this first byte is usually part of the length
+    /// prefix or PLP marker.
     offset: usize,
+    /// Encoded byte length of this cell.
+    ///
+    /// This includes any cell-local length prefix, null sentinel, PLP metadata,
+    /// and value bytes, but does not include the row token.
     len: usize,
 }
 
@@ -40,12 +52,12 @@ impl CellPosition {
         self.column_index
     }
 
-    /// Returns the byte offset.
+    /// Returns the absolute start byte of this cell in the whole payload.
     pub(crate) const fn offset(&self) -> usize {
         self.offset
     }
 
-    /// Returns the encoded byte length.
+    /// Returns the encoded byte length of this cell.
     pub(crate) const fn len(&self) -> usize {
         self.len
     }
