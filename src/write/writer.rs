@@ -21,6 +21,8 @@ use crate::conversion::arrow_to_mssql::{
     primitive::PrimitiveArrowToMssql, variable_width::VariableWidthArrowToMssql,
 };
 
+const DIRECT_RAW_MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+
 /// Write backend selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum WriteBackend {
@@ -487,10 +489,12 @@ where
             backend: WriteBackend::DirectRawBulk,
             reason: "direct raw bulk encoder is not available for this writer".to_owned(),
         })?;
-    let payload = encoder.encode_batch(batch)?;
-    let rows_written = usize_to_u64_saturating(payload.row_count());
+    let measured = encoder.measure_batch(batch)?;
+    let rows_written = usize_to_u64_saturating(measured.row_count());
 
-    if !payload.is_empty() {
+    for range in measured.row_ranges(DIRECT_RAW_MAX_PAYLOAD_BYTES)? {
+        let payload =
+            encoder.encode_measured_batch_range(batch, &measured, range.start, range.len)?;
         sink.send_raw_rows_payload_checked(payload.bytes(), payload.row_token_offsets())
             .await?;
     }
@@ -549,15 +553,16 @@ mod tests {
         task::{Context, Poll, Wake, Waker},
     };
 
-    use arrow_array::{Float64Array, Int32Array, RecordBatch};
+    use arrow_array::{BinaryArray, Float64Array, Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use futures_util::io::{AsyncRead, AsyncWrite};
 
     use super::{
-        BulkTargetColumnMetadata, RawRowsSink, TokenRowSink, WriteBackend, WriteOptions,
-        WriteStats, WriterState, bulk_insert_table_sql, record_batch_view, resolve_backend,
-        tiberius_row_owned, validate_batch_rows, validate_bulk_target_columns,
-        validate_direct_bulk_target_column_types, write_batch_to_sink, write_direct_batch_to_sink,
+        BulkTargetColumnMetadata, DIRECT_RAW_MAX_PAYLOAD_BYTES, RawRowsSink, TokenRowSink,
+        WriteBackend, WriteOptions, WriteStats, WriterState, bulk_insert_table_sql,
+        record_batch_view, resolve_backend, tiberius_row_owned, validate_batch_rows,
+        validate_bulk_target_columns, validate_direct_bulk_target_column_types,
+        write_batch_to_sink, write_direct_batch_to_sink,
     };
     use crate::{
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, MssqlTypeLength,
@@ -1169,6 +1174,34 @@ mod tests {
     }
 
     #[test]
+    fn write_direct_batch_to_sink_chunks_measured_payloads_by_byte_limit() {
+        let mappings = vec![binary_mapping_at(0, "payload")];
+        let mut state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingRawSink::default();
+        let row_bytes = vec![0x5a; DIRECT_RAW_MAX_PAYLOAD_BYTES / 2 + 1];
+        let batch = binary_batch("payload", &[row_bytes.as_slice(), row_bytes.as_slice()]);
+
+        let stats = poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch)).unwrap();
+
+        assert_eq!(
+            stats,
+            WriteStats {
+                rows_written: 2,
+                batches_written: 1
+            }
+        );
+        assert_eq!(sink.payloads.len(), 2);
+        assert_eq!(sink.payloads[0].row_token_offsets, [0]);
+        assert_eq!(sink.payloads[1].row_token_offsets, [0]);
+    }
+
+    #[test]
     fn write_direct_batch_to_sink_skips_send_for_empty_batch_but_records_stats() {
         let mappings = vec![mapping("id")];
         let mut state = WriterState::new(
@@ -1280,6 +1313,13 @@ mod tests {
     fn int32_batch(name: &str, values: &[i32]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, false)]));
         let array = Arc::new(Int32Array::from(values.to_vec()));
+
+        RecordBatch::try_new(schema, vec![array]).unwrap()
+    }
+
+    fn binary_batch(name: &str, values: &[&[u8]]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Binary, false)]));
+        let array = Arc::new(BinaryArray::from_iter_values(values.iter().copied()));
 
         RecordBatch::try_new(schema, vec![array]).unwrap()
     }

@@ -390,6 +390,7 @@ pub(crate) fn measure_primitive_column_cell_lengths(
     cell_lengths: &mut [usize],
 ) -> Result<()> {
     let value_len = primitive_value_len(column.encoding())?;
+    validate_primitive_column_values(array, column)?;
 
     for row_index in 0..array.len() {
         let cell_len = if array.is_null(row_index) {
@@ -415,24 +416,67 @@ pub(crate) fn measure_primitive_column_cell_lengths(
     Ok(())
 }
 
+fn validate_primitive_column_values(array: &dyn Array, column: &DirectColumnPlan) -> Result<()> {
+    if matches!(
+        column.encoding(),
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat)
+    ) {
+        let array = downcast_direct_array::<Float64Array>(array, column)?;
+        for row_index in 0..array.len() {
+            if array.is_null(row_index) {
+                continue;
+            }
+
+            let value = array.value(row_index);
+            if !value.is_finite() {
+                return Err(value_conversion_error(row_column_diagnostic(
+                    column,
+                    row_index,
+                    DiagnosticCode::NonFiniteFloat,
+                    format!("non-finite floating point value {value} is not supported"),
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub(crate) fn build_fixed_width_row_layout(
     row_count: usize,
     column_count: usize,
     cell_lengths: &[usize],
 ) -> Result<RowLayout> {
+    build_fixed_width_row_range_layout(0, row_count, column_count, cell_lengths)
+}
+
+pub(crate) fn build_fixed_width_row_range_layout(
+    start_row: usize,
+    row_count: usize,
+    column_count: usize,
+    cell_lengths: &[usize],
+) -> Result<RowLayout> {
+    let end_row = start_row
+        .checked_add(row_count)
+        .ok_or_else(|| invalid_payload("direct row range end overflowed usize"))?;
     let mut row_token_offsets = Vec::with_capacity(row_count);
     let mut row_lengths = Vec::with_capacity(row_count);
-    let mut cell_positions = Vec::with_capacity(cell_lengths.len());
+    let mut cell_positions = Vec::with_capacity(row_count * column_count);
     let mut offset = 0usize;
 
-    for row_index in 0..row_count {
+    for row_index in start_row..end_row {
         let row_offset = offset;
         row_token_offsets.push(row_offset);
         offset = checked_add(offset, ROW_TOKEN_LEN)?;
 
         for column_index in 0..column_count {
             let cell_len = cell_lengths[row_index * column_count + column_index];
-            cell_positions.push(CellPosition::new(row_index, column_index, offset, cell_len));
+            cell_positions.push(CellPosition::new(
+                row_index - start_row,
+                column_index,
+                offset,
+                cell_len,
+            ));
             offset = checked_add(offset, cell_len)?;
         }
 
@@ -1356,27 +1400,15 @@ mod tests {
             let row_count = array.len();
             let column_count = 1;
             let mut cell_lengths = vec![0; row_count * column_count];
-            measure_primitive_column_cell_lengths(
+
+            let err = measure_primitive_column_cell_lengths(
                 &array,
                 &plan.columns()[0],
                 0,
                 column_count,
                 &mut cell_lengths,
             )
-            .unwrap();
-            let layout =
-                build_fixed_width_row_layout(row_count, column_count, &cell_lengths).unwrap();
-            let mut bytes = allocate_rows_payload_with_tokens(&layout);
-
-            let err = fill_float64_column(
-                &array,
-                &plan.columns()[0],
-                0,
-                column_count,
-                &layout,
-                &mut bytes,
-            )
-            .expect_err("non-finite float must fail");
+            .expect_err("non-finite float must fail before layout is accepted");
 
             assert_value_conversion_diagnostic(
                 err,
