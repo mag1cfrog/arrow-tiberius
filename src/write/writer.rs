@@ -17,7 +17,9 @@ use super::{
     record_batch::RecordBatchView,
     token_row::tiberius_row_owned,
 };
-use crate::conversion::arrow_to_mssql::primitive::PrimitiveArrowToMssql;
+use crate::conversion::arrow_to_mssql::{
+    primitive::PrimitiveArrowToMssql, variable_width::VariableWidthArrowToMssql,
+};
 
 /// Write backend selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -383,6 +385,13 @@ fn expected_direct_bulk_column_type(column: &DirectColumnPlan) -> Option<tiberiu
             Some(tiberius::ColumnType::Float8)
         }
         DirectColumnEncoding::Primitive(_) => None,
+        DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::Utf8ToNVarChar {
+            ..
+        }) => Some(tiberius::ColumnType::NVarchar),
+        DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::BinaryToVarBinary {
+            ..
+        }) => Some(tiberius::ColumnType::BigVarBin),
+        DirectColumnEncoding::VariableWidth(_) => None,
     }
 }
 
@@ -551,8 +560,8 @@ mod tests {
         validate_direct_bulk_target_column_types, write_batch_to_sink, write_direct_batch_to_sink,
     };
     use crate::{
-        ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, PlanOptions,
-        SchemaCheck, SchemaMapping, TableName,
+        ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, MssqlTypeLength,
+        PlanOptions, SchemaCheck, SchemaMapping, TableName,
     };
 
     #[test]
@@ -643,6 +652,14 @@ mod tests {
                 MssqlColumn::new(Identifier::new("id64").unwrap(), MssqlType::BigInt, false),
             ),
             float_mapping_at(2, "score"),
+            SchemaMapping::new(
+                ArrowFieldRef::new(3, "name".to_owned(), true, DataType::Utf8),
+                MssqlColumn::new(
+                    Identifier::new("name").unwrap(),
+                    MssqlType::NVarChar(crate::MssqlTypeLength::Max),
+                    true,
+                ),
+            ),
         ];
 
         let state = WriterState::new(
@@ -660,10 +677,10 @@ mod tests {
     #[test]
     fn direct_writer_state_rejects_unsupported_mappings() {
         let mappings = vec![SchemaMapping::new(
-            ArrowFieldRef::new(0, "name".to_owned(), true, DataType::Utf8),
+            ArrowFieldRef::new(0, "created_on".to_owned(), true, DataType::Date32),
             MssqlColumn::new(
-                Identifier::new("name").unwrap(),
-                MssqlType::NVarChar(crate::MssqlTypeLength::Max),
+                Identifier::new("created_on").unwrap(),
+                MssqlType::Date,
                 true,
             ),
         )];
@@ -897,6 +914,67 @@ mod tests {
             state.direct_encoder().unwrap().plan(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn direct_bulk_target_type_validation_accepts_matching_variable_width_metadata() {
+        let mappings = vec![utf8_mapping_at(0, "name"), binary_mapping_at(1, "payload")];
+        let state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let columns = vec![
+            bulk_target_column_with_type(0, "name", false, tiberius::ColumnType::NVarchar),
+            bulk_target_column_with_type(1, "payload", false, tiberius::ColumnType::BigVarBin),
+        ];
+
+        validate_direct_bulk_target_column_types(
+            columns.into_iter(),
+            state.direct_encoder().unwrap().plan(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn direct_bulk_target_type_validation_rejects_variable_width_type_swap() {
+        let mappings = vec![utf8_mapping_at(0, "name"), binary_mapping_at(1, "payload")];
+        let state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let columns = vec![
+            bulk_target_column_with_type(0, "name", false, tiberius::ColumnType::BigVarBin),
+            bulk_target_column_with_type(1, "payload", false, tiberius::ColumnType::NVarchar),
+        ];
+
+        let err = validate_direct_bulk_target_column_types(
+            columns.into_iter(),
+            state.direct_encoder().unwrap().plan(),
+        )
+        .unwrap_err();
+
+        let Error::ValueConversion { diagnostics } = err else {
+            panic!("expected value conversion error");
+        };
+        assert_eq!(diagnostics.len(), 2);
+        assert!(
+            diagnostics
+                .all()
+                .iter()
+                .any(|diagnostic| diagnostic.message().contains("NVarchar"))
+        );
+        assert!(
+            diagnostics
+                .all()
+                .iter()
+                .any(|diagnostic| diagnostic.message().contains("BigVarBin"))
+        );
     }
 
     #[test]
@@ -1172,6 +1250,28 @@ mod tests {
             MssqlColumn::new(
                 Identifier::new(name).unwrap(),
                 MssqlType::Float { precision: 53 },
+                false,
+            ),
+        )
+    }
+
+    fn utf8_mapping_at(index: usize, name: &str) -> SchemaMapping {
+        SchemaMapping::new(
+            ArrowFieldRef::new(index, name.to_owned(), false, DataType::Utf8),
+            MssqlColumn::new(
+                Identifier::new(name).unwrap(),
+                MssqlType::NVarChar(MssqlTypeLength::Max),
+                false,
+            ),
+        )
+    }
+
+    fn binary_mapping_at(index: usize, name: &str) -> SchemaMapping {
+        SchemaMapping::new(
+            ArrowFieldRef::new(index, name.to_owned(), false, DataType::Binary),
+            MssqlColumn::new(
+                Identifier::new(name).unwrap(),
+                MssqlType::VarBinary(MssqlTypeLength::Max),
                 false,
             ),
         )

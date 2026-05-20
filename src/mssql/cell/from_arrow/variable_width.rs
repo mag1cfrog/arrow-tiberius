@@ -2,7 +2,7 @@
 
 use crate::{
     DiagnosticCode, MssqlTypeLength, Result, SchemaMapping, arrow::cell::ArrowCell,
-    mssql::cell::MssqlCell,
+    conversion::arrow_to_mssql::variable_width::VariableWidthArrowToMssql, mssql::cell::MssqlCell,
 };
 
 use super::{row_mapping_diagnostic, value_conversion_error, value_too_long_error};
@@ -13,6 +13,20 @@ pub(super) fn nvar_char_cell<'a>(
     length: MssqlTypeLength,
     cell: ArrowCell<'a>,
 ) -> Result<MssqlCell<'a>> {
+    let classified = match VariableWidthArrowToMssql::classify(mapping, row_index)? {
+        VariableWidthArrowToMssql::Utf8ToNVarChar { length }
+        | VariableWidthArrowToMssql::LargeUtf8ToNVarChar { length } => length,
+        other => {
+            return Err(value_conversion_error(row_mapping_diagnostic(
+                mapping,
+                row_index,
+                DiagnosticCode::ValueConversionUnsupported,
+                format!("variable-width mapping {other:?} is not supported by nvarchar conversion"),
+            )));
+        }
+    };
+    debug_assert_eq!(length, classified);
+
     let value = mssql_nvarchar_value(mapping, row_index, cell)?;
     let code_units = value.encode_utf16().count();
 
@@ -36,6 +50,22 @@ pub(super) fn var_binary_cell<'a>(
     length: MssqlTypeLength,
     cell: ArrowCell<'a>,
 ) -> Result<MssqlCell<'a>> {
+    let classified = match VariableWidthArrowToMssql::classify(mapping, row_index)? {
+        VariableWidthArrowToMssql::BinaryToVarBinary { length }
+        | VariableWidthArrowToMssql::LargeBinaryToVarBinary { length } => length,
+        other => {
+            return Err(value_conversion_error(row_mapping_diagnostic(
+                mapping,
+                row_index,
+                DiagnosticCode::ValueConversionUnsupported,
+                format!(
+                    "variable-width mapping {other:?} is not supported by varbinary conversion"
+                ),
+            )));
+        }
+    };
+    debug_assert_eq!(length, classified);
+
     let value = mssql_varbinary_value(mapping, row_index, cell)?;
     let bytes = value.len();
 
@@ -159,6 +189,23 @@ mod tests {
         assert_eq!(
             convert_cell(&mappings[1], ArrowCell::Binary(b"large"), 1).unwrap(),
             MssqlCell::VarBinary(Some(b"large"))
+        );
+    }
+
+    #[test]
+    fn scalar_variable_conversion_reuses_classifier_for_large_values() {
+        let mappings = mappings_for_schema(Schema::new(vec![
+            Field::new("large_text", DataType::LargeUtf8, true),
+            Field::new("large_bytes", DataType::LargeBinary, true),
+        ]));
+
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::Utf8("large text"), 0).unwrap(),
+            MssqlCell::NVarChar(Some("large text"))
+        );
+        assert_eq!(
+            convert_cell(&mappings[1], ArrowCell::Binary(b"large bytes"), 1).unwrap(),
+            MssqlCell::VarBinary(Some(b"large bytes"))
         );
     }
 

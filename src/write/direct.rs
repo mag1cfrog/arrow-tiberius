@@ -1,11 +1,15 @@
 //! Direct raw TDS bulk encoder internals.
 #![allow(dead_code)]
 
-use arrow_array::{BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch};
+use arrow_array::{
+    BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+};
 
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, Error, Result, SchemaMapping,
-    conversion::arrow_to_mssql::primitive::PrimitiveArrowToMssql,
+    conversion::arrow_to_mssql::{
+        primitive::PrimitiveArrowToMssql, variable_width::VariableWidthArrowToMssql,
+    },
     write::record_batch::validate_runtime_columns,
 };
 
@@ -13,13 +17,17 @@ pub(crate) mod layout;
 pub(crate) mod payload;
 pub(crate) mod plan;
 pub(crate) mod primitive;
+pub(crate) mod variable_width;
 
 use payload::EncodedRowsPayload;
-use plan::{DirectColumnEncoding, DirectEncoderPlan, PrimitiveDirectMappings};
+use plan::{CurrentDirectMappings, DirectColumnEncoding, DirectEncoderPlan};
 use primitive::{
     allocate_rows_payload_with_tokens, build_fixed_width_row_layout, fill_boolean_column,
     fill_float64_column, fill_int32_column, fill_int64_column,
     measure_primitive_column_cell_lengths, try_encode_fixed_width_primitive_rows,
+};
+use variable_width::{
+    fill_nvarchar_column, fill_varbinary_column, measure_variable_width_column_cell_lengths,
 };
 
 /// Direct raw TDS encoder facade.
@@ -32,7 +40,7 @@ pub(crate) struct DirectEncoder {
 impl DirectEncoder {
     /// Creates a direct encoder using the current supported direct mappings.
     pub(crate) fn new(mappings: &[SchemaMapping]) -> Result<Self> {
-        Self::new_with_support(mappings, &PrimitiveDirectMappings)
+        Self::new_with_support(mappings, &CurrentDirectMappings)
     }
 
     /// Creates a direct encoder using an explicit support checker.
@@ -99,13 +107,26 @@ impl DirectEncoder {
                 )));
             };
 
-            measure_primitive_column_cell_lengths(
-                array,
-                column,
-                column_index,
-                column_count,
-                &mut cell_lengths,
-            )?;
+            match column.encoding() {
+                DirectColumnEncoding::Primitive(_) => {
+                    measure_primitive_column_cell_lengths(
+                        array,
+                        column,
+                        column_index,
+                        column_count,
+                        &mut cell_lengths,
+                    )?;
+                }
+                DirectColumnEncoding::VariableWidth(_) => {
+                    measure_variable_width_column_cell_lengths(
+                        array,
+                        column,
+                        column_index,
+                        column_count,
+                        &mut cell_lengths,
+                    )?;
+                }
+            }
         }
 
         build_fixed_width_row_layout(row_count, column_count, &cell_lengths)
@@ -155,6 +176,35 @@ impl DirectEncoder {
                         "direct primitive fill is not implemented yet for {other:?}"
                     )));
                 }
+                DirectColumnEncoding::VariableWidth(other) => match other {
+                    VariableWidthArrowToMssql::Utf8ToNVarChar { .. } => {
+                        let array = downcast_direct_array::<StringArray>(array, column)?;
+                        fill_nvarchar_column(
+                            array,
+                            column,
+                            column_index,
+                            column_count,
+                            layout,
+                            bytes,
+                        )?;
+                    }
+                    VariableWidthArrowToMssql::BinaryToVarBinary { .. } => {
+                        let array = downcast_direct_array::<BinaryArray>(array, column)?;
+                        fill_varbinary_column(
+                            array,
+                            column,
+                            column_index,
+                            column_count,
+                            layout,
+                            bytes,
+                        )?;
+                    }
+                    unsupported => {
+                        return Err(unsupported_batch(format!(
+                            "direct variable-width fill is not implemented yet for {unsupported:?}"
+                        )));
+                    }
+                },
             }
         }
 
@@ -212,13 +262,16 @@ fn value_conversion_error(diagnostic: Diagnostic) -> Error {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch};
+    use arrow_array::{
+        ArrayRef, BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch,
+        StringArray,
+    };
     use arrow_buffer::{NullBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Schema};
 
     use crate::{
-        ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, SchemaMapping,
-        conversion::arrow_to_mssql::primitive::PrimitiveArrowToMssql,
+        ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, MssqlTypeLength,
+        SchemaMapping, conversion::arrow_to_mssql::primitive::PrimitiveArrowToMssql,
     };
 
     use super::plan::{DirectColumnEncoding, DirectEncoderSupport, DirectMappingSupport};
@@ -383,6 +436,98 @@ mod tests {
                 0x00,
                 0x04,
                 0xC0,
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_encoder_encodes_mixed_primitive_and_variable_width_rows() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "name",
+                DataType::Utf8,
+                MssqlType::NVarChar(MssqlTypeLength::Bounded(3)),
+                true,
+            ),
+            mapping(
+                2,
+                "bytes",
+                DataType::Binary,
+                MssqlType::VarBinary(MssqlTypeLength::Max),
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, true),
+                Field::new("bytes", DataType::Binary, true),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![42, -1])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("A"), None])),
+                Arc::new(BinaryArray::from_iter(vec![
+                    Some(&b""[..]),
+                    Some(&b"xy"[..]),
+                ])),
+            ],
+        );
+
+        let payload = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(payload.row_token_offsets(), [0, 21]);
+        assert_eq!(
+            payload.bytes(),
+            [
+                payload::TDS_ROW_TOKEN,
+                42,
+                0,
+                0,
+                0,
+                2,
+                0,
+                b'A',
+                0,
+                0xfe,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+                0,
+                0,
+                0,
+                0,
+                payload::TDS_ROW_TOKEN,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+                0xfe,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+                2,
+                0,
+                0,
+                0,
+                b'x',
+                b'y',
+                0,
+                0,
+                0,
+                0,
             ]
         );
     }
