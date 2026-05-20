@@ -203,11 +203,12 @@ compare runs.
 
 ## Current Backend Scope
 
-The current production writer backend is the baseline TokenRow path.
-`arrow-odbc` and `odbc-bcp` are benchmark references only. `odbc-bcp` is SQL
-Server-specific and exists to measure Microsoft's native BCP extension against
-this crate's writer paths.
+The production writer backends are the baseline TokenRow path and the direct raw
+TDS path for currently supported direct-encoder mappings. `arrow-odbc` and
+`odbc-bcp` are benchmark references only. `odbc-bcp` is SQL Server-specific and
+exists to measure Microsoft's native BCP extension against this crate's writer
+paths.
 
-The direct raw TDS encoder is not benchmarked until that backend exists. When it
-is added, the compare command should be extended so baseline, `arrow-odbc`,
-`odbc-bcp`, and direct TDS can all consume the same IPC dataset.
+The `direct-raw` compare backend is enabled only for scenarios whose schemas are
+fully supported by the current direct encoder. Unsupported scenarios fail before
+benchmark execution with a validation message instead of silently falling back.
