@@ -512,6 +512,130 @@ async fn direct_raw_writer_round_trips_fast_path_primitive_matrix() -> TestResul
 }
 
 #[tokio::test]
+async fn direct_raw_writer_round_trips_variable_width_matrix() -> TestResult<()> {
+    let Some((connection_string, database)) = integration_config() else {
+        eprintln!(
+            "skipping SQL Server direct raw variable-width integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+        );
+        return Ok(());
+    };
+
+    let mut client = connect(&connection_string, &database).await?;
+    let table = unique_table_name()?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::Int32, false),
+        Field::new("text_value", DataType::Utf8, true),
+        Field::new("bytes_value", DataType::Binary, true),
+    ]));
+    let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
+        Arc::clone(&schema),
+        MssqlProfile::sql_server_2016_compat_100(),
+        PlanOptions::default(),
+    )?
+    .into_parts();
+    let large_text = "x".repeat(5000);
+    let large_bytes = vec![0xab; 9000];
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1_i32, 2, 3, 4])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some(""),
+                Some("ascii"),
+                Some("Tokyo 東京"),
+                Some(large_text.as_str()),
+            ])),
+            Arc::new(BinaryArray::from_iter(vec![
+                Some(&b""[..]),
+                Some(&b"\x00\x01\xfe"[..]),
+                None,
+                Some(large_bytes.as_slice()),
+            ])),
+        ],
+    )?;
+
+    execute_sql(
+        &mut client,
+        create_table_sql_from_mappings(&table, &mappings),
+    )
+    .await?;
+
+    let result = async {
+        let mut writer = BulkWriter::new(
+            &mut client,
+            table.clone(),
+            mappings,
+            WriteOptions {
+                backend: WriteBackend::DirectRawBulk,
+                ..WriteOptions::default()
+            },
+        )
+        .await?;
+        let stats = writer.write_batch(&batch).await?;
+
+        ensure_eq(stats.rows_written, 4, "rows_written")?;
+        ensure_eq(stats.batches_written, 1, "batches_written")?;
+        ensure_eq(writer.finish().await?, stats, "finish stats")?;
+
+        let rows = client
+            .simple_query(format!(
+                "SELECT [row_id], [text_value], [bytes_value] FROM {} ORDER BY [row_id]",
+                table.quoted_sql()
+            ))
+            .await?
+            .into_first_result()
+            .await?;
+
+        ensure_eq(rows.len(), 4, "row count")?;
+
+        ensure_eq(rows[0].get::<i32, _>(0), Some(1), "row 0 row_id")?;
+        ensure_eq(rows[0].get::<&str, _>(1), Some(""), "row 0 text_value")?;
+        ensure_eq(
+            rows[0].get::<&[u8], _>(2),
+            Some(&b""[..]),
+            "row 0 bytes_value",
+        )?;
+
+        ensure_eq(rows[1].get::<i32, _>(0), Some(2), "row 1 row_id")?;
+        ensure_eq(rows[1].get::<&str, _>(1), Some("ascii"), "row 1 text_value")?;
+        ensure_eq(
+            rows[1].get::<&[u8], _>(2),
+            Some(&b"\x00\x01\xfe"[..]),
+            "row 1 bytes_value",
+        )?;
+
+        ensure_eq(rows[2].get::<i32, _>(0), Some(3), "row 2 row_id")?;
+        ensure_eq(
+            rows[2].get::<&str, _>(1),
+            Some("Tokyo 東京"),
+            "row 2 text_value",
+        )?;
+        ensure_eq(rows[2].get::<&[u8], _>(2), None, "row 2 bytes_value")?;
+
+        ensure_eq(rows[3].get::<i32, _>(0), Some(4), "row 3 row_id")?;
+        ensure_eq(
+            rows[3].get::<&str, _>(1),
+            Some(large_text.as_str()),
+            "row 3 text_value",
+        )?;
+        ensure_eq(
+            rows[3].get::<&[u8], _>(2),
+            Some(large_bytes.as_slice()),
+            "row 3 bytes_value",
+        )?;
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    let drop_result = drop_table(&mut client, &table).await;
+    result?;
+    drop_result?;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn baseline_writer_round_trips_uint64_policy_values() -> TestResult<()> {
     let Some((connection_string, database)) = integration_config() else {
         eprintln!(
