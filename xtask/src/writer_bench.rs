@@ -771,13 +771,14 @@ fn parse_benchmark_backends(value: &str) -> Result<Vec<BenchmarkBackend>, Writer
 fn ensure_direct_raw_supported_scenario(
     benchmark: &WriterBenchOptions,
 ) -> Result<(), WriterBenchError> {
-    if benchmark.scenario.name == NARROW_NUMERIC_SCENARIO.name {
+    if DIRECT_RAW_SUPPORTED_SCENARIOS.contains(&benchmark.scenario.name) {
         return Ok(());
     }
 
     Err(WriterBenchError::Validation(format!(
-        "writer-bench compare backend `direct-raw` currently supports only scenario `{}`; scenario `{}` contains column types that are not implemented by the primitive direct TDS encoder yet",
-        NARROW_NUMERIC_SCENARIO.name, benchmark.scenario.name
+        "writer-bench compare backend `direct-raw` currently supports only scenarios {}; scenario `{}` contains column types that are not implemented by the direct TDS encoder yet",
+        DIRECT_RAW_SUPPORTED_SCENARIOS.join(", "),
+        benchmark.scenario.name
     )))
 }
 
@@ -1397,6 +1398,13 @@ const TPCH_LINEITEM_LIKE_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenar
     schema: tpch_lineitem_like_schema,
     columns: tpch_lineitem_like_columns,
 };
+
+const DIRECT_RAW_SUPPORTED_SCENARIOS: &[&str] = &[
+    NARROW_NUMERIC_SCENARIO.name,
+    MIXED_NULLABLE_SCENARIO.name,
+    STRING_HEAVY_SCENARIO.name,
+    WIDE_SPARSE_SCENARIO.name,
+];
 
 const SCENARIOS: &[BenchmarkScenarioDefinition] = &[
     NARROW_NUMERIC_SCENARIO,
@@ -2908,24 +2916,46 @@ mod tests {
     }
 
     #[test]
+    fn compare_allows_direct_raw_for_variable_width_supported_scenarios() {
+        for scenario in ["mixed_nullable", "string_heavy", "wide_sparse"] {
+            let args = [
+                OsString::from("--scenario"),
+                OsString::from(scenario),
+                OsString::from("--backends"),
+                OsString::from("direct-raw"),
+            ];
+
+            let options = super::CompareBenchOptions::parse(&args).unwrap();
+
+            assert_eq!(options.backends, [super::BenchmarkBackend::DirectRaw]);
+            super::ensure_direct_raw_supported_scenario(&options.benchmark).unwrap();
+        }
+    }
+
+    #[test]
     fn compare_rejects_direct_raw_for_unsupported_scenarios() {
-        let args = [
-            OsString::from("--scenario"),
-            OsString::from("mixed_nullable"),
-            OsString::from("--backends"),
-            OsString::from("direct-raw"),
-        ];
+        for scenario in ["wide_mixed", "decimal_temporal", "tpch_lineitem_like"] {
+            let args = [
+                OsString::from("--scenario"),
+                OsString::from(scenario),
+                OsString::from("--backends"),
+                OsString::from("direct-raw"),
+            ];
 
-        let options = super::CompareBenchOptions::parse(&args).unwrap();
-        let err = super::ensure_direct_raw_supported_scenario(&options.benchmark).unwrap_err();
+            let options = super::CompareBenchOptions::parse(&args).unwrap();
+            let err = super::ensure_direct_raw_supported_scenario(&options.benchmark).unwrap_err();
 
-        assert!(matches!(
-            err,
-            WriterBenchError::Validation(message)
-                if message.contains("direct-raw")
-                    && message.contains("narrow_numeric")
-                    && message.contains("mixed_nullable")
-        ));
+            assert!(matches!(
+                err,
+                WriterBenchError::Validation(message)
+                    if message.contains("direct-raw")
+                        && message.contains("narrow_numeric")
+                        && message.contains("mixed_nullable")
+                        && message.contains("string_heavy")
+                        && message.contains("wide_sparse")
+                        && message.contains(scenario)
+            ));
+        }
     }
 
     #[test]
