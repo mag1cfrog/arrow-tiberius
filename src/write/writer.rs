@@ -1,5 +1,7 @@
 //! Baseline bulk writer public API skeleton.
 
+use std::borrow::Cow;
+
 use arrow_array::RecordBatch;
 use futures_util::io::{AsyncRead, AsyncWrite};
 
@@ -11,7 +13,7 @@ use crate::{
 use super::{
     SchemaCheck,
     direct::{
-        DirectEncoder,
+        DirectEncoder, MeasuredDirectBatch, MeasuredRowRange,
         plan::{DirectColumnEncoding, DirectColumnPlan, DirectEncoderPlan},
     },
     record_batch::RecordBatchView,
@@ -493,9 +495,7 @@ where
     let rows_written = usize_to_u64_saturating(measured.row_count());
 
     for range in measured.row_ranges(DIRECT_RAW_MAX_PAYLOAD_BYTES)? {
-        let payload =
-            encoder.encode_measured_batch_range(batch, &measured, range.start, range.len)?;
-        sink.send_raw_rows_payload_checked(payload.bytes(), payload.row_token_offsets())
+        sink.send_measured_raw_rows(encoder, batch, &measured, range)
             .await?;
     }
 
@@ -503,10 +503,12 @@ where
 }
 
 trait RawRowsSink {
-    async fn send_raw_rows_payload_checked(
+    async fn send_measured_raw_rows(
         &mut self,
-        payload: &[u8],
-        row_token_offsets: &[usize],
+        encoder: &DirectEncoder,
+        batch: &RecordBatch,
+        measured: &MeasuredDirectBatch,
+        range: MeasuredRowRange,
     ) -> Result<()>;
 }
 
@@ -514,14 +516,48 @@ impl<S> RawRowsSink for tiberius::BulkLoadRequest<'_, S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    async fn send_raw_rows_payload_checked(
+    async fn send_measured_raw_rows(
         &mut self,
-        payload: &[u8],
-        row_token_offsets: &[usize],
+        encoder: &DirectEncoder,
+        batch: &RecordBatch,
+        measured: &MeasuredDirectBatch,
+        range: MeasuredRowRange,
     ) -> Result<()> {
-        self.send_raw_rows_payload_checked(payload, row_token_offsets)
-            .await
-            .map_err(|source| crate::Error::Tiberius { source })
+        if !encoder.has_variable_width_column() {
+            let payload =
+                encoder.encode_measured_batch_range(batch, measured, range.start, range.len)?;
+            return self
+                .send_raw_rows_payload_checked(payload.bytes(), payload.row_token_offsets())
+                .await
+                .map_err(|source| crate::Error::Tiberius { source });
+        }
+
+        let mut encode_error = None;
+        let send_result = self
+            .send_raw_rows_with(|buf| {
+                match encoder.encode_measured_batch_range_into(
+                    batch,
+                    measured,
+                    range.start,
+                    range.len,
+                    buf,
+                ) {
+                    Ok(append) => Ok(append),
+                    Err(err) => {
+                        encode_error = Some(err);
+                        Err(tiberius::error::Error::BulkInput(Cow::Borrowed(
+                            "direct raw row encoding failed",
+                        )))
+                    }
+                }
+            })
+            .await;
+
+        if let Some(err) = encode_error {
+            return Err(err);
+        }
+
+        send_result.map_err(|source| crate::Error::Tiberius { source })
     }
 }
 
@@ -558,11 +594,11 @@ mod tests {
     use futures_util::io::{AsyncRead, AsyncWrite};
 
     use super::{
-        BulkTargetColumnMetadata, DIRECT_RAW_MAX_PAYLOAD_BYTES, RawRowsSink, TokenRowSink,
-        WriteBackend, WriteOptions, WriteStats, WriterState, bulk_insert_table_sql,
-        record_batch_view, resolve_backend, tiberius_row_owned, validate_batch_rows,
-        validate_bulk_target_columns, validate_direct_bulk_target_column_types,
-        write_batch_to_sink, write_direct_batch_to_sink,
+        BulkTargetColumnMetadata, DIRECT_RAW_MAX_PAYLOAD_BYTES, DirectEncoder, MeasuredDirectBatch,
+        MeasuredRowRange, RawRowsSink, TokenRowSink, WriteBackend, WriteOptions, WriteStats,
+        WriterState, bulk_insert_table_sql, record_batch_view, resolve_backend, tiberius_row_owned,
+        validate_batch_rows, validate_bulk_target_columns,
+        validate_direct_bulk_target_column_types, write_batch_to_sink, write_direct_batch_to_sink,
     };
     use crate::{
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, MssqlTypeLength,
@@ -1386,11 +1422,16 @@ mod tests {
     }
 
     impl RawRowsSink for RecordingRawSink {
-        async fn send_raw_rows_payload_checked(
+        async fn send_measured_raw_rows(
             &mut self,
-            payload: &[u8],
-            row_token_offsets: &[usize],
+            encoder: &DirectEncoder,
+            batch: &RecordBatch,
+            measured: &MeasuredDirectBatch,
+            range: MeasuredRowRange,
         ) -> crate::Result<()> {
+            let payload =
+                encoder.encode_measured_batch_range(batch, measured, range.start, range.len)?;
+
             if self.fail_on_send {
                 return Err(Error::Tiberius {
                     source: tiberius::error::Error::BulkInput(Cow::Borrowed(
@@ -1400,8 +1441,8 @@ mod tests {
             }
 
             self.payloads.push(RecordedRawPayload {
-                bytes: payload.to_vec(),
-                row_token_offsets: row_token_offsets.to_vec(),
+                bytes: payload.bytes().to_vec(),
+                row_token_offsets: payload.row_token_offsets().to_vec(),
             });
             Ok(())
         }

@@ -147,6 +147,109 @@ pub(crate) fn fill_varbinary_column(
     Ok(())
 }
 
+/// Appends one Utf8-to-nvarchar cell to a raw bulk append buffer.
+pub(crate) fn append_nvarchar_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    array: &StringArray,
+    column: &DirectColumnPlan,
+    row_index: usize,
+    measured_len: usize,
+) -> Result<()> {
+    let length = match column.encoding() {
+        DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::Utf8ToNVarChar {
+            length,
+        }) => length,
+        other => {
+            return Err(unsupported_batch(format!(
+                "direct nvarchar append cannot encode mapping {other:?}"
+            )));
+        }
+    };
+
+    if array.is_null(row_index) {
+        return append_null_cell(buf, column, row_index, measured_len, length);
+    }
+
+    match length {
+        MssqlTypeLength::Bounded(limit) => {
+            let encoded_bytes =
+                measured_len
+                    .checked_sub(BOUNDED_LEN_PREFIX_LEN)
+                    .ok_or_else(|| {
+                        invalid_payload(format!(
+                            "bounded nvarchar cell at row {row_index} column {} has length {}, shorter than prefix length {BOUNDED_LEN_PREFIX_LEN}",
+                            column.source_name(),
+                            measured_len
+                        ))
+                    })?;
+            validate_utf16_byte_len_for_append(column, row_index, encoded_bytes)?;
+            if encoded_bytes / 2 > limit {
+                return Err(value_too_long_error(
+                    column,
+                    row_index,
+                    format!(
+                        "string value has {} UTF-16 code unit(s), exceeding planned {}",
+                        encoded_bytes / 2,
+                        column.target_type().to_sql()
+                    ),
+                ));
+            }
+
+            append_bounded_nvarchar_cell(buf, array.value(row_index), encoded_bytes)
+        }
+        MssqlTypeLength::Max => {
+            let encoded_bytes =
+                plp_nvarchar_encoded_bytes_from_len(column, row_index, measured_len)?;
+            append_plp_nvarchar_cell(buf, array.value(row_index), encoded_bytes)
+        }
+    }
+}
+
+/// Appends one Binary-to-varbinary cell to a raw bulk append buffer.
+pub(crate) fn append_varbinary_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    array: &BinaryArray,
+    column: &DirectColumnPlan,
+    row_index: usize,
+    measured_len: usize,
+) -> Result<()> {
+    let length = match column.encoding() {
+        DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::BinaryToVarBinary {
+            length,
+        }) => length,
+        other => {
+            return Err(unsupported_batch(format!(
+                "direct varbinary append cannot encode mapping {other:?}"
+            )));
+        }
+    };
+
+    if array.is_null(row_index) {
+        return append_null_cell(buf, column, row_index, measured_len, length);
+    }
+
+    let value = array.value(row_index);
+    match length {
+        MssqlTypeLength::Bounded(limit) => {
+            if value.len() > limit {
+                return Err(value_too_long_error(
+                    column,
+                    row_index,
+                    format!(
+                        "binary value has {} byte(s), exceeding planned {}",
+                        value.len(),
+                        column.target_type().to_sql()
+                    ),
+                ));
+            }
+            append_bounded_payload_cell(buf, column, row_index, measured_len, value)
+        }
+        MssqlTypeLength::Max => {
+            append_plp_payload_cell(buf, column, row_index, measured_len, value)
+        }
+    }
+}
+
 fn measure_nvarchar_cell_lengths(
     array: &StringArray,
     column: &DirectColumnPlan,
@@ -225,6 +328,159 @@ fn measure_varbinary_cell_lengths(
     }
 
     Ok(())
+}
+
+fn append_null_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    column: &DirectColumnPlan,
+    row_index: usize,
+    measured_len: usize,
+    length: MssqlTypeLength,
+) -> Result<()> {
+    let expected_len = null_cell_len(column, row_index, length)?;
+    if measured_len != expected_len {
+        return Err(invalid_payload(format!(
+            "measured null variable-width cell at row {row_index} column {} has length {}, expected {expected_len}",
+            column.source_name(),
+            measured_len
+        )));
+    }
+
+    match length {
+        MssqlTypeLength::Bounded(_) => buf.put_u16_le(u16::MAX),
+        MssqlTypeLength::Max => buf.put_u64_le(u64::MAX),
+    }
+
+    Ok(())
+}
+
+fn append_bounded_nvarchar_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    value: &str,
+    encoded_bytes: usize,
+) -> Result<()> {
+    let encoded_bytes = u16::try_from(encoded_bytes)
+        .map_err(|_| invalid_payload("bounded variable-width cell length does not fit u16"))?;
+    buf.put_u16_le(encoded_bytes);
+    append_utf16le(buf, value);
+    Ok(())
+}
+
+fn append_bounded_payload_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    column: &DirectColumnPlan,
+    row_index: usize,
+    measured_len: usize,
+    value: &[u8],
+) -> Result<()> {
+    let expected_len = bounded_cell_len(value.len())?;
+    if measured_len != expected_len {
+        return Err(invalid_payload(format!(
+            "measured bounded varbinary cell at row {row_index} column {} has length {}, expected {expected_len}",
+            column.source_name(),
+            measured_len
+        )));
+    }
+
+    let len = u16::try_from(value.len())
+        .map_err(|_| invalid_payload("bounded variable-width cell length does not fit u16"))?;
+    buf.put_u16_le(len);
+    buf.extend_from_slice(value);
+    Ok(())
+}
+
+fn append_plp_nvarchar_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    value: &str,
+    encoded_bytes: usize,
+) -> Result<()> {
+    append_plp_header(buf, encoded_bytes)?;
+    append_utf16le(buf, value);
+    append_plp_terminator(buf, encoded_bytes);
+    Ok(())
+}
+
+fn append_plp_payload_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    column: &DirectColumnPlan,
+    row_index: usize,
+    measured_len: usize,
+    value: &[u8],
+) -> Result<()> {
+    let expected_len = plp_cell_len(value.len())?;
+    if measured_len != expected_len {
+        return Err(invalid_payload(format!(
+            "measured PLP varbinary cell at row {row_index} column {} has length {}, expected {expected_len}",
+            column.source_name(),
+            measured_len
+        )));
+    }
+
+    append_plp_header(buf, value.len())?;
+    buf.extend_from_slice(value);
+    append_plp_terminator(buf, value.len());
+    Ok(())
+}
+
+fn plp_nvarchar_encoded_bytes_from_len(
+    column: &DirectColumnPlan,
+    row_index: usize,
+    measured_len: usize,
+) -> Result<usize> {
+    let minimum_non_null_len = PLP_LEN_PREFIX_LEN + PLP_CHUNK_LEN_PREFIX_LEN;
+    if measured_len == minimum_non_null_len {
+        return Ok(0);
+    }
+
+    let non_empty_overhead = minimum_non_null_len + PLP_TERMINATOR_LEN;
+    let encoded_bytes = measured_len.checked_sub(non_empty_overhead).ok_or_else(|| {
+        invalid_payload(format!(
+            "PLP nvarchar cell at row {row_index} column {} has length {}, shorter than non-empty overhead {non_empty_overhead}",
+            column.source_name(),
+            measured_len
+        ))
+    })?;
+    validate_utf16_byte_len_for_append(column, row_index, encoded_bytes)?;
+    Ok(encoded_bytes)
+}
+
+fn validate_utf16_byte_len_for_append(
+    column: &DirectColumnPlan,
+    row_index: usize,
+    encoded_bytes: usize,
+) -> Result<()> {
+    if encoded_bytes.is_multiple_of(2) {
+        return Ok(());
+    }
+
+    Err(invalid_payload(format!(
+        "nvarchar cell at row {row_index} column {} has odd UTF-16 byte length {encoded_bytes}",
+        column.source_name()
+    )))
+}
+
+fn append_utf16le(buf: &mut tiberius::RawRowsAppendBuffer<'_>, value: &str) {
+    for code_unit in value.encode_utf16() {
+        buf.put_u16_le(code_unit);
+    }
+}
+
+fn append_plp_header(buf: &mut tiberius::RawRowsAppendBuffer<'_>, len: usize) -> Result<()> {
+    if len > MAX_PLP_CHUNK_LEN {
+        return Err(invalid_payload(format!(
+            "direct variable-width PLP chunk length {len} exceeds u32::MAX"
+        )));
+    }
+
+    buf.put_u64_le(0xfffffffffffffffe_u64);
+    buf.put_u32_le(len as u32);
+    Ok(())
+}
+
+fn append_plp_terminator(buf: &mut tiberius::RawRowsAppendBuffer<'_>, len: usize) {
+    if len != 0 {
+        buf.put_u32_le(0);
+    }
 }
 
 fn null_cell_len(

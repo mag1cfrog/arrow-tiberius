@@ -22,13 +22,14 @@ pub(crate) mod variable_width;
 use payload::EncodedRowsPayload;
 use plan::{CurrentDirectMappings, DirectColumnEncoding, DirectEncoderPlan};
 use primitive::{
-    allocate_rows_payload_with_tokens, build_fixed_width_row_layout,
-    build_fixed_width_row_range_layout, fill_boolean_column, fill_float64_column,
-    fill_int32_column, fill_int64_column, measure_primitive_column_cell_lengths,
-    try_encode_fixed_width_primitive_rows,
+    allocate_rows_payload_with_tokens, append_boolean_cell, append_float64_cell, append_int32_cell,
+    append_int64_cell, build_fixed_width_row_layout, build_fixed_width_row_range_layout,
+    fill_boolean_column, fill_float64_column, fill_int32_column, fill_int64_column,
+    measure_primitive_column_cell_lengths, try_encode_fixed_width_primitive_rows,
 };
 use variable_width::{
-    fill_nvarchar_column, fill_varbinary_column, measure_variable_width_column_cell_lengths,
+    append_nvarchar_cell, append_varbinary_cell, fill_nvarchar_column, fill_varbinary_column,
+    measure_variable_width_column_cell_lengths,
 };
 
 /// Direct raw TDS encoder facade.
@@ -63,6 +64,14 @@ impl DirectEncoder {
     /// Returns the checked direct encoder plan.
     pub(crate) const fn plan(&self) -> &DirectEncoderPlan {
         &self.plan
+    }
+
+    /// Returns true when this encoder contains at least one variable-width column.
+    pub(crate) fn has_variable_width_column(&self) -> bool {
+        self.plan
+            .columns()
+            .iter()
+            .any(|column| matches!(column.encoding(), DirectColumnEncoding::VariableWidth(_)))
     }
 
     /// Encodes a runtime batch into complete raw TDS row payload bytes.
@@ -145,6 +154,56 @@ impl DirectEncoder {
         self.fill_columns(&batch, &layout, &mut bytes)?;
 
         EncodedRowsPayload::new(bytes, layout.row_token_offsets().to_vec())
+    }
+
+    /// Encodes one measured range directly into a Tiberius raw rows buffer.
+    pub(crate) fn encode_measured_batch_range_into(
+        &self,
+        batch: &RecordBatch,
+        measured: &MeasuredDirectBatch,
+        start_row: usize,
+        row_count: usize,
+        buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    ) -> Result<tiberius::RawRowsAppend> {
+        measured.check_range(start_row, row_count)?;
+
+        if measured.row_count() != batch.num_rows() {
+            return Err(invalid_payload(format!(
+                "measured row count {} does not match runtime batch row count {}",
+                measured.row_count(),
+                batch.num_rows()
+            )));
+        }
+
+        if measured.column_count() != self.plan.column_count() {
+            return Err(invalid_payload(format!(
+                "measured column count {} does not match direct plan column count {}",
+                measured.column_count(),
+                self.plan.column_count()
+            )));
+        }
+
+        let runtime_columns = self.runtime_columns(batch)?;
+        let mut row_token_offsets = Vec::with_capacity(row_count);
+        let mut written = 0usize;
+
+        let end_row = start_row
+            .checked_add(row_count)
+            .ok_or_else(|| invalid_payload("direct row range end overflowed usize"))?;
+
+        for row_index in start_row..end_row {
+            row_token_offsets.push(written);
+            buf.put_u8(payload::TDS_ROW_TOKEN);
+            written = checked_add(written, 1)?;
+
+            for (column_index, column) in runtime_columns.iter().enumerate() {
+                let measured_len = measured.cell_len(row_index, column_index)?;
+                column.append_cell(buf, row_index, measured_len)?;
+                written = checked_add(written, measured_len)?;
+            }
+        }
+
+        Ok(tiberius::RawRowsAppend::new(row_token_offsets))
     }
 
     fn encode_checked_batch(&self, batch: &RecordBatch) -> Result<EncodedRowsPayload> {
@@ -302,6 +361,138 @@ impl DirectEncoder {
 
         Ok(())
     }
+
+    fn runtime_columns<'a>(
+        &'a self,
+        batch: &'a RecordBatch,
+    ) -> Result<Vec<RuntimeDirectColumn<'a>>> {
+        let mut columns = Vec::with_capacity(self.plan.column_count());
+
+        for column in self.plan.columns() {
+            let Some(array) = batch
+                .columns()
+                .get(column.source_index())
+                .map(AsRef::as_ref)
+            else {
+                return Err(value_conversion_error(row_column_diagnostic(
+                    column,
+                    0,
+                    DiagnosticCode::ValueTypeMismatch,
+                    "planned direct column index is outside the runtime batch",
+                )));
+            };
+
+            let runtime = match column.encoding() {
+                DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::BooleanToBit) => {
+                    RuntimeDirectColumn::Boolean {
+                        column,
+                        array: downcast_direct_array::<BooleanArray>(array, column)?,
+                    }
+                }
+                DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int32ToInt) => {
+                    RuntimeDirectColumn::Int32 {
+                        column,
+                        array: downcast_direct_array::<Int32Array>(array, column)?,
+                    }
+                }
+                DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int64ToBigInt) => {
+                    RuntimeDirectColumn::Int64 {
+                        column,
+                        array: downcast_direct_array::<Int64Array>(array, column)?,
+                    }
+                }
+                DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => {
+                    RuntimeDirectColumn::Float64 {
+                        column,
+                        array: downcast_direct_array::<Float64Array>(array, column)?,
+                    }
+                }
+                DirectColumnEncoding::Primitive(other) => {
+                    return Err(unsupported_batch(format!(
+                        "direct primitive append is not implemented yet for {other:?}"
+                    )));
+                }
+                DirectColumnEncoding::VariableWidth(
+                    VariableWidthArrowToMssql::Utf8ToNVarChar { .. },
+                ) => RuntimeDirectColumn::Utf8 {
+                    column,
+                    array: downcast_direct_array::<StringArray>(array, column)?,
+                },
+                DirectColumnEncoding::VariableWidth(
+                    VariableWidthArrowToMssql::BinaryToVarBinary { .. },
+                ) => RuntimeDirectColumn::Binary {
+                    column,
+                    array: downcast_direct_array::<BinaryArray>(array, column)?,
+                },
+                DirectColumnEncoding::VariableWidth(other) => {
+                    return Err(unsupported_batch(format!(
+                        "direct variable-width append is not implemented yet for {other:?}"
+                    )));
+                }
+            };
+
+            columns.push(runtime);
+        }
+
+        Ok(columns)
+    }
+}
+
+enum RuntimeDirectColumn<'a> {
+    Boolean {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a BooleanArray,
+    },
+    Int32 {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a Int32Array,
+    },
+    Int64 {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a Int64Array,
+    },
+    Float64 {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a Float64Array,
+    },
+    Utf8 {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a StringArray,
+    },
+    Binary {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a BinaryArray,
+    },
+}
+
+impl RuntimeDirectColumn<'_> {
+    fn append_cell(
+        &self,
+        buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+        row_index: usize,
+        measured_len: usize,
+    ) -> Result<()> {
+        match self {
+            Self::Boolean { column, array } => {
+                append_boolean_cell(buf, array, column, row_index, measured_len)
+            }
+            Self::Int32 { column, array } => {
+                append_int32_cell(buf, array, column, row_index, measured_len)
+            }
+            Self::Int64 { column, array } => {
+                append_int64_cell(buf, array, column, row_index, measured_len)
+            }
+            Self::Float64 { column, array } => {
+                append_float64_cell(buf, array, column, row_index, measured_len)
+            }
+            Self::Utf8 { column, array } => {
+                append_nvarchar_cell(buf, array, column, row_index, measured_len)
+            }
+            Self::Binary { column, array } => {
+                append_varbinary_cell(buf, array, column, row_index, measured_len)
+            }
+        }
+    }
 }
 
 /// Direct row payload measurement for one runtime batch.
@@ -400,6 +591,29 @@ impl MeasuredDirectBatch {
         Ok(ranges)
     }
 
+    fn cell_len(&self, row_index: usize, column_index: usize) -> Result<usize> {
+        self.check_range(row_index, 1)?;
+
+        if column_index >= self.column_count {
+            return Err(invalid_payload(format!(
+                "direct measured column index {column_index} is outside measured column count {}",
+                self.column_count
+            )));
+        }
+
+        let index = row_index
+            .checked_mul(self.column_count)
+            .and_then(|base| base.checked_add(column_index))
+            .ok_or_else(|| invalid_payload("measured cell length index overflowed usize"))?;
+
+        self.cell_lengths.get(index).copied().ok_or_else(|| {
+            invalid_payload(format!(
+                "measured cell length index {index} is outside measured cell length count {}",
+                self.cell_lengths.len()
+            ))
+        })
+    }
+
     fn range_layout(&self, start_row: usize, row_count: usize) -> Result<layout::RowLayout> {
         self.check_range(start_row, row_count)?;
         build_fixed_width_row_range_layout(
@@ -495,6 +709,11 @@ fn invalid_payload(message: impl Into<String>) -> Error {
     }
 }
 
+fn checked_add(lhs: usize, rhs: usize) -> Result<usize> {
+    lhs.checked_add(rhs)
+        .ok_or_else(|| invalid_payload("direct encoded length overflowed usize"))
+}
+
 fn row_column_diagnostic(
     column: &plan::DirectColumnPlan,
     row_index: usize,
@@ -555,6 +774,32 @@ mod tests {
 
         assert!(payload.is_empty());
         assert_eq!(payload.row_count(), 0);
+    }
+
+    #[test]
+    fn direct_encoder_reports_variable_width_column_presence() {
+        let primitive = DirectEncoder::new(&[mapping(
+            0,
+            "quantity",
+            DataType::Int32,
+            MssqlType::Int,
+            false,
+        )])
+        .unwrap();
+        assert!(!primitive.has_variable_width_column());
+
+        let mixed = DirectEncoder::new(&[
+            mapping(0, "quantity", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "comment",
+                DataType::Utf8,
+                MssqlType::NVarChar(MssqlTypeLength::Max),
+                true,
+            ),
+        ])
+        .unwrap();
+        assert!(mixed.has_variable_width_column());
     }
 
     #[test]

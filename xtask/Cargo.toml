@@ -12,6 +12,6 @@ arrow-tiberius = { path = ".." }
 arrow-array = "58.2.0"
 arrow-ipc = "58.2.0"
 arrow-schema = "58.2.0"
-tiberius = { package = "tiberius-raw-bulk", version = "0.12.3-raw-bulk.3" }
+tiberius = { package = "tiberius-raw-bulk", version = "0.12.3-raw-bulk.4" }
 tokio = { version = "1", features = ["net", "rt"] }
 tokio-util = { version = "0.7", features = ["compat"] }

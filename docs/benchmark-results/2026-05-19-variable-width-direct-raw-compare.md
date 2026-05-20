@@ -98,6 +98,33 @@ Relative rows/sec:
 | `arrow-odbc` / `direct-raw` | 5.16x |
 | `odbc-bcp` / `direct-raw` | 3.31x |
 
+Additional #81 append-buffer rerun:
+
+After publishing `tiberius-raw-bulk` `0.12.3-raw-bulk.4`, the direct writer
+was rerun with `BulkLoadRequest::send_raw_rows_with`, so encoded row ranges are
+appended directly into the Tiberius bulk-load request buffer for variable-width
+direct plans instead of first building a separate range payload and then copying
+it into Tiberius.
+
+```sh
+cargo xtask writer-bench compare \
+  --container-runtime podman \
+  --scenario string_heavy \
+  --rows 300000 \
+  --batch-size 8192 \
+  --repeat 1 \
+  --backends direct-raw
+```
+
+| Backend | Rows | Write | Finish | Total | Rows/sec | Peak RSS KiB | Peak RSS MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `direct-raw` append-buffer rerun | 300,000 | 120.400s | 0.005s | 120.476s | 2,491.59 | 104,996 | 102.54 |
+
+Compared with the original direct row in this document, the append-buffer path
+improved `string_heavy` throughput by about 13.5 percent and reduced peak RSS by
+about 49.6 percent on this local rerun. Since this was not a full four-backend
+rerun, the original table remains the fair same-run comparison across backends.
+
 Interpretation:
 
 - `direct-raw` is faster than `baseline` on large variable-width rows, but only
@@ -142,12 +169,11 @@ Interpretation:
 
 The #67 direct variable-width encoder is beneficial for short strings and mixed
 nullable rows, but the large-payload result shows a clear optimization target.
-The current direct path still builds full row payload buffers and performs
-UTF-16 encoding into row-major positions. For large `nvarchar(max)` and
-`varbinary(max)` payloads, future work should investigate:
+The #81 follow-up reduced one large-copy source by appending variable-width
+encoded row ranges directly into the Tiberius request buffer. For large
+`nvarchar(max)` and `varbinary(max)` payloads, future work should still
+investigate:
 
-- avoiding full-batch row payload materialization for very large payloads;
-- row-range bounded encoding to cap peak memory;
 - more efficient UTF-16 staging for `nvarchar(max)`;
 - whether PLP chunking strategy affects SQL Server bulk-load throughput;
 - profiling direct `string_heavy` to find whether time is dominated by UTF-16

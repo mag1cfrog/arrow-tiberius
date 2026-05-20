@@ -640,6 +640,91 @@ pub(crate) fn fill_float64_column(
     Ok(())
 }
 
+/// Appends one Boolean-to-bit cell to a raw bulk append buffer.
+pub(crate) fn append_boolean_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    array: &BooleanArray,
+    column: &DirectColumnPlan,
+    row_index: usize,
+    measured_len: usize,
+) -> Result<()> {
+    if array.is_null(row_index) {
+        return append_null_cell(buf, column, row_index, measured_len);
+    }
+
+    append_primitive_cell(
+        buf,
+        column,
+        measured_len,
+        &[u8::from(array.value(row_index))],
+    )
+}
+
+/// Appends one Int32-to-int cell to a raw bulk append buffer.
+pub(crate) fn append_int32_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    array: &Int32Array,
+    column: &DirectColumnPlan,
+    row_index: usize,
+    measured_len: usize,
+) -> Result<()> {
+    if array.is_null(row_index) {
+        return append_null_cell(buf, column, row_index, measured_len);
+    }
+
+    append_primitive_cell(
+        buf,
+        column,
+        measured_len,
+        &array.value(row_index).to_le_bytes(),
+    )
+}
+
+/// Appends one Int64-to-bigint cell to a raw bulk append buffer.
+pub(crate) fn append_int64_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    array: &Int64Array,
+    column: &DirectColumnPlan,
+    row_index: usize,
+    measured_len: usize,
+) -> Result<()> {
+    if array.is_null(row_index) {
+        return append_null_cell(buf, column, row_index, measured_len);
+    }
+
+    append_primitive_cell(
+        buf,
+        column,
+        measured_len,
+        &array.value(row_index).to_le_bytes(),
+    )
+}
+
+/// Appends one Float64-to-float cell to a raw bulk append buffer.
+pub(crate) fn append_float64_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    array: &Float64Array,
+    column: &DirectColumnPlan,
+    row_index: usize,
+    measured_len: usize,
+) -> Result<()> {
+    if array.is_null(row_index) {
+        return append_null_cell(buf, column, row_index, measured_len);
+    }
+
+    let value = array.value(row_index);
+    if !value.is_finite() {
+        return Err(value_conversion_error(row_column_diagnostic(
+            column,
+            row_index,
+            DiagnosticCode::NonFiniteFloat,
+            format!("non-finite floating point value {value} is not supported"),
+        )));
+    }
+
+    append_primitive_cell(buf, column, measured_len, &value.to_le_bytes())
+}
+
 fn cell_position(
     layout: &RowLayout,
     row_index: usize,
@@ -655,6 +740,67 @@ fn cell_position(
         .cell_positions()
         .get(index)
         .ok_or_else(|| invalid_payload("cell position is outside measured row layout"))
+}
+
+fn append_null_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    column: &DirectColumnPlan,
+    row_index: usize,
+    measured_len: usize,
+) -> Result<()> {
+    if !column.nullable() {
+        return Err(value_conversion_error(row_column_diagnostic(
+            column,
+            row_index,
+            DiagnosticCode::NullInNonNullableColumn,
+            "null value in non-nullable direct primitive column",
+        )));
+    }
+
+    if measured_len != CELL_LEN_PREFIX_LEN {
+        return Err(invalid_payload(format!(
+            "measured null primitive cell at row {row_index} column {} has length {}, expected {CELL_LEN_PREFIX_LEN}",
+            column.source_index(),
+            measured_len
+        )));
+    }
+
+    buf.put_u8(0);
+    Ok(())
+}
+
+fn append_primitive_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    column: &DirectColumnPlan,
+    measured_len: usize,
+    value: &[u8],
+) -> Result<()> {
+    if column.nullable() {
+        let expected_len = CELL_LEN_PREFIX_LEN
+            .checked_add(value.len())
+            .ok_or_else(|| invalid_payload("nullable primitive cell length overflowed usize"))?;
+        if measured_len != expected_len {
+            return Err(invalid_payload(format!(
+                "measured nullable primitive cell for column {} has length {}, expected {expected_len}",
+                column.source_name(),
+                measured_len
+            )));
+        }
+
+        let value_len = u8::try_from(value.len())
+            .map_err(|_| invalid_payload("nullable primitive cell value length does not fit u8"))?;
+        buf.put_u8(value_len);
+    } else if measured_len != value.len() {
+        return Err(invalid_payload(format!(
+            "measured fixed-width primitive cell for column {} has length {}, expected {}",
+            column.source_name(),
+            measured_len,
+            value.len()
+        )));
+    }
+
+    buf.extend_from_slice(value);
+    Ok(())
 }
 
 fn write_null_cell(bytes: &mut [u8], cell: &CellPosition) -> Result<()> {
