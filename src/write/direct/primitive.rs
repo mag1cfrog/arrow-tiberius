@@ -4,7 +4,7 @@ use arrow_array::{Array, BooleanArray, Float64Array, Int32Array, Int64Array, Rec
 
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, Result,
-    conversion::arrow_to_mssql::primitive::PrimitiveArrowToMssql,
+    conversion::arrow_to_mssql::primitive::PrimitiveArrowToMssql, write::profile,
 };
 
 use super::{
@@ -748,6 +748,8 @@ fn append_null_cell(
     row_index: usize,
     measured_len: usize,
 ) -> Result<()> {
+    profile::record_null_cell();
+
     if !column.nullable() {
         return Err(value_conversion_error(row_column_diagnostic(
             column,

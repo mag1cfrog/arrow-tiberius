@@ -591,6 +591,21 @@ impl MeasuredDirectBatch {
         Ok(ranges)
     }
 
+    pub(crate) fn range_payload_len(&self, start_row: usize, row_count: usize) -> Result<usize> {
+        self.check_range(start_row, row_count)?;
+
+        let end_row = start_row
+            .checked_add(row_count)
+            .ok_or_else(|| invalid_payload("direct row range end overflowed usize"))?;
+        self.row_lengths[start_row..end_row]
+            .iter()
+            .try_fold(0usize, |total, row_len| {
+                total
+                    .checked_add(*row_len)
+                    .ok_or_else(|| invalid_payload("measured row range length overflowed usize"))
+            })
+    }
+
     fn cell_len(&self, row_index: usize, column_index: usize) -> Result<usize> {
         self.check_range(row_index, 1)?;
 

@@ -30,6 +30,7 @@ name = "arrow_tiberius"
 path = "src/lib.rs"
 
 [features]
+bench-profile = []
 integration-tests = []
 
 [dependencies]

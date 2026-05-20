@@ -16,6 +16,7 @@ use super::{
         DirectEncoder, MeasuredDirectBatch, MeasuredRowRange,
         plan::{DirectColumnEncoding, DirectColumnPlan, DirectEncoderPlan},
     },
+    profile,
     record_batch::RecordBatchView,
     token_row::tiberius_row_owned,
 };
@@ -491,14 +492,21 @@ where
             backend: WriteBackend::DirectRawBulk,
             reason: "direct raw bulk encoder is not available for this writer".to_owned(),
         })?;
-    let measured = encoder.measure_batch(batch)?;
+    let measure_start = std::time::Instant::now();
+    let measured = encoder.measure_batch(batch);
+    let measured = profile::record_elapsed(measure_start, profile::record_measure_batch, measured)?;
     let rows_written = usize_to_u64_saturating(measured.row_count());
 
-    for range in measured.row_ranges(DIRECT_RAW_MAX_PAYLOAD_BYTES)? {
+    let split_start = std::time::Instant::now();
+    let ranges = measured.row_ranges(DIRECT_RAW_MAX_PAYLOAD_BYTES);
+    let ranges = profile::record_elapsed(split_start, profile::record_row_range_split, ranges)?;
+
+    for range in ranges {
         sink.send_measured_raw_rows(encoder, batch, &measured, range)
             .await?;
     }
 
+    profile::record_accepted_batch(measured.row_count());
     Ok(state.record_accepted_batch(rows_written))
 }
 
@@ -523,25 +531,39 @@ where
         measured: &MeasuredDirectBatch,
         range: MeasuredRowRange,
     ) -> Result<()> {
+        let encoded_bytes = measured.range_payload_len(range.start, range.len)?;
+        profile::record_row_range(encoded_bytes);
+
         if !encoder.has_variable_width_column() {
+            let encode_start = std::time::Instant::now();
             let payload =
                 encoder.encode_measured_batch_range(batch, measured, range.start, range.len)?;
-            return self
+            profile::record_append_encode(encode_start.elapsed());
+
+            let send_start = std::time::Instant::now();
+            let send_result = self
                 .send_raw_rows_payload_checked(payload.bytes(), payload.row_token_offsets())
                 .await
                 .map_err(|source| crate::Error::Tiberius { source });
+            profile::record_send_total(send_start.elapsed());
+            return send_result;
         }
 
         let mut encode_error = None;
+        let send_start = std::time::Instant::now();
         let send_result = self
             .send_raw_rows_with(|buf| {
-                match encoder.encode_measured_batch_range_into(
+                let encode_start = std::time::Instant::now();
+                let encoded = encoder.encode_measured_batch_range_into(
                     batch,
                     measured,
                     range.start,
                     range.len,
                     buf,
-                ) {
+                );
+                profile::record_append_encode(encode_start.elapsed());
+
+                match encoded {
                     Ok(append) => Ok(append),
                     Err(err) => {
                         encode_error = Some(err);
@@ -552,6 +574,7 @@ where
                 }
             })
             .await;
+        profile::record_send_total(send_start.elapsed());
 
         if let Some(err) = encode_error {
             return Err(err);

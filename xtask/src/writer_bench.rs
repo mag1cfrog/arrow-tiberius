@@ -15,6 +15,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow_tiberius::{
     BulkWriter, MssqlProfile, PlanOptions, SchemaMapping, TableName, WriteBackend, WriteOptions,
     create_table_sql_from_mappings, plan_arrow_schema_to_mssql_mappings,
+    write::profile::DirectWriteProfile,
 };
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -261,7 +262,7 @@ fn print_arrow_odbc_help() {
 
 fn print_compare_help() {
     println!(
-        "Usage:\n  cargo xtask writer-bench compare [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --backends <LIST>           Comma-separated backends: baseline,direct-raw,arrow-odbc,odbc-bcp [default: baseline,arrow-odbc]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>      Managed ODBC runner image tag\n  --keep-runner-image         Keep the managed ODBC runner image after the task exits\n  -h, --help                  Print help\n\nCompare runs use one shared Arrow IPC dataset as the fairness boundary."
+        "Usage:\n  cargo xtask writer-bench compare [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --backends <LIST>           Comma-separated backends: baseline,direct-raw,arrow-odbc,odbc-bcp [default: baseline,arrow-odbc]\n  --output <FORMAT>           Output format: human [default: human]\n  --profile-direct            Include direct-raw phase timings and counters\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>      Managed ODBC runner image tag\n  --keep-runner-image         Keep the managed ODBC runner image after the task exits\n  -h, --help                  Print help\n\nCompare runs use one shared Arrow IPC dataset as the fairness boundary."
     );
 }
 
@@ -345,6 +346,47 @@ fn print_tiberius_backend_summary(report: &TiberiusBenchReport) {
     println!("    cleanup: {}", format_duration(report.timings.cleanup));
     println!("    total: {}", format_duration(report.timings.total));
     print_peak_rss("    ", report.peak_rss_kib);
+    if let Some(profile) = report.direct_profile {
+        print_direct_profile("    ", profile);
+    }
+}
+
+fn print_direct_profile(prefix: &str, profile: DirectWriteProfile) {
+    println!("{prefix}direct profile:");
+    println!(
+        "{prefix}  measure_batch: {}",
+        format_duration(profile.measure_batch)
+    );
+    println!(
+        "{prefix}  row_range_split: {}",
+        format_duration(profile.row_range_split)
+    );
+    println!(
+        "{prefix}  append_encode: {}",
+        format_duration(profile.append_encode)
+    );
+    println!(
+        "{prefix}  send_total: {}",
+        format_duration(profile.send_total)
+    );
+    println!(
+        "{prefix}  send_without_append_encode: {}",
+        format_duration(profile.send_without_append_encode())
+    );
+    println!("{prefix}  rows: {}", profile.rows);
+    println!("{prefix}  batches: {}", profile.batches);
+    println!("{prefix}  row_ranges: {}", profile.row_ranges);
+    println!("{prefix}  encoded bytes: {}", profile.encoded_bytes);
+    println!(
+        "{prefix}  max row range bytes: {}",
+        profile.max_row_range_bytes
+    );
+    println!(
+        "{prefix}  nvarchar utf16 bytes: {}",
+        profile.nvarchar_utf16_bytes
+    );
+    println!("{prefix}  varbinary bytes: {}", profile.varbinary_bytes);
+    println!("{prefix}  null cells: {}", profile.null_cells);
 }
 
 fn print_compare_summary(options: &CompareBenchOptions, report: &CompareBenchReport) {
@@ -616,6 +658,7 @@ struct CompareBenchOptions {
     backends: Vec<BenchmarkBackend>,
     runner_image: String,
     keep_runner_image: bool,
+    profile_direct: bool,
 }
 
 impl CompareBenchOptions {
@@ -626,6 +669,7 @@ impl CompareBenchOptions {
             backends: vec![BenchmarkBackend::Baseline, BenchmarkBackend::ArrowOdbc],
             runner_image: odbc_runner::DEFAULT_RUNNER_IMAGE_TAG.to_owned(),
             keep_runner_image: false,
+            profile_direct: false,
         };
         let mut index = 0;
 
@@ -692,6 +736,9 @@ impl CompareBenchOptions {
                 }
                 "--keep-runner-image" => {
                     options.keep_runner_image = true;
+                }
+                "--profile-direct" => {
+                    options.profile_direct = true;
                 }
                 other => return Err(WriterBenchError::UnknownOption(other.to_owned())),
             }
@@ -1506,6 +1553,7 @@ struct TiberiusBenchReport {
     validated_rows: u64,
     peak_rss_kib: Option<u64>,
     timings: TiberiusBenchTimings,
+    direct_profile: Option<DirectWriteProfile>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1567,6 +1615,7 @@ async fn run_baseline_async(
         connection,
         &ipc_dataset.host_path,
         WriteBackend::BaselineTokenRow,
+        false,
     )
     .await;
     let dataset_cleanup_result = ipc_dataset.cleanup();
@@ -1580,6 +1629,12 @@ async fn run_baseline_async(
 fn run_compare_benchmark(
     options: &CompareBenchOptions,
 ) -> Result<CompareBenchReport, WriterBenchError> {
+    if options.profile_direct && !options.backends.contains(&BenchmarkBackend::DirectRaw) {
+        return Err(WriterBenchError::Validation(
+            "writer-bench compare --profile-direct requires the direct-raw backend".to_owned(),
+        ));
+    }
+
     if options.backends.contains(&BenchmarkBackend::DirectRaw) {
         ensure_direct_raw_supported_scenario(&options.benchmark)?;
     }
@@ -1612,6 +1667,7 @@ fn run_compare_benchmark(
                     &connection,
                     &ipc_dataset.host_path,
                     WriteBackend::BaselineTokenRow,
+                    false,
                 )
                 .await?;
                 report.timings.total = backend_start.elapsed();
@@ -1628,6 +1684,7 @@ fn run_compare_benchmark(
                     &connection,
                     &ipc_dataset.host_path,
                     WriteBackend::DirectRawBulk,
+                    options.profile_direct,
                 )
                 .await?;
                 report.timings.total = backend_start.elapsed();
@@ -1692,6 +1749,7 @@ async fn run_tiberius_benchmark_from_ipc(
     connection: &sqlserver::SqlServerConnection,
     ipc_path: &Path,
     backend: WriteBackend,
+    profile_direct: bool,
 ) -> Result<TiberiusBenchReport, WriterBenchError> {
     let mut report = TiberiusBenchReport::default();
 
@@ -1705,8 +1763,15 @@ async fn run_tiberius_benchmark_from_ipc(
         let repeat_result = async {
             let table = unique_benchmark_table_name()?;
             let repeat_report =
-                run_tiberius_repeat_from_ipc(&mut client, &mappings, &table, ipc_path, backend)
-                    .await;
+                run_tiberius_repeat_from_ipc(
+                    &mut client,
+                    &mappings,
+                    &table,
+                    ipc_path,
+                    backend,
+                    profile_direct,
+                )
+                .await;
             let cleanup_start = Instant::now();
             let cleanup_result = drop_table(&mut client, &table).await;
             report.timings.cleanup += cleanup_start.elapsed();
@@ -1738,6 +1803,7 @@ async fn run_tiberius_benchmark_from_ipc(
             report.timings.write += repeat_report.timings.write;
             report.timings.finish += repeat_report.timings.finish;
             report.timings.validate += repeat_report.timings.validate;
+            merge_direct_profile(&mut report.direct_profile, repeat_report.direct_profile);
 
             Ok(())
         }
@@ -1784,11 +1850,13 @@ async fn run_tiberius_repeat_from_ipc(
     table: &TableName,
     ipc_path: &Path,
     backend: WriteBackend,
+    profile_direct: bool,
 ) -> Result<TiberiusBenchReport, WriterBenchError> {
     let batches =
         dataset::ipc_dataset_reader(ipc_path)?.map(|batch| batch.map_err(WriterBenchError::Arrow));
 
-    run_tiberius_repeat_with_batches(client, mappings, table, batches, backend).await
+    run_tiberius_repeat_with_batches(client, mappings, table, batches, backend, profile_direct)
+        .await
 }
 
 async fn run_tiberius_repeat_with_batches(
@@ -1797,6 +1865,7 @@ async fn run_tiberius_repeat_with_batches(
     table: &TableName,
     batches: impl IntoIterator<Item = Result<RecordBatch, WriterBenchError>>,
     backend: WriteBackend,
+    profile_direct: bool,
 ) -> Result<TiberiusBenchReport, WriterBenchError> {
     let mut report = TiberiusBenchReport::default();
     let setup_start = Instant::now();
@@ -1819,6 +1888,11 @@ async fn run_tiberius_repeat_with_batches(
     .await
     .map_err(WriterBenchError::ArrowTiberius)?;
     report.timings.setup += setup_start.elapsed();
+
+    let profiling_direct = profile_direct && backend == WriteBackend::DirectRawBulk;
+    if profiling_direct {
+        arrow_tiberius::write::profile::start_direct_write_profile();
+    }
 
     let write_start = Instant::now();
     for batch in batches {
@@ -1848,7 +1922,38 @@ async fn run_tiberius_repeat_with_batches(
         });
     }
 
+    if profiling_direct {
+        report.direct_profile = arrow_tiberius::write::profile::finish_direct_write_profile();
+    }
+
     Ok(report)
+}
+
+fn merge_direct_profile(
+    target: &mut Option<DirectWriteProfile>,
+    source: Option<DirectWriteProfile>,
+) {
+    let Some(source) = source else {
+        return;
+    };
+
+    let target = target.get_or_insert_with(DirectWriteProfile::default);
+    target.measure_batch += source.measure_batch;
+    target.row_range_split += source.row_range_split;
+    target.append_encode += source.append_encode;
+    target.send_total += source.send_total;
+    target.rows = target.rows.saturating_add(source.rows);
+    target.batches = target.batches.saturating_add(source.batches);
+    target.row_ranges = target.row_ranges.saturating_add(source.row_ranges);
+    target.encoded_bytes = target.encoded_bytes.saturating_add(source.encoded_bytes);
+    target.max_row_range_bytes = target.max_row_range_bytes.max(source.max_row_range_bytes);
+    target.nvarchar_utf16_bytes = target
+        .nvarchar_utf16_bytes
+        .saturating_add(source.nvarchar_utf16_bytes);
+    target.varbinary_bytes = target
+        .varbinary_bytes
+        .saturating_add(source.varbinary_bytes);
+    target.null_cells = target.null_cells.saturating_add(source.null_cells);
 }
 
 async fn connect(connection_string: &str, database: &str) -> Result<BenchClient, WriterBenchError> {
@@ -2865,6 +2970,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_compare_direct_profile_flag() {
+        let args = [
+            OsString::from("--backends"),
+            OsString::from("direct-raw"),
+            OsString::from("--profile-direct"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+
+        assert!(options.profile_direct);
+    }
+
+    #[test]
     fn compare_defaults_to_both_initial_backends() {
         let options = super::CompareBenchOptions::parse(&[]).unwrap();
 
@@ -2876,6 +2994,7 @@ mod tests {
             ]
         );
         assert_eq!(options.benchmark.scenario.name, "narrow_numeric");
+        assert!(!options.profile_direct);
     }
 
     #[test]
@@ -2998,6 +3117,25 @@ mod tests {
     }
 
     #[test]
+    fn compare_rejects_direct_profile_without_direct_backend() {
+        let args = [
+            OsString::from("--backends"),
+            OsString::from("baseline"),
+            OsString::from("--profile-direct"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+        let err = super::run_compare_benchmark(&options).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("--profile-direct")
+                    && message.contains("direct-raw")
+        ));
+    }
+
+    #[test]
     fn parses_ipc_dataset_command_options() {
         let args = [
             OsString::from("--path"),
@@ -3089,6 +3227,7 @@ mod tests {
             backends: vec![super::BenchmarkBackend::Baseline],
             runner_image: crate::odbc_runner::DEFAULT_RUNNER_IMAGE_TAG.to_owned(),
             keep_runner_image: false,
+            profile_direct: false,
         };
 
         let dataset = super::prepare_compare_ipc_dataset(&options).unwrap();

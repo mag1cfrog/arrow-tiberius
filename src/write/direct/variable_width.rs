@@ -4,7 +4,7 @@ use arrow_array::{Array, BinaryArray, StringArray};
 
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, MssqlTypeLength, Result,
-    conversion::arrow_to_mssql::variable_width::VariableWidthArrowToMssql,
+    conversion::arrow_to_mssql::variable_width::VariableWidthArrowToMssql, write::profile,
 };
 
 use super::{
@@ -195,11 +195,13 @@ pub(crate) fn append_nvarchar_cell(
                 ));
             }
 
+            profile::record_nvarchar_utf16_bytes(encoded_bytes);
             append_bounded_nvarchar_cell(buf, array.value(row_index), encoded_bytes)
         }
         MssqlTypeLength::Max => {
             let encoded_bytes =
                 plp_nvarchar_encoded_bytes_from_len(column, row_index, measured_len)?;
+            profile::record_nvarchar_utf16_bytes(encoded_bytes);
             append_plp_nvarchar_cell(buf, array.value(row_index), encoded_bytes)
         }
     }
@@ -242,9 +244,11 @@ pub(crate) fn append_varbinary_cell(
                     ),
                 ));
             }
+            profile::record_varbinary_bytes(value.len());
             append_bounded_payload_cell(buf, column, row_index, measured_len, value)
         }
         MssqlTypeLength::Max => {
+            profile::record_varbinary_bytes(value.len());
             append_plp_payload_cell(buf, column, row_index, measured_len, value)
         }
     }
@@ -337,6 +341,8 @@ fn append_null_cell(
     measured_len: usize,
     length: MssqlTypeLength,
 ) -> Result<()> {
+    profile::record_null_cell();
+
     let expected_len = null_cell_len(column, row_index, length)?;
     if measured_len != expected_len {
         return Err(invalid_payload(format!(
