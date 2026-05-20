@@ -125,6 +125,51 @@ improved `string_heavy` throughput by about 13.5 percent and reduced peak RSS by
 about 49.6 percent on this local rerun. Since this was not a full four-backend
 rerun, the original table remains the fair same-run comparison across backends.
 
+Profiled #81 append-buffer rerun:
+
+After adding the optional direct writer profiler, the same direct-only benchmark
+shape was rerun to separate direct encoding time from time spent below the
+encoder in Tiberius packet writes, network I/O, and SQL Server ingestion.
+
+```sh
+cargo xtask writer-bench compare \
+  --container-runtime podman \
+  --scenario string_heavy \
+  --rows 300000 \
+  --batch-size 8192 \
+  --repeat 1 \
+  --backends direct-raw \
+  --profile-direct
+```
+
+| Backend | Rows | Write | Finish | Total | Rows/sec | Peak RSS KiB | Peak RSS MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `direct-raw` profiled append-buffer rerun | 300,000 | 118.161s | 0.005s | 118.232s | 2,538.81 | 105,516 | 103.04 |
+
+Direct profile:
+
+| Phase or counter | Value |
+| --- | ---: |
+| `measure_batch` | 8.855s |
+| `row_range_split` | 0.004s |
+| `append_encode` | 22.094s |
+| `send_total` | 108.583s |
+| `send_without_append_encode` | 86.490s |
+| rows | 300,000 |
+| batches | 37 |
+| row ranges | 256 |
+| encoded bytes | 1,883,800,622 |
+| max row range bytes | 8,388,567 |
+| nvarchar UTF-16 bytes | 950,022,348 |
+| varbinary bytes | 902,553,858 |
+| null cells | 34,448 |
+
+The profiler shows that the largest measured cost is below the direct encoder:
+`send_without_append_encode` was about 73 percent of the total write window.
+The next `string_heavy` optimization should therefore focus on Tiberius raw bulk
+packet write behavior, PLP chunking shape, packet sizing, or SQL Server ingestion
+behavior before spending more time on local UTF-16 encoding micro-optimizations.
+
 Interpretation:
 
 - `direct-raw` is faster than `baseline` on large variable-width rows, but only
@@ -174,10 +219,11 @@ encoded row ranges directly into the Tiberius request buffer. For large
 `nvarchar(max)` and `varbinary(max)` payloads, future work should still
 investigate:
 
-- more efficient UTF-16 staging for `nvarchar(max)`;
+- Tiberius raw bulk packet write behavior and packet sizing;
 - whether PLP chunking strategy affects SQL Server bulk-load throughput;
-- profiling direct `string_heavy` to find whether time is dominated by UTF-16
-  conversion, payload allocation, SQL Server send, or raw bulk API behavior.
+- SQL Server ingestion behavior for PLP-heavy raw bulk rows;
+- more efficient UTF-16 staging for `nvarchar(max)` after lower-level send costs
+  are better understood.
 
 This benchmark supports keeping the direct raw path, but it also shows that
 large variable-width payloads need targeted optimization before claiming broad
