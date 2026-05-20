@@ -170,6 +170,55 @@ The next `string_heavy` optimization should therefore focus on Tiberius raw bulk
 packet write behavior, PLP chunking shape, packet sizing, or SQL Server ingestion
 behavior before spending more time on local UTF-16 encoding micro-optimizations.
 
+After publishing `tiberius-raw-bulk` `0.12.3-raw-bulk.5`, the same direct-only
+profile was rerun with packet statistics from `BulkLoadRequest`.
+
+```sh
+cargo xtask writer-bench compare \
+  --container-runtime podman \
+  --scenario string_heavy \
+  --rows 300000 \
+  --batch-size 8192 \
+  --repeat 1 \
+  --backends direct-raw \
+  --profile-direct
+```
+
+| Backend | Rows | Write | Finish | Total | Rows/sec | Peak RSS KiB | Peak RSS MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `direct-raw` packet-profile rerun | 300,000 | 121.155s | 0.005s | 121.229s | 2,476.07 | 105,756 | 103.28 |
+
+Direct packet profile:
+
+| Phase or counter | Value |
+| --- | ---: |
+| `measure_batch` | 9.147s |
+| `row_range_split` | 0.005s |
+| `append_encode` | 22.404s |
+| `send_total` | 111.260s |
+| `send_without_append_encode` | 88.855s |
+| rows | 300,000 |
+| batches | 37 |
+| row ranges | 256 |
+| encoded bytes | 1,883,800,622 |
+| max row range bytes | 8,388,567 |
+| nvarchar UTF-16 bytes | 950,022,348 |
+| varbinary bytes | 902,553,858 |
+| null cells | 34,448 |
+| packet write calls | 257 |
+| packets written before finalization | 460,812 |
+| packet payload bytes before finalization | 1,883,799,456 |
+| max packet payload bytes | 4,088 |
+| max buffered bytes before write | 8,392,264 |
+| buffered bytes after last write | 1,365 |
+| finalized packet payload bytes | 1,365 |
+
+The packet profile explains the large `send_without_append_encode` window more
+directly: this path writes 460,812 bulk-load packets with a maximum payload of
+4,088 bytes. The next optimization should therefore investigate packet-size
+negotiation or packet coalescing in the Tiberius fork before changing the Arrow
+encoder again.
+
 Interpretation:
 
 - `direct-raw` is faster than `baseline` on large variable-width rows, but only

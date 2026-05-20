@@ -387,6 +387,31 @@ fn print_direct_profile(prefix: &str, profile: DirectWriteProfile) {
     );
     println!("{prefix}  varbinary bytes: {}", profile.varbinary_bytes);
     println!("{prefix}  null cells: {}", profile.null_cells);
+    println!(
+        "{prefix}  packet write calls: {}",
+        profile.packet_write_calls
+    );
+    println!("{prefix}  packets written: {}", profile.packets_written);
+    println!(
+        "{prefix}  packet payload bytes: {}",
+        profile.packet_payload_bytes
+    );
+    println!(
+        "{prefix}  max packet payload bytes: {}",
+        profile.max_packet_payload_bytes
+    );
+    println!(
+        "{prefix}  max buffered bytes before write: {}",
+        profile.max_buffered_bytes_before_write
+    );
+    println!(
+        "{prefix}  buffered bytes after last write: {}",
+        profile.buffered_bytes_after_last_write
+    );
+    println!(
+        "{prefix}  finalized packet payload bytes: {}",
+        profile.finalized_packet_payload_bytes
+    );
 }
 
 fn print_compare_summary(options: &CompareBenchOptions, report: &CompareBenchReport) {
@@ -1954,6 +1979,25 @@ fn merge_direct_profile(
         .varbinary_bytes
         .saturating_add(source.varbinary_bytes);
     target.null_cells = target.null_cells.saturating_add(source.null_cells);
+    target.packet_write_calls = target
+        .packet_write_calls
+        .saturating_add(source.packet_write_calls);
+    target.packets_written = target
+        .packets_written
+        .saturating_add(source.packets_written);
+    target.packet_payload_bytes = target
+        .packet_payload_bytes
+        .saturating_add(source.packet_payload_bytes);
+    target.max_packet_payload_bytes = target
+        .max_packet_payload_bytes
+        .max(source.max_packet_payload_bytes);
+    target.max_buffered_bytes_before_write = target
+        .max_buffered_bytes_before_write
+        .max(source.max_buffered_bytes_before_write);
+    target.buffered_bytes_after_last_write = source.buffered_bytes_after_last_write;
+    target.finalized_packet_payload_bytes = target
+        .finalized_packet_payload_bytes
+        .saturating_add(source.finalized_packet_payload_bytes);
 }
 
 async fn connect(connection_string: &str, database: &str) -> Result<BenchClient, WriterBenchError> {

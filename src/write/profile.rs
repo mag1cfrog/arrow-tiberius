@@ -6,6 +6,8 @@ use std::time::Duration;
 mod enabled {
     use std::{cell::RefCell, time::Duration};
 
+    use tiberius::BulkLoadPacketStats;
+
     /// Accumulated timings for the direct raw writer path.
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
     pub struct DirectWriteProfile {
@@ -33,6 +35,20 @@ mod enabled {
         pub varbinary_bytes: u64,
         /// Number of null cells observed by the profiled direct writer path.
         pub null_cells: u64,
+        /// Number of bulk packet drain attempts inside Tiberius.
+        pub packet_write_calls: u64,
+        /// Number of full TDS bulk-load packets written before finalization.
+        pub packets_written: u64,
+        /// Total packet payload bytes written before finalization.
+        pub packet_payload_bytes: u64,
+        /// Largest full packet payload written before finalization.
+        pub max_packet_payload_bytes: u64,
+        /// Largest buffered bulk-load byte count before a packet drain attempt.
+        pub max_buffered_bytes_before_write: u64,
+        /// Buffered bulk-load tail left after the latest packet drain attempt.
+        pub buffered_bytes_after_last_write: u64,
+        /// Final `EndOfMessage` packet payload bytes written during finalization.
+        pub finalized_packet_payload_bytes: u64,
     }
 
     impl DirectWriteProfile {
@@ -114,6 +130,36 @@ mod enabled {
         });
     }
 
+    pub(crate) fn record_bulk_packet_stats(stats: BulkLoadPacketStats) {
+        with_profile(|profile| {
+            profile.packet_write_calls = profile
+                .packet_write_calls
+                .saturating_add(stats.write_packets_calls);
+            profile.packets_written = profile
+                .packets_written
+                .saturating_add(stats.packets_written);
+            profile.packet_payload_bytes = profile
+                .packet_payload_bytes
+                .saturating_add(stats.packet_payload_bytes);
+            profile.max_packet_payload_bytes = profile
+                .max_packet_payload_bytes
+                .max(usize_to_u64_saturating(stats.max_packet_payload_bytes));
+            profile.max_buffered_bytes_before_write =
+                profile
+                    .max_buffered_bytes_before_write
+                    .max(usize_to_u64_saturating(
+                        stats.max_buffered_bytes_before_write,
+                    ));
+            profile.buffered_bytes_after_last_write =
+                usize_to_u64_saturating(stats.buffered_bytes_after_last_write);
+            profile.finalized_packet_payload_bytes = profile
+                .finalized_packet_payload_bytes
+                .saturating_add(usize_to_u64_saturating(
+                    stats.finalized_packet_payload_bytes,
+                ));
+        });
+    }
+
     fn with_profile(update: impl FnOnce(&mut DirectWriteProfile)) {
         DIRECT_PROFILE.with(|profile| {
             if let Some(profile) = profile.borrow_mut().as_mut() {
@@ -148,6 +194,8 @@ mod disabled {
     pub(crate) fn record_varbinary_bytes(_encoded_bytes: usize) {}
 
     pub(crate) fn record_null_cell() {}
+
+    pub(crate) fn record_bulk_packet_stats(_stats: tiberius::BulkLoadPacketStats) {}
 }
 
 #[cfg(not(feature = "bench-profile"))]
@@ -156,9 +204,9 @@ pub(crate) use disabled::*;
 pub use enabled::{DirectWriteProfile, finish_direct_write_profile, start_direct_write_profile};
 #[cfg(feature = "bench-profile")]
 pub(crate) use enabled::{
-    record_accepted_batch, record_append_encode, record_measure_batch, record_null_cell,
-    record_nvarchar_utf16_bytes, record_row_range, record_row_range_split, record_send_total,
-    record_varbinary_bytes,
+    record_accepted_batch, record_append_encode, record_bulk_packet_stats, record_measure_batch,
+    record_null_cell, record_nvarchar_utf16_bytes, record_row_range, record_row_range_split,
+    record_send_total, record_varbinary_bytes,
 };
 
 pub(crate) fn record_elapsed<T>(start: std::time::Instant, record: fn(Duration), value: T) -> T {
@@ -182,6 +230,15 @@ mod tests {
         super::record_nvarchar_utf16_bytes(17);
         super::record_varbinary_bytes(19);
         super::record_null_cell();
+        super::record_bulk_packet_stats(tiberius::BulkLoadPacketStats {
+            write_packets_calls: 23,
+            packets_written: 29,
+            packet_payload_bytes: 31,
+            max_packet_payload_bytes: 37,
+            max_buffered_bytes_before_write: 41,
+            buffered_bytes_after_last_write: 43,
+            finalized_packet_payload_bytes: 47,
+        });
 
         let profile = super::finish_direct_write_profile().unwrap();
 
@@ -201,6 +258,13 @@ mod tests {
         assert_eq!(profile.nvarchar_utf16_bytes, 17);
         assert_eq!(profile.varbinary_bytes, 19);
         assert_eq!(profile.null_cells, 1);
+        assert_eq!(profile.packet_write_calls, 23);
+        assert_eq!(profile.packets_written, 29);
+        assert_eq!(profile.packet_payload_bytes, 31);
+        assert_eq!(profile.max_packet_payload_bytes, 37);
+        assert_eq!(profile.max_buffered_bytes_before_write, 41);
+        assert_eq!(profile.buffered_bytes_after_last_write, 43);
+        assert_eq!(profile.finalized_packet_payload_bytes, 47);
         assert!(super::finish_direct_write_profile().is_none());
     }
 }
