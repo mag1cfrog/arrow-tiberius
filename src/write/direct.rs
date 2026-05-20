@@ -66,6 +66,34 @@ impl DirectEncoder {
 
     /// Encodes a runtime batch into complete raw TDS row payload bytes.
     pub(crate) fn encode_batch(&self, batch: &RecordBatch) -> Result<EncodedRowsPayload> {
+        self.encode_checked_batch(batch)
+    }
+
+    /// Encodes a contiguous row range from a runtime batch.
+    ///
+    /// Returned row-token offsets are relative to the returned payload, so the
+    /// first non-empty range always starts at offset zero.
+    pub(crate) fn encode_batch_range(
+        &self,
+        batch: &RecordBatch,
+        start_row: usize,
+        row_count: usize,
+    ) -> Result<EncodedRowsPayload> {
+        let end_row = start_row
+            .checked_add(row_count)
+            .ok_or_else(|| invalid_payload("direct row range end overflowed usize"))?;
+        if end_row > batch.num_rows() {
+            return Err(invalid_payload(format!(
+                "direct row range {start_row}..{end_row} is outside batch row count {}",
+                batch.num_rows()
+            )));
+        }
+
+        let batch = batch.slice(start_row, row_count);
+        self.encode_checked_batch(&batch)
+    }
+
+    fn encode_checked_batch(&self, batch: &RecordBatch) -> Result<EncodedRowsPayload> {
         validate_runtime_columns(batch, &self.mappings)?;
 
         if self.plan.is_empty() && batch.num_rows() == 0 {
@@ -233,6 +261,15 @@ fn unsupported_batch(message: impl Into<String>) -> Error {
     Error::DirectEncoding {
         diagnostics: DiagnosticSet::from(vec![Diagnostic::error(
             DiagnosticCode::DirectEncodingUnsupportedBatch,
+            message,
+        )]),
+    }
+}
+
+fn invalid_payload(message: impl Into<String>) -> Error {
+    Error::DirectEncoding {
+        diagnostics: DiagnosticSet::from(vec![Diagnostic::error(
+            DiagnosticCode::DirectEncodingInvalidPayload,
             message,
         )]),
     }
@@ -533,6 +570,79 @@ mod tests {
     }
 
     #[test]
+    fn direct_encoder_row_ranges_concatenate_to_full_payload() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "name",
+                DataType::Utf8,
+                MssqlType::NVarChar(MssqlTypeLength::Max),
+                true,
+            ),
+            mapping(
+                2,
+                "bytes",
+                DataType::Binary,
+                MssqlType::VarBinary(MssqlTypeLength::Max),
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, true),
+                Field::new("bytes", DataType::Binary, true),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("alpha"),
+                    Some("東京"),
+                    None,
+                    Some(""),
+                ])),
+                Arc::new(BinaryArray::from_iter(vec![
+                    Some(&b"abc"[..]),
+                    None,
+                    Some(&b""[..]),
+                    Some(&b"\x00\xff"[..]),
+                ])),
+            ],
+        );
+
+        let full = encoder.encode_batch(&batch).unwrap();
+        let first = encoder.encode_batch_range(&batch, 0, 2).unwrap();
+        let second = encoder.encode_batch_range(&batch, 2, 2).unwrap();
+        let mut concatenated = Vec::new();
+        concatenated.extend_from_slice(first.bytes());
+        concatenated.extend_from_slice(second.bytes());
+
+        assert_eq!(concatenated, full.bytes());
+        assert_eq!(first.row_count(), 2);
+        assert_eq!(second.row_count(), 2);
+        assert_eq!(first.row_token_offsets()[0], 0);
+        assert_eq!(second.row_token_offsets()[0], 0);
+    }
+
+    #[test]
+    fn direct_encoder_row_range_rejects_out_of_bounds_range() {
+        let mappings = vec![mapping(0, "id", DataType::Int32, MssqlType::Int, false)];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![Field::new("id", DataType::Int32, false)],
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        );
+
+        let err = encoder
+            .encode_batch_range(&batch, 1, 2)
+            .expect_err("range past batch end must fail");
+
+        assert_direct_encoding_diagnostic(err, DiagnosticCode::DirectEncodingInvalidPayload);
+    }
+
+    #[test]
     fn direct_encoder_encodes_nullable_primitive_cells() {
         let mappings = vec![
             mapping(0, "is_active", DataType::Boolean, MssqlType::Bit, true),
@@ -819,15 +929,16 @@ mod tests {
     }
 
     fn assert_unsupported_batch(err: Error) {
+        assert_direct_encoding_diagnostic(err, DiagnosticCode::DirectEncodingUnsupportedBatch);
+    }
+
+    fn assert_direct_encoding_diagnostic(err: Error, expected_code: DiagnosticCode) {
         let Error::DirectEncoding { diagnostics } = err else {
             panic!("expected direct encoding error");
         };
 
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(
-            diagnostics.all()[0].code(),
-            DiagnosticCode::DirectEncodingUnsupportedBatch
-        );
+        assert_eq!(diagnostics.all()[0].code(), expected_code);
     }
 
     fn mapping(
