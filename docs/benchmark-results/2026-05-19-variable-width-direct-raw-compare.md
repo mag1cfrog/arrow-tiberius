@@ -587,6 +587,64 @@ Interpretation:
   should be data-driven around reducing packet/write call count or changing the
   lower-level write strategy.
 
+After publishing `tiberius-raw-bulk` `0.12.3-raw-bulk.10`, the direct-only
+profile was rerun with a deeper split inside the direct packet write path:
+
+```sh
+cargo run --release -p xtask -- writer-bench compare \
+  --container-runtime podman \
+  --scenario string_heavy \
+  --rows 300000 \
+  --batch-size 8192 \
+  --repeat 1 \
+  --backends direct-raw \
+  --profile-direct \
+  --tds-packet-size 32767
+```
+
+Selected deep packet profile counters:
+
+| Metric | Value |
+| --- | ---: |
+| Write rows/sec | 9,345.29 |
+| Write elapsed | 31.763s |
+| Peak RSS KiB | 101,064 |
+| Append encode elapsed | 2.581s |
+| Send without append encode | 28.264s |
+| Bulk write_to_wire elapsed | 28.253s |
+| Bulk direct packet write elapsed | 28.231s |
+| Bulk direct packet header write elapsed | 0.081s |
+| Bulk direct packet payload write elapsed | 28.149s |
+| Bulk direct packet poll_write pending elapsed | 27.744s |
+| Bulk direct packet poll_write ready elapsed | 0.492s |
+| Bulk direct packet poll_write pending count | 1,194 |
+| Bulk direct packet payload partial writes | 767 |
+| Bulk direct packet flush elapsed | 0.002s |
+
+This split narrows the remaining `string_heavy` send cost further:
+
+- Direct packet payload writes dominate direct packet writes. Header writes and
+  explicit direct packet flushes are negligible.
+- Payload write time is almost entirely low-level `poll_write` `Pending` wait,
+  not ready write CPU time.
+- The benchmark used the raw stream direct packet path, not a TLS stream path.
+- The next evidence needs to explain payload backpressure rather than spend more
+  time on packet header handling or explicit flush micro-optimizations.
+
+A follow-up packet-size x direct-row-range sweep tested packet sizes `4096`,
+`8192`, `16384`, and `32767` with row range targets `1 MiB`, `4 MiB`,
+`8 MiB`, and `16 MiB` on the same 300,000-row `string_heavy` shape. Increasing
+packet size reduced packets from 460,812 at `4096` to 57,842 at `32767`, but it
+did not materially change throughput. Row range size changed throughput and
+peak RSS at some points, but it did not remove the dominant payload
+`poll_write` `Pending` window. `16 MiB` row ranges also increased peak RSS in
+several runs without a stable throughput gain.
+
+The sweep argues against more blind local packet or row-range tuning. The next
+investigation step is SQL Server side profiling during the write so the client
+backpressure can be compared with SQL Server request state, waits, connection
+counters, and database file I/O. That work is tracked separately in #82.
+
 ## Results: mixed_nullable
 
 - Rows per repeat: 5,000,000.
@@ -626,9 +684,10 @@ encoded row ranges directly into the Tiberius request buffer. For large
 `nvarchar(max)` and `varbinary(max)` payloads, future work should still
 investigate:
 
-- Tiberius raw bulk packet write behavior and packet sizing;
-- whether PLP chunking strategy affects SQL Server bulk-load throughput;
-- SQL Server ingestion behavior for PLP-heavy raw bulk rows;
+- SQL Server side evidence for the payload `poll_write` `Pending`
+  backpressure observed after direct packet write profiling;
+- whether PLP chunking strategy affects SQL Server bulk-load throughput after
+  SQL Server side waits and file I/O are measured;
 - more efficient UTF-16 staging for `nvarchar(max)` after lower-level send costs
   are better understood.
 
