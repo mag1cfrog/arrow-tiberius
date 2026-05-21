@@ -8,6 +8,8 @@ pub(super) struct ConnectionSnapshot {
     pub(super) net_packet_size: i32,
     pub(super) num_reads: i64,
     pub(super) num_writes: i64,
+    pub(super) last_read: Option<String>,
+    pub(super) last_write: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +102,8 @@ pub(super) async fn connection_snapshot(
         net_packet_size: required_i32(&row, "net_packet_size")?,
         num_reads: required_i64(&row, "num_reads")?,
         num_writes: required_i64(&row, "num_writes")?,
+        last_read: optional_string(&row, "last_read")?,
+        last_write: optional_string(&row, "last_write")?,
     })
 }
 
@@ -223,7 +227,9 @@ fn connection_snapshot_query(writer_session_id: i32) -> String {
             CONVERT(nvarchar(60), c.encrypt_option) AS encrypt_option, \
             CONVERT(int, c.net_packet_size) AS net_packet_size, \
             CONVERT(bigint, c.num_reads) AS num_reads, \
-            CONVERT(bigint, c.num_writes) AS num_writes \
+            CONVERT(bigint, c.num_writes) AS num_writes, \
+            CONVERT(nvarchar(33), c.last_read, 126) AS last_read, \
+            CONVERT(nvarchar(33), c.last_write, 126) AS last_write \
         FROM sys.dm_exec_connections AS c \
         WHERE CONVERT(int, c.session_id) = {writer_session_id}"
     )
@@ -353,6 +359,8 @@ mod tests {
         assert!(query.contains("AS net_packet_size"));
         assert!(query.contains("AS num_reads"));
         assert!(query.contains("AS num_writes"));
+        assert!(query.contains("AS last_read"));
+        assert!(query.contains("AS last_write"));
     }
 
     #[test]

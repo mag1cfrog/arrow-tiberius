@@ -720,13 +720,25 @@ fn print_sql_server_profile_target(prefix: &str, target: Option<&SqlServerProfil
             target.observer_session_id
         );
         println!(
-            "{prefix}  writer connection: {} {} encrypted={} packet_size={} reads={} writes={}",
+            "{prefix}  writer connection: {} {} encrypted={} packet_size={} reads={} writes={} last_read={} last_write={}",
             target.initial_activity.connection.net_transport,
             target.initial_activity.connection.protocol_type,
             target.initial_activity.connection.encrypt_option,
             target.initial_activity.connection.net_packet_size,
             target.initial_activity.connection.num_reads,
-            target.initial_activity.connection.num_writes
+            target.initial_activity.connection.num_writes,
+            target
+                .initial_activity
+                .connection
+                .last_read
+                .as_deref()
+                .unwrap_or("<none>"),
+            target
+                .initial_activity
+                .connection
+                .last_write
+                .as_deref()
+                .unwrap_or("<none>")
         );
         match &target.initial_activity.request {
             Some(request) => println!(
@@ -3845,6 +3857,8 @@ mod tests {
                     net_packet_size: 4096,
                     num_reads: 3,
                     num_writes: 5,
+                    last_read: Some("2026-05-21T12:00:00".to_owned()),
+                    last_write: Some("2026-05-21T12:00:01".to_owned()),
                 },
                 request: status_and_wait.map(|(status, wait_type)| {
                     sqlserver_profile::RequestSnapshot {
