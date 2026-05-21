@@ -347,6 +347,7 @@ fn print_tiberius_backend_summary(report: &TiberiusBenchReport) {
     println!("    cleanup: {}", format_duration(report.timings.cleanup));
     println!("    total: {}", format_duration(report.timings.total));
     print_peak_rss("    ", report.peak_rss_kib);
+    print_sql_server_profile_target("    ", report.sql_server_profile_target);
     if let Some(profile) = report.direct_profile {
         print_direct_profile("    ", profile);
     }
@@ -700,6 +701,21 @@ fn print_compare_summary(options: &CompareBenchOptions, report: &CompareBenchRep
 fn print_peak_rss(prefix: &str, peak_rss_kib: Option<u64>) {
     if let Some(peak_rss_kib) = peak_rss_kib {
         println!("{prefix}peak rss KiB: {peak_rss_kib}");
+    }
+}
+
+fn print_sql_server_profile_target(prefix: &str, target: Option<SqlServerProfileTarget>) {
+    if let Some(target) = target {
+        println!("{prefix}sql server profile:");
+        println!(
+            "{prefix}  sample interval: {} ms",
+            target.sample_interval.as_millis()
+        );
+        println!("{prefix}  writer session id: {}", target.writer_session_id);
+        println!(
+            "{prefix}  observer session id: {}",
+            target.observer_session_id
+        );
     }
 }
 
@@ -1080,6 +1096,12 @@ enum BenchmarkBackend {
     DirectRaw,
     ArrowOdbc,
     OdbcBcp,
+}
+
+impl BenchmarkBackend {
+    fn is_tiberius(&self) -> bool {
+        matches!(self, Self::Baseline | Self::DirectRaw)
+    }
 }
 
 impl fmt::Display for BenchmarkBackend {
@@ -1879,6 +1901,7 @@ struct TiberiusBenchReport {
     validated_rows: u64,
     peak_rss_kib: Option<u64>,
     timings: TiberiusBenchTimings,
+    sql_server_profile_target: Option<SqlServerProfileTarget>,
     direct_profile: Option<DirectWriteProfile>,
 }
 
@@ -1927,6 +1950,44 @@ struct OdbcRunnerBenchReport {
 
 type BenchClient = tiberius::Client<Compat<TcpStream>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SqlServerProfileTarget {
+    writer_session_id: i32,
+    observer_session_id: i32,
+    sample_interval: Duration,
+}
+
+struct SqlServerProfileSession {
+    target: SqlServerProfileTarget,
+    _observer: BenchClient,
+}
+
+impl SqlServerProfileSession {
+    async fn start(
+        writer: &mut BenchClient,
+        connection: &sqlserver::SqlServerConnection,
+        options: SqlServerProfileOptions,
+    ) -> Result<Self, WriterBenchError> {
+        let writer_session_id = select_session_id(writer).await?;
+        let mut observer =
+            connect(&connection.connection_string, &connection.database, None).await?;
+        let observer_session_id = select_session_id(&mut observer).await?;
+
+        Ok(Self {
+            target: SqlServerProfileTarget {
+                writer_session_id,
+                observer_session_id,
+                sample_interval: options.sample_interval,
+            },
+            _observer: observer,
+        })
+    }
+
+    fn target(&self) -> SqlServerProfileTarget {
+        self.target
+    }
+}
+
 async fn run_baseline_async(
     options: &BaselineBenchOptions,
     connection: &sqlserver::SqlServerConnection,
@@ -1943,6 +2004,7 @@ async fn run_baseline_async(
         WriteBackend::BaselineTokenRow,
         false,
         options.tds_packet_size,
+        None,
     )
     .await;
     let dataset_cleanup_result = ipc_dataset.cleanup();
@@ -1959,6 +2021,15 @@ fn run_compare_benchmark(
     if options.profile_direct && !options.backends.contains(&BenchmarkBackend::DirectRaw) {
         return Err(WriterBenchError::Validation(
             "writer-bench compare --profile-direct requires the direct-raw backend".to_owned(),
+        ));
+    }
+
+    if options.sql_server_profile.is_some()
+        && !options.backends.iter().any(BenchmarkBackend::is_tiberius)
+    {
+        return Err(WriterBenchError::Validation(
+            "writer-bench compare --profile-sqlserver requires the baseline or direct-raw backend"
+                .to_owned(),
         ));
     }
 
@@ -1996,6 +2067,7 @@ fn run_compare_benchmark(
                     WriteBackend::BaselineTokenRow,
                     false,
                     options.tds_packet_size,
+                    options.sql_server_profile,
                 )
                 .await?;
                 report.timings.total = backend_start.elapsed();
@@ -2014,6 +2086,7 @@ fn run_compare_benchmark(
                     WriteBackend::DirectRawBulk,
                     options.profile_direct,
                     options.tds_packet_size,
+                    options.sql_server_profile,
                 )
                 .await?;
                 report.timings.total = backend_start.elapsed();
@@ -2080,6 +2153,7 @@ async fn run_tiberius_benchmark_from_ipc(
     backend: WriteBackend,
     profile_direct: bool,
     tds_packet_size: Option<u32>,
+    sql_server_profile: Option<SqlServerProfileOptions>,
 ) -> Result<TiberiusBenchReport, WriterBenchError> {
     let mut report = TiberiusBenchReport::default();
 
@@ -2090,8 +2164,16 @@ async fn run_tiberius_benchmark_from_ipc(
         tds_packet_size,
     )
     .await?;
+    let sql_server_profile_session = if let Some(options) = sql_server_profile {
+        Some(SqlServerProfileSession::start(&mut client, connection, options).await?)
+    } else {
+        None
+    };
     let schema = (benchmark.scenario.schema)();
     let mappings = benchmark_mappings_for_schema(Arc::clone(&schema))?;
+    report.sql_server_profile_target = sql_server_profile_session
+        .as_ref()
+        .map(SqlServerProfileSession::target);
     report.timings.setup += setup_start.elapsed();
 
     for _repeat_index in 0..benchmark.repeat {
@@ -2504,6 +2586,23 @@ async fn execute_sql(client: &mut BenchClient, sql: String) -> Result<(), Writer
         .map_err(WriterBenchError::Tiberius)?;
 
     Ok(())
+}
+
+async fn select_session_id(client: &mut BenchClient) -> Result<i32, WriterBenchError> {
+    let row = client
+        .simple_query("SELECT CONVERT(int, @@SPID)")
+        .await
+        .map_err(WriterBenchError::Tiberius)?
+        .into_row()
+        .await
+        .map_err(WriterBenchError::Tiberius)?
+        .ok_or_else(|| {
+            WriterBenchError::Validation("session id query returned no row".to_owned())
+        })?;
+
+    row.try_get::<i32, _>(0)
+        .map_err(WriterBenchError::Tiberius)?
+        .ok_or_else(|| WriterBenchError::Validation("session id query returned null".to_owned()))
 }
 
 async fn drop_table(client: &mut BenchClient, table: &TableName) -> tiberius::Result<()> {
@@ -3957,6 +4056,26 @@ mod tests {
             err,
             WriterBenchError::Validation(message)
                 if message.contains("--profile-direct")
+                    && message.contains("direct-raw")
+        ));
+    }
+
+    #[test]
+    fn compare_rejects_sql_server_profile_for_external_backends_only() {
+        let args = [
+            OsString::from("--backends"),
+            OsString::from("arrow-odbc,odbc-bcp"),
+            OsString::from("--profile-sqlserver"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+        let err = super::run_compare_benchmark(&options).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("--profile-sqlserver")
+                    && message.contains("baseline")
                     && message.contains("direct-raw")
         ));
     }
