@@ -75,6 +75,24 @@ mod enabled {
         pub bulk_finalize_flush_elapsed: Duration,
         /// Time spent waiting for the server result after final bulk flush.
         pub bulk_finalize_result_elapsed: Duration,
+        /// Number of bulk-load packets passed through the framed connection sink.
+        pub bulk_connection_write_calls: u64,
+        /// Payload bytes passed through the framed connection sink.
+        pub bulk_connection_write_payload_bytes: u64,
+        /// Time spent waiting for the framed connection sink to accept packets.
+        pub bulk_connection_write_ready_elapsed: Duration,
+        /// Time spent encoding packets into the framed connection sink.
+        pub bulk_connection_write_encode_elapsed: Duration,
+        /// Time spent flushing packets through the framed connection sink.
+        pub bulk_connection_write_flush_elapsed: Duration,
+        /// Slowest framed connection sink readiness wait.
+        pub bulk_connection_write_max_ready_elapsed: Duration,
+        /// Slowest packet encode into the framed connection sink.
+        pub bulk_connection_write_max_encode_elapsed: Duration,
+        /// Slowest framed connection sink flush.
+        pub bulk_connection_write_max_flush_elapsed: Duration,
+        /// Largest payload passed through the framed connection sink.
+        pub bulk_connection_write_max_payload_bytes: u64,
     }
 
     impl DirectWriteProfile {
@@ -159,6 +177,7 @@ mod enabled {
     pub(crate) fn record_bulk_load_stats(stats: BulkLoadStats) {
         let packet = stats.packet;
         let timing = stats.write_timing;
+        let connection = timing.connection_write;
 
         with_profile(|profile| {
             profile.packet_write_calls = profile
@@ -210,6 +229,27 @@ mod enabled {
             profile.bulk_finalize_write_to_wire_elapsed += timing.finalize_write_to_wire_elapsed;
             profile.bulk_finalize_flush_elapsed += timing.finalize_flush_elapsed;
             profile.bulk_finalize_result_elapsed += timing.finalize_result_elapsed;
+            profile.bulk_connection_write_calls = profile
+                .bulk_connection_write_calls
+                .saturating_add(connection.calls);
+            profile.bulk_connection_write_payload_bytes = profile
+                .bulk_connection_write_payload_bytes
+                .saturating_add(connection.payload_bytes);
+            profile.bulk_connection_write_ready_elapsed += connection.ready_elapsed;
+            profile.bulk_connection_write_encode_elapsed += connection.encode_elapsed;
+            profile.bulk_connection_write_flush_elapsed += connection.flush_elapsed;
+            profile.bulk_connection_write_max_ready_elapsed = profile
+                .bulk_connection_write_max_ready_elapsed
+                .max(connection.max_ready_elapsed);
+            profile.bulk_connection_write_max_encode_elapsed = profile
+                .bulk_connection_write_max_encode_elapsed
+                .max(connection.max_encode_elapsed);
+            profile.bulk_connection_write_max_flush_elapsed = profile
+                .bulk_connection_write_max_flush_elapsed
+                .max(connection.max_flush_elapsed);
+            profile.bulk_connection_write_max_payload_bytes = profile
+                .bulk_connection_write_max_payload_bytes
+                .max(usize_to_u64_saturating(connection.max_payload_bytes));
         });
     }
 
@@ -307,6 +347,17 @@ mod tests {
                 finalize_write_to_wire_elapsed: Duration::from_millis(101),
                 finalize_flush_elapsed: Duration::from_millis(103),
                 finalize_result_elapsed: Duration::from_millis(107),
+                connection_write: tiberius::BulkLoadConnectionWriteStats {
+                    calls: 109,
+                    payload_bytes: 113,
+                    ready_elapsed: Duration::from_millis(127),
+                    encode_elapsed: Duration::from_millis(131),
+                    flush_elapsed: Duration::from_millis(137),
+                    max_ready_elapsed: Duration::from_millis(139),
+                    max_encode_elapsed: Duration::from_millis(149),
+                    max_flush_elapsed: Duration::from_millis(151),
+                    max_payload_bytes: 157,
+                },
             },
         });
 
@@ -366,6 +417,33 @@ mod tests {
             profile.bulk_finalize_result_elapsed,
             Duration::from_millis(107)
         );
+        assert_eq!(profile.bulk_connection_write_calls, 109);
+        assert_eq!(profile.bulk_connection_write_payload_bytes, 113);
+        assert_eq!(
+            profile.bulk_connection_write_ready_elapsed,
+            Duration::from_millis(127)
+        );
+        assert_eq!(
+            profile.bulk_connection_write_encode_elapsed,
+            Duration::from_millis(131)
+        );
+        assert_eq!(
+            profile.bulk_connection_write_flush_elapsed,
+            Duration::from_millis(137)
+        );
+        assert_eq!(
+            profile.bulk_connection_write_max_ready_elapsed,
+            Duration::from_millis(139)
+        );
+        assert_eq!(
+            profile.bulk_connection_write_max_encode_elapsed,
+            Duration::from_millis(149)
+        );
+        assert_eq!(
+            profile.bulk_connection_write_max_flush_elapsed,
+            Duration::from_millis(151)
+        );
+        assert_eq!(profile.bulk_connection_write_max_payload_bytes, 157);
         assert!(super::finish_direct_write_profile().is_none());
     }
 }

@@ -461,6 +461,42 @@ fn print_direct_profile(prefix: &str, profile: DirectWriteProfile) {
         "{prefix}  bulk finalize result elapsed: {}",
         format_duration(profile.bulk_finalize_result_elapsed)
     );
+    println!(
+        "{prefix}  bulk connection write calls: {}",
+        profile.bulk_connection_write_calls
+    );
+    println!(
+        "{prefix}  bulk connection write payload bytes: {}",
+        profile.bulk_connection_write_payload_bytes
+    );
+    println!(
+        "{prefix}  bulk connection write ready elapsed: {}",
+        format_duration(profile.bulk_connection_write_ready_elapsed)
+    );
+    println!(
+        "{prefix}  bulk connection write encode elapsed: {}",
+        format_duration(profile.bulk_connection_write_encode_elapsed)
+    );
+    println!(
+        "{prefix}  bulk connection write flush elapsed: {}",
+        format_duration(profile.bulk_connection_write_flush_elapsed)
+    );
+    println!(
+        "{prefix}  bulk connection write max ready elapsed: {}",
+        format_duration(profile.bulk_connection_write_max_ready_elapsed)
+    );
+    println!(
+        "{prefix}  bulk connection write max encode elapsed: {}",
+        format_duration(profile.bulk_connection_write_max_encode_elapsed)
+    );
+    println!(
+        "{prefix}  bulk connection write max flush elapsed: {}",
+        format_duration(profile.bulk_connection_write_max_flush_elapsed)
+    );
+    println!(
+        "{prefix}  bulk connection write max payload bytes: {}",
+        profile.bulk_connection_write_max_payload_bytes
+    );
 }
 
 fn print_compare_summary(options: &CompareBenchOptions, report: &CompareBenchReport) {
@@ -2099,6 +2135,27 @@ fn merge_direct_profile(
     target.bulk_finalize_write_to_wire_elapsed += source.bulk_finalize_write_to_wire_elapsed;
     target.bulk_finalize_flush_elapsed += source.bulk_finalize_flush_elapsed;
     target.bulk_finalize_result_elapsed += source.bulk_finalize_result_elapsed;
+    target.bulk_connection_write_calls = target
+        .bulk_connection_write_calls
+        .saturating_add(source.bulk_connection_write_calls);
+    target.bulk_connection_write_payload_bytes = target
+        .bulk_connection_write_payload_bytes
+        .saturating_add(source.bulk_connection_write_payload_bytes);
+    target.bulk_connection_write_ready_elapsed += source.bulk_connection_write_ready_elapsed;
+    target.bulk_connection_write_encode_elapsed += source.bulk_connection_write_encode_elapsed;
+    target.bulk_connection_write_flush_elapsed += source.bulk_connection_write_flush_elapsed;
+    target.bulk_connection_write_max_ready_elapsed = target
+        .bulk_connection_write_max_ready_elapsed
+        .max(source.bulk_connection_write_max_ready_elapsed);
+    target.bulk_connection_write_max_encode_elapsed = target
+        .bulk_connection_write_max_encode_elapsed
+        .max(source.bulk_connection_write_max_encode_elapsed);
+    target.bulk_connection_write_max_flush_elapsed = target
+        .bulk_connection_write_max_flush_elapsed
+        .max(source.bulk_connection_write_max_flush_elapsed);
+    target.bulk_connection_write_max_payload_bytes = target
+        .bulk_connection_write_max_payload_bytes
+        .max(source.bulk_connection_write_max_payload_bytes);
 }
 
 async fn connect(

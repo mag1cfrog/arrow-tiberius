@@ -338,6 +338,75 @@ Future optimization should measure whether Tiberius can safely reduce awaited
 write calls, change PLP/max-type chunking, or stream larger contiguous writes to
 SQL Server without disturbing packet framing.
 
+After publishing `tiberius-raw-bulk` `0.12.3-raw-bulk.8`, the same packet-size
+profile was rerun with connection write timing split below `write_to_wire`.
+
+```sh
+cargo xtask writer-bench compare \
+  --container-runtime podman \
+  --scenario string_heavy \
+  --rows 300000 \
+  --batch-size 8192 \
+  --repeat 1 \
+  --backends direct-raw \
+  --profile-direct \
+  --tds-packet-size 32767
+```
+
+| Backend | Rows | Write | Finish | Total | Rows/sec | Peak RSS KiB | Peak RSS MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `direct-raw` connection-write profile rerun | 300,000 | 117.940s | 0.006s | 118.026s | 2,543.53 | 105,272 | 102.80 |
+
+Connection write timing profile:
+
+| Phase or counter | Value |
+| --- | ---: |
+| `measure_batch` | 9.208s |
+| `row_range_split` | 0.005s |
+| `append_encode` | 22.510s |
+| `send_total` | 107.724s |
+| `send_without_append_encode` | 85.214s |
+| rows | 300,000 |
+| batches | 37 |
+| row ranges | 256 |
+| encoded bytes | 1,883,800,622 |
+| max row range bytes | 8,388,567 |
+| nvarchar UTF-16 bytes | 950,022,348 |
+| varbinary bytes | 902,553,858 |
+| null cells | 34,448 |
+| packet write calls | 257 |
+| packets written before finalization | 57,842 |
+| packet payload bytes before finalization | 1,883,798,256 |
+| max packet payload bytes | 32,568 |
+| max buffered bytes before write | 8,420,360 |
+| buffered bytes after last write | 2,565 |
+| finalized packet payload bytes | 2,565 |
+| bulk `write_packets` elapsed | 85.204s |
+| bulk `write_to_wire` calls | 57,843 |
+| bulk `write_to_wire` elapsed | 85.176s |
+| bulk `write_to_wire` payload bytes | 1,883,800,821 |
+| bulk max `write_to_wire` elapsed | 0.003s |
+| bulk max `write_to_wire` payload bytes | 32,568 |
+| bulk flush calls | 1 |
+| bulk flush elapsed | 0.000s |
+| bulk finalize elapsed | 0.004s |
+| bulk connection write calls | 57,843 |
+| bulk connection write payload bytes | 1,883,800,821 |
+| bulk connection write ready elapsed | 0.005s |
+| bulk connection write encode elapsed | 84.413s |
+| bulk connection write flush elapsed | 0.743s |
+| bulk connection write max encode elapsed | 0.003s |
+| bulk connection write max payload bytes | 32,568 |
+
+The deeper split shows that the framed sink is not primarily waiting for
+readiness or flush. The dominant measured cost is packet encode/start-send into
+the framed sink: 84.413s of the 85.176s `write_to_wire` window. The next useful
+optimization target is therefore the Tiberius packet serialization path itself,
+especially avoiding or reducing the packet payload copy from the bulk-load
+buffer into the framed sink buffer. A direct bulk packet write path that writes
+header and payload bytes to the underlying stream without re-copying every
+packet should be investigated before more Arrow-side encoding changes.
+
 Interpretation:
 
 - `direct-raw` is faster than `baseline` on large variable-width rows, but only
