@@ -22,6 +22,16 @@ on:
 These are local benchmark results from one machine. They are useful development
 evidence, not a universal performance claim.
 
+Performance-sensitive runs should use a release-built xtask:
+
+```sh
+cargo run --release -p xtask -- writer-bench compare ...
+```
+
+Using `cargo xtask` directly runs the benchmark harness in debug mode. For this
+benchmark family, debug mode materially distorts the internal Rust writer
+timings.
+
 ## Environment
 
 - Date: 2026-05-19 local time.
@@ -406,6 +416,86 @@ especially avoiding or reducing the packet payload copy from the bulk-load
 buffer into the framed sink buffer. A direct bulk packet write path that writes
 header and payload bytes to the underlying stream without re-copying every
 packet should be investigated before more Arrow-side encoding changes.
+
+The same profile was then rerun through a release-built xtask to avoid making
+optimization decisions from debug-mode timings.
+
+```sh
+cargo run --release -p xtask -- writer-bench compare \
+  --container-runtime podman \
+  --scenario string_heavy \
+  --rows 300000 \
+  --batch-size 8192 \
+  --repeat 1 \
+  --backends direct-raw \
+  --profile-direct \
+  --tds-packet-size 32767
+```
+
+| Backend | Rows | Write | Finish | Total | Rows/sec | Peak RSS KiB | Peak RSS MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `direct-raw` release connection-write profile rerun | 300,000 | 35.382s | 0.339s | 35.793s | 8,398.43 | 100,912 | 98.55 |
+
+Release connection write timing profile:
+
+| Phase or counter | Value |
+| --- | ---: |
+| `measure_batch` | 0.155s |
+| `row_range_split` | 0.000s |
+| `append_encode` | 2.479s |
+| `send_total` | 34.496s |
+| `send_without_append_encode` | 32.017s |
+| bulk `write_packets` elapsed | 32.015s |
+| bulk `write_to_wire` elapsed | 32.009s |
+| bulk max `write_to_wire` elapsed | 1.679s |
+| bulk finalize elapsed | 0.336s |
+| bulk finalize result elapsed | 0.336s |
+| bulk connection write ready elapsed | 0.001s |
+| bulk connection write encode elapsed | 9.083s |
+| bulk connection write flush elapsed | 22.917s |
+| bulk connection write max flush elapsed | 1.679s |
+
+Release mode changes the interpretation. Packet encode/start-send is still
+meaningful, but it is not the dominant phase under optimization. The largest
+measured cost is now framed sink flush: 22.917s of the 32.009s
+`write_to_wire` window. The next fork experiment should therefore focus on
+changing bulk packet flushing/write behavior with release-mode benchmarks,
+rather than assuming the debug-mode packet encode cost is representative.
+
+After updating the ODBC runner commands to use `cargo run --release` inside the
+runner container as well, the four-backend `string_heavy` compare was rerun with
+optimized internal and external benchmark binaries.
+
+```sh
+cargo run --release -p xtask -- writer-bench compare \
+  --container-runtime podman \
+  --scenario string_heavy \
+  --rows 300000 \
+  --batch-size 8192 \
+  --repeat 1 \
+  --backends baseline,direct-raw,arrow-odbc,odbc-bcp \
+  --tds-packet-size 32767
+```
+
+| Backend | Rows | Write | Finish | Total | Rows/sec | Peak RSS KiB | Peak RSS MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `baseline` | 300,000 | 34.158s | 0.293s | 34.523s | 8,708.13 | 96,696 | 94.43 |
+| `direct-raw` | 300,000 | 28.259s | 0.275s | 28.597s | 10,513.81 | 100,916 | 98.55 |
+| `arrow-odbc` | 300,000 | 20.886s | n/a | n/a | 14,363.69 | 1,453,492 | 1,419.43 |
+| `odbc-bcp` | 300,000 | 36.375s | n/a | n/a | 8,247.42 | 50,524 | 49.34 |
+
+Release relative rows/sec:
+
+| Comparison | Ratio |
+| --- | ---: |
+| `direct-raw` / `baseline` | 1.21x |
+| `arrow-odbc` / `direct-raw` | 1.37x |
+| `direct-raw` / `odbc-bcp` | 1.27x |
+
+In optimized builds, `direct-raw` is materially faster than the baseline
+TokenRow writer and the benchmark-only ODBC BCP runner for this workload. It is
+still slower than `arrow-odbc` on large string/binary payloads, while using far
+less memory than `arrow-odbc`.
 
 Interpretation:
 

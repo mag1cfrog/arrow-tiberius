@@ -1243,6 +1243,7 @@ fn arrow_odbc_runner_args(
     Ok(vec![
         "cargo".to_owned(),
         "run".to_owned(),
+        "--release".to_owned(),
         "--manifest-path".to_owned(),
         "xtask/arrow-odbc-runner/Cargo.toml".to_owned(),
         "--target-dir".to_owned(),
@@ -1304,6 +1305,7 @@ fn odbc_bcp_runner_args(
     Ok(vec![
         "cargo".to_owned(),
         "run".to_owned(),
+        "--release".to_owned(),
         "--manifest-path".to_owned(),
         "xtask/odbc-bcp-runner/Cargo.toml".to_owned(),
         "--target-dir".to_owned(),
@@ -3662,6 +3664,7 @@ mod tests {
             super::arrow_odbc_runner_args(&options.benchmark, "/workspace/target/bench.arrow")
                 .unwrap();
 
+        assert!(args.iter().any(|arg| arg == "--release"));
         assert!(args.windows(2).any(|pair| pair == ["--rows", "25"]));
         assert!(args.windows(2).any(|pair| pair == ["--batch-size", "5"]));
         assert!(
@@ -3694,6 +3697,7 @@ mod tests {
         let args =
             super::odbc_bcp_runner_args(&benchmark, "/workspace/target/bench.arrow").unwrap();
 
+        assert!(args.iter().any(|arg| arg == "--release"));
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--manifest-path", "xtask/odbc-bcp-runner/Cargo.toml"])
