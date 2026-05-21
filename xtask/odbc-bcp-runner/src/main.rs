@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 use std::ffi::{CString, c_char, c_void};
@@ -68,14 +69,12 @@ type SqlGetData = unsafe extern "C" fn(HStmt, u16, i16, Pointer, SqlLen, *mut Sq
 type SqlSetConnectAttr = unsafe extern "C" fn(HDbc, i32, Pointer, i32) -> SqlReturn;
 type SqlSetEnvAttr = unsafe extern "C" fn(HEnv, i32, Pointer, i32) -> SqlReturn;
 
-type BcpBind =
-    unsafe extern "C" fn(HDbc, *const u8, i32, DbInt, *const u8, i32, i32, i32) -> i16;
+type BcpBind = unsafe extern "C" fn(HDbc, *const u8, i32, DbInt, *const u8, i32, i32, i32) -> i16;
 type BcpBatch = unsafe extern "C" fn(HDbc) -> DbInt;
 type BcpCollen = unsafe extern "C" fn(HDbc, DbInt, i32) -> i16;
 type BcpColptr = unsafe extern "C" fn(HDbc, *const u8, i32) -> i16;
 type BcpDone = unsafe extern "C" fn(HDbc) -> DbInt;
-type BcpInitA =
-    unsafe extern "C" fn(HDbc, *const c_char, *const c_char, *const c_char, i32) -> i16;
+type BcpInitA = unsafe extern "C" fn(HDbc, *const c_char, *const c_char, *const c_char, i32) -> i16;
 type BcpSendRow = unsafe extern "C" fn(HDbc) -> i16;
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -105,23 +104,44 @@ fn bench(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     let database = required_env(DATABASE_ENV)?;
     let apis = NativeApis::load_from_env()?;
     let connection = RawBcpConnection::connect(&apis.odbc, &connection_string)?;
+    let mut sql_server_profile = if options.profile_sqlserver {
+        let observer = RawBcpConnection::connect(&apis.odbc, &connection_string)?;
+        Some(SqlServerProfile::start(&connection, observer)?)
+    } else {
+        None
+    };
 
     let write_start = Instant::now();
-    let total_rows = run_repeats(&connection, &apis.bcp, &options)?;
+    let report = run_repeats(
+        &connection,
+        &apis.bcp,
+        &options,
+        sql_server_profile.as_mut(),
+    )?;
     let write_elapsed = write_start.elapsed();
+    if let Some(profile) = sql_server_profile.as_mut() {
+        profile.finish()?;
+    }
 
     println!("odbc-bcp runner");
     println!("  database: {database}");
     println!("  scenario: {}", options.scenario);
     println!("  repeat: {}", options.repeat);
-    println!("  rows written: {total_rows}");
+    println!("  transaction policy: {}", options.transaction_policy());
+    println!("  bcp batch calls: {}", report.batch_calls);
+    println!("  bcp batch rows reported: {}", report.batch_rows_reported);
+    println!("  bcp done rows reported: {}", report.done_rows_reported);
+    println!("  rows written: {}", report.rows_reported);
     println!("  write seconds: {:.3}", write_elapsed.as_secs_f64());
     println!(
         "  write rows/sec: {:.2}",
-        rows_per_second(total_rows, write_elapsed)
+        rows_per_second(report.rows_reported, write_elapsed)
     );
     if let Some(peak_rss_kib) = current_process_peak_rss_kib() {
         println!("  peak rss KiB: {peak_rss_kib}");
+    }
+    if let Some(profile) = sql_server_profile {
+        profile.print("  ");
     }
 
     Ok(())
@@ -131,8 +151,9 @@ fn run_repeats(
     connection: &RawBcpConnection<'_>,
     bcp: &BcpApi,
     options: &BenchOptions,
-) -> Result<u64, Box<dyn Error>> {
-    let mut total_rows = 0_u64;
+    mut sql_server_profile: Option<&mut SqlServerProfile<'_>>,
+) -> Result<BcpCopyResult, Box<dyn Error>> {
+    let mut report = BcpCopyResult::default();
 
     for repeat in 0..options.repeat {
         let table = format!(
@@ -140,7 +161,13 @@ fn run_repeats(
             std::process::id(),
             repeat
         );
-        let repeat_result = run_repeat(connection, bcp, &table, options);
+        let repeat_result = run_repeat(
+            connection,
+            bcp,
+            &table,
+            options,
+            sql_server_profile.as_deref_mut(),
+        );
         let cleanup_result = execute_sql(connection, &format!("DROP TABLE IF EXISTS {table}"));
 
         if let Err(error) = cleanup_result {
@@ -151,10 +178,10 @@ fn run_repeats(
             }
         }
 
-        total_rows = total_rows.saturating_add(repeat_result?);
+        report.merge(repeat_result?);
     }
 
-    Ok(total_rows)
+    Ok(report)
 }
 
 fn run_repeat(
@@ -162,21 +189,32 @@ fn run_repeat(
     bcp: &BcpApi,
     table: &str,
     options: &BenchOptions,
-) -> Result<u64, Box<dyn Error>> {
+    mut sql_server_profile: Option<&mut SqlServerProfile<'_>>,
+) -> Result<BcpCopyResult, Box<dyn Error>> {
     execute_sql(connection, &format!("DROP TABLE IF EXISTS {table}"))?;
     execute_sql(connection, &options.create_table_sql(table)?)?;
 
-    let rows_written = bcp.copy_ipc_dataset(connection, table, options)?;
+    let copy_result = bcp.copy_ipc_dataset(
+        connection,
+        table,
+        options,
+        sql_server_profile.as_deref_mut(),
+    )?;
 
     let actual = select_count(connection, table)?;
-    if actual != rows_written {
+    if actual != copy_result.rows_reported {
         return Err(format!(
-            "odbc-bcp row-count validation failed: expected {rows_written}, got {actual}"
+            "odbc-bcp row-count validation failed: expected {}, got {actual}",
+            copy_result.rows_reported
         )
         .into());
     }
 
-    Ok(actual)
+    if let Some(profile) = sql_server_profile {
+        profile.snapshot_table_pages(table)?;
+    }
+
+    Ok(copy_result)
 }
 
 #[cfg(test)]
@@ -241,8 +279,7 @@ impl OdbcApi {
 
     fn load(path: impl AsRef<Path>) -> Result<Self, Box<dyn Error>> {
         let library = unsafe { Library::new(path.as_ref())? };
-        let sql_alloc_handle =
-            unsafe { *library.get::<SqlAllocHandle>(b"SQLAllocHandle\0")? };
+        let sql_alloc_handle = unsafe { *library.get::<SqlAllocHandle>(b"SQLAllocHandle\0")? };
         let sql_disconnect = unsafe { *library.get::<SqlDisconnect>(b"SQLDisconnect\0")? };
         let sql_driver_connect =
             unsafe { *library.get::<SqlDriverConnect>(b"SQLDriverConnect\0")? };
@@ -280,6 +317,27 @@ struct BcpApi {
     bcp_sendrow: BcpSendRow,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BcpCopyResult {
+    rows_reported: u64,
+    batch_calls: u64,
+    batch_rows_reported: u64,
+    done_rows_reported: u64,
+}
+
+impl BcpCopyResult {
+    fn merge(&mut self, source: Self) {
+        self.rows_reported = self.rows_reported.saturating_add(source.rows_reported);
+        self.batch_calls = self.batch_calls.saturating_add(source.batch_calls);
+        self.batch_rows_reported = self
+            .batch_rows_reported
+            .saturating_add(source.batch_rows_reported);
+        self.done_rows_reported = self
+            .done_rows_reported
+            .saturating_add(source.done_rows_reported);
+    }
+}
+
 impl BcpApi {
     fn load_from_env() -> Result<Self, Box<dyn Error>> {
         let library_path =
@@ -314,76 +372,103 @@ impl BcpApi {
         connection: &RawBcpConnection,
         table: &str,
         options: &BenchOptions,
-    ) -> Result<u64, Box<dyn Error>> {
+        mut sql_server_profile: Option<&mut SqlServerProfile<'_>>,
+    ) -> Result<BcpCopyResult, Box<dyn Error>> {
         let table = c_string("table", table)?;
         let init_result =
             unsafe { (self.bcp_init_a)(connection.hdbc, table.as_ptr(), null(), null(), DB_IN) };
         require_bcp_success("bcp_initA", init_result)?;
 
-        let file = File::open(&options.input_ipc)?;
-        let reader = FileReader::try_new(file, None)?;
-        let mut rows_seen = 0_usize;
-        let mut sent_since_batch = 0_usize;
-        let mut rows_reported = 0_u64;
-        let mut bindings: Option<BcpColumnBindings> = None;
+        let copy_and_batch = || -> Result<BcpCopyResult, Box<dyn Error>> {
+            let file = File::open(&options.input_ipc)?;
+            let reader = FileReader::try_new(file, None)?;
+            let mut rows_seen = 0_usize;
+            let mut sent_since_batch = 0_usize;
+            let mut report = BcpCopyResult::default();
+            let mut bindings: Option<BcpColumnBindings> = None;
 
-        for batch in reader {
-            let batch = batch?;
-            if bindings.is_none() {
-                let mut next_bindings = BcpColumnBindings::new(&batch)?;
-                next_bindings.bind(connection, self)?;
-                bindings = Some(next_bindings);
-            }
-            let bindings = bindings
-                .as_mut()
-                .ok_or("BCP column bindings were not initialized")?;
-            bindings.validate_batch(&batch)?;
+            for batch in reader {
+                let batch = batch?;
+                if bindings.is_none() {
+                    let mut next_bindings = BcpColumnBindings::new(&batch)?;
+                    next_bindings.bind(connection, self)?;
+                    bindings = Some(next_bindings);
+                }
+                let bindings = bindings
+                    .as_mut()
+                    .ok_or("BCP column bindings were not initialized")?;
+                bindings.validate_batch(&batch)?;
 
-            for row_index in 0..batch.num_rows() {
-                bindings.set_row(connection, self, &batch, row_index)?;
-                let send_result = unsafe { (self.bcp_sendrow)(connection.hdbc) };
-                require_bcp_success("bcp_sendrow", send_result)?;
-                sent_since_batch += 1;
-                rows_seen += 1;
+                for row_index in 0..batch.num_rows() {
+                    bindings.set_row(connection, self, &batch, row_index)?;
+                    let send_result = unsafe { (self.bcp_sendrow)(connection.hdbc) };
+                    require_bcp_success("bcp_sendrow", send_result)?;
+                    sent_since_batch += 1;
+                    rows_seen += 1;
 
-                if sent_since_batch == options.batch_size {
-                    rows_reported = rows_reported.saturating_add(self.flush_batch(connection)?);
-                    sent_since_batch = 0;
+                    if !options.defer_batches && sent_since_batch == options.batch_size {
+                        report.batch_rows_reported = report
+                            .batch_rows_reported
+                            .saturating_add(self.flush_batch(connection)?);
+                        report.batch_calls = report.batch_calls.saturating_add(1);
+                        sent_since_batch = 0;
+                    }
                 }
             }
-        }
 
-        if bindings.is_none() {
-            return Err("Arrow IPC file did not contain any record batches".into());
-        }
+            if bindings.is_none() {
+                return Err("Arrow IPC file did not contain any record batches".into());
+            }
 
-        if sent_since_batch > 0 {
-            rows_reported = rows_reported.saturating_add(self.flush_batch(connection)?);
-        }
+            if !options.defer_batches && sent_since_batch > 0 {
+                report.batch_rows_reported = report
+                    .batch_rows_reported
+                    .saturating_add(self.flush_batch(connection)?);
+                report.batch_calls = report.batch_calls.saturating_add(1);
+            }
 
-        let done_rows = unsafe { (self.bcp_done)(connection.hdbc) };
-        if done_rows < 0 {
-            return Err("bcp_done failed".into());
-        }
-        rows_reported = rows_reported.saturating_add(u64::try_from(done_rows)?);
+            if rows_seen != options.rows {
+                return Err(format!(
+                    "Arrow IPC row count does not match --rows: expected {}, got {rows_seen}",
+                    options.rows
+                )
+                .into());
+            }
 
-        if rows_seen != options.rows {
-            return Err(format!(
-                "Arrow IPC row count does not match --rows: expected {}, got {rows_seen}",
-                options.rows
-            )
-            .into());
-        }
+            Ok(report)
+        };
+        let mut report = if let Some(profile) = sql_server_profile.as_deref_mut() {
+            profile.capture_phase("copy_and_bcp_batch", copy_and_batch)?
+        } else {
+            copy_and_batch()?
+        };
+
+        let done = || -> Result<u64, Box<dyn Error>> {
+            let done_rows = unsafe { (self.bcp_done)(connection.hdbc) };
+            if done_rows < 0 {
+                return Err("bcp_done failed".into());
+            }
+            Ok(u64::try_from(done_rows)?)
+        };
+        report.done_rows_reported = if let Some(profile) = sql_server_profile {
+            profile.capture_phase("bcp_done", done)?
+        } else {
+            done()?
+        };
+        report.rows_reported = report
+            .batch_rows_reported
+            .saturating_add(report.done_rows_reported);
 
         let expected = u64::try_from(options.rows)?;
-        if rows_reported != expected {
+        if report.rows_reported != expected {
             return Err(format!(
-                "BCP reported {rows_reported} rows across bcp_batch and bcp_done, expected {expected}"
+                "BCP reported {} rows across bcp_batch and bcp_done, expected {expected}",
+                report.rows_reported
             )
             .into());
         }
 
-        Ok(rows_reported)
+        Ok(report)
     }
 
     fn bind_column(
@@ -454,7 +539,9 @@ impl BcpColumnBindings {
             .fields()
             .iter()
             .enumerate()
-            .map(|(index, field)| BcpColumnBinding::new(index, field.name(), field.data_type(), field.is_nullable()))
+            .map(|(index, field)| {
+                BcpColumnBinding::new(index, field.name(), field.data_type(), field.is_nullable())
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self { columns })
@@ -594,10 +681,16 @@ impl BcpColumnBinding {
             return bcp.set_column_len(connection, &self.name, SQL_NULL_DATA, self.server_column);
         }
 
-        self.buffer.set_from_batch(batch, self.index, row_index, &self.name)?;
+        self.buffer
+            .set_from_batch(batch, self.index, row_index, &self.name)?;
 
         if self.buffer.is_variable_len() {
-            bcp.set_column_ptr(connection, &self.name, self.buffer.ptr(), self.server_column)?;
+            bcp.set_column_ptr(
+                connection,
+                &self.name,
+                self.buffer.ptr(),
+                self.server_column,
+            )?;
         }
 
         bcp.set_column_len(
@@ -744,7 +837,8 @@ impl BcpColumnBuffer {
                             )
                             .into());
                         }
-                        let array = required_column::<TimestampMillisecondArray>(batch, index, name)?;
+                        let array =
+                            required_column::<TimestampMillisecondArray>(batch, index, name)?;
                         bytes.extend_from_slice(
                             format_timestamp_millis(array.value(row_index))?.as_bytes(),
                         );
@@ -787,7 +881,9 @@ fn required_column<'a, T: 'static>(
 
 fn format_decimal(unscaled: i128, scale: i8) -> Result<String, Box<dyn Error>> {
     if scale < 0 {
-        return Err(format!("odbc-bcp runner does not support negative decimal scale {scale}").into());
+        return Err(
+            format!("odbc-bcp runner does not support negative decimal scale {scale}").into(),
+        );
     }
 
     let scale = usize::try_from(scale)?;
@@ -879,17 +975,11 @@ impl<'a> RawBcpConnection<'a> {
 
     fn allocate(odbc: &'a OdbcApi) -> Result<Self, Box<dyn Error>> {
         let mut henv = null_mut();
-        let env_result =
-            unsafe { (odbc.sql_alloc_handle)(SQL_HANDLE_ENV, null_mut(), &mut henv) };
+        let env_result = unsafe { (odbc.sql_alloc_handle)(SQL_HANDLE_ENV, null_mut(), &mut henv) };
         require_odbc_success("SQLAllocHandle ENV", env_result)?;
 
         let version_result = unsafe {
-            (odbc.sql_set_env_attr)(
-                henv,
-                SQL_ATTR_ODBC_VERSION,
-                SQL_OV_ODBC3 as Pointer,
-                0,
-            )
+            (odbc.sql_set_env_attr)(henv, SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3 as Pointer, 0)
         };
         if let Err(error) = require_odbc_success("SQLSetEnvAttr ODBC version", version_result) {
             unsafe {
@@ -1004,16 +1094,27 @@ fn execute_sql(connection: &RawBcpConnection<'_>, sql: &str) -> Result<(), Box<d
     let sql = c_string("SQL statement", sql)?;
     let statement = connection.allocate_statement()?;
     let result = unsafe {
-        (connection.odbc.sql_exec_direct)(statement.hstmt, sql.as_ptr().cast::<u8>(), SQL_NTS.into())
+        (connection.odbc.sql_exec_direct)(
+            statement.hstmt,
+            sql.as_ptr().cast::<u8>(),
+            SQL_NTS.into(),
+        )
     };
     require_odbc_success("SQLExecDirect", result)
 }
 
 fn select_count(connection: &RawBcpConnection<'_>, table: &str) -> Result<u64, Box<dyn Error>> {
-    let sql = c_string("count SQL statement", &format!("SELECT COUNT_BIG(*) FROM {table}"))?;
+    let sql = c_string(
+        "count SQL statement",
+        &format!("SELECT COUNT_BIG(*) FROM {table}"),
+    )?;
     let statement = connection.allocate_statement()?;
     let exec_result = unsafe {
-        (connection.odbc.sql_exec_direct)(statement.hstmt, sql.as_ptr().cast::<u8>(), SQL_NTS.into())
+        (connection.odbc.sql_exec_direct)(
+            statement.hstmt,
+            sql.as_ptr().cast::<u8>(),
+            SQL_NTS.into(),
+        )
     };
     require_odbc_success("SQLExecDirect count", exec_result)?;
 
@@ -1051,6 +1152,69 @@ fn select_count(connection: &RawBcpConnection<'_>, table: &str) -> Result<u64, B
     Ok(text.trim().parse::<u64>()?)
 }
 
+fn text_rows(
+    connection: &RawBcpConnection<'_>,
+    sql: &str,
+    columns: usize,
+) -> Result<Vec<Vec<Option<String>>>, Box<dyn Error>> {
+    let sql = c_string("SQL Server profile SQL statement", sql)?;
+    let statement = connection.allocate_statement()?;
+    let exec_result = unsafe {
+        (connection.odbc.sql_exec_direct)(
+            statement.hstmt,
+            sql.as_ptr().cast::<u8>(),
+            SQL_NTS.into(),
+        )
+    };
+    require_odbc_success("SQLExecDirect SQL Server profile", exec_result)?;
+
+    let mut rows = Vec::new();
+    loop {
+        let fetch_result = unsafe { (connection.odbc.sql_fetch)(statement.hstmt) };
+        if fetch_result == SQL_NO_DATA {
+            return Ok(rows);
+        }
+        require_odbc_success("SQLFetch SQL Server profile", fetch_result)?;
+
+        let mut row = Vec::with_capacity(columns);
+        for column in 1..=columns {
+            row.push(text_column(&statement, u16::try_from(column)?)?);
+        }
+        rows.push(row);
+    }
+}
+
+fn text_column(
+    statement: &RawStatement<'_>,
+    column: u16,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let mut buffer = [0_u8; 256];
+    let mut indicator = 0;
+    let get_result = unsafe {
+        (statement.odbc.sql_get_data)(
+            statement.hstmt,
+            column,
+            SQL_C_CHAR,
+            buffer.as_mut_ptr().cast::<c_void>(),
+            SqlLen::try_from(buffer.len())?,
+            &mut indicator,
+        )
+    };
+    require_odbc_success("SQLGetData SQL Server profile", get_result)?;
+
+    if indicator < 0 {
+        return Ok(None);
+    }
+
+    let nul_position = buffer
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(buffer.len());
+    Ok(Some(
+        std::str::from_utf8(&buffer[..nul_position])?.to_owned(),
+    ))
+}
+
 fn rows_per_second(rows: u64, elapsed: Duration) -> f64 {
     if elapsed.is_zero() {
         return 0.0;
@@ -1083,6 +1247,459 @@ fn c_string(label: &str, value: &str) -> Result<CString, Box<dyn Error>> {
     CString::new(value).map_err(|_| format!("{label} contains an interior NUL byte").into())
 }
 
+struct SqlServerProfile<'a> {
+    observer: RawBcpConnection<'a>,
+    writer_session_id: i32,
+    recovery_model: String,
+    initial_session_waits: Vec<SessionWaitSnapshot>,
+    initial_database_file_io: Vec<DatabaseFileIoSnapshot>,
+    session_wait_deltas: Vec<SessionWaitDelta>,
+    database_file_io_deltas: Vec<DatabaseFileIoDelta>,
+    phase_deltas: Vec<SqlServerProfilePhaseDelta>,
+    table_page_snapshots: Vec<TablePageSnapshot>,
+}
+
+impl<'a> SqlServerProfile<'a> {
+    fn start(
+        writer: &RawBcpConnection<'_>,
+        observer: RawBcpConnection<'a>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let writer_session_id = select_session_id(writer)?;
+        Ok(Self {
+            recovery_model: recovery_model(&observer)?,
+            initial_session_waits: session_wait_snapshots(&observer, writer_session_id)?,
+            initial_database_file_io: database_file_io_snapshots(&observer)?,
+            observer,
+            writer_session_id,
+            session_wait_deltas: Vec::new(),
+            database_file_io_deltas: Vec::new(),
+            phase_deltas: Vec::new(),
+            table_page_snapshots: Vec::new(),
+        })
+    }
+
+    fn finish(&mut self) -> Result<(), Box<dyn Error>> {
+        self.session_wait_deltas = session_wait_deltas(
+            &self.initial_session_waits,
+            &session_wait_snapshots(&self.observer, self.writer_session_id)?,
+        );
+        self.database_file_io_deltas = database_file_io_deltas(
+            &self.initial_database_file_io,
+            &database_file_io_snapshots(&self.observer)?,
+        );
+        Ok(())
+    }
+
+    fn print(&self, prefix: &str) {
+        println!("{prefix}sql server profile:");
+        println!("{prefix}  writer session id: {}", self.writer_session_id);
+        println!("{prefix}  recovery model: {}", self.recovery_model);
+        print_session_wait_deltas(prefix, &self.session_wait_deltas);
+        print_database_file_io_deltas(prefix, &self.database_file_io_deltas);
+        print_phase_deltas(prefix, &self.phase_deltas);
+        print_table_page_snapshots(prefix, &self.table_page_snapshots);
+    }
+
+    fn capture_phase<T>(
+        &mut self,
+        phase: &str,
+        work: impl FnOnce() -> Result<T, Box<dyn Error>>,
+    ) -> Result<T, Box<dyn Error>> {
+        let initial_session_waits = session_wait_snapshots(&self.observer, self.writer_session_id)?;
+        let initial_database_file_io = database_file_io_snapshots(&self.observer)?;
+        let result = work();
+        self.phase_deltas.push(SqlServerProfilePhaseDelta {
+            phase: phase.to_owned(),
+            session_wait_deltas: session_wait_deltas(
+                &initial_session_waits,
+                &session_wait_snapshots(&self.observer, self.writer_session_id)?,
+            ),
+            database_file_io_deltas: database_file_io_deltas(
+                &initial_database_file_io,
+                &database_file_io_snapshots(&self.observer)?,
+            ),
+        });
+        result
+    }
+
+    fn snapshot_table_pages(&mut self, table: &str) -> Result<(), Box<dyn Error>> {
+        self.table_page_snapshots
+            .push(table_page_snapshot(&self.observer, table)?);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionWaitSnapshot {
+    wait_type: String,
+    waiting_tasks_count: i64,
+    wait_time_ms: i64,
+    signal_wait_time_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionWaitDelta {
+    wait_type: String,
+    waiting_tasks_count: i64,
+    wait_time_ms: i64,
+    signal_wait_time_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DatabaseFileIoSnapshot {
+    file_id: i32,
+    logical_name: String,
+    file_type: String,
+    read_count: i64,
+    read_bytes: i64,
+    read_stall_ms: i64,
+    write_count: i64,
+    write_bytes: i64,
+    write_stall_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DatabaseFileIoDelta {
+    file_id: i32,
+    logical_name: String,
+    file_type: String,
+    read_count: i64,
+    read_bytes: i64,
+    read_stall_ms: i64,
+    write_count: i64,
+    write_bytes: i64,
+    write_stall_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqlServerProfilePhaseDelta {
+    phase: String,
+    session_wait_deltas: Vec<SessionWaitDelta>,
+    database_file_io_deltas: Vec<DatabaseFileIoDelta>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TablePageSnapshot {
+    table: String,
+    row_count: i64,
+    in_row_used_page_count: i64,
+    lob_used_page_count: i64,
+    row_overflow_used_page_count: i64,
+    used_page_count: i64,
+}
+
+fn print_session_wait_deltas(prefix: &str, waits: &[SessionWaitDelta]) {
+    if waits.is_empty() {
+        println!("{prefix}  session wait deltas: <none>");
+        return;
+    }
+
+    println!("{prefix}  session wait deltas:");
+    for wait in waits {
+        println!(
+            "{prefix}    {}: wait_ms={} tasks={} signal_wait_ms={}",
+            wait.wait_type, wait.wait_time_ms, wait.waiting_tasks_count, wait.signal_wait_time_ms
+        );
+    }
+}
+
+fn print_database_file_io_deltas(prefix: &str, files: &[DatabaseFileIoDelta]) {
+    if files.is_empty() {
+        println!("{prefix}  database file IO deltas: <none>");
+        return;
+    }
+
+    println!("{prefix}  database file IO deltas:");
+    for file in files {
+        println!(
+            "{prefix}    {} {}: reads={} read_bytes={} read_stall_ms={} writes={} write_bytes={} write_stall_ms={}",
+            file.file_type,
+            file.logical_name,
+            file.read_count,
+            file.read_bytes,
+            file.read_stall_ms,
+            file.write_count,
+            file.write_bytes,
+            file.write_stall_ms
+        );
+    }
+}
+
+fn print_phase_deltas(prefix: &str, phases: &[SqlServerProfilePhaseDelta]) {
+    if phases.is_empty() {
+        println!("{prefix}  phase deltas: <none>");
+        return;
+    }
+
+    println!("{prefix}  phase deltas:");
+    for phase in phases {
+        println!("{prefix}    {}:", phase.phase);
+        print_session_wait_deltas(&format!("{prefix}    "), &phase.session_wait_deltas);
+        print_database_file_io_deltas(&format!("{prefix}    "), &phase.database_file_io_deltas);
+    }
+}
+
+fn print_table_page_snapshots(prefix: &str, tables: &[TablePageSnapshot]) {
+    if tables.is_empty() {
+        println!("{prefix}  table page snapshots: <none>");
+        return;
+    }
+
+    println!("{prefix}  table page snapshots:");
+    for table in tables {
+        println!(
+            "{prefix}    {}: rows={} used_pages={} in_row_used_pages={} lob_used_pages={} row_overflow_used_pages={}",
+            table.table,
+            table.row_count,
+            table.used_page_count,
+            table.in_row_used_page_count,
+            table.lob_used_page_count,
+            table.row_overflow_used_page_count
+        );
+    }
+}
+
+fn select_session_id(connection: &RawBcpConnection<'_>) -> Result<i32, Box<dyn Error>> {
+    let rows = text_rows(connection, "SELECT CONVERT(nvarchar(16), @@SPID)", 1)?;
+    let row = rows.first().ok_or("SELECT @@SPID did not return a row")?;
+    Ok(required_profile_column(row, 0, "session_id")?
+        .trim()
+        .parse()?)
+}
+
+fn recovery_model(connection: &RawBcpConnection<'_>) -> Result<String, Box<dyn Error>> {
+    let rows = text_rows(
+        connection,
+        "SELECT CONVERT(nvarchar(60), d.recovery_model_desc) \
+        FROM sys.databases AS d \
+        WHERE d.database_id = DB_ID()",
+        1,
+    )?;
+    let row = rows
+        .first()
+        .ok_or("SQL Server recovery model snapshot found no current database")?;
+    Ok(required_profile_column(row, 0, "recovery_model")?.to_owned())
+}
+
+fn table_page_snapshot(
+    connection: &RawBcpConnection<'_>,
+    table: &str,
+) -> Result<TablePageSnapshot, Box<dyn Error>> {
+    let table_literal = table.replace('\'', "''");
+    let rows = text_rows(
+        connection,
+        &format!(
+            "SELECT \
+                CONVERT(nvarchar(32), COALESCE(SUM(s.row_count), 0)), \
+                CONVERT(nvarchar(32), COALESCE(SUM(s.in_row_used_page_count), 0)), \
+                CONVERT(nvarchar(32), COALESCE(SUM(s.lob_used_page_count), 0)), \
+                CONVERT(nvarchar(32), COALESCE(SUM(s.row_overflow_used_page_count), 0)), \
+                CONVERT(nvarchar(32), COALESCE(SUM(s.used_page_count), 0)) \
+            FROM sys.dm_db_partition_stats AS s \
+            WHERE s.object_id = OBJECT_ID(N'{table_literal}')"
+        ),
+        5,
+    )?;
+    let row = rows
+        .first()
+        .ok_or_else(|| format!("SQL Server table page snapshot found no row for {table}"))?;
+
+    Ok(TablePageSnapshot {
+        table: table.to_owned(),
+        row_count: parse_profile_column(row, 0, "row_count")?,
+        in_row_used_page_count: parse_profile_column(row, 1, "in_row_used_page_count")?,
+        lob_used_page_count: parse_profile_column(row, 2, "lob_used_page_count")?,
+        row_overflow_used_page_count: parse_profile_column(row, 3, "row_overflow_used_page_count")?,
+        used_page_count: parse_profile_column(row, 4, "used_page_count")?,
+    })
+}
+
+fn session_wait_snapshots(
+    connection: &RawBcpConnection<'_>,
+    writer_session_id: i32,
+) -> Result<Vec<SessionWaitSnapshot>, Box<dyn Error>> {
+    text_rows(
+        connection,
+        &format!(
+            "SELECT \
+            CONVERT(nvarchar(60), s.wait_type), \
+            CONVERT(nvarchar(32), CONVERT(bigint, s.waiting_tasks_count)), \
+            CONVERT(nvarchar(32), CONVERT(bigint, s.wait_time_ms)), \
+            CONVERT(nvarchar(32), CONVERT(bigint, s.signal_wait_time_ms)) \
+        FROM sys.dm_exec_session_wait_stats AS s \
+        WHERE CONVERT(int, s.session_id) = {writer_session_id} \
+        ORDER BY s.wait_time_ms DESC, s.wait_type"
+        ),
+        4,
+    )?
+    .into_iter()
+    .map(|row| {
+        Ok(SessionWaitSnapshot {
+            wait_type: required_profile_column(&row, 0, "wait_type")?.to_owned(),
+            waiting_tasks_count: parse_profile_column(&row, 1, "waiting_tasks_count")?,
+            wait_time_ms: parse_profile_column(&row, 2, "wait_time_ms")?,
+            signal_wait_time_ms: parse_profile_column(&row, 3, "signal_wait_time_ms")?,
+        })
+    })
+    .collect()
+}
+
+fn database_file_io_snapshots(
+    connection: &RawBcpConnection<'_>,
+) -> Result<Vec<DatabaseFileIoSnapshot>, Box<dyn Error>> {
+    text_rows(
+        connection,
+        "SELECT \
+            CONVERT(nvarchar(16), CONVERT(int, f.file_id)), \
+            CONVERT(nvarchar(128), f.name), \
+            CONVERT(nvarchar(60), f.type_desc), \
+            CONVERT(nvarchar(32), CONVERT(bigint, vfs.num_of_reads)), \
+            CONVERT(nvarchar(32), CONVERT(bigint, vfs.num_of_bytes_read)), \
+            CONVERT(nvarchar(32), CONVERT(bigint, vfs.io_stall_read_ms)), \
+            CONVERT(nvarchar(32), CONVERT(bigint, vfs.num_of_writes)), \
+            CONVERT(nvarchar(32), CONVERT(bigint, vfs.num_of_bytes_written)), \
+            CONVERT(nvarchar(32), CONVERT(bigint, vfs.io_stall_write_ms)) \
+        FROM sys.dm_io_virtual_file_stats(DB_ID(), NULL) AS vfs \
+        INNER JOIN sys.database_files AS f \
+            ON f.file_id = vfs.file_id \
+        ORDER BY f.type, f.file_id",
+        9,
+    )?
+    .into_iter()
+    .map(|row| {
+        Ok(DatabaseFileIoSnapshot {
+            file_id: parse_profile_column(&row, 0, "file_id")?,
+            logical_name: required_profile_column(&row, 1, "logical_name")?.to_owned(),
+            file_type: required_profile_column(&row, 2, "file_type")?.to_owned(),
+            read_count: parse_profile_column(&row, 3, "read_count")?,
+            read_bytes: parse_profile_column(&row, 4, "read_bytes")?,
+            read_stall_ms: parse_profile_column(&row, 5, "read_stall_ms")?,
+            write_count: parse_profile_column(&row, 6, "write_count")?,
+            write_bytes: parse_profile_column(&row, 7, "write_bytes")?,
+            write_stall_ms: parse_profile_column(&row, 8, "write_stall_ms")?,
+        })
+    })
+    .collect()
+}
+
+fn required_profile_column<'a>(
+    row: &'a [Option<String>],
+    index: usize,
+    column: &str,
+) -> Result<&'a str, Box<dyn Error>> {
+    row.get(index)
+        .and_then(Option::as_deref)
+        .ok_or_else(|| format!("SQL Server profile column `{column}` was null").into())
+}
+
+fn parse_profile_column<T>(
+    row: &[Option<String>],
+    index: usize,
+    column: &str,
+) -> Result<T, Box<dyn Error>>
+where
+    T: std::str::FromStr,
+    T::Err: Error + 'static,
+{
+    Ok(required_profile_column(row, index, column)?.parse()?)
+}
+
+fn session_wait_deltas(
+    initial: &[SessionWaitSnapshot],
+    final_waits: &[SessionWaitSnapshot],
+) -> Vec<SessionWaitDelta> {
+    let initial_waits = initial
+        .iter()
+        .map(|wait| (wait.wait_type.as_str(), wait))
+        .collect::<BTreeMap<_, _>>();
+    let mut deltas = final_waits
+        .iter()
+        .filter_map(|final_wait| {
+            let initial_wait = initial_waits.get(final_wait.wait_type.as_str()).copied();
+            let delta = SessionWaitDelta {
+                wait_type: final_wait.wait_type.clone(),
+                waiting_tasks_count: counter_delta(
+                    initial_wait.map_or(0, |wait| wait.waiting_tasks_count),
+                    final_wait.waiting_tasks_count,
+                ),
+                wait_time_ms: counter_delta(
+                    initial_wait.map_or(0, |wait| wait.wait_time_ms),
+                    final_wait.wait_time_ms,
+                ),
+                signal_wait_time_ms: counter_delta(
+                    initial_wait.map_or(0, |wait| wait.signal_wait_time_ms),
+                    final_wait.signal_wait_time_ms,
+                ),
+            };
+
+            (delta.waiting_tasks_count > 0 || delta.wait_time_ms > 0).then_some(delta)
+        })
+        .collect::<Vec<_>>();
+    deltas.sort_by(|left, right| {
+        right
+            .wait_time_ms
+            .cmp(&left.wait_time_ms)
+            .then_with(|| left.wait_type.cmp(&right.wait_type))
+    });
+    deltas
+}
+
+fn database_file_io_deltas(
+    initial: &[DatabaseFileIoSnapshot],
+    final_files: &[DatabaseFileIoSnapshot],
+) -> Vec<DatabaseFileIoDelta> {
+    let initial_files = initial
+        .iter()
+        .map(|file| (file.file_id, file))
+        .collect::<BTreeMap<_, _>>();
+    let mut deltas = final_files
+        .iter()
+        .map(|final_file| {
+            let initial_file = initial_files.get(&final_file.file_id).copied();
+            DatabaseFileIoDelta {
+                file_id: final_file.file_id,
+                logical_name: final_file.logical_name.clone(),
+                file_type: final_file.file_type.clone(),
+                read_count: counter_delta(
+                    initial_file.map_or(0, |file| file.read_count),
+                    final_file.read_count,
+                ),
+                read_bytes: counter_delta(
+                    initial_file.map_or(0, |file| file.read_bytes),
+                    final_file.read_bytes,
+                ),
+                read_stall_ms: counter_delta(
+                    initial_file.map_or(0, |file| file.read_stall_ms),
+                    final_file.read_stall_ms,
+                ),
+                write_count: counter_delta(
+                    initial_file.map_or(0, |file| file.write_count),
+                    final_file.write_count,
+                ),
+                write_bytes: counter_delta(
+                    initial_file.map_or(0, |file| file.write_bytes),
+                    final_file.write_bytes,
+                ),
+                write_stall_ms: counter_delta(
+                    initial_file.map_or(0, |file| file.write_stall_ms),
+                    final_file.write_stall_ms,
+                ),
+            }
+        })
+        .collect::<Vec<_>>();
+    deltas.sort_by(|left, right| {
+        left.file_type
+            .cmp(&right.file_type)
+            .then_with(|| left.logical_name.cmp(&right.logical_name))
+            .then_with(|| left.file_id.cmp(&right.file_id))
+    });
+    deltas
+}
+
+fn counter_delta(initial: i64, final_value: i64) -> i64 {
+    final_value.saturating_sub(initial)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BenchOptions {
     rows: usize,
@@ -1091,6 +1708,8 @@ struct BenchOptions {
     repeat: usize,
     input_ipc: PathBuf,
     create_table_sql_template: String,
+    profile_sqlserver: bool,
+    defer_batches: bool,
 }
 
 impl BenchOptions {
@@ -1102,6 +1721,8 @@ impl BenchOptions {
             repeat: 1,
             input_ipc: PathBuf::new(),
             create_table_sql_template: String::new(),
+            profile_sqlserver: false,
+            defer_batches: false,
         };
         let mut input_ipc = None;
         let mut create_table_sql_template = None;
@@ -1135,6 +1756,8 @@ impl BenchOptions {
                         required_arg("--create-table-sql-template", args.get(index))?.to_owned(),
                     );
                 }
+                "--profile-sqlserver" => options.profile_sqlserver = true,
+                "--defer-batches" => options.defer_batches = true,
                 other => return Err(format!("unknown odbc-bcp runner option `{other}`").into()),
             }
 
@@ -1145,11 +1768,13 @@ impl BenchOptions {
             input_ipc.ok_or("missing required odbc-bcp runner option `--input-ipc <FILE>`")?;
         options.create_table_sql_template = create_table_sql_template
             .ok_or("missing required odbc-bcp runner option `--create-table-sql-template <SQL>`")?;
-        if !options.create_table_sql_template.contains(TABLE_PLACEHOLDER) {
-            return Err(format!(
-                "--create-table-sql-template must contain `{TABLE_PLACEHOLDER}`"
-            )
-            .into());
+        if !options
+            .create_table_sql_template
+            .contains(TABLE_PLACEHOLDER)
+        {
+            return Err(
+                format!("--create-table-sql-template must contain `{TABLE_PLACEHOLDER}`").into(),
+            );
         }
 
         Ok(options)
@@ -1160,7 +1785,17 @@ impl BenchOptions {
             return Err("benchmark table name unexpectedly contains template placeholder".into());
         }
 
-        Ok(self.create_table_sql_template.replace(TABLE_PLACEHOLDER, table))
+        Ok(self
+            .create_table_sql_template
+            .replace(TABLE_PLACEHOLDER, table))
+    }
+
+    fn transaction_policy(&self) -> String {
+        if self.defer_batches {
+            "defer all BCP rows to bcp_done".to_owned()
+        } else {
+            format!("bcp_batch every {} rows plus bcp_done", self.batch_size)
+        }
     }
 }
 
@@ -1183,14 +1818,15 @@ fn required_arg<'a>(option: &str, value: Option<&'a String>) -> Result<&'a str, 
 #[cfg(test)]
 mod tests {
     use super::{
-        BcpColumnBindings, BenchOptions, TABLE_PLACEHOLDER, c_string, format_date32,
-        format_decimal, format_timestamp_millis, push_utf16le, rows_per_second,
-        validate_ipc_schema_and_count, BcpColumnBuffer,
+        BcpColumnBindings, BcpColumnBuffer, BenchOptions, DatabaseFileIoDelta,
+        DatabaseFileIoSnapshot, SessionWaitDelta, SessionWaitSnapshot, TABLE_PLACEHOLDER, c_string,
+        database_file_io_deltas, format_date32, format_decimal, format_timestamp_millis,
+        push_utf16le, rows_per_second, session_wait_deltas, validate_ipc_schema_and_count,
     };
     use arrow_array::{
         ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-        Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
-        TimestampMillisecondArray, TimestampNanosecondArray,
+        Float64Array, Int32Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
+        TimestampNanosecondArray,
     };
     use arrow_ipc::writer::FileWriter;
     use arrow_schema::{DataType, Field, Schema};
@@ -1222,11 +1858,182 @@ mod tests {
         assert_eq!(options.batch_size, 8);
         assert_eq!(options.scenario, "narrow_numeric");
         assert_eq!(options.repeat, 3);
+        assert!(!options.profile_sqlserver);
+        assert!(!options.defer_batches);
         assert_eq!(
             options.input_ipc.as_path(),
             std::path::Path::new("/workspace/bench.arrow")
         );
-        assert_eq!(options.create_table_sql_template, create_table_sql_template());
+        assert_eq!(
+            options.create_table_sql_template,
+            create_table_sql_template()
+        );
+    }
+
+    #[test]
+    fn parses_sql_server_profile_option() {
+        let options = BenchOptions::parse(vec![
+            "--input-ipc".to_owned(),
+            "/workspace/bench.arrow".to_owned(),
+            "--create-table-sql-template".to_owned(),
+            create_table_sql_template(),
+            "--profile-sqlserver".to_owned(),
+        ])
+        .expect("profile option should parse");
+
+        assert!(options.profile_sqlserver);
+    }
+
+    #[test]
+    fn parses_deferred_batch_policy() {
+        let options = BenchOptions::parse(vec![
+            "--batch-size".to_owned(),
+            "8".to_owned(),
+            "--input-ipc".to_owned(),
+            "/workspace/bench.arrow".to_owned(),
+            "--create-table-sql-template".to_owned(),
+            create_table_sql_template(),
+            "--defer-batches".to_owned(),
+        ])
+        .expect("deferred batch option should parse");
+
+        assert!(options.defer_batches);
+        assert_eq!(
+            options.transaction_policy(),
+            "defer all BCP rows to bcp_done"
+        );
+    }
+
+    #[test]
+    fn default_batch_policy_reports_bcp_batch_boundary() {
+        let options = BenchOptions::parse(vec![
+            "--batch-size".to_owned(),
+            "8".to_owned(),
+            "--input-ipc".to_owned(),
+            "/workspace/bench.arrow".to_owned(),
+            "--create-table-sql-template".to_owned(),
+            create_table_sql_template(),
+        ])
+        .expect("default batch policy should parse");
+
+        assert_eq!(
+            options.transaction_policy(),
+            "bcp_batch every 8 rows plus bcp_done"
+        );
+    }
+
+    #[test]
+    fn sql_server_session_wait_deltas_exclude_initial_totals() {
+        let waits = session_wait_deltas(
+            &[
+                session_wait("ASYNC_NETWORK_IO", 3, 5, 1),
+                session_wait("UNCHANGED", 8, 13, 2),
+            ],
+            &[
+                session_wait("WRITELOG", 4, 23, 3),
+                session_wait("ASYNC_NETWORK_IO", 5, 16, 4),
+                session_wait("UNCHANGED", 8, 13, 2),
+            ],
+        );
+
+        assert_eq!(
+            waits,
+            [
+                SessionWaitDelta {
+                    wait_type: "WRITELOG".to_owned(),
+                    waiting_tasks_count: 4,
+                    wait_time_ms: 23,
+                    signal_wait_time_ms: 3,
+                },
+                SessionWaitDelta {
+                    wait_type: "ASYNC_NETWORK_IO".to_owned(),
+                    waiting_tasks_count: 2,
+                    wait_time_ms: 11,
+                    signal_wait_time_ms: 3,
+                },
+            ]
+        );
+    }
+
+    fn session_wait(
+        wait_type: &str,
+        waiting_tasks_count: i64,
+        wait_time_ms: i64,
+        signal_wait_time_ms: i64,
+    ) -> SessionWaitSnapshot {
+        SessionWaitSnapshot {
+            wait_type: wait_type.to_owned(),
+            waiting_tasks_count,
+            wait_time_ms,
+            signal_wait_time_ms,
+        }
+    }
+
+    #[test]
+    fn sql_server_database_file_io_deltas_preserve_metadata() {
+        let files = database_file_io_deltas(
+            &[
+                database_file_io(2, "bench_log", "LOG", 1, 8, 2, 3, 64, 5),
+                database_file_io(1, "bench_data", "ROWS", 5, 40, 3, 7, 96, 11),
+            ],
+            &[
+                database_file_io(2, "bench_log", "LOG", 1, 8, 2, 9, 192, 17),
+                database_file_io(1, "bench_data", "ROWS", 8, 88, 7, 11, 160, 19),
+            ],
+        );
+
+        assert_eq!(
+            files,
+            [
+                DatabaseFileIoDelta {
+                    file_id: 2,
+                    logical_name: "bench_log".to_owned(),
+                    file_type: "LOG".to_owned(),
+                    read_count: 0,
+                    read_bytes: 0,
+                    read_stall_ms: 0,
+                    write_count: 6,
+                    write_bytes: 128,
+                    write_stall_ms: 12,
+                },
+                DatabaseFileIoDelta {
+                    file_id: 1,
+                    logical_name: "bench_data".to_owned(),
+                    file_type: "ROWS".to_owned(),
+                    read_count: 3,
+                    read_bytes: 48,
+                    read_stall_ms: 4,
+                    write_count: 4,
+                    write_bytes: 64,
+                    write_stall_ms: 8,
+                },
+            ]
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn database_file_io(
+        file_id: i32,
+        logical_name: &str,
+        file_type: &str,
+        read_count: i64,
+        read_bytes: i64,
+        read_stall_ms: i64,
+        write_count: i64,
+        write_bytes: i64,
+        write_stall_ms: i64,
+    ) -> DatabaseFileIoSnapshot {
+        DatabaseFileIoSnapshot {
+            file_id,
+            logical_name: logical_name.to_owned(),
+            file_type: file_type.to_owned(),
+            read_count,
+            read_bytes,
+            read_stall_ms,
+            write_count,
+            write_bytes,
+            write_stall_ms,
+        }
     }
 
     #[test]
@@ -1268,10 +2075,7 @@ mod tests {
             .create_table_sql("[dbo].[target]")
             .expect("template should render");
 
-        assert_eq!(
-            sql,
-            "CREATE TABLE [dbo].[target] ([id32] int NOT NULL);"
-        );
+        assert_eq!(sql, "CREATE TABLE [dbo].[target] ([id32] int NOT NULL);");
     }
 
     #[test]

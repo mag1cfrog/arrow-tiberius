@@ -266,7 +266,7 @@ fn print_arrow_odbc_help() {
 
 fn print_compare_help() {
     println!(
-        "Usage:\n  cargo xtask writer-bench compare [OPTIONS]\n\nData Options:\n  --rows <COUNT>                    Total rows to generate [default: 100000]\n  --batch-size <COUNT>              Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>                 Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>                  Number of benchmark repeats [default: 1]\n  --backends <LIST>                 Comma-separated backends: baseline,direct-raw,arrow-odbc,odbc-bcp [default: baseline,arrow-odbc]\n  --output <FORMAT>                 Output format: human [default: human]\n  --profile-direct                  Include direct-raw phase timings and counters\n\nSQL Server Options:\n  --container-runtime <PATH>        Container runtime executable, such as docker or podman\n  --connection-string <URL>         Use an existing SQL Server instead of a local container\n  --image <IMAGE>                   SQL Server container image\n  --database <NAME>                 Benchmark database name\n  --tds-packet-size <BYTES>         Requested TDS packet size for Tiberius writers\n  --profile-sqlserver               Profile the SQL Server writer session during compare writes\n  --sqlserver-profile-sample-ms <MILLIS>\n                                    SQL Server profile sample interval [default: 250]\n  --keep-container                  Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>            Managed ODBC runner image tag\n  --keep-runner-image               Keep the managed ODBC runner image after the task exits\n  -h, --help                        Print help\n\nCompare runs use one shared Arrow IPC dataset as the fairness boundary."
+        "Usage:\n  cargo xtask writer-bench compare [OPTIONS]\n\nData Options:\n  --rows <COUNT>                    Total rows to generate [default: 100000]\n  --batch-size <COUNT>              Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>                 Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>                  Number of benchmark repeats [default: 1]\n  --backends <LIST>                 Comma-separated backends: baseline,direct-raw,arrow-odbc,odbc-bcp [default: baseline,arrow-odbc]\n  --output <FORMAT>                 Output format: human [default: human]\n  --profile-direct                  Include direct-raw phase timings and counters\n\nSQL Server Options:\n  --container-runtime <PATH>        Container runtime executable, such as docker or podman\n  --connection-string <URL>         Use an existing SQL Server instead of a local container\n  --image <IMAGE>                   SQL Server container image\n  --database <NAME>                 Benchmark database name\n  --tds-packet-size <BYTES>         Requested TDS packet size for Tiberius writers\n  --profile-sqlserver               Profile the SQL Server writer session during compare writes\n  --sqlserver-profile-sample-ms <MILLIS>\n                                    SQL Server profile sample interval [default: 250]\n  --keep-container                  Keep managed containers after the task exits\n\nODBC Runner Options:\n  --arrow-odbc-autocommit           Use ODBC autocommit for arrow-odbc compares\n  --odbc-bcp-defer-batches          Defer odbc-bcp commits to bcp_done\n  --runner-image <IMAGE>            Managed ODBC runner image tag\n  --keep-runner-image               Keep the managed ODBC runner image after the task exits\n  -h, --help                        Print help\n\nCompare runs use one shared Arrow IPC dataset as the fairness boundary."
     );
 }
 
@@ -719,6 +719,10 @@ fn print_sql_server_profile_target(prefix: &str, target: Option<&SqlServerProfil
             "{prefix}  observer session id: {}",
             target.observer_session_id
         );
+        println!("{prefix}  recovery model: {}", target.recovery_model);
+        println!(
+            "{prefix}  transaction policy: bulk writer request without explicit benchmark transaction"
+        );
         println!(
             "{prefix}  writer connection: {} {} encrypted={} packet_size={} reads={} writes={} last_read={} last_write={}",
             target.initial_activity.connection.net_transport,
@@ -776,6 +780,8 @@ fn print_sql_server_profile_target(prefix: &str, target: Option<&SqlServerProfil
         );
         print_sql_server_session_wait_deltas(prefix, &target.session_wait_deltas);
         print_sql_server_database_file_io_deltas(prefix, &target.database_file_io_deltas);
+        print_sql_server_profile_phase_deltas(prefix, &target.phase_deltas);
+        print_sql_server_table_page_snapshots(prefix, &target.table_page_snapshots);
     }
 }
 
@@ -845,6 +851,46 @@ fn print_sql_server_database_file_io_deltas(prefix: &str, files: &[SqlServerData
             file.write_count,
             file.write_bytes,
             file.write_stall_ms
+        );
+    }
+}
+
+fn print_sql_server_profile_phase_deltas(prefix: &str, phases: &[SqlServerProfilePhaseDelta]) {
+    if phases.is_empty() {
+        println!("{prefix}  phase deltas: <none>");
+        return;
+    }
+
+    println!("{prefix}  phase deltas:");
+    for phase in phases {
+        println!("{prefix}    {}:", phase.phase);
+        print_sql_server_session_wait_deltas(&format!("{prefix}    "), &phase.session_wait_deltas);
+        print_sql_server_database_file_io_deltas(
+            &format!("{prefix}    "),
+            &phase.database_file_io_deltas,
+        );
+    }
+}
+
+fn print_sql_server_table_page_snapshots(
+    prefix: &str,
+    tables: &[sqlserver_profile::TablePageSnapshot],
+) {
+    if tables.is_empty() {
+        println!("{prefix}  table page snapshots: <none>");
+        return;
+    }
+
+    println!("{prefix}  table page snapshots:");
+    for table in tables {
+        println!(
+            "{prefix}    {}: rows={} used_pages={} in_row_used_pages={} lob_used_pages={} row_overflow_used_pages={}",
+            table.table,
+            table.row_count,
+            table.used_page_count,
+            table.in_row_used_page_count,
+            table.lob_used_page_count,
+            table.row_overflow_used_page_count
         );
     }
 }
@@ -1083,6 +1129,8 @@ struct CompareBenchOptions {
     keep_runner_image: bool,
     profile_direct: bool,
     tds_packet_size: Option<u32>,
+    arrow_odbc_autocommit: bool,
+    odbc_bcp_defer_batches: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1109,6 +1157,8 @@ impl CompareBenchOptions {
             keep_runner_image: false,
             profile_direct: false,
             tds_packet_size: None,
+            arrow_odbc_autocommit: false,
+            odbc_bcp_defer_batches: false,
         };
         let mut sql_server_profile_sample_interval = None;
         let mut index = 0;
@@ -1197,6 +1247,12 @@ impl CompareBenchOptions {
                 "--keep-runner-image" => {
                     options.keep_runner_image = true;
                 }
+                "--arrow-odbc-autocommit" => {
+                    options.arrow_odbc_autocommit = true;
+                }
+                "--odbc-bcp-defer-batches" => {
+                    options.odbc_bcp_defer_batches = true;
+                }
                 "--profile-direct" => {
                     options.profile_direct = true;
                 }
@@ -1231,6 +1287,10 @@ enum BenchmarkBackend {
 impl BenchmarkBackend {
     fn is_tiberius(&self) -> bool {
         matches!(self, Self::Baseline | Self::DirectRaw)
+    }
+
+    fn supports_sql_server_profile(&self) -> bool {
+        self.is_tiberius() || matches!(self, Self::ArrowOdbc | Self::OdbcBcp)
     }
 }
 
@@ -1499,6 +1559,8 @@ fn run_arrow_odbc_runner_for_benchmark(
         network,
         connection,
         ipc_dataset,
+        false,
+        false,
     )?;
 
     odbc_runner::run_runner_command(&command_options).map_err(WriterBenchError::OdbcRunner)
@@ -1510,6 +1572,8 @@ fn run_arrow_odbc_runner_for_benchmark_capture(
     network: Option<&sqlserver::ManagedNetwork>,
     connection: &sqlserver::SqlServerConnection,
     ipc_dataset: &ManagedIpcDataset,
+    profile_sql_server: bool,
+    autocommit: bool,
 ) -> Result<OdbcRunnerBenchReport, WriterBenchError> {
     println!("  action: run_arrow_odbc_runner");
     let command_options = arrow_odbc_runner_command_options(
@@ -1518,6 +1582,8 @@ fn run_arrow_odbc_runner_for_benchmark_capture(
         network,
         connection,
         ipc_dataset,
+        profile_sql_server,
+        autocommit,
     )?;
     let output = odbc_runner::run_runner_command_capture(&command_options)
         .map_err(WriterBenchError::OdbcRunner)?;
@@ -1534,10 +1600,19 @@ fn run_odbc_bcp_runner_for_benchmark_capture(
     network: Option<&sqlserver::ManagedNetwork>,
     connection: &sqlserver::SqlServerConnection,
     ipc_dataset: &ManagedIpcDataset,
+    profile_sql_server: bool,
+    defer_batches: bool,
 ) -> Result<OdbcRunnerBenchReport, WriterBenchError> {
     println!("  action: run_odbc_bcp_runner");
-    let command_options =
-        odbc_bcp_runner_command_options(benchmark, runner_image, network, connection, ipc_dataset)?;
+    let command_options = odbc_bcp_runner_command_options(
+        benchmark,
+        runner_image,
+        network,
+        connection,
+        ipc_dataset,
+        profile_sql_server,
+        defer_batches,
+    )?;
     let output = odbc_runner::run_runner_command_capture(&command_options)
         .map_err(WriterBenchError::OdbcRunner)?;
 
@@ -1553,6 +1628,8 @@ fn arrow_odbc_runner_command_options(
     network: Option<&sqlserver::ManagedNetwork>,
     connection: &sqlserver::SqlServerConnection,
     ipc_dataset: &ManagedIpcDataset,
+    profile_sql_server: bool,
+    autocommit: bool,
 ) -> Result<odbc_runner::RunnerCommandOptions, WriterBenchError> {
     let container_path = ipc_dataset.container_path.as_deref().ok_or_else(|| {
         WriterBenchError::Validation(
@@ -1578,17 +1655,19 @@ fn arrow_odbc_runner_command_options(
         ],
         Some(repository_root()?),
         Some("/workspace".to_owned()),
-        arrow_odbc_runner_args(benchmark, container_path)?,
+        arrow_odbc_runner_args(benchmark, container_path, profile_sql_server, autocommit)?,
     ))
 }
 
 fn arrow_odbc_runner_args(
     benchmark: &WriterBenchOptions,
     input_ipc: &str,
+    profile_sql_server: bool,
+    autocommit: bool,
 ) -> Result<Vec<String>, WriterBenchError> {
     let create_table_sql_template = arrow_odbc_create_table_sql_template(benchmark)?;
 
-    Ok(vec![
+    let mut args = vec![
         "cargo".to_owned(),
         "run".to_owned(),
         "--release".to_owned(),
@@ -1610,7 +1689,15 @@ fn arrow_odbc_runner_args(
         input_ipc.to_owned(),
         "--create-table-sql-template".to_owned(),
         create_table_sql_template,
-    ])
+    ];
+    if profile_sql_server {
+        args.push("--profile-sqlserver".to_owned());
+    }
+    if autocommit {
+        args.push("--autocommit".to_owned());
+    }
+
+    Ok(args)
 }
 
 fn odbc_bcp_runner_command_options(
@@ -1619,6 +1706,8 @@ fn odbc_bcp_runner_command_options(
     network: Option<&sqlserver::ManagedNetwork>,
     connection: &sqlserver::SqlServerConnection,
     ipc_dataset: &ManagedIpcDataset,
+    profile_sql_server: bool,
+    defer_batches: bool,
 ) -> Result<odbc_runner::RunnerCommandOptions, WriterBenchError> {
     let container_path = ipc_dataset.container_path.as_deref().ok_or_else(|| {
         WriterBenchError::Validation(
@@ -1640,17 +1729,19 @@ fn odbc_bcp_runner_command_options(
         ],
         Some(repository_root()?),
         Some("/workspace".to_owned()),
-        odbc_bcp_runner_args(benchmark, container_path)?,
+        odbc_bcp_runner_args(benchmark, container_path, profile_sql_server, defer_batches)?,
     ))
 }
 
 fn odbc_bcp_runner_args(
     benchmark: &WriterBenchOptions,
     input_ipc: &str,
+    profile_sql_server: bool,
+    defer_batches: bool,
 ) -> Result<Vec<String>, WriterBenchError> {
     let create_table_sql_template = arrow_odbc_create_table_sql_template(benchmark)?;
 
-    Ok(vec![
+    let mut args = vec![
         "cargo".to_owned(),
         "run".to_owned(),
         "--release".to_owned(),
@@ -1672,7 +1763,15 @@ fn odbc_bcp_runner_args(
         input_ipc.to_owned(),
         "--create-table-sql-template".to_owned(),
         create_table_sql_template,
-    ])
+    ];
+    if profile_sql_server {
+        args.push("--profile-sqlserver".to_owned());
+    }
+    if defer_batches {
+        args.push("--defer-batches".to_owned());
+    }
+
+    Ok(args)
 }
 
 fn arrow_odbc_create_table_sql_template(
@@ -2084,11 +2183,14 @@ type BenchClient = tiberius::Client<Compat<TcpStream>>;
 struct SqlServerProfileTarget {
     writer_session_id: i32,
     observer_session_id: i32,
+    recovery_model: String,
     sample_interval: Duration,
     initial_activity: sqlserver_profile::ActivitySnapshot,
     write_samples: Vec<SqlServerProfileSample>,
     session_wait_deltas: Vec<SqlServerSessionWaitDelta>,
     database_file_io_deltas: Vec<SqlServerDatabaseFileIoDelta>,
+    phase_deltas: Vec<SqlServerProfilePhaseDelta>,
+    table_page_snapshots: Vec<sqlserver_profile::TablePageSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2118,6 +2220,13 @@ struct SqlServerDatabaseFileIoDelta {
     write_count: i64,
     write_bytes: i64,
     write_stall_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqlServerProfilePhaseDelta {
+    phase: String,
+    session_wait_deltas: Vec<SqlServerSessionWaitDelta>,
+    database_file_io_deltas: Vec<SqlServerDatabaseFileIoDelta>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -2335,6 +2444,31 @@ fn merge_sql_server_database_file_io_deltas(
     });
 }
 
+fn merge_sql_server_profile_phase_delta(
+    target: &mut Vec<SqlServerProfilePhaseDelta>,
+    phase: &str,
+    session_wait_deltas: Vec<SqlServerSessionWaitDelta>,
+    database_file_io_deltas: Vec<SqlServerDatabaseFileIoDelta>,
+) {
+    if let Some(phase_delta) = target.iter_mut().find(|delta| delta.phase == phase) {
+        merge_sql_server_session_wait_deltas(
+            &mut phase_delta.session_wait_deltas,
+            session_wait_deltas,
+        );
+        merge_sql_server_database_file_io_deltas(
+            &mut phase_delta.database_file_io_deltas,
+            database_file_io_deltas,
+        );
+        return;
+    }
+
+    target.push(SqlServerProfilePhaseDelta {
+        phase: phase.to_owned(),
+        session_wait_deltas,
+        database_file_io_deltas,
+    });
+}
+
 struct SqlServerProfileSession {
     target: SqlServerProfileTarget,
     observer: BenchClient,
@@ -2351,6 +2485,7 @@ impl SqlServerProfileSession {
         let mut observer =
             connect(&connection.connection_string, &connection.database, None).await?;
         let observer_session_id = select_session_id(&mut observer).await?;
+        let recovery_model = sqlserver_profile::recovery_model(&mut observer).await?;
         let initial_activity =
             sqlserver_profile::current_activity_snapshot(&mut observer, writer_session_id).await?;
 
@@ -2358,11 +2493,14 @@ impl SqlServerProfileSession {
             target: SqlServerProfileTarget {
                 writer_session_id,
                 observer_session_id,
+                recovery_model,
                 sample_interval: options.sample_interval,
                 initial_activity,
                 write_samples: Vec::new(),
                 session_wait_deltas: Vec::new(),
                 database_file_io_deltas: Vec::new(),
+                phase_deltas: Vec::new(),
+                table_page_snapshots: Vec::new(),
             },
             observer,
             next_repeat_index: 0,
@@ -2373,7 +2511,25 @@ impl SqlServerProfileSession {
         self.target.clone()
     }
 
-    async fn sample_write<T, F>(&mut self, write: F) -> Result<T, WriterBenchError>
+    async fn snapshot_table_pages(&mut self, table: &TableName) -> Result<(), WriterBenchError> {
+        self.target.table_page_snapshots.push(
+            sqlserver_profile::table_page_snapshot(&mut self.observer, &table.quoted_sql()).await?,
+        );
+        Ok(())
+    }
+
+    fn next_repeat_index(&mut self) -> usize {
+        let repeat_index = self.next_repeat_index;
+        self.next_repeat_index = self.next_repeat_index.saturating_add(1);
+        repeat_index
+    }
+
+    async fn sample_phase<T, F>(
+        &mut self,
+        repeat_index: usize,
+        phase: &str,
+        write: F,
+    ) -> Result<T, WriterBenchError>
     where
         F: Future<Output = Result<T, WriterBenchError>>,
     {
@@ -2384,8 +2540,6 @@ impl SqlServerProfileSession {
         .await?;
         let initial_database_file_io =
             sqlserver_profile::database_file_io_snapshots(&mut self.observer).await?;
-        let repeat_index = self.next_repeat_index;
-        self.next_repeat_index = self.next_repeat_index.saturating_add(1);
         let started_at = Instant::now();
 
         let write_result = {
@@ -2418,6 +2572,12 @@ impl SqlServerProfileSession {
             sqlserver_profile::database_file_io_snapshots(&mut self.observer).await?;
         merge_sql_server_database_file_io_deltas(
             &mut self.target.database_file_io_deltas,
+            sql_server_database_file_io_deltas(&initial_database_file_io, &final_database_file_io),
+        );
+        merge_sql_server_profile_phase_delta(
+            &mut self.target.phase_deltas,
+            phase,
+            sql_server_session_wait_deltas(&initial_session_waits, &final_session_waits),
             sql_server_database_file_io_deltas(&initial_database_file_io, &final_database_file_io),
         );
 
@@ -2487,11 +2647,28 @@ fn run_compare_benchmark(
         ));
     }
 
+    if options.arrow_odbc_autocommit && !options.backends.contains(&BenchmarkBackend::ArrowOdbc) {
+        return Err(WriterBenchError::Validation(
+            "writer-bench compare --arrow-odbc-autocommit requires the arrow-odbc backend"
+                .to_owned(),
+        ));
+    }
+
+    if options.odbc_bcp_defer_batches && !options.backends.contains(&BenchmarkBackend::OdbcBcp) {
+        return Err(WriterBenchError::Validation(
+            "writer-bench compare --odbc-bcp-defer-batches requires the odbc-bcp backend"
+                .to_owned(),
+        ));
+    }
+
     if options.sql_server_profile.is_some()
-        && !options.backends.iter().any(BenchmarkBackend::is_tiberius)
+        && !options
+            .backends
+            .iter()
+            .any(BenchmarkBackend::supports_sql_server_profile)
     {
         return Err(WriterBenchError::Validation(
-            "writer-bench compare --profile-sqlserver requires the baseline or direct-raw backend"
+            "writer-bench compare --profile-sqlserver requires the baseline, direct-raw, arrow-odbc, or odbc-bcp backend"
                 .to_owned(),
         ));
     }
@@ -2571,6 +2748,8 @@ fn run_compare_benchmark(
                 network.as_ref(),
                 &connection,
                 &ipc_dataset,
+                options.sql_server_profile.is_some(),
+                options.arrow_odbc_autocommit,
             )?;
             backends.push(CompareBackendBenchReport::ArrowOdbc { report });
         }
@@ -2587,6 +2766,8 @@ fn run_compare_benchmark(
                 network.as_ref(),
                 &connection,
                 &ipc_dataset,
+                options.sql_server_profile.is_some(),
+                options.odbc_bcp_defer_batches,
             )?;
             backends.push(CompareBackendBenchReport::OdbcBcp { report });
         }
@@ -2786,7 +2967,7 @@ async fn run_tiberius_repeat_with_batches(
         arrow_tiberius::write::profile::start_direct_write_profile();
     }
 
-    let write_and_finish = async {
+    let write_batches = async {
         let write_start = Instant::now();
         for batch in batches {
             let batch = batch?;
@@ -2796,7 +2977,22 @@ async fn run_tiberius_repeat_with_batches(
                 .map_err(WriterBenchError::ArrowTiberius)?;
         }
         report.timings.write += write_start.elapsed();
+        Ok(())
+    };
+    let repeat_index = sql_server_profile_session
+        .as_mut()
+        .map(|profile_session| profile_session.next_repeat_index());
+    if let (Some(profile_session), Some(repeat_index)) =
+        (sql_server_profile_session.as_mut(), repeat_index)
+    {
+        profile_session
+            .sample_phase(repeat_index, "write_batch", write_batches)
+            .await?;
+    } else {
+        write_batches.await?;
+    }
 
+    let finish_writer = async {
         let finish_start = Instant::now();
         report.stats = writer
             .finish()
@@ -2805,10 +3001,14 @@ async fn run_tiberius_repeat_with_batches(
         report.timings.finish += finish_start.elapsed();
         Ok(())
     };
-    if let Some(profile_session) = sql_server_profile_session.as_mut() {
-        profile_session.sample_write(write_and_finish).await?;
+    if let (Some(profile_session), Some(repeat_index)) =
+        (sql_server_profile_session.as_mut(), repeat_index)
+    {
+        profile_session
+            .sample_phase(repeat_index, "finish", finish_writer)
+            .await?;
     } else {
-        write_and_finish.await?;
+        finish_writer.await?;
     }
 
     let validate_start = Instant::now();
@@ -2820,6 +3020,10 @@ async fn run_tiberius_repeat_with_batches(
             expected: report.stats.rows_written,
             actual: report.validated_rows,
         });
+    }
+
+    if let Some(profile_session) = sql_server_profile_session.as_mut() {
+        profile_session.snapshot_table_pages(table).await?;
     }
 
     if profiling_direct {
@@ -4280,6 +4484,7 @@ mod tests {
             OsString::from("bench_db"),
             OsString::from("--tds-packet-size"),
             OsString::from("32767"),
+            OsString::from("--arrow-odbc-autocommit"),
         ];
 
         let options = super::CompareBenchOptions::parse(&args).unwrap();
@@ -4300,6 +4505,7 @@ mod tests {
         assert_eq!(options.sql_server.database, "bench_db");
         assert!(options.sql_server.connection_string.is_some());
         assert_eq!(options.tds_packet_size, Some(32767));
+        assert!(options.arrow_odbc_autocommit);
     }
 
     #[test]
@@ -4329,6 +4535,7 @@ mod tests {
             OsString::from("narrow_numeric"),
             OsString::from("--backends"),
             OsString::from("baseline,direct-raw,arrow-odbc,odbc-bcp"),
+            OsString::from("--odbc-bcp-defer-batches"),
         ];
 
         let options = super::CompareBenchOptions::parse(&args).unwrap();
@@ -4342,6 +4549,7 @@ mod tests {
                 super::BenchmarkBackend::OdbcBcp
             ]
         );
+        assert!(options.odbc_bcp_defer_batches);
     }
 
     #[test]
@@ -4750,11 +4958,11 @@ mod tests {
     }
 
     #[test]
-    fn compare_rejects_sql_server_profile_for_external_backends_only() {
+    fn compare_rejects_bcp_deferred_batches_without_bcp_backend() {
         let args = [
             OsString::from("--backends"),
-            OsString::from("arrow-odbc,odbc-bcp"),
-            OsString::from("--profile-sqlserver"),
+            OsString::from("baseline"),
+            OsString::from("--odbc-bcp-defer-batches"),
         ];
 
         let options = super::CompareBenchOptions::parse(&args).unwrap();
@@ -4763,10 +4971,33 @@ mod tests {
         assert!(matches!(
             err,
             WriterBenchError::Validation(message)
-                if message.contains("--profile-sqlserver")
-                    && message.contains("baseline")
-                    && message.contains("direct-raw")
+                if message.contains("--odbc-bcp-defer-batches")
+                    && message.contains("odbc-bcp")
         ));
+    }
+
+    #[test]
+    fn compare_rejects_arrow_odbc_autocommit_without_arrow_odbc_backend() {
+        let args = [
+            OsString::from("--backends"),
+            OsString::from("baseline"),
+            OsString::from("--arrow-odbc-autocommit"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+        let err = super::run_compare_benchmark(&options).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("--arrow-odbc-autocommit")
+                    && message.contains("arrow-odbc")
+        ));
+    }
+
+    #[test]
+    fn odbc_bcp_supports_sql_server_profile() {
+        assert!(super::BenchmarkBackend::OdbcBcp.supports_sql_server_profile());
     }
 
     #[test]
@@ -4865,6 +5096,8 @@ mod tests {
             keep_runner_image: false,
             profile_direct: false,
             tds_packet_size: None,
+            arrow_odbc_autocommit: false,
+            odbc_bcp_defer_batches: false,
         };
 
         let dataset = super::prepare_compare_ipc_dataset(&options).unwrap();
@@ -5030,9 +5263,13 @@ mod tests {
             keep_runner_image: false,
         };
 
-        let args =
-            super::arrow_odbc_runner_args(&options.benchmark, "/workspace/target/bench.arrow")
-                .unwrap();
+        let args = super::arrow_odbc_runner_args(
+            &options.benchmark,
+            "/workspace/target/bench.arrow",
+            false,
+            false,
+        )
+        .unwrap();
 
         assert!(args.iter().any(|arg| arg == "--release"));
         assert!(args.windows(2).any(|pair| pair == ["--rows", "25"]));
@@ -5055,6 +5292,40 @@ mod tests {
     }
 
     #[test]
+    fn arrow_odbc_runner_args_pass_sql_server_profile_flag() {
+        let benchmark = WriterBenchOptions {
+            rows: 25,
+            batch_size: 5,
+            scenario: super::scenario_by_name("mixed_nullable").unwrap(),
+            repeat: 3,
+            output: BenchmarkOutput::Human,
+        };
+
+        let args =
+            super::arrow_odbc_runner_args(&benchmark, "/workspace/target/bench.arrow", true, false)
+                .unwrap();
+
+        assert!(args.iter().any(|arg| arg == "--profile-sqlserver"));
+    }
+
+    #[test]
+    fn arrow_odbc_runner_args_pass_autocommit_flag() {
+        let benchmark = WriterBenchOptions {
+            rows: 25,
+            batch_size: 5,
+            scenario: super::scenario_by_name("mixed_nullable").unwrap(),
+            repeat: 3,
+            output: BenchmarkOutput::Human,
+        };
+
+        let args =
+            super::arrow_odbc_runner_args(&benchmark, "/workspace/target/bench.arrow", false, true)
+                .unwrap();
+
+        assert!(args.iter().any(|arg| arg == "--autocommit"));
+    }
+
+    #[test]
     fn odbc_bcp_runner_args_include_shared_ipc_dataset() {
         let benchmark = WriterBenchOptions {
             rows: 25,
@@ -5065,7 +5336,8 @@ mod tests {
         };
 
         let args =
-            super::odbc_bcp_runner_args(&benchmark, "/workspace/target/bench.arrow").unwrap();
+            super::odbc_bcp_runner_args(&benchmark, "/workspace/target/bench.arrow", false, false)
+                .unwrap();
 
         assert!(args.iter().any(|arg| arg == "--release"));
         assert!(
@@ -5096,12 +5368,47 @@ mod tests {
         };
 
         let args =
-            super::odbc_bcp_runner_args(&benchmark, "/workspace/target/bench.arrow").unwrap();
+            super::odbc_bcp_runner_args(&benchmark, "/workspace/target/bench.arrow", false, false)
+                .unwrap();
 
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--scenario", "mixed_nullable"])
         );
+    }
+
+    #[test]
+    fn odbc_bcp_runner_args_pass_sql_server_profile_flag() {
+        let benchmark = WriterBenchOptions {
+            rows: 25,
+            batch_size: 5,
+            scenario: super::scenario_by_name("narrow_numeric").unwrap(),
+            repeat: 3,
+            output: BenchmarkOutput::Human,
+        };
+
+        let args =
+            super::odbc_bcp_runner_args(&benchmark, "/workspace/target/bench.arrow", true, false)
+                .unwrap();
+
+        assert!(args.iter().any(|arg| arg == "--profile-sqlserver"));
+    }
+
+    #[test]
+    fn odbc_bcp_runner_args_pass_deferred_batch_flag() {
+        let benchmark = WriterBenchOptions {
+            rows: 25,
+            batch_size: 5,
+            scenario: super::scenario_by_name("narrow_numeric").unwrap(),
+            repeat: 3,
+            output: BenchmarkOutput::Human,
+        };
+
+        let args =
+            super::odbc_bcp_runner_args(&benchmark, "/workspace/target/bench.arrow", false, true)
+                .unwrap();
+
+        assert!(args.iter().any(|arg| arg == "--defer-batches"));
     }
 
     #[test]

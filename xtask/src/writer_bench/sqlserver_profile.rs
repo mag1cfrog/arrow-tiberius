@@ -67,6 +67,16 @@ pub(super) struct DatabaseFileIoSnapshot {
     pub(super) write_stall_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TablePageSnapshot {
+    pub(super) table: String,
+    pub(super) row_count: i64,
+    pub(super) in_row_used_page_count: i64,
+    pub(super) lob_used_page_count: i64,
+    pub(super) row_overflow_used_page_count: i64,
+    pub(super) used_page_count: i64,
+}
+
 pub(super) async fn current_activity_snapshot(
     observer: &mut BenchClient,
     writer_session_id: i32,
@@ -134,6 +144,50 @@ pub(super) async fn database_file_io_snapshots(
         .map_err(WriterBenchError::Tiberius)?;
 
     rows.iter().map(database_file_io_from_row).collect()
+}
+
+pub(super) async fn recovery_model(observer: &mut BenchClient) -> Result<String, WriterBenchError> {
+    let row = observer
+        .simple_query(recovery_model_query())
+        .await
+        .map_err(WriterBenchError::Tiberius)?
+        .into_row()
+        .await
+        .map_err(WriterBenchError::Tiberius)?
+        .ok_or_else(|| {
+            WriterBenchError::Validation(
+                "SQL Server recovery model snapshot found no current database".to_owned(),
+            )
+        })?;
+
+    required_string(&row, "recovery_model")
+}
+
+pub(super) async fn table_page_snapshot(
+    observer: &mut BenchClient,
+    table: &str,
+) -> Result<TablePageSnapshot, WriterBenchError> {
+    let row = observer
+        .simple_query(table_page_query(table))
+        .await
+        .map_err(WriterBenchError::Tiberius)?
+        .into_row()
+        .await
+        .map_err(WriterBenchError::Tiberius)?
+        .ok_or_else(|| {
+            WriterBenchError::Validation(format!(
+                "SQL Server table page snapshot found no row for {table}"
+            ))
+        })?;
+
+    Ok(TablePageSnapshot {
+        table: table.to_owned(),
+        row_count: required_i64(&row, "row_count")?,
+        in_row_used_page_count: required_i64(&row, "in_row_used_page_count")?,
+        lob_used_page_count: required_i64(&row, "lob_used_page_count")?,
+        row_overflow_used_page_count: required_i64(&row, "row_overflow_used_page_count")?,
+        used_page_count: required_i64(&row, "used_page_count")?,
+    })
 }
 
 async fn request_snapshot(
@@ -301,6 +355,27 @@ fn database_file_io_query() -> &'static str {
     ORDER BY f.type, f.file_id"
 }
 
+fn recovery_model_query() -> &'static str {
+    "SELECT \
+        CONVERT(nvarchar(60), d.recovery_model_desc) AS recovery_model \
+    FROM sys.databases AS d \
+    WHERE d.database_id = DB_ID()"
+}
+
+fn table_page_query(table: &str) -> String {
+    let table = table.replace('\'', "''");
+    format!(
+        "SELECT \
+            CONVERT(bigint, COALESCE(SUM(s.row_count), 0)) AS row_count, \
+            CONVERT(bigint, COALESCE(SUM(s.in_row_used_page_count), 0)) AS in_row_used_page_count, \
+            CONVERT(bigint, COALESCE(SUM(s.lob_used_page_count), 0)) AS lob_used_page_count, \
+            CONVERT(bigint, COALESCE(SUM(s.row_overflow_used_page_count), 0)) AS row_overflow_used_page_count, \
+            CONVERT(bigint, COALESCE(SUM(s.used_page_count), 0)) AS used_page_count \
+        FROM sys.dm_db_partition_stats AS s \
+        WHERE s.object_id = OBJECT_ID(N'{table}')"
+    )
+}
+
 fn required_i32(row: &tiberius::Row, column: &'static str) -> Result<i32, WriterBenchError> {
     row.try_get::<i32, _>(column)
         .map_err(WriterBenchError::Tiberius)?
@@ -346,8 +421,8 @@ fn null_snapshot_column(column: &'static str) -> WriterBenchError {
 #[cfg(test)]
 mod tests {
     use super::{
-        connection_snapshot_query, database_file_io_query, request_snapshot_query,
-        session_waits_query, waiting_tasks_query,
+        connection_snapshot_query, database_file_io_query, recovery_model_query,
+        request_snapshot_query, session_waits_query, table_page_query, waiting_tasks_query,
     };
 
     #[test]
@@ -401,5 +476,25 @@ mod tests {
         assert!(query.contains("INNER JOIN sys.database_files AS f"));
         assert!(query.contains("AS logical_name"));
         assert!(query.contains("AS write_stall_ms"));
+    }
+
+    #[test]
+    fn recovery_model_query_targets_current_database() {
+        let query = recovery_model_query();
+
+        assert!(query.contains("FROM sys.databases AS d"));
+        assert!(query.contains("WHERE d.database_id = DB_ID()"));
+        assert!(query.contains("AS recovery_model"));
+    }
+
+    #[test]
+    fn table_page_query_targets_one_table_allocation_units() {
+        let query = table_page_query("[dbo].[bench'o]");
+
+        assert!(query.contains("FROM sys.dm_db_partition_stats AS s"));
+        assert!(query.contains("OBJECT_ID(N'[dbo].[bench''o]')"));
+        assert!(query.contains("AS in_row_used_page_count"));
+        assert!(query.contains("AS lob_used_page_count"));
+        assert!(query.contains("AS row_overflow_used_page_count"));
     }
 }
