@@ -21,6 +21,7 @@ use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 mod dataset;
+mod sqlserver_profile;
 
 static BENCH_TABLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static BENCH_IPC_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -347,7 +348,7 @@ fn print_tiberius_backend_summary(report: &TiberiusBenchReport) {
     println!("    cleanup: {}", format_duration(report.timings.cleanup));
     println!("    total: {}", format_duration(report.timings.total));
     print_peak_rss("    ", report.peak_rss_kib);
-    print_sql_server_profile_target("    ", report.sql_server_profile_target);
+    print_sql_server_profile_target("    ", report.sql_server_profile_target.as_ref());
     if let Some(profile) = report.direct_profile {
         print_direct_profile("    ", profile);
     }
@@ -704,7 +705,7 @@ fn print_peak_rss(prefix: &str, peak_rss_kib: Option<u64>) {
     }
 }
 
-fn print_sql_server_profile_target(prefix: &str, target: Option<SqlServerProfileTarget>) {
+fn print_sql_server_profile_target(prefix: &str, target: Option<&SqlServerProfileTarget>) {
     if let Some(target) = target {
         println!("{prefix}sql server profile:");
         println!(
@@ -715,6 +716,15 @@ fn print_sql_server_profile_target(prefix: &str, target: Option<SqlServerProfile
         println!(
             "{prefix}  observer session id: {}",
             target.observer_session_id
+        );
+        println!(
+            "{prefix}  writer connection: {} {} encrypted={} packet_size={} reads={} writes={}",
+            target.initial_connection.net_transport,
+            target.initial_connection.protocol_type,
+            target.initial_connection.encrypt_option,
+            target.initial_connection.net_packet_size,
+            target.initial_connection.num_reads,
+            target.initial_connection.num_writes
         );
     }
 }
@@ -1895,7 +1905,7 @@ struct GeneratedBatchSummary {
     rows: usize,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct TiberiusBenchReport {
     stats: arrow_tiberius::WriteStats,
     validated_rows: u64,
@@ -1922,7 +1932,7 @@ struct CompareBenchReport {
     backends: Vec<CompareBackendBenchReport>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CompareBackendBenchReport {
     Baseline { report: TiberiusBenchReport },
     DirectRaw { report: TiberiusBenchReport },
@@ -1950,11 +1960,12 @@ struct OdbcRunnerBenchReport {
 
 type BenchClient = tiberius::Client<Compat<TcpStream>>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SqlServerProfileTarget {
     writer_session_id: i32,
     observer_session_id: i32,
     sample_interval: Duration,
+    initial_connection: sqlserver_profile::ConnectionSnapshot,
 }
 
 struct SqlServerProfileSession {
@@ -1972,19 +1983,22 @@ impl SqlServerProfileSession {
         let mut observer =
             connect(&connection.connection_string, &connection.database, None).await?;
         let observer_session_id = select_session_id(&mut observer).await?;
+        let initial_connection =
+            sqlserver_profile::connection_snapshot(&mut observer, writer_session_id).await?;
 
         Ok(Self {
             target: SqlServerProfileTarget {
                 writer_session_id,
                 observer_session_id,
                 sample_interval: options.sample_interval,
+                initial_connection,
             },
             _observer: observer,
         })
     }
 
     fn target(&self) -> SqlServerProfileTarget {
-        self.target
+        self.target.clone()
     }
 }
 
