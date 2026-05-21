@@ -821,12 +821,8 @@ fn print_sql_server_session_wait_deltas(prefix: &str, waits: &[SqlServerSessionW
     println!("{prefix}  session wait deltas:");
     for wait in waits {
         println!(
-            "{prefix}    {}: wait_ms={} tasks={} max_wait_ms={} signal_wait_ms={}",
-            wait.wait_type,
-            wait.wait_time_ms,
-            wait.waiting_tasks_count,
-            wait.max_wait_time_ms,
-            wait.signal_wait_time_ms
+            "{prefix}    {}: wait_ms={} tasks={} signal_wait_ms={}",
+            wait.wait_type, wait.wait_time_ms, wait.waiting_tasks_count, wait.signal_wait_time_ms
         );
     }
 }
@@ -2108,7 +2104,6 @@ struct SqlServerSessionWaitDelta {
     wait_type: String,
     waiting_tasks_count: i64,
     wait_time_ms: i64,
-    max_wait_time_ms: i64,
     signal_wait_time_ms: i64,
 }
 
@@ -2187,7 +2182,6 @@ fn sql_server_session_wait_deltas(
                     initial_wait.map_or(0, |wait| wait.wait_time_ms),
                     final_wait.wait_time_ms,
                 ),
-                max_wait_time_ms: final_wait.max_wait_time_ms,
                 signal_wait_time_ms: counter_delta(
                     initial_wait.map_or(0, |wait| wait.signal_wait_time_ms),
                     final_wait.signal_wait_time_ms,
@@ -2262,12 +2256,89 @@ fn sql_server_database_file_io_deltas(
     deltas
 }
 
+fn merge_sql_server_session_wait_deltas(
+    target: &mut Vec<SqlServerSessionWaitDelta>,
+    source: Vec<SqlServerSessionWaitDelta>,
+) {
+    let mut merged = target
+        .drain(..)
+        .map(|wait| (wait.wait_type.clone(), wait))
+        .collect::<BTreeMap<_, _>>();
+
+    for wait in source {
+        let merged_wait =
+            merged
+                .entry(wait.wait_type.clone())
+                .or_insert(SqlServerSessionWaitDelta {
+                    wait_type: wait.wait_type,
+                    waiting_tasks_count: 0,
+                    wait_time_ms: 0,
+                    signal_wait_time_ms: 0,
+                });
+        merged_wait.waiting_tasks_count = merged_wait
+            .waiting_tasks_count
+            .saturating_add(wait.waiting_tasks_count);
+        merged_wait.wait_time_ms = merged_wait.wait_time_ms.saturating_add(wait.wait_time_ms);
+        merged_wait.signal_wait_time_ms = merged_wait
+            .signal_wait_time_ms
+            .saturating_add(wait.signal_wait_time_ms);
+    }
+
+    *target = merged.into_values().collect();
+    target.sort_by(|left, right| {
+        right
+            .wait_time_ms
+            .cmp(&left.wait_time_ms)
+            .then_with(|| left.wait_type.cmp(&right.wait_type))
+    });
+}
+
+fn merge_sql_server_database_file_io_deltas(
+    target: &mut Vec<SqlServerDatabaseFileIoDelta>,
+    source: Vec<SqlServerDatabaseFileIoDelta>,
+) {
+    let mut merged = target
+        .drain(..)
+        .map(|file| (file.file_id, file))
+        .collect::<BTreeMap<_, _>>();
+
+    for file in source {
+        let merged_file = merged
+            .entry(file.file_id)
+            .or_insert(SqlServerDatabaseFileIoDelta {
+                file_id: file.file_id,
+                logical_name: file.logical_name,
+                file_type: file.file_type,
+                read_count: 0,
+                read_bytes: 0,
+                read_stall_ms: 0,
+                write_count: 0,
+                write_bytes: 0,
+                write_stall_ms: 0,
+            });
+        merged_file.read_count = merged_file.read_count.saturating_add(file.read_count);
+        merged_file.read_bytes = merged_file.read_bytes.saturating_add(file.read_bytes);
+        merged_file.read_stall_ms = merged_file.read_stall_ms.saturating_add(file.read_stall_ms);
+        merged_file.write_count = merged_file.write_count.saturating_add(file.write_count);
+        merged_file.write_bytes = merged_file.write_bytes.saturating_add(file.write_bytes);
+        merged_file.write_stall_ms = merged_file
+            .write_stall_ms
+            .saturating_add(file.write_stall_ms);
+    }
+
+    *target = merged.into_values().collect();
+    target.sort_by(|left, right| {
+        left.file_type
+            .cmp(&right.file_type)
+            .then_with(|| left.logical_name.cmp(&right.logical_name))
+            .then_with(|| left.file_id.cmp(&right.file_id))
+    });
+}
+
 struct SqlServerProfileSession {
     target: SqlServerProfileTarget,
     observer: BenchClient,
     next_repeat_index: usize,
-    initial_session_waits: Vec<sqlserver_profile::SessionWaitSnapshot>,
-    initial_database_file_io: Vec<sqlserver_profile::DatabaseFileIoSnapshot>,
 }
 
 impl SqlServerProfileSession {
@@ -2282,10 +2353,6 @@ impl SqlServerProfileSession {
         let observer_session_id = select_session_id(&mut observer).await?;
         let initial_activity =
             sqlserver_profile::current_activity_snapshot(&mut observer, writer_session_id).await?;
-        let initial_session_waits =
-            sqlserver_profile::session_wait_snapshots(&mut observer, writer_session_id).await?;
-        let initial_database_file_io =
-            sqlserver_profile::database_file_io_snapshots(&mut observer).await?;
 
         Ok(Self {
             target: SqlServerProfileTarget {
@@ -2299,8 +2366,6 @@ impl SqlServerProfileSession {
             },
             observer,
             next_repeat_index: 0,
-            initial_session_waits,
-            initial_database_file_io,
         })
     }
 
@@ -2308,53 +2373,80 @@ impl SqlServerProfileSession {
         self.target.clone()
     }
 
-    async fn finish(&mut self) -> Result<(), WriterBenchError> {
+    async fn sample_write<T, F>(&mut self, write: F) -> Result<T, WriterBenchError>
+    where
+        F: Future<Output = Result<T, WriterBenchError>>,
+    {
+        let initial_session_waits = sqlserver_profile::session_wait_snapshots(
+            &mut self.observer,
+            self.target.writer_session_id,
+        )
+        .await?;
+        let initial_database_file_io =
+            sqlserver_profile::database_file_io_snapshots(&mut self.observer).await?;
+        let repeat_index = self.next_repeat_index;
+        self.next_repeat_index = self.next_repeat_index.saturating_add(1);
+        let started_at = Instant::now();
+
+        let write_result = {
+            let sample_activity = self.sample_write_activity(repeat_index, started_at);
+            tokio::pin!(sample_activity);
+            tokio::pin!(write);
+
+            tokio::select! {
+                result = &mut write => result,
+                result = &mut sample_activity => {
+                    result?;
+                    Err(WriterBenchError::Validation(
+                        "SQL Server write sampler stopped before the measured write finished"
+                            .to_owned(),
+                    ))
+                }
+            }
+        };
+
         let final_session_waits = sqlserver_profile::session_wait_snapshots(
             &mut self.observer,
             self.target.writer_session_id,
         )
         .await?;
-        self.target.session_wait_deltas =
-            sql_server_session_wait_deltas(&self.initial_session_waits, &final_session_waits);
+        merge_sql_server_session_wait_deltas(
+            &mut self.target.session_wait_deltas,
+            sql_server_session_wait_deltas(&initial_session_waits, &final_session_waits),
+        );
         let final_database_file_io =
             sqlserver_profile::database_file_io_snapshots(&mut self.observer).await?;
-        self.target.database_file_io_deltas = sql_server_database_file_io_deltas(
-            &self.initial_database_file_io,
-            &final_database_file_io,
+        merge_sql_server_database_file_io_deltas(
+            &mut self.target.database_file_io_deltas,
+            sql_server_database_file_io_deltas(&initial_database_file_io, &final_database_file_io),
         );
-        Ok(())
+
+        write_result
     }
 
-    async fn sample_write<T, F>(&mut self, write: F) -> Result<T, WriterBenchError>
-    where
-        F: Future<Output = Result<T, WriterBenchError>>,
-    {
-        let repeat_index = self.next_repeat_index;
-        self.next_repeat_index = self.next_repeat_index.saturating_add(1);
-        let started_at = Instant::now();
+    async fn sample_write_activity(
+        &mut self,
+        repeat_index: usize,
+        started_at: Instant,
+    ) -> Result<(), WriterBenchError> {
         let mut sample_interval = tokio::time::interval(self.target.sample_interval);
         sample_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         sample_interval.tick().await;
-        tokio::pin!(write);
 
         loop {
-            tokio::select! {
-                result = &mut write => return result,
-                _ = sample_interval.tick() => {
-                    let write_elapsed_start = started_at.elapsed();
-                    let activity = sqlserver_profile::current_activity_snapshot(
-                        &mut self.observer,
-                        self.target.writer_session_id,
-                    )
-                    .await?;
-                    self.target.write_samples.push(SqlServerProfileSample {
-                        repeat_index,
-                        write_elapsed_start,
-                        write_elapsed_end: started_at.elapsed(),
-                        activity,
-                    });
-                }
-            }
+            sample_interval.tick().await;
+            let write_elapsed_start = started_at.elapsed();
+            let activity = sqlserver_profile::current_activity_snapshot(
+                &mut self.observer,
+                self.target.writer_session_id,
+            )
+            .await?;
+            self.target.write_samples.push(SqlServerProfileSample {
+                repeat_index,
+                write_elapsed_start,
+                write_elapsed_end: started_at.elapsed(),
+                activity,
+            });
         }
     }
 }
@@ -2599,9 +2691,6 @@ async fn run_tiberius_benchmark_from_ipc(
     }
 
     report.peak_rss_kib = current_process_peak_rss_kib();
-    if let Some(profile_session) = sql_server_profile_session.as_mut() {
-        profile_session.finish().await?;
-    }
     report.sql_server_profile_target = sql_server_profile_session
         .as_ref()
         .map(SqlServerProfileSession::target);
@@ -2697,7 +2786,8 @@ async fn run_tiberius_repeat_with_batches(
         arrow_tiberius::write::profile::start_direct_write_profile();
     }
 
-    let write_batches = async {
+    let write_and_finish = async {
+        let write_start = Instant::now();
         for batch in batches {
             let batch = batch?;
             report.stats = writer
@@ -2705,23 +2795,21 @@ async fn run_tiberius_repeat_with_batches(
                 .await
                 .map_err(WriterBenchError::ArrowTiberius)?;
         }
+        report.timings.write += write_start.elapsed();
 
+        let finish_start = Instant::now();
+        report.stats = writer
+            .finish()
+            .await
+            .map_err(WriterBenchError::ArrowTiberius)?;
+        report.timings.finish += finish_start.elapsed();
         Ok(())
     };
-    let write_start = Instant::now();
     if let Some(profile_session) = sql_server_profile_session.as_mut() {
-        profile_session.sample_write(write_batches).await?;
+        profile_session.sample_write(write_and_finish).await?;
     } else {
-        write_batches.await?;
+        write_and_finish.await?;
     }
-    report.timings.write += write_start.elapsed();
-
-    let finish_start = Instant::now();
-    report.stats = writer
-        .finish()
-        .await
-        .map_err(WriterBenchError::ArrowTiberius)?;
-    report.timings.finish += finish_start.elapsed();
 
     let validate_start = Instant::now();
     report.validated_rows = select_count(client, table).await?;
@@ -3960,14 +4048,12 @@ mod tests {
                     wait_type: "WRITELOG".to_owned(),
                     waiting_tasks_count: 4,
                     wait_time_ms: 23,
-                    max_wait_time_ms: 17,
                     signal_wait_time_ms: 3,
                 },
                 super::SqlServerSessionWaitDelta {
                     wait_type: "ASYNC_NETWORK_IO".to_owned(),
                     waiting_tasks_count: 2,
                     wait_time_ms: 11,
-                    max_wait_time_ms: 7,
                     signal_wait_time_ms: 3,
                 },
             ]
