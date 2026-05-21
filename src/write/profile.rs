@@ -6,7 +6,7 @@ use std::time::Duration;
 mod enabled {
     use std::{cell::RefCell, time::Duration};
 
-    use tiberius::BulkLoadPacketStats;
+    use tiberius::BulkLoadStats;
 
     /// Accumulated timings for the direct raw writer path.
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -49,6 +49,32 @@ mod enabled {
         pub buffered_bytes_after_last_write: u64,
         /// Final `EndOfMessage` packet payload bytes written during finalization.
         pub finalized_packet_payload_bytes: u64,
+        /// Time spent inside bulk-load packet drain attempts.
+        pub bulk_write_packets_elapsed: Duration,
+        /// Number of lower-level connection writes issued by bulk load.
+        pub bulk_write_to_wire_calls: u64,
+        /// Time spent awaiting lower-level connection writes from bulk load.
+        pub bulk_write_to_wire_elapsed: Duration,
+        /// Payload bytes passed to lower-level connection writes from bulk load.
+        pub bulk_write_to_wire_payload_bytes: u64,
+        /// Slowest lower-level connection write awaited by bulk load.
+        pub bulk_max_write_to_wire_elapsed: Duration,
+        /// Largest lower-level connection write payload from bulk load.
+        pub bulk_max_write_to_wire_payload_bytes: u64,
+        /// Number of explicit bulk-load flushes.
+        pub bulk_flush_calls: u64,
+        /// Time spent awaiting explicit bulk-load flushes.
+        pub bulk_flush_elapsed: Duration,
+        /// Slowest explicit bulk-load flush.
+        pub bulk_max_flush_elapsed: Duration,
+        /// Time spent finalizing the bulk-load request.
+        pub bulk_finalize_elapsed: Duration,
+        /// Time spent awaiting the final `EndOfMessage` packet write.
+        pub bulk_finalize_write_to_wire_elapsed: Duration,
+        /// Time spent awaiting the final explicit flush.
+        pub bulk_finalize_flush_elapsed: Duration,
+        /// Time spent waiting for the server result after final bulk flush.
+        pub bulk_finalize_result_elapsed: Duration,
     }
 
     impl DirectWriteProfile {
@@ -130,33 +156,60 @@ mod enabled {
         });
     }
 
-    pub(crate) fn record_bulk_packet_stats(stats: BulkLoadPacketStats) {
+    pub(crate) fn record_bulk_load_stats(stats: BulkLoadStats) {
+        let packet = stats.packet;
+        let timing = stats.write_timing;
+
         with_profile(|profile| {
             profile.packet_write_calls = profile
                 .packet_write_calls
-                .saturating_add(stats.write_packets_calls);
+                .saturating_add(packet.write_packets_calls);
             profile.packets_written = profile
                 .packets_written
-                .saturating_add(stats.packets_written);
+                .saturating_add(packet.packets_written);
             profile.packet_payload_bytes = profile
                 .packet_payload_bytes
-                .saturating_add(stats.packet_payload_bytes);
+                .saturating_add(packet.packet_payload_bytes);
             profile.max_packet_payload_bytes = profile
                 .max_packet_payload_bytes
-                .max(usize_to_u64_saturating(stats.max_packet_payload_bytes));
+                .max(usize_to_u64_saturating(packet.max_packet_payload_bytes));
             profile.max_buffered_bytes_before_write =
                 profile
                     .max_buffered_bytes_before_write
                     .max(usize_to_u64_saturating(
-                        stats.max_buffered_bytes_before_write,
+                        packet.max_buffered_bytes_before_write,
                     ));
             profile.buffered_bytes_after_last_write =
-                usize_to_u64_saturating(stats.buffered_bytes_after_last_write);
+                usize_to_u64_saturating(packet.buffered_bytes_after_last_write);
             profile.finalized_packet_payload_bytes = profile
                 .finalized_packet_payload_bytes
                 .saturating_add(usize_to_u64_saturating(
-                    stats.finalized_packet_payload_bytes,
+                    packet.finalized_packet_payload_bytes,
                 ));
+            profile.bulk_write_packets_elapsed += timing.write_packets_elapsed;
+            profile.bulk_write_to_wire_calls = profile
+                .bulk_write_to_wire_calls
+                .saturating_add(timing.write_to_wire_calls);
+            profile.bulk_write_to_wire_elapsed += timing.write_to_wire_elapsed;
+            profile.bulk_write_to_wire_payload_bytes = profile
+                .bulk_write_to_wire_payload_bytes
+                .saturating_add(timing.write_to_wire_payload_bytes);
+            profile.bulk_max_write_to_wire_elapsed = profile
+                .bulk_max_write_to_wire_elapsed
+                .max(timing.max_write_to_wire_elapsed);
+            profile.bulk_max_write_to_wire_payload_bytes = profile
+                .bulk_max_write_to_wire_payload_bytes
+                .max(usize_to_u64_saturating(
+                    timing.max_write_to_wire_payload_bytes,
+                ));
+            profile.bulk_flush_calls = profile.bulk_flush_calls.saturating_add(timing.flush_calls);
+            profile.bulk_flush_elapsed += timing.flush_elapsed;
+            profile.bulk_max_flush_elapsed =
+                profile.bulk_max_flush_elapsed.max(timing.max_flush_elapsed);
+            profile.bulk_finalize_elapsed += timing.finalize_elapsed;
+            profile.bulk_finalize_write_to_wire_elapsed += timing.finalize_write_to_wire_elapsed;
+            profile.bulk_finalize_flush_elapsed += timing.finalize_flush_elapsed;
+            profile.bulk_finalize_result_elapsed += timing.finalize_result_elapsed;
         });
     }
 
@@ -195,7 +248,7 @@ mod disabled {
 
     pub(crate) fn record_null_cell() {}
 
-    pub(crate) fn record_bulk_packet_stats(_stats: tiberius::BulkLoadPacketStats) {}
+    pub(crate) fn record_bulk_load_stats(_stats: tiberius::BulkLoadStats) {}
 }
 
 #[cfg(not(feature = "bench-profile"))]
@@ -204,7 +257,7 @@ pub(crate) use disabled::*;
 pub use enabled::{DirectWriteProfile, finish_direct_write_profile, start_direct_write_profile};
 #[cfg(feature = "bench-profile")]
 pub(crate) use enabled::{
-    record_accepted_batch, record_append_encode, record_bulk_packet_stats, record_measure_batch,
+    record_accepted_batch, record_append_encode, record_bulk_load_stats, record_measure_batch,
     record_null_cell, record_nvarchar_utf16_bytes, record_row_range, record_row_range_split,
     record_send_total, record_varbinary_bytes,
 };
@@ -230,14 +283,31 @@ mod tests {
         super::record_nvarchar_utf16_bytes(17);
         super::record_varbinary_bytes(19);
         super::record_null_cell();
-        super::record_bulk_packet_stats(tiberius::BulkLoadPacketStats {
-            write_packets_calls: 23,
-            packets_written: 29,
-            packet_payload_bytes: 31,
-            max_packet_payload_bytes: 37,
-            max_buffered_bytes_before_write: 41,
-            buffered_bytes_after_last_write: 43,
-            finalized_packet_payload_bytes: 47,
+        super::record_bulk_load_stats(tiberius::BulkLoadStats {
+            packet: tiberius::BulkLoadPacketStats {
+                write_packets_calls: 23,
+                packets_written: 29,
+                packet_payload_bytes: 31,
+                max_packet_payload_bytes: 37,
+                max_buffered_bytes_before_write: 41,
+                buffered_bytes_after_last_write: 43,
+                finalized_packet_payload_bytes: 47,
+            },
+            write_timing: tiberius::BulkLoadWriteTimingStats {
+                write_packets_elapsed: Duration::from_millis(53),
+                write_to_wire_calls: 59,
+                write_to_wire_elapsed: Duration::from_millis(61),
+                write_to_wire_payload_bytes: 67,
+                max_write_to_wire_elapsed: Duration::from_millis(71),
+                max_write_to_wire_payload_bytes: 73,
+                flush_calls: 79,
+                flush_elapsed: Duration::from_millis(83),
+                max_flush_elapsed: Duration::from_millis(89),
+                finalize_elapsed: Duration::from_millis(97),
+                finalize_write_to_wire_elapsed: Duration::from_millis(101),
+                finalize_flush_elapsed: Duration::from_millis(103),
+                finalize_result_elapsed: Duration::from_millis(107),
+            },
         });
 
         let profile = super::finish_direct_write_profile().unwrap();
@@ -265,6 +335,37 @@ mod tests {
         assert_eq!(profile.max_buffered_bytes_before_write, 41);
         assert_eq!(profile.buffered_bytes_after_last_write, 43);
         assert_eq!(profile.finalized_packet_payload_bytes, 47);
+        assert_eq!(
+            profile.bulk_write_packets_elapsed,
+            Duration::from_millis(53)
+        );
+        assert_eq!(profile.bulk_write_to_wire_calls, 59);
+        assert_eq!(
+            profile.bulk_write_to_wire_elapsed,
+            Duration::from_millis(61)
+        );
+        assert_eq!(profile.bulk_write_to_wire_payload_bytes, 67);
+        assert_eq!(
+            profile.bulk_max_write_to_wire_elapsed,
+            Duration::from_millis(71)
+        );
+        assert_eq!(profile.bulk_max_write_to_wire_payload_bytes, 73);
+        assert_eq!(profile.bulk_flush_calls, 79);
+        assert_eq!(profile.bulk_flush_elapsed, Duration::from_millis(83));
+        assert_eq!(profile.bulk_max_flush_elapsed, Duration::from_millis(89));
+        assert_eq!(profile.bulk_finalize_elapsed, Duration::from_millis(97));
+        assert_eq!(
+            profile.bulk_finalize_write_to_wire_elapsed,
+            Duration::from_millis(101)
+        );
+        assert_eq!(
+            profile.bulk_finalize_flush_elapsed,
+            Duration::from_millis(103)
+        );
+        assert_eq!(
+            profile.bulk_finalize_result_elapsed,
+            Duration::from_millis(107)
+        );
         assert!(super::finish_direct_write_profile().is_none());
     }
 }

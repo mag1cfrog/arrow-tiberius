@@ -412,6 +412,55 @@ fn print_direct_profile(prefix: &str, profile: DirectWriteProfile) {
         "{prefix}  finalized packet payload bytes: {}",
         profile.finalized_packet_payload_bytes
     );
+    println!(
+        "{prefix}  bulk write_packets elapsed: {}",
+        format_duration(profile.bulk_write_packets_elapsed)
+    );
+    println!(
+        "{prefix}  bulk write_to_wire calls: {}",
+        profile.bulk_write_to_wire_calls
+    );
+    println!(
+        "{prefix}  bulk write_to_wire elapsed: {}",
+        format_duration(profile.bulk_write_to_wire_elapsed)
+    );
+    println!(
+        "{prefix}  bulk write_to_wire payload bytes: {}",
+        profile.bulk_write_to_wire_payload_bytes
+    );
+    println!(
+        "{prefix}  bulk max write_to_wire elapsed: {}",
+        format_duration(profile.bulk_max_write_to_wire_elapsed)
+    );
+    println!(
+        "{prefix}  bulk max write_to_wire payload bytes: {}",
+        profile.bulk_max_write_to_wire_payload_bytes
+    );
+    println!("{prefix}  bulk flush calls: {}", profile.bulk_flush_calls);
+    println!(
+        "{prefix}  bulk flush elapsed: {}",
+        format_duration(profile.bulk_flush_elapsed)
+    );
+    println!(
+        "{prefix}  bulk max flush elapsed: {}",
+        format_duration(profile.bulk_max_flush_elapsed)
+    );
+    println!(
+        "{prefix}  bulk finalize elapsed: {}",
+        format_duration(profile.bulk_finalize_elapsed)
+    );
+    println!(
+        "{prefix}  bulk finalize write_to_wire elapsed: {}",
+        format_duration(profile.bulk_finalize_write_to_wire_elapsed)
+    );
+    println!(
+        "{prefix}  bulk finalize flush elapsed: {}",
+        format_duration(profile.bulk_finalize_flush_elapsed)
+    );
+    println!(
+        "{prefix}  bulk finalize result elapsed: {}",
+        format_duration(profile.bulk_finalize_result_elapsed)
+    );
 }
 
 fn print_compare_summary(options: &CompareBenchOptions, report: &CompareBenchReport) {
@@ -2025,6 +2074,31 @@ fn merge_direct_profile(
     target.finalized_packet_payload_bytes = target
         .finalized_packet_payload_bytes
         .saturating_add(source.finalized_packet_payload_bytes);
+    target.bulk_write_packets_elapsed += source.bulk_write_packets_elapsed;
+    target.bulk_write_to_wire_calls = target
+        .bulk_write_to_wire_calls
+        .saturating_add(source.bulk_write_to_wire_calls);
+    target.bulk_write_to_wire_elapsed += source.bulk_write_to_wire_elapsed;
+    target.bulk_write_to_wire_payload_bytes = target
+        .bulk_write_to_wire_payload_bytes
+        .saturating_add(source.bulk_write_to_wire_payload_bytes);
+    target.bulk_max_write_to_wire_elapsed = target
+        .bulk_max_write_to_wire_elapsed
+        .max(source.bulk_max_write_to_wire_elapsed);
+    target.bulk_max_write_to_wire_payload_bytes = target
+        .bulk_max_write_to_wire_payload_bytes
+        .max(source.bulk_max_write_to_wire_payload_bytes);
+    target.bulk_flush_calls = target
+        .bulk_flush_calls
+        .saturating_add(source.bulk_flush_calls);
+    target.bulk_flush_elapsed += source.bulk_flush_elapsed;
+    target.bulk_max_flush_elapsed = target
+        .bulk_max_flush_elapsed
+        .max(source.bulk_max_flush_elapsed);
+    target.bulk_finalize_elapsed += source.bulk_finalize_elapsed;
+    target.bulk_finalize_write_to_wire_elapsed += source.bulk_finalize_write_to_wire_elapsed;
+    target.bulk_finalize_flush_elapsed += source.bulk_finalize_flush_elapsed;
+    target.bulk_finalize_result_elapsed += source.bulk_finalize_result_elapsed;
 }
 
 async fn connect(

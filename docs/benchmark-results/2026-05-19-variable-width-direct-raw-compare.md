@@ -272,6 +272,72 @@ server-ingestion side of `send_without_append_encode`, Tiberius flush/write
 behavior, or PLP/max-type encoding shape rather than assuming packet size alone
 can close the gap.
 
+After publishing `tiberius-raw-bulk` `0.12.3-raw-bulk.7`, the same packet-size
+profile was rerun with lower-level bulk write timing statistics.
+
+```sh
+cargo xtask writer-bench compare \
+  --container-runtime podman \
+  --scenario string_heavy \
+  --rows 300000 \
+  --batch-size 8192 \
+  --repeat 1 \
+  --backends direct-raw \
+  --profile-direct \
+  --tds-packet-size 32767
+```
+
+| Backend | Rows | Write | Finish | Total | Rows/sec | Peak RSS KiB | Peak RSS MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `direct-raw` write-timing rerun | 300,000 | 119.703s | 0.006s | 119.795s | 2,506.08 | 105,096 | 102.63 |
+
+Direct write timing profile:
+
+| Phase or counter | Value |
+| --- | ---: |
+| `measure_batch` | 9.282s |
+| `row_range_split` | 0.005s |
+| `append_encode` | 22.622s |
+| `send_total` | 109.494s |
+| `send_without_append_encode` | 86.873s |
+| rows | 300,000 |
+| batches | 37 |
+| row ranges | 256 |
+| encoded bytes | 1,883,800,622 |
+| max row range bytes | 8,388,567 |
+| nvarchar UTF-16 bytes | 950,022,348 |
+| varbinary bytes | 902,553,858 |
+| null cells | 34,448 |
+| packet write calls | 257 |
+| packets written before finalization | 57,842 |
+| packet payload bytes before finalization | 1,883,798,256 |
+| max packet payload bytes | 32,568 |
+| max buffered bytes before write | 8,420,360 |
+| buffered bytes after last write | 2,565 |
+| finalized packet payload bytes | 2,565 |
+| bulk `write_packets` elapsed | 86.861s |
+| bulk `write_to_wire` calls | 57,843 |
+| bulk `write_to_wire` elapsed | 86.824s |
+| bulk `write_to_wire` payload bytes | 1,883,800,821 |
+| bulk max `write_to_wire` elapsed | 0.004s |
+| bulk max `write_to_wire` payload bytes | 32,568 |
+| bulk flush calls | 1 |
+| bulk flush elapsed | 0.000s |
+| bulk max flush elapsed | 0.000s |
+| bulk finalize elapsed | 0.004s |
+| bulk finalize `write_to_wire` elapsed | 0.000s |
+| bulk finalize flush elapsed | 0.000s |
+| bulk finalize result elapsed | 0.004s |
+
+The lower-level timing shows that nearly all remaining
+`send_without_append_encode` time is spent awaiting `write_to_wire` calls.
+Finalization and explicit flush time are effectively noise in this run. That
+makes the next useful investigation narrower: packet payloads are already large,
+but this path still performs 57,843 awaited writes for 1.88 GB of row payload.
+Future optimization should measure whether Tiberius can safely reduce awaited
+write calls, change PLP/max-type chunking, or stream larger contiguous writes to
+SQL Server without disturbing packet framing.
+
 Interpretation:
 
 - `direct-raw` is faster than `baseline` on large variable-width rows, but only

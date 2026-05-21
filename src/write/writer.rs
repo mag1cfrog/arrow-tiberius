@@ -201,11 +201,11 @@ where
 
         #[cfg(feature = "bench-profile")]
         {
-            let (_result, packet_stats) = request
-                .finalize_with_packet_stats()
+            let (_result, stats) = request
+                .finalize_with_stats()
                 .await
                 .map_err(|source| crate::Error::Tiberius { source })?;
-            profile::record_bulk_packet_stats(packet_stats);
+            profile::record_bulk_load_stats(stats);
         }
 
         #[cfg(not(feature = "bench-profile"))]
