@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::future::Future;
@@ -744,6 +745,56 @@ fn print_sql_server_profile_target(prefix: &str, target: Option<&SqlServerProfil
             target.initial_activity.waiting_tasks.len()
         );
         println!("{prefix}  write samples: {}", target.write_samples.len());
+        print_sql_server_profile_sample_coverage(prefix, &target.write_samples);
+        let sample_summary = SqlServerProfileSampleSummary::from_samples(&target.write_samples);
+        print_sql_server_profile_sample_distribution(
+            prefix,
+            "request status samples",
+            &sample_summary.request_statuses,
+        );
+        print_sql_server_profile_sample_distribution(
+            prefix,
+            "request wait samples",
+            &sample_summary.request_waits,
+        );
+        print_sql_server_profile_sample_distribution(
+            prefix,
+            "waiting task wait samples",
+            &sample_summary.waiting_task_waits,
+        );
+    }
+}
+
+fn print_sql_server_profile_sample_coverage(prefix: &str, samples: &[SqlServerProfileSample]) {
+    let (Some(first), Some(last)) = (samples.first(), samples.last()) else {
+        println!("{prefix}  write sample coverage: <none>");
+        return;
+    };
+
+    println!(
+        "{prefix}  write sample coverage: first=repeat {} {}..{} last=repeat {} {}..{}",
+        first.repeat_index + 1,
+        format_duration(first.write_elapsed_start),
+        format_duration(first.write_elapsed_end),
+        last.repeat_index + 1,
+        format_duration(last.write_elapsed_start),
+        format_duration(last.write_elapsed_end),
+    );
+}
+
+fn print_sql_server_profile_sample_distribution(
+    prefix: &str,
+    label: &str,
+    distribution: &BTreeMap<String, usize>,
+) {
+    if distribution.is_empty() {
+        println!("{prefix}  {label}: <none>");
+        return;
+    }
+
+    println!("{prefix}  {label}:");
+    for (value, count) in distribution {
+        println!("{prefix}    {value}: {count}");
     }
 }
 
@@ -1989,13 +2040,56 @@ struct SqlServerProfileTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SqlServerProfileSample {
-    elapsed: Duration,
+    repeat_index: usize,
+    write_elapsed_start: Duration,
+    write_elapsed_end: Duration,
     activity: sqlserver_profile::ActivitySnapshot,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct SqlServerProfileSampleSummary {
+    request_statuses: BTreeMap<String, usize>,
+    request_waits: BTreeMap<String, usize>,
+    waiting_task_waits: BTreeMap<String, usize>,
+}
+
+impl SqlServerProfileSampleSummary {
+    fn from_samples(samples: &[SqlServerProfileSample]) -> Self {
+        let mut summary = Self::default();
+
+        for sample in samples {
+            match &sample.activity.request {
+                Some(request) => {
+                    increment_sample_count(&mut summary.request_statuses, &request.status);
+                    increment_sample_count(
+                        &mut summary.request_waits,
+                        request.wait_type.as_deref().unwrap_or("<none>"),
+                    );
+                }
+                None => {
+                    increment_sample_count(&mut summary.request_statuses, "<no request>");
+                    increment_sample_count(&mut summary.request_waits, "<no request>");
+                }
+            }
+
+            for waiting_task in &sample.activity.waiting_tasks {
+                increment_sample_count(&mut summary.waiting_task_waits, &waiting_task.wait_type);
+            }
+        }
+
+        summary
+    }
+}
+
+fn increment_sample_count(distribution: &mut BTreeMap<String, usize>, value: &str) {
+    let count = distribution.entry(value.to_owned()).or_default();
+    *count = count.saturating_add(1);
 }
 
 struct SqlServerProfileSession {
     target: SqlServerProfileTarget,
     observer: BenchClient,
+    next_repeat_index: usize,
 }
 
 impl SqlServerProfileSession {
@@ -2020,6 +2114,7 @@ impl SqlServerProfileSession {
                 write_samples: Vec::new(),
             },
             observer,
+            next_repeat_index: 0,
         })
     }
 
@@ -2031,6 +2126,8 @@ impl SqlServerProfileSession {
     where
         F: Future<Output = Result<T, WriterBenchError>>,
     {
+        let repeat_index = self.next_repeat_index;
+        self.next_repeat_index = self.next_repeat_index.saturating_add(1);
         let started_at = Instant::now();
         let mut sample_interval = tokio::time::interval(self.target.sample_interval);
         sample_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2041,13 +2138,16 @@ impl SqlServerProfileSession {
             tokio::select! {
                 result = &mut write => return result,
                 _ = sample_interval.tick() => {
+                    let write_elapsed_start = started_at.elapsed();
                     let activity = sqlserver_profile::current_activity_snapshot(
                         &mut self.observer,
                         self.target.writer_session_id,
                     )
                     .await?;
                     self.target.write_samples.push(SqlServerProfileSample {
-                        elapsed: started_at.elapsed(),
+                        repeat_index,
+                        write_elapsed_start,
+                        write_elapsed_end: started_at.elapsed(),
                         activity,
                     });
                 }
@@ -3520,7 +3620,10 @@ fn scenario_names() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{BenchmarkOutput, DirectWriteProfile, WriterBenchError, WriterBenchOptions};
+    use super::{
+        BenchmarkOutput, DirectWriteProfile, SqlServerProfileSample, SqlServerProfileSampleSummary,
+        WriterBenchError, WriterBenchOptions, sqlserver_profile,
+    };
     use arrow_array::{
         Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int32Array,
         Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
@@ -3532,6 +3635,57 @@ mod tests {
 
     static TEST_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    fn sql_server_profile_sample(
+        status_and_wait: Option<(&str, Option<&str>)>,
+        waiting_task_waits: &[&str],
+    ) -> SqlServerProfileSample {
+        SqlServerProfileSample {
+            repeat_index: 0,
+            write_elapsed_start: Duration::from_millis(10),
+            write_elapsed_end: Duration::from_millis(11),
+            activity: sqlserver_profile::ActivitySnapshot {
+                connection: sqlserver_profile::ConnectionSnapshot {
+                    net_transport: "TCP".to_owned(),
+                    protocol_type: "TSQL".to_owned(),
+                    encrypt_option: "FALSE".to_owned(),
+                    net_packet_size: 4096,
+                    num_reads: 3,
+                    num_writes: 5,
+                },
+                request: status_and_wait.map(|(status, wait_type)| {
+                    sqlserver_profile::RequestSnapshot {
+                        status: status.to_owned(),
+                        command: "INSERT BULK".to_owned(),
+                        wait_type: wait_type.map(ToOwned::to_owned),
+                        wait_time_ms: 0,
+                        last_wait_type: "SOS_SCHEDULER_YIELD".to_owned(),
+                        wait_resource: String::new(),
+                        blocking_session_id: 0,
+                        cpu_time_ms: 7,
+                        total_elapsed_time_ms: 9,
+                        reads: 11,
+                        writes: 13,
+                        logical_reads: 17,
+                        open_transaction_count: 1,
+                    }
+                }),
+                waiting_tasks: waiting_task_waits
+                    .iter()
+                    .enumerate()
+                    .map(
+                        |(exec_context_id, wait_type)| sqlserver_profile::WaitingTaskSnapshot {
+                            exec_context_id: exec_context_id as i32,
+                            wait_type: (*wait_type).to_owned(),
+                            wait_duration_ms: 19,
+                            blocking_session_id: None,
+                            resource_description: None,
+                        },
+                    )
+                    .collect(),
+            },
+        }
+    }
+
     #[test]
     fn parses_writer_bench_defaults() {
         let options = WriterBenchOptions::parse(&[]).unwrap();
@@ -3541,6 +3695,28 @@ mod tests {
         assert_eq!(options.scenario.name, "narrow_numeric");
         assert_eq!(options.repeat, 1);
         assert_eq!(options.output, BenchmarkOutput::Human);
+    }
+
+    #[test]
+    fn sql_server_profile_summary_counts_request_and_task_wait_samples() {
+        let samples = [
+            sql_server_profile_sample(
+                Some(("running", Some("ASYNC_NETWORK_IO"))),
+                &["ASYNC_NETWORK_IO", "WRITELOG"],
+            ),
+            sql_server_profile_sample(Some(("running", None)), &["ASYNC_NETWORK_IO"]),
+            sql_server_profile_sample(None, &[]),
+        ];
+
+        let summary = SqlServerProfileSampleSummary::from_samples(&samples);
+
+        assert_eq!(summary.request_statuses.get("running"), Some(&2));
+        assert_eq!(summary.request_statuses.get("<no request>"), Some(&1));
+        assert_eq!(summary.request_waits.get("ASYNC_NETWORK_IO"), Some(&1));
+        assert_eq!(summary.request_waits.get("<none>"), Some(&1));
+        assert_eq!(summary.request_waits.get("<no request>"), Some(&1));
+        assert_eq!(summary.waiting_task_waits.get("ASYNC_NETWORK_IO"), Some(&2));
+        assert_eq!(summary.waiting_task_waits.get("WRITELOG"), Some(&1));
     }
 
     #[test]
