@@ -762,6 +762,7 @@ fn print_sql_server_profile_target(prefix: &str, target: Option<&SqlServerProfil
             "waiting task wait samples",
             &sample_summary.waiting_task_waits,
         );
+        print_sql_server_session_wait_deltas(prefix, &target.session_wait_deltas);
     }
 }
 
@@ -795,6 +796,25 @@ fn print_sql_server_profile_sample_distribution(
     println!("{prefix}  {label}:");
     for (value, count) in distribution {
         println!("{prefix}    {value}: {count}");
+    }
+}
+
+fn print_sql_server_session_wait_deltas(prefix: &str, waits: &[SqlServerSessionWaitDelta]) {
+    if waits.is_empty() {
+        println!("{prefix}  session wait deltas: <none>");
+        return;
+    }
+
+    println!("{prefix}  session wait deltas:");
+    for wait in waits {
+        println!(
+            "{prefix}    {}: wait_ms={} tasks={} max_wait_ms={} signal_wait_ms={}",
+            wait.wait_type,
+            wait.wait_time_ms,
+            wait.waiting_tasks_count,
+            wait.max_wait_time_ms,
+            wait.signal_wait_time_ms
+        );
     }
 }
 
@@ -2036,6 +2056,7 @@ struct SqlServerProfileTarget {
     sample_interval: Duration,
     initial_activity: sqlserver_profile::ActivitySnapshot,
     write_samples: Vec<SqlServerProfileSample>,
+    session_wait_deltas: Vec<SqlServerSessionWaitDelta>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2044,6 +2065,15 @@ struct SqlServerProfileSample {
     write_elapsed_start: Duration,
     write_elapsed_end: Duration,
     activity: sqlserver_profile::ActivitySnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqlServerSessionWaitDelta {
+    wait_type: String,
+    waiting_tasks_count: i64,
+    wait_time_ms: i64,
+    max_wait_time_ms: i64,
+    signal_wait_time_ms: i64,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -2086,10 +2116,56 @@ fn increment_sample_count(distribution: &mut BTreeMap<String, usize>, value: &st
     *count = count.saturating_add(1);
 }
 
+fn sql_server_session_wait_deltas(
+    initial: &[sqlserver_profile::SessionWaitSnapshot],
+    final_waits: &[sqlserver_profile::SessionWaitSnapshot],
+) -> Vec<SqlServerSessionWaitDelta> {
+    let initial_waits = initial
+        .iter()
+        .map(|wait| (wait.wait_type.as_str(), wait))
+        .collect::<BTreeMap<_, _>>();
+    let mut deltas = final_waits
+        .iter()
+        .filter_map(|final_wait| {
+            let initial_wait = initial_waits.get(final_wait.wait_type.as_str()).copied();
+            let delta = SqlServerSessionWaitDelta {
+                wait_type: final_wait.wait_type.clone(),
+                waiting_tasks_count: counter_delta(
+                    initial_wait.map_or(0, |wait| wait.waiting_tasks_count),
+                    final_wait.waiting_tasks_count,
+                ),
+                wait_time_ms: counter_delta(
+                    initial_wait.map_or(0, |wait| wait.wait_time_ms),
+                    final_wait.wait_time_ms,
+                ),
+                max_wait_time_ms: final_wait.max_wait_time_ms,
+                signal_wait_time_ms: counter_delta(
+                    initial_wait.map_or(0, |wait| wait.signal_wait_time_ms),
+                    final_wait.signal_wait_time_ms,
+                ),
+            };
+
+            (delta.waiting_tasks_count > 0 || delta.wait_time_ms > 0).then_some(delta)
+        })
+        .collect::<Vec<_>>();
+    deltas.sort_by(|left, right| {
+        right
+            .wait_time_ms
+            .cmp(&left.wait_time_ms)
+            .then_with(|| left.wait_type.cmp(&right.wait_type))
+    });
+    deltas
+}
+
+fn counter_delta(initial: i64, final_value: i64) -> i64 {
+    final_value.saturating_sub(initial)
+}
+
 struct SqlServerProfileSession {
     target: SqlServerProfileTarget,
     observer: BenchClient,
     next_repeat_index: usize,
+    initial_session_waits: Vec<sqlserver_profile::SessionWaitSnapshot>,
 }
 
 impl SqlServerProfileSession {
@@ -2104,6 +2180,8 @@ impl SqlServerProfileSession {
         let observer_session_id = select_session_id(&mut observer).await?;
         let initial_activity =
             sqlserver_profile::current_activity_snapshot(&mut observer, writer_session_id).await?;
+        let initial_session_waits =
+            sqlserver_profile::session_wait_snapshots(&mut observer, writer_session_id).await?;
 
         Ok(Self {
             target: SqlServerProfileTarget {
@@ -2112,14 +2190,27 @@ impl SqlServerProfileSession {
                 sample_interval: options.sample_interval,
                 initial_activity,
                 write_samples: Vec::new(),
+                session_wait_deltas: Vec::new(),
             },
             observer,
             next_repeat_index: 0,
+            initial_session_waits,
         })
     }
 
     fn target(&self) -> SqlServerProfileTarget {
         self.target.clone()
+    }
+
+    async fn finish(&mut self) -> Result<(), WriterBenchError> {
+        let final_session_waits = sqlserver_profile::session_wait_snapshots(
+            &mut self.observer,
+            self.target.writer_session_id,
+        )
+        .await?;
+        self.target.session_wait_deltas =
+            sql_server_session_wait_deltas(&self.initial_session_waits, &final_session_waits);
+        Ok(())
     }
 
     async fn sample_write<T, F>(&mut self, write: F) -> Result<T, WriterBenchError>
@@ -2396,6 +2487,9 @@ async fn run_tiberius_benchmark_from_ipc(
     }
 
     report.peak_rss_kib = current_process_peak_rss_kib();
+    if let Some(profile_session) = sql_server_profile_session.as_mut() {
+        profile_session.finish().await?;
+    }
     report.sql_server_profile_target = sql_server_profile_session
         .as_ref()
         .map(SqlServerProfileSession::target);
@@ -3717,6 +3811,69 @@ mod tests {
         assert_eq!(summary.request_waits.get("<no request>"), Some(&1));
         assert_eq!(summary.waiting_task_waits.get("ASYNC_NETWORK_IO"), Some(&2));
         assert_eq!(summary.waiting_task_waits.get("WRITELOG"), Some(&1));
+    }
+
+    #[test]
+    fn sql_server_profile_wait_deltas_exclude_initial_session_totals() {
+        let initial = [
+            sqlserver_profile::SessionWaitSnapshot {
+                wait_type: "ASYNC_NETWORK_IO".to_owned(),
+                waiting_tasks_count: 3,
+                wait_time_ms: 5,
+                max_wait_time_ms: 4,
+                signal_wait_time_ms: 1,
+            },
+            sqlserver_profile::SessionWaitSnapshot {
+                wait_type: "UNCHANGED".to_owned(),
+                waiting_tasks_count: 8,
+                wait_time_ms: 13,
+                max_wait_time_ms: 9,
+                signal_wait_time_ms: 2,
+            },
+        ];
+        let final_waits = [
+            sqlserver_profile_wait("WRITELOG", 4, 23, 17, 3),
+            sqlserver_profile_wait("ASYNC_NETWORK_IO", 5, 16, 7, 4),
+            sqlserver_profile_wait("UNCHANGED", 8, 13, 9, 2),
+        ];
+
+        let waits = super::sql_server_session_wait_deltas(&initial, &final_waits);
+
+        assert_eq!(
+            waits,
+            [
+                super::SqlServerSessionWaitDelta {
+                    wait_type: "WRITELOG".to_owned(),
+                    waiting_tasks_count: 4,
+                    wait_time_ms: 23,
+                    max_wait_time_ms: 17,
+                    signal_wait_time_ms: 3,
+                },
+                super::SqlServerSessionWaitDelta {
+                    wait_type: "ASYNC_NETWORK_IO".to_owned(),
+                    waiting_tasks_count: 2,
+                    wait_time_ms: 11,
+                    max_wait_time_ms: 7,
+                    signal_wait_time_ms: 3,
+                },
+            ]
+        );
+    }
+
+    fn sqlserver_profile_wait(
+        wait_type: &str,
+        waiting_tasks_count: i64,
+        wait_time_ms: i64,
+        max_wait_time_ms: i64,
+        signal_wait_time_ms: i64,
+    ) -> sqlserver_profile::SessionWaitSnapshot {
+        sqlserver_profile::SessionWaitSnapshot {
+            wait_type: wait_type.to_owned(),
+            waiting_tasks_count,
+            wait_time_ms,
+            max_wait_time_ms,
+            signal_wait_time_ms,
+        }
     }
 
     #[test]

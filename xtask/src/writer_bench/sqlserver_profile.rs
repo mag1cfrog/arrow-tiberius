@@ -43,6 +43,15 @@ pub(super) struct WaitingTaskSnapshot {
     pub(super) resource_description: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SessionWaitSnapshot {
+    pub(super) wait_type: String,
+    pub(super) waiting_tasks_count: i64,
+    pub(super) wait_time_ms: i64,
+    pub(super) max_wait_time_ms: i64,
+    pub(super) signal_wait_time_ms: i64,
+}
+
 pub(super) async fn current_activity_snapshot(
     observer: &mut BenchClient,
     writer_session_id: i32,
@@ -79,6 +88,21 @@ pub(super) async fn connection_snapshot(
         num_reads: required_i64(&row, "num_reads")?,
         num_writes: required_i64(&row, "num_writes")?,
     })
+}
+
+pub(super) async fn session_wait_snapshots(
+    observer: &mut BenchClient,
+    writer_session_id: i32,
+) -> Result<Vec<SessionWaitSnapshot>, WriterBenchError> {
+    let rows = observer
+        .simple_query(session_waits_query(writer_session_id))
+        .await
+        .map_err(WriterBenchError::Tiberius)?
+        .into_first_result()
+        .await
+        .map_err(WriterBenchError::Tiberius)?;
+
+    rows.iter().map(session_wait_from_row).collect()
 }
 
 async fn request_snapshot(
@@ -138,6 +162,16 @@ fn waiting_task_from_row(row: &tiberius::Row) -> Result<WaitingTaskSnapshot, Wri
     })
 }
 
+fn session_wait_from_row(row: &tiberius::Row) -> Result<SessionWaitSnapshot, WriterBenchError> {
+    Ok(SessionWaitSnapshot {
+        wait_type: required_string(row, "wait_type")?,
+        waiting_tasks_count: required_i64(row, "waiting_tasks_count")?,
+        wait_time_ms: required_i64(row, "wait_time_ms")?,
+        max_wait_time_ms: required_i64(row, "max_wait_time_ms")?,
+        signal_wait_time_ms: required_i64(row, "signal_wait_time_ms")?,
+    })
+}
+
 fn connection_snapshot_query(writer_session_id: i32) -> String {
     format!(
         "SELECT \
@@ -187,6 +221,20 @@ fn waiting_tasks_query(writer_session_id: i32) -> String {
     )
 }
 
+fn session_waits_query(writer_session_id: i32) -> String {
+    format!(
+        "SELECT \
+            CONVERT(nvarchar(60), s.wait_type) AS wait_type, \
+            CONVERT(bigint, s.waiting_tasks_count) AS waiting_tasks_count, \
+            CONVERT(bigint, s.wait_time_ms) AS wait_time_ms, \
+            CONVERT(bigint, s.max_wait_time_ms) AS max_wait_time_ms, \
+            CONVERT(bigint, s.signal_wait_time_ms) AS signal_wait_time_ms \
+        FROM sys.dm_exec_session_wait_stats AS s \
+        WHERE CONVERT(int, s.session_id) = {writer_session_id} \
+        ORDER BY s.wait_time_ms DESC, s.wait_type"
+    )
+}
+
 fn required_i32(row: &tiberius::Row, column: &'static str) -> Result<i32, WriterBenchError> {
     row.try_get::<i32, _>(column)
         .map_err(WriterBenchError::Tiberius)?
@@ -231,7 +279,9 @@ fn null_snapshot_column(column: &'static str) -> WriterBenchError {
 
 #[cfg(test)]
 mod tests {
-    use super::{connection_snapshot_query, request_snapshot_query, waiting_tasks_query};
+    use super::{
+        connection_snapshot_query, request_snapshot_query, session_waits_query, waiting_tasks_query,
+    };
 
     #[test]
     fn connection_snapshot_query_targets_one_writer_session() {
@@ -262,5 +312,15 @@ mod tests {
         assert!(query.contains("WHERE CONVERT(int, w.session_id) = 43"));
         assert!(query.contains("AS wait_duration_ms"));
         assert!(query.contains("AS resource_description"));
+    }
+
+    #[test]
+    fn session_waits_query_targets_one_writer_session() {
+        let query = session_waits_query(47);
+
+        assert!(query.contains("FROM sys.dm_exec_session_wait_stats AS s"));
+        assert!(query.contains("WHERE CONVERT(int, s.session_id) = 47"));
+        assert!(query.contains("AS wait_time_ms"));
+        assert!(query.contains("AS signal_wait_time_ms"));
     }
 }
