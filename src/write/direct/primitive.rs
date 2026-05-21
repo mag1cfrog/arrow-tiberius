@@ -4,7 +4,7 @@ use arrow_array::{Array, BooleanArray, Float64Array, Int32Array, Int64Array, Rec
 
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, Result,
-    conversion::arrow_to_mssql::primitive::PrimitiveArrowToMssql,
+    conversion::arrow_to_mssql::primitive::PrimitiveArrowToMssql, write::profile,
 };
 
 use super::{
@@ -390,6 +390,7 @@ pub(crate) fn measure_primitive_column_cell_lengths(
     cell_lengths: &mut [usize],
 ) -> Result<()> {
     let value_len = primitive_value_len(column.encoding())?;
+    validate_primitive_column_values(array, column)?;
 
     for row_index in 0..array.len() {
         let cell_len = if array.is_null(row_index) {
@@ -415,24 +416,67 @@ pub(crate) fn measure_primitive_column_cell_lengths(
     Ok(())
 }
 
+fn validate_primitive_column_values(array: &dyn Array, column: &DirectColumnPlan) -> Result<()> {
+    if matches!(
+        column.encoding(),
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat)
+    ) {
+        let array = downcast_direct_array::<Float64Array>(array, column)?;
+        for row_index in 0..array.len() {
+            if array.is_null(row_index) {
+                continue;
+            }
+
+            let value = array.value(row_index);
+            if !value.is_finite() {
+                return Err(value_conversion_error(row_column_diagnostic(
+                    column,
+                    row_index,
+                    DiagnosticCode::NonFiniteFloat,
+                    format!("non-finite floating point value {value} is not supported"),
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub(crate) fn build_fixed_width_row_layout(
     row_count: usize,
     column_count: usize,
     cell_lengths: &[usize],
 ) -> Result<RowLayout> {
+    build_fixed_width_row_range_layout(0, row_count, column_count, cell_lengths)
+}
+
+pub(crate) fn build_fixed_width_row_range_layout(
+    start_row: usize,
+    row_count: usize,
+    column_count: usize,
+    cell_lengths: &[usize],
+) -> Result<RowLayout> {
+    let end_row = start_row
+        .checked_add(row_count)
+        .ok_or_else(|| invalid_payload("direct row range end overflowed usize"))?;
     let mut row_token_offsets = Vec::with_capacity(row_count);
     let mut row_lengths = Vec::with_capacity(row_count);
-    let mut cell_positions = Vec::with_capacity(cell_lengths.len());
+    let mut cell_positions = Vec::with_capacity(row_count * column_count);
     let mut offset = 0usize;
 
-    for row_index in 0..row_count {
+    for row_index in start_row..end_row {
         let row_offset = offset;
         row_token_offsets.push(row_offset);
         offset = checked_add(offset, ROW_TOKEN_LEN)?;
 
         for column_index in 0..column_count {
             let cell_len = cell_lengths[row_index * column_count + column_index];
-            cell_positions.push(CellPosition::new(row_index, column_index, offset, cell_len));
+            cell_positions.push(CellPosition::new(
+                row_index - start_row,
+                column_index,
+                offset,
+                cell_len,
+            ));
             offset = checked_add(offset, cell_len)?;
         }
 
@@ -596,6 +640,91 @@ pub(crate) fn fill_float64_column(
     Ok(())
 }
 
+/// Appends one Boolean-to-bit cell to a raw bulk append buffer.
+pub(crate) fn append_boolean_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    array: &BooleanArray,
+    column: &DirectColumnPlan,
+    row_index: usize,
+    measured_len: usize,
+) -> Result<()> {
+    if array.is_null(row_index) {
+        return append_null_cell(buf, column, row_index, measured_len);
+    }
+
+    append_primitive_cell(
+        buf,
+        column,
+        measured_len,
+        &[u8::from(array.value(row_index))],
+    )
+}
+
+/// Appends one Int32-to-int cell to a raw bulk append buffer.
+pub(crate) fn append_int32_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    array: &Int32Array,
+    column: &DirectColumnPlan,
+    row_index: usize,
+    measured_len: usize,
+) -> Result<()> {
+    if array.is_null(row_index) {
+        return append_null_cell(buf, column, row_index, measured_len);
+    }
+
+    append_primitive_cell(
+        buf,
+        column,
+        measured_len,
+        &array.value(row_index).to_le_bytes(),
+    )
+}
+
+/// Appends one Int64-to-bigint cell to a raw bulk append buffer.
+pub(crate) fn append_int64_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    array: &Int64Array,
+    column: &DirectColumnPlan,
+    row_index: usize,
+    measured_len: usize,
+) -> Result<()> {
+    if array.is_null(row_index) {
+        return append_null_cell(buf, column, row_index, measured_len);
+    }
+
+    append_primitive_cell(
+        buf,
+        column,
+        measured_len,
+        &array.value(row_index).to_le_bytes(),
+    )
+}
+
+/// Appends one Float64-to-float cell to a raw bulk append buffer.
+pub(crate) fn append_float64_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    array: &Float64Array,
+    column: &DirectColumnPlan,
+    row_index: usize,
+    measured_len: usize,
+) -> Result<()> {
+    if array.is_null(row_index) {
+        return append_null_cell(buf, column, row_index, measured_len);
+    }
+
+    let value = array.value(row_index);
+    if !value.is_finite() {
+        return Err(value_conversion_error(row_column_diagnostic(
+            column,
+            row_index,
+            DiagnosticCode::NonFiniteFloat,
+            format!("non-finite floating point value {value} is not supported"),
+        )));
+    }
+
+    append_primitive_cell(buf, column, measured_len, &value.to_le_bytes())
+}
+
 fn cell_position(
     layout: &RowLayout,
     row_index: usize,
@@ -611,6 +740,69 @@ fn cell_position(
         .cell_positions()
         .get(index)
         .ok_or_else(|| invalid_payload("cell position is outside measured row layout"))
+}
+
+fn append_null_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    column: &DirectColumnPlan,
+    row_index: usize,
+    measured_len: usize,
+) -> Result<()> {
+    profile::record_null_cell();
+
+    if !column.nullable() {
+        return Err(value_conversion_error(row_column_diagnostic(
+            column,
+            row_index,
+            DiagnosticCode::NullInNonNullableColumn,
+            "null value in non-nullable direct primitive column",
+        )));
+    }
+
+    if measured_len != CELL_LEN_PREFIX_LEN {
+        return Err(invalid_payload(format!(
+            "measured null primitive cell at row {row_index} column {} has length {}, expected {CELL_LEN_PREFIX_LEN}",
+            column.source_index(),
+            measured_len
+        )));
+    }
+
+    buf.put_u8(0);
+    Ok(())
+}
+
+fn append_primitive_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    column: &DirectColumnPlan,
+    measured_len: usize,
+    value: &[u8],
+) -> Result<()> {
+    if column.nullable() {
+        let expected_len = CELL_LEN_PREFIX_LEN
+            .checked_add(value.len())
+            .ok_or_else(|| invalid_payload("nullable primitive cell length overflowed usize"))?;
+        if measured_len != expected_len {
+            return Err(invalid_payload(format!(
+                "measured nullable primitive cell for column {} has length {}, expected {expected_len}",
+                column.source_name(),
+                measured_len
+            )));
+        }
+
+        let value_len = u8::try_from(value.len())
+            .map_err(|_| invalid_payload("nullable primitive cell value length does not fit u8"))?;
+        buf.put_u8(value_len);
+    } else if measured_len != value.len() {
+        return Err(invalid_payload(format!(
+            "measured fixed-width primitive cell for column {} has length {}, expected {}",
+            column.source_name(),
+            measured_len,
+            value.len()
+        )));
+    }
+
+    buf.extend_from_slice(value);
+    Ok(())
 }
 
 fn write_null_cell(bytes: &mut [u8], cell: &CellPosition) -> Result<()> {
@@ -1356,27 +1548,15 @@ mod tests {
             let row_count = array.len();
             let column_count = 1;
             let mut cell_lengths = vec![0; row_count * column_count];
-            measure_primitive_column_cell_lengths(
+
+            let err = measure_primitive_column_cell_lengths(
                 &array,
                 &plan.columns()[0],
                 0,
                 column_count,
                 &mut cell_lengths,
             )
-            .unwrap();
-            let layout =
-                build_fixed_width_row_layout(row_count, column_count, &cell_lengths).unwrap();
-            let mut bytes = allocate_rows_payload_with_tokens(&layout);
-
-            let err = fill_float64_column(
-                &array,
-                &plan.columns()[0],
-                0,
-                column_count,
-                &layout,
-                &mut bytes,
-            )
-            .expect_err("non-finite float must fail");
+            .expect_err("non-finite float must fail before layout is accepted");
 
             assert_value_conversion_diagnostic(
                 err,

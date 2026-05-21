@@ -15,6 +15,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow_tiberius::{
     BulkWriter, MssqlProfile, PlanOptions, SchemaMapping, TableName, WriteBackend, WriteOptions,
     create_table_sql_from_mappings, plan_arrow_schema_to_mssql_mappings,
+    write::profile::DirectWriteProfile,
 };
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -249,7 +250,7 @@ fn print_help() {
 
 fn print_baseline_help() {
     println!(
-        "Usage:\n  cargo xtask writer-bench baseline [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep the container after the task exits\n  -h, --help                  Print help"
+        "Usage:\n  cargo xtask writer-bench baseline [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --tds-packet-size <BYTES>   Requested TDS packet size for Tiberius writers\n  --keep-container            Keep the container after the task exits\n  -h, --help                  Print help"
     );
 }
 
@@ -261,7 +262,7 @@ fn print_arrow_odbc_help() {
 
 fn print_compare_help() {
     println!(
-        "Usage:\n  cargo xtask writer-bench compare [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --backends <LIST>           Comma-separated backends: baseline,direct-raw,arrow-odbc,odbc-bcp [default: baseline,arrow-odbc]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>      Managed ODBC runner image tag\n  --keep-runner-image         Keep the managed ODBC runner image after the task exits\n  -h, --help                  Print help\n\nCompare runs use one shared Arrow IPC dataset as the fairness boundary."
+        "Usage:\n  cargo xtask writer-bench compare [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --backends <LIST>           Comma-separated backends: baseline,direct-raw,arrow-odbc,odbc-bcp [default: baseline,arrow-odbc]\n  --output <FORMAT>           Output format: human [default: human]\n  --profile-direct            Include direct-raw phase timings and counters\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --tds-packet-size <BYTES>   Requested TDS packet size for Tiberius writers\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>      Managed ODBC runner image tag\n  --keep-runner-image         Keep the managed ODBC runner image after the task exits\n  -h, --help                  Print help\n\nCompare runs use one shared Arrow IPC dataset as the fairness boundary."
     );
 }
 
@@ -345,6 +346,313 @@ fn print_tiberius_backend_summary(report: &TiberiusBenchReport) {
     println!("    cleanup: {}", format_duration(report.timings.cleanup));
     println!("    total: {}", format_duration(report.timings.total));
     print_peak_rss("    ", report.peak_rss_kib);
+    if let Some(profile) = report.direct_profile {
+        print_direct_profile("    ", profile);
+    }
+}
+
+fn print_direct_profile(prefix: &str, profile: DirectWriteProfile) {
+    println!("{prefix}direct profile:");
+    println!(
+        "{prefix}  measure_batch: {}",
+        format_duration(profile.measure_batch)
+    );
+    println!(
+        "{prefix}  row_range_split: {}",
+        format_duration(profile.row_range_split)
+    );
+    println!(
+        "{prefix}  append_encode: {}",
+        format_duration(profile.append_encode)
+    );
+    println!(
+        "{prefix}  send_total: {}",
+        format_duration(profile.send_total)
+    );
+    println!(
+        "{prefix}  send_without_append_encode: {}",
+        format_duration(profile.send_without_append_encode())
+    );
+    println!("{prefix}  rows: {}", profile.rows);
+    println!("{prefix}  batches: {}", profile.batches);
+    println!("{prefix}  row_ranges: {}", profile.row_ranges);
+    println!("{prefix}  encoded bytes: {}", profile.encoded_bytes);
+    println!(
+        "{prefix}  max row range bytes: {}",
+        profile.max_row_range_bytes
+    );
+    println!(
+        "{prefix}  nvarchar utf16 bytes: {}",
+        profile.nvarchar_utf16_bytes
+    );
+    println!("{prefix}  varbinary bytes: {}", profile.varbinary_bytes);
+    println!("{prefix}  null cells: {}", profile.null_cells);
+    println!(
+        "{prefix}  packet write calls: {}",
+        profile.packet_write_calls
+    );
+    println!("{prefix}  packets written: {}", profile.packets_written);
+    println!(
+        "{prefix}  packet payload bytes: {}",
+        profile.packet_payload_bytes
+    );
+    println!(
+        "{prefix}  max packet payload bytes: {}",
+        profile.max_packet_payload_bytes
+    );
+    println!(
+        "{prefix}  max buffered bytes before write: {}",
+        profile.max_buffered_bytes_before_write
+    );
+    println!(
+        "{prefix}  buffered bytes after last write: {}",
+        profile.buffered_bytes_after_last_write
+    );
+    println!(
+        "{prefix}  finalized packet payload bytes: {}",
+        profile.finalized_packet_payload_bytes
+    );
+    println!(
+        "{prefix}  bulk write_packets elapsed: {}",
+        format_duration(profile.bulk_write_packets_elapsed)
+    );
+    println!(
+        "{prefix}  bulk write_to_wire calls: {}",
+        profile.bulk_write_to_wire_calls
+    );
+    println!(
+        "{prefix}  bulk write_to_wire elapsed: {}",
+        format_duration(profile.bulk_write_to_wire_elapsed)
+    );
+    println!(
+        "{prefix}  bulk write_to_wire payload bytes: {}",
+        profile.bulk_write_to_wire_payload_bytes
+    );
+    println!(
+        "{prefix}  bulk max write_to_wire elapsed: {}",
+        format_duration(profile.bulk_max_write_to_wire_elapsed)
+    );
+    println!(
+        "{prefix}  bulk max write_to_wire payload bytes: {}",
+        profile.bulk_max_write_to_wire_payload_bytes
+    );
+    println!("{prefix}  bulk flush calls: {}", profile.bulk_flush_calls);
+    println!(
+        "{prefix}  bulk flush elapsed: {}",
+        format_duration(profile.bulk_flush_elapsed)
+    );
+    println!(
+        "{prefix}  bulk max flush elapsed: {}",
+        format_duration(profile.bulk_max_flush_elapsed)
+    );
+    println!(
+        "{prefix}  bulk finalize elapsed: {}",
+        format_duration(profile.bulk_finalize_elapsed)
+    );
+    println!(
+        "{prefix}  bulk finalize write_to_wire elapsed: {}",
+        format_duration(profile.bulk_finalize_write_to_wire_elapsed)
+    );
+    println!(
+        "{prefix}  bulk finalize flush elapsed: {}",
+        format_duration(profile.bulk_finalize_flush_elapsed)
+    );
+    println!(
+        "{prefix}  bulk finalize result elapsed: {}",
+        format_duration(profile.bulk_finalize_result_elapsed)
+    );
+    println!(
+        "{prefix}  bulk connection write calls: {}",
+        profile.bulk_connection_write_calls
+    );
+    println!(
+        "{prefix}  bulk connection write payload bytes: {}",
+        profile.bulk_connection_write_payload_bytes
+    );
+    println!(
+        "{prefix}  bulk connection write ready elapsed: {}",
+        format_duration(profile.bulk_connection_write_ready_elapsed)
+    );
+    println!(
+        "{prefix}  bulk connection write encode elapsed: {}",
+        format_duration(profile.bulk_connection_write_encode_elapsed)
+    );
+    println!(
+        "{prefix}  bulk connection write flush elapsed: {}",
+        format_duration(profile.bulk_connection_write_flush_elapsed)
+    );
+    println!(
+        "{prefix}  bulk connection write max ready elapsed: {}",
+        format_duration(profile.bulk_connection_write_max_ready_elapsed)
+    );
+    println!(
+        "{prefix}  bulk connection write max encode elapsed: {}",
+        format_duration(profile.bulk_connection_write_max_encode_elapsed)
+    );
+    println!(
+        "{prefix}  bulk connection write max flush elapsed: {}",
+        format_duration(profile.bulk_connection_write_max_flush_elapsed)
+    );
+    println!(
+        "{prefix}  bulk connection write max payload bytes: {}",
+        profile.bulk_connection_write_max_payload_bytes
+    );
+    println!(
+        "{prefix}  bulk direct packet write calls: {}",
+        profile.bulk_direct_packet_write_calls
+    );
+    println!(
+        "{prefix}  bulk direct packet payload bytes: {}",
+        profile.bulk_direct_packet_payload_bytes
+    );
+    println!(
+        "{prefix}  bulk direct packet header bytes: {}",
+        profile.bulk_direct_packet_header_bytes
+    );
+    println!(
+        "{prefix}  bulk direct packet max payload bytes: {}",
+        profile.bulk_direct_packet_max_payload_bytes
+    );
+    println!(
+        "{prefix}  bulk direct packet final calls: {}",
+        profile.bulk_direct_packet_final_calls
+    );
+    println!(
+        "{prefix}  bulk direct packet final payload bytes: {}",
+        profile.bulk_direct_packet_final_payload_bytes
+    );
+    println!(
+        "{prefix}  bulk direct packet final header bytes: {}",
+        profile.bulk_direct_packet_final_header_bytes
+    );
+    println!(
+        "{prefix}  bulk direct packet raw stream calls: {}",
+        profile.bulk_direct_packet_raw_stream_calls
+    );
+    println!(
+        "{prefix}  bulk direct packet TLS stream calls: {}",
+        profile.bulk_direct_packet_tls_stream_calls
+    );
+    println!(
+        "{prefix}  bulk direct packet low-level write calls: {}",
+        profile.bulk_direct_packet_low_level_write_calls
+    );
+    println!(
+        "{prefix}  bulk direct packet low-level write bytes: {}",
+        profile.bulk_direct_packet_low_level_write_bytes
+    );
+    println!(
+        "{prefix}  bulk direct packet max low-level write bytes: {}",
+        profile.bulk_direct_packet_max_low_level_write_bytes
+    );
+    println!(
+        "{prefix}  bulk direct packet write elapsed: {}",
+        format_duration(profile.bulk_direct_packet_write_elapsed)
+    );
+    println!(
+        "{prefix}  bulk direct packet max write elapsed: {}",
+        format_duration(profile.bulk_direct_packet_max_write_elapsed)
+    );
+    println!(
+        "{prefix}  bulk direct packet header write calls: {}",
+        profile.bulk_direct_packet_header_write_calls
+    );
+    println!(
+        "{prefix}  bulk direct packet header write bytes: {}",
+        profile.bulk_direct_packet_header_write_bytes
+    );
+    println!(
+        "{prefix}  bulk direct packet header max write bytes: {}",
+        profile.bulk_direct_packet_header_max_write_bytes
+    );
+    println!(
+        "{prefix}  bulk direct packet header write elapsed: {}",
+        format_duration(profile.bulk_direct_packet_header_write_elapsed)
+    );
+    println!(
+        "{prefix}  bulk direct packet header max write elapsed: {}",
+        format_duration(profile.bulk_direct_packet_header_max_write_elapsed)
+    );
+    println!(
+        "{prefix}  bulk direct packet header partial writes: {}",
+        profile.bulk_direct_packet_header_partial_writes
+    );
+    println!(
+        "{prefix}  bulk direct packet payload write calls: {}",
+        profile.bulk_direct_packet_payload_write_calls
+    );
+    println!(
+        "{prefix}  bulk direct packet payload write bytes: {}",
+        profile.bulk_direct_packet_payload_write_bytes
+    );
+    println!(
+        "{prefix}  bulk direct packet payload max write bytes: {}",
+        profile.bulk_direct_packet_payload_max_write_bytes
+    );
+    println!(
+        "{prefix}  bulk direct packet payload write elapsed: {}",
+        format_duration(profile.bulk_direct_packet_payload_write_elapsed)
+    );
+    println!(
+        "{prefix}  bulk direct packet payload max write elapsed: {}",
+        format_duration(profile.bulk_direct_packet_payload_max_write_elapsed)
+    );
+    println!(
+        "{prefix}  bulk direct packet payload partial writes: {}",
+        profile.bulk_direct_packet_payload_partial_writes
+    );
+    println!(
+        "{prefix}  bulk direct packet poll_write polls: {}",
+        profile.bulk_direct_packet_poll_write_polls
+    );
+    println!(
+        "{prefix}  bulk direct packet poll_write pending count: {}",
+        profile.bulk_direct_packet_poll_write_pending_count
+    );
+    println!(
+        "{prefix}  bulk direct packet poll_write pending elapsed: {}",
+        format_duration(profile.bulk_direct_packet_poll_write_pending_elapsed)
+    );
+    println!(
+        "{prefix}  bulk direct packet poll_write max pending elapsed: {}",
+        format_duration(profile.bulk_direct_packet_poll_write_max_pending_elapsed)
+    );
+    println!(
+        "{prefix}  bulk direct packet poll_write ready count: {}",
+        profile.bulk_direct_packet_poll_write_ready_count
+    );
+    println!(
+        "{prefix}  bulk direct packet poll_write ready elapsed: {}",
+        format_duration(profile.bulk_direct_packet_poll_write_ready_elapsed)
+    );
+    println!(
+        "{prefix}  bulk direct packet poll_write max ready elapsed: {}",
+        format_duration(profile.bulk_direct_packet_poll_write_max_ready_elapsed)
+    );
+    println!(
+        "{prefix}  bulk direct packet flush calls: {}",
+        profile.bulk_direct_packet_flush_calls
+    );
+    println!(
+        "{prefix}  bulk direct packet flush elapsed: {}",
+        format_duration(profile.bulk_direct_packet_flush_elapsed)
+    );
+    println!(
+        "{prefix}  bulk direct packet max flush elapsed: {}",
+        format_duration(profile.bulk_direct_packet_max_flush_elapsed)
+    );
+    println!(
+        "{prefix}  bulk direct packet flush pending count: {}",
+        profile.bulk_direct_packet_flush_pending_count
+    );
+    println!(
+        "{prefix}  bulk direct packet flush pending elapsed: {}",
+        format_duration(profile.bulk_direct_packet_flush_pending_elapsed)
+    );
+    println!(
+        "{prefix}  bulk direct packet flush max pending elapsed: {}",
+        format_duration(profile.bulk_direct_packet_flush_max_pending_elapsed)
+    );
 }
 
 fn print_compare_summary(options: &CompareBenchOptions, report: &CompareBenchReport) {
@@ -522,6 +830,7 @@ impl IpcDatasetOptions {
 struct BaselineBenchOptions {
     benchmark: WriterBenchOptions,
     sql_server: sqlserver::SqlServerConnectionOptions,
+    tds_packet_size: Option<u32>,
 }
 
 impl BaselineBenchOptions {
@@ -529,6 +838,7 @@ impl BaselineBenchOptions {
         let mut options = Self {
             benchmark: WriterBenchOptions::default(),
             sql_server: sqlserver::SqlServerConnectionOptions::benchmark_default(),
+            tds_packet_size: None,
         };
         let mut index = 0;
 
@@ -582,6 +892,13 @@ impl BaselineBenchOptions {
                     options.sql_server.database = required_value(args, index)?;
                     index += 1;
                 }
+                "--tds-packet-size" => {
+                    options.tds_packet_size = Some(parse_positive_u32(
+                        "--tds-packet-size",
+                        &required_value(args, index)?,
+                    )?);
+                    index += 1;
+                }
                 "--keep-container" => {
                     options.sql_server.keep_container = true;
                 }
@@ -616,6 +933,8 @@ struct CompareBenchOptions {
     backends: Vec<BenchmarkBackend>,
     runner_image: String,
     keep_runner_image: bool,
+    profile_direct: bool,
+    tds_packet_size: Option<u32>,
 }
 
 impl CompareBenchOptions {
@@ -626,6 +945,8 @@ impl CompareBenchOptions {
             backends: vec![BenchmarkBackend::Baseline, BenchmarkBackend::ArrowOdbc],
             runner_image: odbc_runner::DEFAULT_RUNNER_IMAGE_TAG.to_owned(),
             keep_runner_image: false,
+            profile_direct: false,
+            tds_packet_size: None,
         };
         let mut index = 0;
 
@@ -683,6 +1004,13 @@ impl CompareBenchOptions {
                     options.sql_server.database = required_value(args, index)?;
                     index += 1;
                 }
+                "--tds-packet-size" => {
+                    options.tds_packet_size = Some(parse_positive_u32(
+                        "--tds-packet-size",
+                        &required_value(args, index)?,
+                    )?);
+                    index += 1;
+                }
                 "--keep-container" => {
                     options.sql_server.keep_container = true;
                 }
@@ -692,6 +1020,9 @@ impl CompareBenchOptions {
                 }
                 "--keep-runner-image" => {
                     options.keep_runner_image = true;
+                }
+                "--profile-direct" => {
+                    options.profile_direct = true;
                 }
                 other => return Err(WriterBenchError::UnknownOption(other.to_owned())),
             }
@@ -771,13 +1102,14 @@ fn parse_benchmark_backends(value: &str) -> Result<Vec<BenchmarkBackend>, Writer
 fn ensure_direct_raw_supported_scenario(
     benchmark: &WriterBenchOptions,
 ) -> Result<(), WriterBenchError> {
-    if benchmark.scenario.name == NARROW_NUMERIC_SCENARIO.name {
+    if DIRECT_RAW_SUPPORTED_SCENARIOS.contains(&benchmark.scenario.name) {
         return Ok(());
     }
 
     Err(WriterBenchError::Validation(format!(
-        "writer-bench compare backend `direct-raw` currently supports only scenario `{}`; scenario `{}` contains column types that are not implemented by the primitive direct TDS encoder yet",
-        NARROW_NUMERIC_SCENARIO.name, benchmark.scenario.name
+        "writer-bench compare backend `direct-raw` currently supports only scenarios {}; scenario `{}` contains column types that are not implemented by the direct TDS encoder yet",
+        DIRECT_RAW_SUPPORTED_SCENARIOS.join(", "),
+        benchmark.scenario.name
     )))
 }
 
@@ -1067,6 +1399,7 @@ fn arrow_odbc_runner_args(
     Ok(vec![
         "cargo".to_owned(),
         "run".to_owned(),
+        "--release".to_owned(),
         "--manifest-path".to_owned(),
         "xtask/arrow-odbc-runner/Cargo.toml".to_owned(),
         "--target-dir".to_owned(),
@@ -1128,6 +1461,7 @@ fn odbc_bcp_runner_args(
     Ok(vec![
         "cargo".to_owned(),
         "run".to_owned(),
+        "--release".to_owned(),
         "--manifest-path".to_owned(),
         "xtask/odbc-bcp-runner/Cargo.toml".to_owned(),
         "--target-dir".to_owned(),
@@ -1398,6 +1732,13 @@ const TPCH_LINEITEM_LIKE_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenar
     columns: tpch_lineitem_like_columns,
 };
 
+const DIRECT_RAW_SUPPORTED_SCENARIOS: &[&str] = &[
+    NARROW_NUMERIC_SCENARIO.name,
+    MIXED_NULLABLE_SCENARIO.name,
+    STRING_HEAVY_SCENARIO.name,
+    WIDE_SPARSE_SCENARIO.name,
+];
+
 const SCENARIOS: &[BenchmarkScenarioDefinition] = &[
     NARROW_NUMERIC_SCENARIO,
     MIXED_NULLABLE_SCENARIO,
@@ -1498,6 +1839,7 @@ struct TiberiusBenchReport {
     validated_rows: u64,
     peak_rss_kib: Option<u64>,
     timings: TiberiusBenchTimings,
+    direct_profile: Option<DirectWriteProfile>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1559,6 +1901,8 @@ async fn run_baseline_async(
         connection,
         &ipc_dataset.host_path,
         WriteBackend::BaselineTokenRow,
+        false,
+        options.tds_packet_size,
     )
     .await;
     let dataset_cleanup_result = ipc_dataset.cleanup();
@@ -1572,6 +1916,12 @@ async fn run_baseline_async(
 fn run_compare_benchmark(
     options: &CompareBenchOptions,
 ) -> Result<CompareBenchReport, WriterBenchError> {
+    if options.profile_direct && !options.backends.contains(&BenchmarkBackend::DirectRaw) {
+        return Err(WriterBenchError::Validation(
+            "writer-bench compare --profile-direct requires the direct-raw backend".to_owned(),
+        ));
+    }
+
     if options.backends.contains(&BenchmarkBackend::DirectRaw) {
         ensure_direct_raw_supported_scenario(&options.benchmark)?;
     }
@@ -1604,6 +1954,8 @@ fn run_compare_benchmark(
                     &connection,
                     &ipc_dataset.host_path,
                     WriteBackend::BaselineTokenRow,
+                    false,
+                    options.tds_packet_size,
                 )
                 .await?;
                 report.timings.total = backend_start.elapsed();
@@ -1620,6 +1972,8 @@ fn run_compare_benchmark(
                     &connection,
                     &ipc_dataset.host_path,
                     WriteBackend::DirectRawBulk,
+                    options.profile_direct,
+                    options.tds_packet_size,
                 )
                 .await?;
                 report.timings.total = backend_start.elapsed();
@@ -1684,11 +2038,18 @@ async fn run_tiberius_benchmark_from_ipc(
     connection: &sqlserver::SqlServerConnection,
     ipc_path: &Path,
     backend: WriteBackend,
+    profile_direct: bool,
+    tds_packet_size: Option<u32>,
 ) -> Result<TiberiusBenchReport, WriterBenchError> {
     let mut report = TiberiusBenchReport::default();
 
     let setup_start = Instant::now();
-    let mut client = connect(&connection.connection_string, &connection.database).await?;
+    let mut client = connect(
+        &connection.connection_string,
+        &connection.database,
+        tds_packet_size,
+    )
+    .await?;
     let schema = (benchmark.scenario.schema)();
     let mappings = benchmark_mappings_for_schema(Arc::clone(&schema))?;
     report.timings.setup += setup_start.elapsed();
@@ -1697,8 +2058,15 @@ async fn run_tiberius_benchmark_from_ipc(
         let repeat_result = async {
             let table = unique_benchmark_table_name()?;
             let repeat_report =
-                run_tiberius_repeat_from_ipc(&mut client, &mappings, &table, ipc_path, backend)
-                    .await;
+                run_tiberius_repeat_from_ipc(
+                    &mut client,
+                    &mappings,
+                    &table,
+                    ipc_path,
+                    backend,
+                    profile_direct,
+                )
+                .await;
             let cleanup_start = Instant::now();
             let cleanup_result = drop_table(&mut client, &table).await;
             report.timings.cleanup += cleanup_start.elapsed();
@@ -1730,6 +2098,7 @@ async fn run_tiberius_benchmark_from_ipc(
             report.timings.write += repeat_report.timings.write;
             report.timings.finish += repeat_report.timings.finish;
             report.timings.validate += repeat_report.timings.validate;
+            merge_direct_profile(&mut report.direct_profile, repeat_report.direct_profile);
 
             Ok(())
         }
@@ -1776,11 +2145,13 @@ async fn run_tiberius_repeat_from_ipc(
     table: &TableName,
     ipc_path: &Path,
     backend: WriteBackend,
+    profile_direct: bool,
 ) -> Result<TiberiusBenchReport, WriterBenchError> {
     let batches =
         dataset::ipc_dataset_reader(ipc_path)?.map(|batch| batch.map_err(WriterBenchError::Arrow));
 
-    run_tiberius_repeat_with_batches(client, mappings, table, batches, backend).await
+    run_tiberius_repeat_with_batches(client, mappings, table, batches, backend, profile_direct)
+        .await
 }
 
 async fn run_tiberius_repeat_with_batches(
@@ -1789,6 +2160,7 @@ async fn run_tiberius_repeat_with_batches(
     table: &TableName,
     batches: impl IntoIterator<Item = Result<RecordBatch, WriterBenchError>>,
     backend: WriteBackend,
+    profile_direct: bool,
 ) -> Result<TiberiusBenchReport, WriterBenchError> {
     let mut report = TiberiusBenchReport::default();
     let setup_start = Instant::now();
@@ -1811,6 +2183,11 @@ async fn run_tiberius_repeat_with_batches(
     .await
     .map_err(WriterBenchError::ArrowTiberius)?;
     report.timings.setup += setup_start.elapsed();
+
+    let profiling_direct = profile_direct && backend == WriteBackend::DirectRawBulk;
+    if profiling_direct {
+        arrow_tiberius::write::profile::start_direct_write_profile();
+    }
 
     let write_start = Instant::now();
     for batch in batches {
@@ -1840,11 +2217,220 @@ async fn run_tiberius_repeat_with_batches(
         });
     }
 
+    if profiling_direct {
+        report.direct_profile = arrow_tiberius::write::profile::finish_direct_write_profile();
+    }
+
     Ok(report)
 }
 
-async fn connect(connection_string: &str, database: &str) -> Result<BenchClient, WriterBenchError> {
-    let connection_string = format!("{connection_string};database={database}");
+fn merge_direct_profile(
+    target: &mut Option<DirectWriteProfile>,
+    source: Option<DirectWriteProfile>,
+) {
+    let Some(source) = source else {
+        return;
+    };
+
+    let target = target.get_or_insert_with(DirectWriteProfile::default);
+    target.measure_batch += source.measure_batch;
+    target.row_range_split += source.row_range_split;
+    target.append_encode += source.append_encode;
+    target.send_total += source.send_total;
+    target.rows = target.rows.saturating_add(source.rows);
+    target.batches = target.batches.saturating_add(source.batches);
+    target.row_ranges = target.row_ranges.saturating_add(source.row_ranges);
+    target.encoded_bytes = target.encoded_bytes.saturating_add(source.encoded_bytes);
+    target.max_row_range_bytes = target.max_row_range_bytes.max(source.max_row_range_bytes);
+    target.nvarchar_utf16_bytes = target
+        .nvarchar_utf16_bytes
+        .saturating_add(source.nvarchar_utf16_bytes);
+    target.varbinary_bytes = target
+        .varbinary_bytes
+        .saturating_add(source.varbinary_bytes);
+    target.null_cells = target.null_cells.saturating_add(source.null_cells);
+    target.packet_write_calls = target
+        .packet_write_calls
+        .saturating_add(source.packet_write_calls);
+    target.packets_written = target
+        .packets_written
+        .saturating_add(source.packets_written);
+    target.packet_payload_bytes = target
+        .packet_payload_bytes
+        .saturating_add(source.packet_payload_bytes);
+    target.max_packet_payload_bytes = target
+        .max_packet_payload_bytes
+        .max(source.max_packet_payload_bytes);
+    target.max_buffered_bytes_before_write = target
+        .max_buffered_bytes_before_write
+        .max(source.max_buffered_bytes_before_write);
+    target.buffered_bytes_after_last_write = source.buffered_bytes_after_last_write;
+    target.finalized_packet_payload_bytes = target
+        .finalized_packet_payload_bytes
+        .saturating_add(source.finalized_packet_payload_bytes);
+    target.bulk_write_packets_elapsed += source.bulk_write_packets_elapsed;
+    target.bulk_write_to_wire_calls = target
+        .bulk_write_to_wire_calls
+        .saturating_add(source.bulk_write_to_wire_calls);
+    target.bulk_write_to_wire_elapsed += source.bulk_write_to_wire_elapsed;
+    target.bulk_write_to_wire_payload_bytes = target
+        .bulk_write_to_wire_payload_bytes
+        .saturating_add(source.bulk_write_to_wire_payload_bytes);
+    target.bulk_max_write_to_wire_elapsed = target
+        .bulk_max_write_to_wire_elapsed
+        .max(source.bulk_max_write_to_wire_elapsed);
+    target.bulk_max_write_to_wire_payload_bytes = target
+        .bulk_max_write_to_wire_payload_bytes
+        .max(source.bulk_max_write_to_wire_payload_bytes);
+    target.bulk_flush_calls = target
+        .bulk_flush_calls
+        .saturating_add(source.bulk_flush_calls);
+    target.bulk_flush_elapsed += source.bulk_flush_elapsed;
+    target.bulk_max_flush_elapsed = target
+        .bulk_max_flush_elapsed
+        .max(source.bulk_max_flush_elapsed);
+    target.bulk_finalize_elapsed += source.bulk_finalize_elapsed;
+    target.bulk_finalize_write_to_wire_elapsed += source.bulk_finalize_write_to_wire_elapsed;
+    target.bulk_finalize_flush_elapsed += source.bulk_finalize_flush_elapsed;
+    target.bulk_finalize_result_elapsed += source.bulk_finalize_result_elapsed;
+    target.bulk_connection_write_calls = target
+        .bulk_connection_write_calls
+        .saturating_add(source.bulk_connection_write_calls);
+    target.bulk_connection_write_payload_bytes = target
+        .bulk_connection_write_payload_bytes
+        .saturating_add(source.bulk_connection_write_payload_bytes);
+    target.bulk_connection_write_ready_elapsed += source.bulk_connection_write_ready_elapsed;
+    target.bulk_connection_write_encode_elapsed += source.bulk_connection_write_encode_elapsed;
+    target.bulk_connection_write_flush_elapsed += source.bulk_connection_write_flush_elapsed;
+    target.bulk_connection_write_max_ready_elapsed = target
+        .bulk_connection_write_max_ready_elapsed
+        .max(source.bulk_connection_write_max_ready_elapsed);
+    target.bulk_connection_write_max_encode_elapsed = target
+        .bulk_connection_write_max_encode_elapsed
+        .max(source.bulk_connection_write_max_encode_elapsed);
+    target.bulk_connection_write_max_flush_elapsed = target
+        .bulk_connection_write_max_flush_elapsed
+        .max(source.bulk_connection_write_max_flush_elapsed);
+    target.bulk_connection_write_max_payload_bytes = target
+        .bulk_connection_write_max_payload_bytes
+        .max(source.bulk_connection_write_max_payload_bytes);
+    target.bulk_direct_packet_write_calls = target
+        .bulk_direct_packet_write_calls
+        .saturating_add(source.bulk_direct_packet_write_calls);
+    target.bulk_direct_packet_payload_bytes = target
+        .bulk_direct_packet_payload_bytes
+        .saturating_add(source.bulk_direct_packet_payload_bytes);
+    target.bulk_direct_packet_header_bytes = target
+        .bulk_direct_packet_header_bytes
+        .saturating_add(source.bulk_direct_packet_header_bytes);
+    target.bulk_direct_packet_max_payload_bytes = target
+        .bulk_direct_packet_max_payload_bytes
+        .max(source.bulk_direct_packet_max_payload_bytes);
+    target.bulk_direct_packet_final_calls = target
+        .bulk_direct_packet_final_calls
+        .saturating_add(source.bulk_direct_packet_final_calls);
+    target.bulk_direct_packet_final_payload_bytes = target
+        .bulk_direct_packet_final_payload_bytes
+        .saturating_add(source.bulk_direct_packet_final_payload_bytes);
+    target.bulk_direct_packet_final_header_bytes = target
+        .bulk_direct_packet_final_header_bytes
+        .saturating_add(source.bulk_direct_packet_final_header_bytes);
+    target.bulk_direct_packet_raw_stream_calls = target
+        .bulk_direct_packet_raw_stream_calls
+        .saturating_add(source.bulk_direct_packet_raw_stream_calls);
+    target.bulk_direct_packet_tls_stream_calls = target
+        .bulk_direct_packet_tls_stream_calls
+        .saturating_add(source.bulk_direct_packet_tls_stream_calls);
+    target.bulk_direct_packet_low_level_write_calls = target
+        .bulk_direct_packet_low_level_write_calls
+        .saturating_add(source.bulk_direct_packet_low_level_write_calls);
+    target.bulk_direct_packet_low_level_write_bytes = target
+        .bulk_direct_packet_low_level_write_bytes
+        .saturating_add(source.bulk_direct_packet_low_level_write_bytes);
+    target.bulk_direct_packet_max_low_level_write_bytes = target
+        .bulk_direct_packet_max_low_level_write_bytes
+        .max(source.bulk_direct_packet_max_low_level_write_bytes);
+    target.bulk_direct_packet_write_elapsed += source.bulk_direct_packet_write_elapsed;
+    target.bulk_direct_packet_max_write_elapsed = target
+        .bulk_direct_packet_max_write_elapsed
+        .max(source.bulk_direct_packet_max_write_elapsed);
+    target.bulk_direct_packet_header_write_calls = target
+        .bulk_direct_packet_header_write_calls
+        .saturating_add(source.bulk_direct_packet_header_write_calls);
+    target.bulk_direct_packet_header_write_bytes = target
+        .bulk_direct_packet_header_write_bytes
+        .saturating_add(source.bulk_direct_packet_header_write_bytes);
+    target.bulk_direct_packet_header_max_write_bytes = target
+        .bulk_direct_packet_header_max_write_bytes
+        .max(source.bulk_direct_packet_header_max_write_bytes);
+    target.bulk_direct_packet_header_write_elapsed +=
+        source.bulk_direct_packet_header_write_elapsed;
+    target.bulk_direct_packet_header_max_write_elapsed = target
+        .bulk_direct_packet_header_max_write_elapsed
+        .max(source.bulk_direct_packet_header_max_write_elapsed);
+    target.bulk_direct_packet_header_partial_writes = target
+        .bulk_direct_packet_header_partial_writes
+        .saturating_add(source.bulk_direct_packet_header_partial_writes);
+    target.bulk_direct_packet_payload_write_calls = target
+        .bulk_direct_packet_payload_write_calls
+        .saturating_add(source.bulk_direct_packet_payload_write_calls);
+    target.bulk_direct_packet_payload_write_bytes = target
+        .bulk_direct_packet_payload_write_bytes
+        .saturating_add(source.bulk_direct_packet_payload_write_bytes);
+    target.bulk_direct_packet_payload_max_write_bytes = target
+        .bulk_direct_packet_payload_max_write_bytes
+        .max(source.bulk_direct_packet_payload_max_write_bytes);
+    target.bulk_direct_packet_payload_write_elapsed +=
+        source.bulk_direct_packet_payload_write_elapsed;
+    target.bulk_direct_packet_payload_max_write_elapsed = target
+        .bulk_direct_packet_payload_max_write_elapsed
+        .max(source.bulk_direct_packet_payload_max_write_elapsed);
+    target.bulk_direct_packet_payload_partial_writes = target
+        .bulk_direct_packet_payload_partial_writes
+        .saturating_add(source.bulk_direct_packet_payload_partial_writes);
+    target.bulk_direct_packet_poll_write_polls = target
+        .bulk_direct_packet_poll_write_polls
+        .saturating_add(source.bulk_direct_packet_poll_write_polls);
+    target.bulk_direct_packet_poll_write_pending_count = target
+        .bulk_direct_packet_poll_write_pending_count
+        .saturating_add(source.bulk_direct_packet_poll_write_pending_count);
+    target.bulk_direct_packet_poll_write_pending_elapsed +=
+        source.bulk_direct_packet_poll_write_pending_elapsed;
+    target.bulk_direct_packet_poll_write_max_pending_elapsed = target
+        .bulk_direct_packet_poll_write_max_pending_elapsed
+        .max(source.bulk_direct_packet_poll_write_max_pending_elapsed);
+    target.bulk_direct_packet_poll_write_ready_count = target
+        .bulk_direct_packet_poll_write_ready_count
+        .saturating_add(source.bulk_direct_packet_poll_write_ready_count);
+    target.bulk_direct_packet_poll_write_ready_elapsed +=
+        source.bulk_direct_packet_poll_write_ready_elapsed;
+    target.bulk_direct_packet_poll_write_max_ready_elapsed = target
+        .bulk_direct_packet_poll_write_max_ready_elapsed
+        .max(source.bulk_direct_packet_poll_write_max_ready_elapsed);
+    target.bulk_direct_packet_flush_calls = target
+        .bulk_direct_packet_flush_calls
+        .saturating_add(source.bulk_direct_packet_flush_calls);
+    target.bulk_direct_packet_flush_elapsed += source.bulk_direct_packet_flush_elapsed;
+    target.bulk_direct_packet_max_flush_elapsed = target
+        .bulk_direct_packet_max_flush_elapsed
+        .max(source.bulk_direct_packet_max_flush_elapsed);
+    target.bulk_direct_packet_flush_pending_count = target
+        .bulk_direct_packet_flush_pending_count
+        .saturating_add(source.bulk_direct_packet_flush_pending_count);
+    target.bulk_direct_packet_flush_pending_elapsed +=
+        source.bulk_direct_packet_flush_pending_elapsed;
+    target.bulk_direct_packet_flush_max_pending_elapsed = target
+        .bulk_direct_packet_flush_max_pending_elapsed
+        .max(source.bulk_direct_packet_flush_max_pending_elapsed);
+}
+
+async fn connect(
+    connection_string: &str,
+    database: &str,
+    tds_packet_size: Option<u32>,
+) -> Result<BenchClient, WriterBenchError> {
+    let connection_string =
+        tiberius_connection_string(connection_string, database, tds_packet_size);
     let config = tiberius::Config::from_ado_string(&connection_string)
         .map_err(WriterBenchError::Tiberius)?;
     let tcp = TcpStream::connect(config.get_addr())
@@ -1854,6 +2440,18 @@ async fn connect(connection_string: &str, database: &str) -> Result<BenchClient,
     tiberius::Client::connect(config, tcp.compat_write())
         .await
         .map_err(WriterBenchError::Tiberius)
+}
+
+fn tiberius_connection_string(
+    connection_string: &str,
+    database: &str,
+    tds_packet_size: Option<u32>,
+) -> String {
+    let mut connection_string = format!("{connection_string};database={database}");
+    if let Some(tds_packet_size) = tds_packet_size {
+        connection_string.push_str(&format!(";Packet Size={tds_packet_size}"));
+    }
+    connection_string
 }
 
 async fn execute_sql(client: &mut BenchClient, sql: String) -> Result<(), WriterBenchError> {
@@ -2576,6 +3174,24 @@ fn parse_positive_usize(option: &'static str, value: &str) -> Result<usize, Writ
     Ok(parsed)
 }
 
+fn parse_positive_u32(option: &'static str, value: &str) -> Result<u32, WriterBenchError> {
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_| WriterBenchError::InvalidPositiveInteger {
+            option,
+            value: value.to_owned(),
+        })?;
+
+    if parsed == 0 {
+        return Err(WriterBenchError::InvalidPositiveInteger {
+            option,
+            value: value.to_owned(),
+        });
+    }
+
+    Ok(parsed)
+}
+
 fn required_value(args: &[OsString], index: usize) -> Result<String, WriterBenchError> {
     let value = args
         .get(index + 1)
@@ -2658,15 +3274,15 @@ fn scenario_names() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{BenchmarkOutput, WriterBenchError, WriterBenchOptions};
+    use super::{BenchmarkOutput, DirectWriteProfile, WriterBenchError, WriterBenchOptions};
     use arrow_array::{
         Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int32Array,
         Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
     };
     use arrow_schema::{DataType, TimeUnit};
-    use std::ffi::OsString;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{ffi::OsString, time::Duration};
 
     static TEST_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -2762,6 +3378,8 @@ mod tests {
             OsString::from("server=tcp:127.0.0.1,1433;password=secret"),
             OsString::from("--database"),
             OsString::from("bench_db"),
+            OsString::from("--tds-packet-size"),
+            OsString::from("32767"),
         ];
 
         let options = super::BaselineBenchOptions::parse(&args).unwrap();
@@ -2771,6 +3389,7 @@ mod tests {
         assert_eq!(options.benchmark.scenario.name, "mixed_nullable");
         assert_eq!(options.sql_server.database, "bench_db");
         assert!(options.sql_server.connection_string.is_some());
+        assert_eq!(options.tds_packet_size, Some(32767));
     }
 
     #[test]
@@ -2813,6 +3432,8 @@ mod tests {
             OsString::from("server=tcp:127.0.0.1,1433;password=secret"),
             OsString::from("--database"),
             OsString::from("bench_db"),
+            OsString::from("--tds-packet-size"),
+            OsString::from("32767"),
         ];
 
         let options = super::CompareBenchOptions::parse(&args).unwrap();
@@ -2832,6 +3453,27 @@ mod tests {
         assert!(options.keep_runner_image);
         assert_eq!(options.sql_server.database, "bench_db");
         assert!(options.sql_server.connection_string.is_some());
+        assert_eq!(options.tds_packet_size, Some(32767));
+    }
+
+    #[test]
+    fn rejects_invalid_tds_packet_size() {
+        let args = [
+            OsString::from("--backends"),
+            OsString::from("direct-raw"),
+            OsString::from("--tds-packet-size"),
+            OsString::from("0"),
+        ];
+
+        let err = super::CompareBenchOptions::parse(&args).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::InvalidPositiveInteger {
+                option: "--tds-packet-size",
+                value
+            } if value == "0"
+        ));
     }
 
     #[test]
@@ -2857,6 +3499,192 @@ mod tests {
     }
 
     #[test]
+    fn parses_compare_direct_profile_flag() {
+        let args = [
+            OsString::from("--backends"),
+            OsString::from("direct-raw"),
+            OsString::from("--profile-direct"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+
+        assert!(options.profile_direct);
+    }
+
+    #[test]
+    fn merge_direct_profile_preserves_direct_packet_stats() {
+        let mut target = Some(DirectWriteProfile {
+            bulk_direct_packet_write_calls: 2,
+            bulk_direct_packet_payload_bytes: 3,
+            bulk_direct_packet_header_bytes: 5,
+            bulk_direct_packet_max_payload_bytes: 7,
+            bulk_direct_packet_final_calls: 11,
+            bulk_direct_packet_final_payload_bytes: 13,
+            bulk_direct_packet_final_header_bytes: 17,
+            bulk_direct_packet_raw_stream_calls: 19,
+            bulk_direct_packet_tls_stream_calls: 23,
+            bulk_direct_packet_low_level_write_calls: 7,
+            bulk_direct_packet_low_level_write_bytes: 11,
+            bulk_direct_packet_max_low_level_write_bytes: 13,
+            bulk_direct_packet_write_elapsed: Duration::from_millis(17),
+            bulk_direct_packet_max_write_elapsed: Duration::from_millis(19),
+            bulk_direct_packet_header_write_calls: 29,
+            bulk_direct_packet_header_write_bytes: 31,
+            bulk_direct_packet_header_max_write_bytes: 37,
+            bulk_direct_packet_header_write_elapsed: Duration::from_millis(41),
+            bulk_direct_packet_header_max_write_elapsed: Duration::from_millis(43),
+            bulk_direct_packet_header_partial_writes: 47,
+            bulk_direct_packet_payload_write_calls: 53,
+            bulk_direct_packet_payload_write_bytes: 59,
+            bulk_direct_packet_payload_max_write_bytes: 61,
+            bulk_direct_packet_payload_write_elapsed: Duration::from_millis(67),
+            bulk_direct_packet_payload_max_write_elapsed: Duration::from_millis(71),
+            bulk_direct_packet_payload_partial_writes: 73,
+            bulk_direct_packet_poll_write_polls: 79,
+            bulk_direct_packet_poll_write_pending_count: 83,
+            bulk_direct_packet_poll_write_pending_elapsed: Duration::from_millis(89),
+            bulk_direct_packet_poll_write_max_pending_elapsed: Duration::from_millis(97),
+            bulk_direct_packet_poll_write_ready_count: 101,
+            bulk_direct_packet_poll_write_ready_elapsed: Duration::from_millis(103),
+            bulk_direct_packet_poll_write_max_ready_elapsed: Duration::from_millis(107),
+            bulk_direct_packet_flush_calls: 23,
+            bulk_direct_packet_flush_elapsed: Duration::from_millis(29),
+            bulk_direct_packet_max_flush_elapsed: Duration::from_millis(31),
+            bulk_direct_packet_flush_pending_count: 109,
+            bulk_direct_packet_flush_pending_elapsed: Duration::from_millis(113),
+            bulk_direct_packet_flush_max_pending_elapsed: Duration::from_millis(127),
+            ..DirectWriteProfile::default()
+        });
+        let source = DirectWriteProfile {
+            bulk_direct_packet_write_calls: 37,
+            bulk_direct_packet_payload_bytes: 41,
+            bulk_direct_packet_header_bytes: 43,
+            bulk_direct_packet_max_payload_bytes: 47,
+            bulk_direct_packet_final_calls: 53,
+            bulk_direct_packet_final_payload_bytes: 59,
+            bulk_direct_packet_final_header_bytes: 61,
+            bulk_direct_packet_raw_stream_calls: 67,
+            bulk_direct_packet_tls_stream_calls: 71,
+            bulk_direct_packet_low_level_write_calls: 47,
+            bulk_direct_packet_low_level_write_bytes: 53,
+            bulk_direct_packet_max_low_level_write_bytes: 59,
+            bulk_direct_packet_write_elapsed: Duration::from_millis(61),
+            bulk_direct_packet_max_write_elapsed: Duration::from_millis(67),
+            bulk_direct_packet_header_write_calls: 73,
+            bulk_direct_packet_header_write_bytes: 79,
+            bulk_direct_packet_header_max_write_bytes: 83,
+            bulk_direct_packet_header_write_elapsed: Duration::from_millis(89),
+            bulk_direct_packet_header_max_write_elapsed: Duration::from_millis(97),
+            bulk_direct_packet_header_partial_writes: 101,
+            bulk_direct_packet_payload_write_calls: 103,
+            bulk_direct_packet_payload_write_bytes: 107,
+            bulk_direct_packet_payload_max_write_bytes: 109,
+            bulk_direct_packet_payload_write_elapsed: Duration::from_millis(113),
+            bulk_direct_packet_payload_max_write_elapsed: Duration::from_millis(127),
+            bulk_direct_packet_payload_partial_writes: 131,
+            bulk_direct_packet_poll_write_polls: 137,
+            bulk_direct_packet_poll_write_pending_count: 139,
+            bulk_direct_packet_poll_write_pending_elapsed: Duration::from_millis(149),
+            bulk_direct_packet_poll_write_max_pending_elapsed: Duration::from_millis(151),
+            bulk_direct_packet_poll_write_ready_count: 157,
+            bulk_direct_packet_poll_write_ready_elapsed: Duration::from_millis(163),
+            bulk_direct_packet_poll_write_max_ready_elapsed: Duration::from_millis(167),
+            bulk_direct_packet_flush_calls: 71,
+            bulk_direct_packet_flush_elapsed: Duration::from_millis(73),
+            bulk_direct_packet_max_flush_elapsed: Duration::from_millis(79),
+            bulk_direct_packet_flush_pending_count: 173,
+            bulk_direct_packet_flush_pending_elapsed: Duration::from_millis(179),
+            bulk_direct_packet_flush_max_pending_elapsed: Duration::from_millis(181),
+            ..DirectWriteProfile::default()
+        };
+
+        super::merge_direct_profile(&mut target, Some(source));
+
+        let profile = target.unwrap();
+        assert_eq!(profile.bulk_direct_packet_write_calls, 39);
+        assert_eq!(profile.bulk_direct_packet_payload_bytes, 44);
+        assert_eq!(profile.bulk_direct_packet_header_bytes, 48);
+        assert_eq!(profile.bulk_direct_packet_max_payload_bytes, 47);
+        assert_eq!(profile.bulk_direct_packet_final_calls, 64);
+        assert_eq!(profile.bulk_direct_packet_final_payload_bytes, 72);
+        assert_eq!(profile.bulk_direct_packet_final_header_bytes, 78);
+        assert_eq!(profile.bulk_direct_packet_raw_stream_calls, 86);
+        assert_eq!(profile.bulk_direct_packet_tls_stream_calls, 94);
+        assert_eq!(profile.bulk_direct_packet_low_level_write_calls, 54);
+        assert_eq!(profile.bulk_direct_packet_low_level_write_bytes, 64);
+        assert_eq!(profile.bulk_direct_packet_max_low_level_write_bytes, 59);
+        assert_eq!(
+            profile.bulk_direct_packet_write_elapsed,
+            Duration::from_millis(78)
+        );
+        assert_eq!(
+            profile.bulk_direct_packet_max_write_elapsed,
+            Duration::from_millis(67)
+        );
+        assert_eq!(profile.bulk_direct_packet_header_write_calls, 102);
+        assert_eq!(profile.bulk_direct_packet_header_write_bytes, 110);
+        assert_eq!(profile.bulk_direct_packet_header_max_write_bytes, 83);
+        assert_eq!(
+            profile.bulk_direct_packet_header_write_elapsed,
+            Duration::from_millis(130)
+        );
+        assert_eq!(
+            profile.bulk_direct_packet_header_max_write_elapsed,
+            Duration::from_millis(97)
+        );
+        assert_eq!(profile.bulk_direct_packet_header_partial_writes, 148);
+        assert_eq!(profile.bulk_direct_packet_payload_write_calls, 156);
+        assert_eq!(profile.bulk_direct_packet_payload_write_bytes, 166);
+        assert_eq!(profile.bulk_direct_packet_payload_max_write_bytes, 109);
+        assert_eq!(
+            profile.bulk_direct_packet_payload_write_elapsed,
+            Duration::from_millis(180)
+        );
+        assert_eq!(
+            profile.bulk_direct_packet_payload_max_write_elapsed,
+            Duration::from_millis(127)
+        );
+        assert_eq!(profile.bulk_direct_packet_payload_partial_writes, 204);
+        assert_eq!(profile.bulk_direct_packet_poll_write_polls, 216);
+        assert_eq!(profile.bulk_direct_packet_poll_write_pending_count, 222);
+        assert_eq!(
+            profile.bulk_direct_packet_poll_write_pending_elapsed,
+            Duration::from_millis(238)
+        );
+        assert_eq!(
+            profile.bulk_direct_packet_poll_write_max_pending_elapsed,
+            Duration::from_millis(151)
+        );
+        assert_eq!(profile.bulk_direct_packet_poll_write_ready_count, 258);
+        assert_eq!(
+            profile.bulk_direct_packet_poll_write_ready_elapsed,
+            Duration::from_millis(266)
+        );
+        assert_eq!(
+            profile.bulk_direct_packet_poll_write_max_ready_elapsed,
+            Duration::from_millis(167)
+        );
+        assert_eq!(profile.bulk_direct_packet_flush_calls, 94);
+        assert_eq!(
+            profile.bulk_direct_packet_flush_elapsed,
+            Duration::from_millis(102)
+        );
+        assert_eq!(
+            profile.bulk_direct_packet_max_flush_elapsed,
+            Duration::from_millis(79)
+        );
+        assert_eq!(profile.bulk_direct_packet_flush_pending_count, 282);
+        assert_eq!(
+            profile.bulk_direct_packet_flush_pending_elapsed,
+            Duration::from_millis(292)
+        );
+        assert_eq!(
+            profile.bulk_direct_packet_flush_max_pending_elapsed,
+            Duration::from_millis(181)
+        );
+    }
+
+    #[test]
     fn compare_defaults_to_both_initial_backends() {
         let options = super::CompareBenchOptions::parse(&[]).unwrap();
 
@@ -2868,6 +3696,7 @@ mod tests {
             ]
         );
         assert_eq!(options.benchmark.scenario.name, "narrow_numeric");
+        assert!(!options.profile_direct);
     }
 
     #[test]
@@ -2908,24 +3737,46 @@ mod tests {
     }
 
     #[test]
+    fn compare_allows_direct_raw_for_variable_width_supported_scenarios() {
+        for scenario in ["mixed_nullable", "string_heavy", "wide_sparse"] {
+            let args = [
+                OsString::from("--scenario"),
+                OsString::from(scenario),
+                OsString::from("--backends"),
+                OsString::from("direct-raw"),
+            ];
+
+            let options = super::CompareBenchOptions::parse(&args).unwrap();
+
+            assert_eq!(options.backends, [super::BenchmarkBackend::DirectRaw]);
+            super::ensure_direct_raw_supported_scenario(&options.benchmark).unwrap();
+        }
+    }
+
+    #[test]
     fn compare_rejects_direct_raw_for_unsupported_scenarios() {
-        let args = [
-            OsString::from("--scenario"),
-            OsString::from("mixed_nullable"),
-            OsString::from("--backends"),
-            OsString::from("direct-raw"),
-        ];
+        for scenario in ["wide_mixed", "decimal_temporal", "tpch_lineitem_like"] {
+            let args = [
+                OsString::from("--scenario"),
+                OsString::from(scenario),
+                OsString::from("--backends"),
+                OsString::from("direct-raw"),
+            ];
 
-        let options = super::CompareBenchOptions::parse(&args).unwrap();
-        let err = super::ensure_direct_raw_supported_scenario(&options.benchmark).unwrap_err();
+            let options = super::CompareBenchOptions::parse(&args).unwrap();
+            let err = super::ensure_direct_raw_supported_scenario(&options.benchmark).unwrap_err();
 
-        assert!(matches!(
-            err,
-            WriterBenchError::Validation(message)
-                if message.contains("direct-raw")
-                    && message.contains("narrow_numeric")
-                    && message.contains("mixed_nullable")
-        ));
+            assert!(matches!(
+                err,
+                WriterBenchError::Validation(message)
+                    if message.contains("direct-raw")
+                        && message.contains("narrow_numeric")
+                        && message.contains("mixed_nullable")
+                        && message.contains("string_heavy")
+                        && message.contains("wide_sparse")
+                        && message.contains(scenario)
+            ));
+        }
     }
 
     #[test]
@@ -2964,6 +3815,25 @@ mod tests {
         assert!(matches!(
             err,
             WriterBenchError::Validation(message) if message.contains("unknown writer-bench compare backend `raw`")
+        ));
+    }
+
+    #[test]
+    fn compare_rejects_direct_profile_without_direct_backend() {
+        let args = [
+            OsString::from("--backends"),
+            OsString::from("baseline"),
+            OsString::from("--profile-direct"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+        let err = super::run_compare_benchmark(&options).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("--profile-direct")
+                    && message.contains("direct-raw")
         ));
     }
 
@@ -3031,6 +3901,7 @@ mod tests {
                 output: BenchmarkOutput::Human,
             },
             sql_server: crate::sqlserver::SqlServerConnectionOptions::benchmark_default(),
+            tds_packet_size: None,
         };
 
         let dataset = super::prepare_baseline_ipc_dataset(&options).unwrap();
@@ -3059,6 +3930,8 @@ mod tests {
             backends: vec![super::BenchmarkBackend::Baseline],
             runner_image: crate::odbc_runner::DEFAULT_RUNNER_IMAGE_TAG.to_owned(),
             keep_runner_image: false,
+            profile_direct: false,
+            tds_packet_size: None,
         };
 
         let dataset = super::prepare_compare_ipc_dataset(&options).unwrap();
@@ -3228,6 +4101,7 @@ mod tests {
             super::arrow_odbc_runner_args(&options.benchmark, "/workspace/target/bench.arrow")
                 .unwrap();
 
+        assert!(args.iter().any(|arg| arg == "--release"));
         assert!(args.windows(2).any(|pair| pair == ["--rows", "25"]));
         assert!(args.windows(2).any(|pair| pair == ["--batch-size", "5"]));
         assert!(
@@ -3260,6 +4134,7 @@ mod tests {
         let args =
             super::odbc_bcp_runner_args(&benchmark, "/workspace/target/bench.arrow").unwrap();
 
+        assert!(args.iter().any(|arg| arg == "--release"));
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--manifest-path", "xtask/odbc-bcp-runner/Cargo.toml"])
@@ -3444,6 +4319,31 @@ odbc-bcp runner
 
         assert!(
             matches!(err, WriterBenchError::Validation(message) if message.contains("password"))
+        );
+    }
+
+    #[test]
+    fn tiberius_connection_string_appends_database_and_optional_packet_size() {
+        let connection_string = super::tiberius_connection_string(
+            "server=tcp:127.0.0.1,1433;User ID=sa;Password=secret",
+            "bench",
+            Some(32767),
+        );
+
+        assert_eq!(
+            connection_string,
+            "server=tcp:127.0.0.1,1433;User ID=sa;Password=secret;database=bench;Packet Size=32767"
+        );
+
+        let connection_string = super::tiberius_connection_string(
+            "server=tcp:127.0.0.1,1433;User ID=sa;Password=secret",
+            "bench",
+            None,
+        );
+
+        assert_eq!(
+            connection_string,
+            "server=tcp:127.0.0.1,1433;User ID=sa;Password=secret;database=bench"
         );
     }
 

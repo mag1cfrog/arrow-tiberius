@@ -3,6 +3,11 @@
 pub(crate) mod direct;
 /// Write-path planning and conversion policies.
 pub mod policy;
+/// Benchmark-only write profiling hooks.
+#[cfg(feature = "bench-profile")]
+pub mod profile;
+#[cfg(not(feature = "bench-profile"))]
+pub(crate) mod profile;
 pub(crate) mod record_batch;
 pub(crate) mod token_row;
 /// Baseline bulk writer public API skeleton.

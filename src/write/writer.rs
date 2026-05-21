@@ -1,5 +1,7 @@
 //! Baseline bulk writer public API skeleton.
 
+use std::borrow::Cow;
+
 use arrow_array::RecordBatch;
 use futures_util::io::{AsyncRead, AsyncWrite};
 
@@ -11,15 +13,18 @@ use crate::{
 use super::{
     SchemaCheck,
     direct::{
-        DirectEncoder,
+        DirectEncoder, MeasuredDirectBatch, MeasuredRowRange,
         plan::{DirectColumnEncoding, DirectColumnPlan, DirectEncoderPlan},
     },
+    profile,
     record_batch::RecordBatchView,
     token_row::tiberius_row_owned,
 };
 use crate::conversion::arrow_to_mssql::{
     primitive::PrimitiveArrowToMssql, variable_width::VariableWidthArrowToMssql,
 };
+
+const DIRECT_RAW_MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 
 /// Write backend selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -144,7 +149,7 @@ where
             options.plan_options,
             mappings,
         )?;
-        let request = match state.backend() {
+        let mut request = match state.backend() {
             WriteBackend::BaselineTokenRow | WriteBackend::DirectRawBulk => {
                 let table_sql = bulk_insert_table_sql(&table);
                 let columns = client
@@ -173,6 +178,10 @@ where
             }
         };
 
+        if state.backend() == WriteBackend::DirectRawBulk {
+            request.enable_direct_packet_writes();
+        }
+
         Ok(Self { state, request })
     }
 
@@ -194,6 +203,16 @@ where
         let Self { state, request } = self;
         let stats = state.stats();
 
+        #[cfg(feature = "bench-profile")]
+        {
+            let (_result, stats) = request
+                .finalize_with_stats()
+                .await
+                .map_err(|source| crate::Error::Tiberius { source })?;
+            profile::record_bulk_load_stats(stats);
+        }
+
+        #[cfg(not(feature = "bench-profile"))]
         request
             .finalize()
             .await
@@ -487,22 +506,31 @@ where
             backend: WriteBackend::DirectRawBulk,
             reason: "direct raw bulk encoder is not available for this writer".to_owned(),
         })?;
-    let payload = encoder.encode_batch(batch)?;
-    let rows_written = usize_to_u64_saturating(payload.row_count());
+    let measure_start = std::time::Instant::now();
+    let measured = encoder.measure_batch(batch);
+    let measured = profile::record_elapsed(measure_start, profile::record_measure_batch, measured)?;
+    let rows_written = usize_to_u64_saturating(measured.row_count());
 
-    if !payload.is_empty() {
-        sink.send_raw_rows_payload_checked(payload.bytes(), payload.row_token_offsets())
+    let split_start = std::time::Instant::now();
+    let ranges = measured.row_ranges(DIRECT_RAW_MAX_PAYLOAD_BYTES);
+    let ranges = profile::record_elapsed(split_start, profile::record_row_range_split, ranges)?;
+
+    for range in ranges {
+        sink.send_measured_raw_rows(encoder, batch, &measured, range)
             .await?;
     }
 
+    profile::record_accepted_batch(measured.row_count());
     Ok(state.record_accepted_batch(rows_written))
 }
 
 trait RawRowsSink {
-    async fn send_raw_rows_payload_checked(
+    async fn send_measured_raw_rows(
         &mut self,
-        payload: &[u8],
-        row_token_offsets: &[usize],
+        encoder: &DirectEncoder,
+        batch: &RecordBatch,
+        measured: &MeasuredDirectBatch,
+        range: MeasuredRowRange,
     ) -> Result<()>;
 }
 
@@ -510,14 +538,65 @@ impl<S> RawRowsSink for tiberius::BulkLoadRequest<'_, S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    async fn send_raw_rows_payload_checked(
+    async fn send_measured_raw_rows(
         &mut self,
-        payload: &[u8],
-        row_token_offsets: &[usize],
+        encoder: &DirectEncoder,
+        batch: &RecordBatch,
+        measured: &MeasuredDirectBatch,
+        range: MeasuredRowRange,
     ) -> Result<()> {
-        self.send_raw_rows_payload_checked(payload, row_token_offsets)
-            .await
-            .map_err(|source| crate::Error::Tiberius { source })
+        self.enable_direct_packet_writes();
+
+        let encoded_bytes = measured.range_payload_len(range.start, range.len)?;
+        profile::record_row_range(encoded_bytes);
+
+        if !encoder.has_variable_width_column() {
+            let encode_start = std::time::Instant::now();
+            let payload =
+                encoder.encode_measured_batch_range(batch, measured, range.start, range.len)?;
+            profile::record_append_encode(encode_start.elapsed());
+
+            let send_start = std::time::Instant::now();
+            let send_result = self
+                .send_raw_rows_payload_checked(payload.bytes(), payload.row_token_offsets())
+                .await
+                .map_err(|source| crate::Error::Tiberius { source });
+            profile::record_send_total(send_start.elapsed());
+            return send_result;
+        }
+
+        let mut encode_error = None;
+        let send_start = std::time::Instant::now();
+        let send_result = self
+            .send_raw_rows_with(|buf| {
+                let encode_start = std::time::Instant::now();
+                let encoded = encoder.encode_measured_batch_range_into(
+                    batch,
+                    measured,
+                    range.start,
+                    range.len,
+                    buf,
+                );
+                profile::record_append_encode(encode_start.elapsed());
+
+                match encoded {
+                    Ok(append) => Ok(append),
+                    Err(err) => {
+                        encode_error = Some(err);
+                        Err(tiberius::error::Error::BulkInput(Cow::Borrowed(
+                            "direct raw row encoding failed",
+                        )))
+                    }
+                }
+            })
+            .await;
+        profile::record_send_total(send_start.elapsed());
+
+        if let Some(err) = encode_error {
+            return Err(err);
+        }
+
+        send_result.map_err(|source| crate::Error::Tiberius { source })
     }
 }
 
@@ -549,14 +628,15 @@ mod tests {
         task::{Context, Poll, Wake, Waker},
     };
 
-    use arrow_array::{Float64Array, Int32Array, RecordBatch};
+    use arrow_array::{BinaryArray, Float64Array, Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use futures_util::io::{AsyncRead, AsyncWrite};
 
     use super::{
-        BulkTargetColumnMetadata, RawRowsSink, TokenRowSink, WriteBackend, WriteOptions,
-        WriteStats, WriterState, bulk_insert_table_sql, record_batch_view, resolve_backend,
-        tiberius_row_owned, validate_batch_rows, validate_bulk_target_columns,
+        BulkTargetColumnMetadata, DIRECT_RAW_MAX_PAYLOAD_BYTES, DirectEncoder, MeasuredDirectBatch,
+        MeasuredRowRange, RawRowsSink, TokenRowSink, WriteBackend, WriteOptions, WriteStats,
+        WriterState, bulk_insert_table_sql, record_batch_view, resolve_backend, tiberius_row_owned,
+        validate_batch_rows, validate_bulk_target_columns,
         validate_direct_bulk_target_column_types, write_batch_to_sink, write_direct_batch_to_sink,
     };
     use crate::{
@@ -1169,6 +1249,34 @@ mod tests {
     }
 
     #[test]
+    fn write_direct_batch_to_sink_chunks_measured_payloads_by_byte_limit() {
+        let mappings = vec![binary_mapping_at(0, "payload")];
+        let mut state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingRawSink::default();
+        let row_bytes = vec![0x5a; DIRECT_RAW_MAX_PAYLOAD_BYTES / 2 + 1];
+        let batch = binary_batch("payload", &[row_bytes.as_slice(), row_bytes.as_slice()]);
+
+        let stats = poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch)).unwrap();
+
+        assert_eq!(
+            stats,
+            WriteStats {
+                rows_written: 2,
+                batches_written: 1
+            }
+        );
+        assert_eq!(sink.payloads.len(), 2);
+        assert_eq!(sink.payloads[0].row_token_offsets, [0]);
+        assert_eq!(sink.payloads[1].row_token_offsets, [0]);
+    }
+
+    #[test]
     fn write_direct_batch_to_sink_skips_send_for_empty_batch_but_records_stats() {
         let mappings = vec![mapping("id")];
         let mut state = WriterState::new(
@@ -1284,6 +1392,13 @@ mod tests {
         RecordBatch::try_new(schema, vec![array]).unwrap()
     }
 
+    fn binary_batch(name: &str, values: &[&[u8]]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Binary, false)]));
+        let array = Arc::new(BinaryArray::from_iter_values(values.iter().copied()));
+
+        RecordBatch::try_new(schema, vec![array]).unwrap()
+    }
+
     fn bulk_target_column(ordinal: usize, name: &str, nullable: bool) -> FakeBulkTargetColumn {
         bulk_target_column_with_type(ordinal, name, nullable, tiberius::ColumnType::Int4)
     }
@@ -1346,11 +1461,16 @@ mod tests {
     }
 
     impl RawRowsSink for RecordingRawSink {
-        async fn send_raw_rows_payload_checked(
+        async fn send_measured_raw_rows(
             &mut self,
-            payload: &[u8],
-            row_token_offsets: &[usize],
+            encoder: &DirectEncoder,
+            batch: &RecordBatch,
+            measured: &MeasuredDirectBatch,
+            range: MeasuredRowRange,
         ) -> crate::Result<()> {
+            let payload =
+                encoder.encode_measured_batch_range(batch, measured, range.start, range.len)?;
+
             if self.fail_on_send {
                 return Err(Error::Tiberius {
                     source: tiberius::error::Error::BulkInput(Cow::Borrowed(
@@ -1360,8 +1480,8 @@ mod tests {
             }
 
             self.payloads.push(RecordedRawPayload {
-                bytes: payload.to_vec(),
-                row_token_offsets: row_token_offsets.to_vec(),
+                bytes: payload.bytes().to_vec(),
+                row_token_offsets: payload.row_token_offsets().to_vec(),
             });
             Ok(())
         }

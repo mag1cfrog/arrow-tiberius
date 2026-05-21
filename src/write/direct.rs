@@ -22,12 +22,14 @@ pub(crate) mod variable_width;
 use payload::EncodedRowsPayload;
 use plan::{CurrentDirectMappings, DirectColumnEncoding, DirectEncoderPlan};
 use primitive::{
-    allocate_rows_payload_with_tokens, build_fixed_width_row_layout, fill_boolean_column,
-    fill_float64_column, fill_int32_column, fill_int64_column,
+    allocate_rows_payload_with_tokens, append_boolean_cell, append_float64_cell, append_int32_cell,
+    append_int64_cell, build_fixed_width_row_layout, build_fixed_width_row_range_layout,
+    fill_boolean_column, fill_float64_column, fill_int32_column, fill_int64_column,
     measure_primitive_column_cell_lengths, try_encode_fixed_width_primitive_rows,
 };
 use variable_width::{
-    fill_nvarchar_column, fill_varbinary_column, measure_variable_width_column_cell_lengths,
+    append_nvarchar_cell, append_varbinary_cell, fill_nvarchar_column, fill_varbinary_column,
+    measure_variable_width_column_cell_lengths,
 };
 
 /// Direct raw TDS encoder facade.
@@ -64,8 +66,147 @@ impl DirectEncoder {
         &self.plan
     }
 
+    /// Returns true when this encoder contains at least one variable-width column.
+    pub(crate) fn has_variable_width_column(&self) -> bool {
+        self.plan
+            .columns()
+            .iter()
+            .any(|column| matches!(column.encoding(), DirectColumnEncoding::VariableWidth(_)))
+    }
+
     /// Encodes a runtime batch into complete raw TDS row payload bytes.
     pub(crate) fn encode_batch(&self, batch: &RecordBatch) -> Result<EncodedRowsPayload> {
+        self.encode_checked_batch(batch)
+    }
+
+    /// Measures and validates a runtime batch without allocating encoded bytes.
+    pub(crate) fn measure_batch(&self, batch: &RecordBatch) -> Result<MeasuredDirectBatch> {
+        validate_runtime_columns(batch, &self.mappings)?;
+
+        let row_count = batch.num_rows();
+        let column_count = self.plan.column_count();
+
+        if row_count == 0 {
+            return Ok(MeasuredDirectBatch::empty(column_count));
+        }
+
+        let cell_lengths = self.measure_cell_lengths(batch)?;
+        MeasuredDirectBatch::new(row_count, column_count, cell_lengths)
+    }
+
+    /// Encodes a contiguous row range from a runtime batch.
+    ///
+    /// Returned row-token offsets are relative to the returned payload, so the
+    /// first non-empty range always starts at offset zero.
+    pub(crate) fn encode_batch_range(
+        &self,
+        batch: &RecordBatch,
+        start_row: usize,
+        row_count: usize,
+    ) -> Result<EncodedRowsPayload> {
+        let end_row = start_row
+            .checked_add(row_count)
+            .ok_or_else(|| invalid_payload("direct row range end overflowed usize"))?;
+        if end_row > batch.num_rows() {
+            return Err(invalid_payload(format!(
+                "direct row range {start_row}..{end_row} is outside batch row count {}",
+                batch.num_rows()
+            )));
+        }
+
+        let batch = batch.slice(start_row, row_count);
+        self.encode_checked_batch(&batch)
+    }
+
+    /// Encodes one range from a pre-measured direct batch.
+    pub(crate) fn encode_measured_batch_range(
+        &self,
+        batch: &RecordBatch,
+        measured: &MeasuredDirectBatch,
+        start_row: usize,
+        row_count: usize,
+    ) -> Result<EncodedRowsPayload> {
+        measured.check_range(start_row, row_count)?;
+
+        if row_count == 0 {
+            return EncodedRowsPayload::new(Vec::new(), Vec::new());
+        }
+
+        if measured.row_count() != batch.num_rows() {
+            return Err(invalid_payload(format!(
+                "measured row count {} does not match runtime batch row count {}",
+                measured.row_count(),
+                batch.num_rows()
+            )));
+        }
+
+        if measured.column_count() != self.plan.column_count() {
+            return Err(invalid_payload(format!(
+                "measured column count {} does not match direct plan column count {}",
+                measured.column_count(),
+                self.plan.column_count()
+            )));
+        }
+
+        let layout = measured.range_layout(start_row, row_count)?;
+        let batch = batch.slice(start_row, row_count);
+        let mut bytes = allocate_rows_payload_with_tokens(&layout);
+        self.fill_columns(&batch, &layout, &mut bytes)?;
+
+        EncodedRowsPayload::new(bytes, layout.row_token_offsets().to_vec())
+    }
+
+    /// Encodes one measured range directly into a Tiberius raw rows buffer.
+    pub(crate) fn encode_measured_batch_range_into(
+        &self,
+        batch: &RecordBatch,
+        measured: &MeasuredDirectBatch,
+        start_row: usize,
+        row_count: usize,
+        buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    ) -> Result<tiberius::RawRowsAppend> {
+        measured.check_range(start_row, row_count)?;
+
+        if measured.row_count() != batch.num_rows() {
+            return Err(invalid_payload(format!(
+                "measured row count {} does not match runtime batch row count {}",
+                measured.row_count(),
+                batch.num_rows()
+            )));
+        }
+
+        if measured.column_count() != self.plan.column_count() {
+            return Err(invalid_payload(format!(
+                "measured column count {} does not match direct plan column count {}",
+                measured.column_count(),
+                self.plan.column_count()
+            )));
+        }
+
+        let runtime_columns = self.runtime_columns(batch)?;
+        let mut row_token_offsets = Vec::with_capacity(row_count);
+        let mut written = 0usize;
+
+        let end_row = start_row
+            .checked_add(row_count)
+            .ok_or_else(|| invalid_payload("direct row range end overflowed usize"))?;
+
+        for row_index in start_row..end_row {
+            row_token_offsets.push(written);
+            buf.put_u8(payload::TDS_ROW_TOKEN);
+            written = checked_add(written, 1)?;
+
+            for (column_index, column) in runtime_columns.iter().enumerate() {
+                let measured_len = measured.cell_len(row_index, column_index)?;
+                column.append_cell(buf, row_index, measured_len)?;
+                written = checked_add(written, measured_len)?;
+            }
+        }
+
+        Ok(tiberius::RawRowsAppend::new(row_token_offsets))
+    }
+
+    fn encode_checked_batch(&self, batch: &RecordBatch) -> Result<EncodedRowsPayload> {
         validate_runtime_columns(batch, &self.mappings)?;
 
         if self.plan.is_empty() && batch.num_rows() == 0 {
@@ -85,10 +226,20 @@ impl DirectEncoder {
 
     fn measure_layout(&self, batch: &RecordBatch) -> Result<layout::RowLayout> {
         let row_count = batch.num_rows();
+        if row_count == 0 {
+            return layout::RowLayout::new(Vec::new(), Vec::new(), Vec::new(), 0);
+        }
+
+        let cell_lengths = self.measure_cell_lengths(batch)?;
+        build_fixed_width_row_layout(row_count, self.plan.column_count(), &cell_lengths)
+    }
+
+    fn measure_cell_lengths(&self, batch: &RecordBatch) -> Result<Vec<usize>> {
+        let row_count = batch.num_rows();
         let column_count = self.plan.column_count();
 
         if row_count == 0 {
-            return layout::RowLayout::new(Vec::new(), Vec::new(), Vec::new(), 0);
+            return Ok(Vec::new());
         }
 
         let mut cell_lengths = vec![0; row_count * column_count];
@@ -129,7 +280,7 @@ impl DirectEncoder {
             }
         }
 
-        build_fixed_width_row_layout(row_count, column_count, &cell_lengths)
+        Ok(cell_lengths)
     }
 
     fn fill_columns(
@@ -210,6 +361,332 @@ impl DirectEncoder {
 
         Ok(())
     }
+
+    fn runtime_columns<'a>(
+        &'a self,
+        batch: &'a RecordBatch,
+    ) -> Result<Vec<RuntimeDirectColumn<'a>>> {
+        let mut columns = Vec::with_capacity(self.plan.column_count());
+
+        for column in self.plan.columns() {
+            let Some(array) = batch
+                .columns()
+                .get(column.source_index())
+                .map(AsRef::as_ref)
+            else {
+                return Err(value_conversion_error(row_column_diagnostic(
+                    column,
+                    0,
+                    DiagnosticCode::ValueTypeMismatch,
+                    "planned direct column index is outside the runtime batch",
+                )));
+            };
+
+            let runtime = match column.encoding() {
+                DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::BooleanToBit) => {
+                    RuntimeDirectColumn::Boolean {
+                        column,
+                        array: downcast_direct_array::<BooleanArray>(array, column)?,
+                    }
+                }
+                DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int32ToInt) => {
+                    RuntimeDirectColumn::Int32 {
+                        column,
+                        array: downcast_direct_array::<Int32Array>(array, column)?,
+                    }
+                }
+                DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int64ToBigInt) => {
+                    RuntimeDirectColumn::Int64 {
+                        column,
+                        array: downcast_direct_array::<Int64Array>(array, column)?,
+                    }
+                }
+                DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => {
+                    RuntimeDirectColumn::Float64 {
+                        column,
+                        array: downcast_direct_array::<Float64Array>(array, column)?,
+                    }
+                }
+                DirectColumnEncoding::Primitive(other) => {
+                    return Err(unsupported_batch(format!(
+                        "direct primitive append is not implemented yet for {other:?}"
+                    )));
+                }
+                DirectColumnEncoding::VariableWidth(
+                    VariableWidthArrowToMssql::Utf8ToNVarChar { .. },
+                ) => RuntimeDirectColumn::Utf8 {
+                    column,
+                    array: downcast_direct_array::<StringArray>(array, column)?,
+                },
+                DirectColumnEncoding::VariableWidth(
+                    VariableWidthArrowToMssql::BinaryToVarBinary { .. },
+                ) => RuntimeDirectColumn::Binary {
+                    column,
+                    array: downcast_direct_array::<BinaryArray>(array, column)?,
+                },
+                DirectColumnEncoding::VariableWidth(other) => {
+                    return Err(unsupported_batch(format!(
+                        "direct variable-width append is not implemented yet for {other:?}"
+                    )));
+                }
+            };
+
+            columns.push(runtime);
+        }
+
+        Ok(columns)
+    }
+}
+
+enum RuntimeDirectColumn<'a> {
+    Boolean {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a BooleanArray,
+    },
+    Int32 {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a Int32Array,
+    },
+    Int64 {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a Int64Array,
+    },
+    Float64 {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a Float64Array,
+    },
+    Utf8 {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a StringArray,
+    },
+    Binary {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a BinaryArray,
+    },
+}
+
+impl RuntimeDirectColumn<'_> {
+    fn append_cell(
+        &self,
+        buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+        row_index: usize,
+        measured_len: usize,
+    ) -> Result<()> {
+        match self {
+            Self::Boolean { column, array } => {
+                append_boolean_cell(buf, array, column, row_index, measured_len)
+            }
+            Self::Int32 { column, array } => {
+                append_int32_cell(buf, array, column, row_index, measured_len)
+            }
+            Self::Int64 { column, array } => {
+                append_int64_cell(buf, array, column, row_index, measured_len)
+            }
+            Self::Float64 { column, array } => {
+                append_float64_cell(buf, array, column, row_index, measured_len)
+            }
+            Self::Utf8 { column, array } => {
+                append_nvarchar_cell(buf, array, column, row_index, measured_len)
+            }
+            Self::Binary { column, array } => {
+                append_varbinary_cell(buf, array, column, row_index, measured_len)
+            }
+        }
+    }
+}
+
+/// Direct row payload measurement for one runtime batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MeasuredDirectBatch {
+    row_count: usize,
+    column_count: usize,
+    cell_lengths: Vec<usize>,
+    row_lengths: Vec<usize>,
+    payload_len: usize,
+}
+
+impl MeasuredDirectBatch {
+    fn empty(column_count: usize) -> Self {
+        Self {
+            row_count: 0,
+            column_count,
+            cell_lengths: Vec::new(),
+            row_lengths: Vec::new(),
+            payload_len: 0,
+        }
+    }
+
+    fn new(row_count: usize, column_count: usize, cell_lengths: Vec<usize>) -> Result<Self> {
+        let expected_cell_count = row_count
+            .checked_mul(column_count)
+            .ok_or_else(|| invalid_payload("measured cell count overflowed usize"))?;
+        if cell_lengths.len() != expected_cell_count {
+            return Err(invalid_payload(format!(
+                "measured cell length count {} does not match row count {row_count} and column count {column_count}",
+                cell_lengths.len()
+            )));
+        }
+
+        let (row_lengths, payload_len) =
+            measure_row_lengths(row_count, column_count, &cell_lengths)?;
+
+        Ok(Self {
+            row_count,
+            column_count,
+            cell_lengths,
+            row_lengths,
+            payload_len,
+        })
+    }
+
+    /// Returns the measured row count.
+    pub(crate) const fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    /// Returns the measured column count.
+    pub(crate) const fn column_count(&self) -> usize {
+        self.column_count
+    }
+
+    /// Returns the complete measured payload length.
+    pub(crate) const fn payload_len(&self) -> usize {
+        self.payload_len
+    }
+
+    /// Splits measured rows into payload ranges capped by byte length.
+    pub(crate) fn row_ranges(&self, max_payload_bytes: usize) -> Result<Vec<MeasuredRowRange>> {
+        if max_payload_bytes == 0 {
+            return Err(invalid_payload(
+                "direct row range byte limit must be greater than zero",
+            ));
+        }
+
+        let mut ranges = Vec::new();
+        let mut start = 0usize;
+        let mut len = 0usize;
+        let mut bytes = 0usize;
+
+        for (row_index, row_len) in self.row_lengths.iter().copied().enumerate() {
+            let next_bytes = bytes
+                .checked_add(row_len)
+                .ok_or_else(|| invalid_payload("measured row range length overflowed usize"))?;
+
+            if len > 0 && next_bytes > max_payload_bytes {
+                ranges.push(MeasuredRowRange { start, len });
+                start = row_index;
+                len = 0;
+                bytes = row_len;
+            } else {
+                bytes = next_bytes;
+            }
+
+            len += 1;
+        }
+
+        if len > 0 {
+            ranges.push(MeasuredRowRange { start, len });
+        }
+
+        Ok(ranges)
+    }
+
+    pub(crate) fn range_payload_len(&self, start_row: usize, row_count: usize) -> Result<usize> {
+        self.check_range(start_row, row_count)?;
+
+        let end_row = start_row
+            .checked_add(row_count)
+            .ok_or_else(|| invalid_payload("direct row range end overflowed usize"))?;
+        self.row_lengths[start_row..end_row]
+            .iter()
+            .try_fold(0usize, |total, row_len| {
+                total
+                    .checked_add(*row_len)
+                    .ok_or_else(|| invalid_payload("measured row range length overflowed usize"))
+            })
+    }
+
+    fn cell_len(&self, row_index: usize, column_index: usize) -> Result<usize> {
+        self.check_range(row_index, 1)?;
+
+        if column_index >= self.column_count {
+            return Err(invalid_payload(format!(
+                "direct measured column index {column_index} is outside measured column count {}",
+                self.column_count
+            )));
+        }
+
+        let index = row_index
+            .checked_mul(self.column_count)
+            .and_then(|base| base.checked_add(column_index))
+            .ok_or_else(|| invalid_payload("measured cell length index overflowed usize"))?;
+
+        self.cell_lengths.get(index).copied().ok_or_else(|| {
+            invalid_payload(format!(
+                "measured cell length index {index} is outside measured cell length count {}",
+                self.cell_lengths.len()
+            ))
+        })
+    }
+
+    fn range_layout(&self, start_row: usize, row_count: usize) -> Result<layout::RowLayout> {
+        self.check_range(start_row, row_count)?;
+        build_fixed_width_row_range_layout(
+            start_row,
+            row_count,
+            self.column_count,
+            &self.cell_lengths,
+        )
+    }
+
+    fn check_range(&self, start_row: usize, row_count: usize) -> Result<()> {
+        let end_row = start_row
+            .checked_add(row_count)
+            .ok_or_else(|| invalid_payload("direct row range end overflowed usize"))?;
+        if end_row > self.row_count {
+            return Err(invalid_payload(format!(
+                "direct measured row range {start_row}..{end_row} is outside measured row count {}",
+                self.row_count
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+fn measure_row_lengths(
+    row_count: usize,
+    column_count: usize,
+    cell_lengths: &[usize],
+) -> Result<(Vec<usize>, usize)> {
+    let mut row_lengths = Vec::with_capacity(row_count);
+    let mut payload_len = 0usize;
+
+    for row_index in 0..row_count {
+        let mut row_len = 1usize;
+
+        for column_index in 0..column_count {
+            row_len = row_len
+                .checked_add(cell_lengths[row_index * column_count + column_index])
+                .ok_or_else(|| invalid_payload("measured row length overflowed usize"))?;
+        }
+
+        payload_len = payload_len
+            .checked_add(row_len)
+            .ok_or_else(|| invalid_payload("measured payload length overflowed usize"))?;
+        row_lengths.push(row_len);
+    }
+
+    Ok((row_lengths, payload_len))
+}
+
+/// Contiguous measured row range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MeasuredRowRange {
+    /// First row in the measured batch.
+    pub(crate) start: usize,
+    /// Number of rows in this range.
+    pub(crate) len: usize,
 }
 
 fn downcast_direct_array<'a, T: arrow_array::Array + 'static>(
@@ -236,6 +713,20 @@ fn unsupported_batch(message: impl Into<String>) -> Error {
             message,
         )]),
     }
+}
+
+fn invalid_payload(message: impl Into<String>) -> Error {
+    Error::DirectEncoding {
+        diagnostics: DiagnosticSet::from(vec![Diagnostic::error(
+            DiagnosticCode::DirectEncodingInvalidPayload,
+            message,
+        )]),
+    }
+}
+
+fn checked_add(lhs: usize, rhs: usize) -> Result<usize> {
+    lhs.checked_add(rhs)
+        .ok_or_else(|| invalid_payload("direct encoded length overflowed usize"))
 }
 
 fn row_column_diagnostic(
@@ -298,6 +789,32 @@ mod tests {
 
         assert!(payload.is_empty());
         assert_eq!(payload.row_count(), 0);
+    }
+
+    #[test]
+    fn direct_encoder_reports_variable_width_column_presence() {
+        let primitive = DirectEncoder::new(&[mapping(
+            0,
+            "quantity",
+            DataType::Int32,
+            MssqlType::Int,
+            false,
+        )])
+        .unwrap();
+        assert!(!primitive.has_variable_width_column());
+
+        let mixed = DirectEncoder::new(&[
+            mapping(0, "quantity", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "comment",
+                DataType::Utf8,
+                MssqlType::NVarChar(MssqlTypeLength::Max),
+                true,
+            ),
+        ])
+        .unwrap();
+        assert!(mixed.has_variable_width_column());
     }
 
     #[test]
@@ -530,6 +1047,151 @@ mod tests {
                 0,
             ]
         );
+    }
+
+    #[test]
+    fn direct_encoder_row_ranges_concatenate_to_full_payload() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "name",
+                DataType::Utf8,
+                MssqlType::NVarChar(MssqlTypeLength::Max),
+                true,
+            ),
+            mapping(
+                2,
+                "bytes",
+                DataType::Binary,
+                MssqlType::VarBinary(MssqlTypeLength::Max),
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, true),
+                Field::new("bytes", DataType::Binary, true),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("alpha"),
+                    Some("東京"),
+                    None,
+                    Some(""),
+                ])),
+                Arc::new(BinaryArray::from_iter(vec![
+                    Some(&b"abc"[..]),
+                    None,
+                    Some(&b""[..]),
+                    Some(&b"\x00\xff"[..]),
+                ])),
+            ],
+        );
+
+        let full = encoder.encode_batch(&batch).unwrap();
+        let first = encoder.encode_batch_range(&batch, 0, 2).unwrap();
+        let second = encoder.encode_batch_range(&batch, 2, 2).unwrap();
+        let mut concatenated = Vec::new();
+        concatenated.extend_from_slice(first.bytes());
+        concatenated.extend_from_slice(second.bytes());
+
+        assert_eq!(concatenated, full.bytes());
+        assert_eq!(first.row_count(), 2);
+        assert_eq!(second.row_count(), 2);
+        assert_eq!(first.row_token_offsets()[0], 0);
+        assert_eq!(second.row_token_offsets()[0], 0);
+    }
+
+    #[test]
+    fn direct_encoder_measured_ranges_concatenate_to_full_payload() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "name",
+                DataType::Utf8,
+                MssqlType::NVarChar(MssqlTypeLength::Max),
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, true),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("alpha"), None, Some("東京")])),
+            ],
+        );
+
+        let measured = encoder.measure_batch(&batch).unwrap();
+        let full = encoder.encode_batch(&batch).unwrap();
+        let first = encoder
+            .encode_measured_batch_range(&batch, &measured, 0, 1)
+            .unwrap();
+        let second = encoder
+            .encode_measured_batch_range(&batch, &measured, 1, 2)
+            .unwrap();
+        let mut concatenated = Vec::new();
+        concatenated.extend_from_slice(first.bytes());
+        concatenated.extend_from_slice(second.bytes());
+
+        assert_eq!(measured.row_count(), 3);
+        assert_eq!(concatenated, full.bytes());
+        assert_eq!(first.row_token_offsets()[0], 0);
+        assert_eq!(second.row_token_offsets()[0], 0);
+    }
+
+    #[test]
+    fn measured_direct_batch_ranges_split_by_payload_byte_limit() {
+        let mappings = vec![mapping(0, "id", DataType::Int32, MssqlType::Int, false)];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![Field::new("id", DataType::Int32, false)],
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4]))],
+        );
+
+        let measured = encoder.measure_batch(&batch).unwrap();
+
+        assert_eq!(measured.payload_len(), 20);
+        assert_eq!(
+            measured.row_ranges(10).unwrap(),
+            [
+                super::MeasuredRowRange { start: 0, len: 2 },
+                super::MeasuredRowRange { start: 2, len: 2 },
+            ]
+        );
+        assert_eq!(
+            measured.row_ranges(4).unwrap(),
+            [
+                super::MeasuredRowRange { start: 0, len: 1 },
+                super::MeasuredRowRange { start: 1, len: 1 },
+                super::MeasuredRowRange { start: 2, len: 1 },
+                super::MeasuredRowRange { start: 3, len: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_encoder_row_range_rejects_out_of_bounds_range() {
+        let mappings = vec![mapping(0, "id", DataType::Int32, MssqlType::Int, false)];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![Field::new("id", DataType::Int32, false)],
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        );
+
+        let err = encoder
+            .encode_batch_range(&batch, 1, 2)
+            .expect_err("range past batch end must fail");
+
+        assert_direct_encoding_diagnostic(err, DiagnosticCode::DirectEncodingInvalidPayload);
     }
 
     #[test]
@@ -819,15 +1481,16 @@ mod tests {
     }
 
     fn assert_unsupported_batch(err: Error) {
+        assert_direct_encoding_diagnostic(err, DiagnosticCode::DirectEncodingUnsupportedBatch);
+    }
+
+    fn assert_direct_encoding_diagnostic(err: Error, expected_code: DiagnosticCode) {
         let Error::DirectEncoding { diagnostics } = err else {
             panic!("expected direct encoding error");
         };
 
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(
-            diagnostics.all()[0].code(),
-            DiagnosticCode::DirectEncodingUnsupportedBatch
-        );
+        assert_eq!(diagnostics.all()[0].code(), expected_code);
     }
 
     fn mapping(
