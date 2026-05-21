@@ -25,6 +25,7 @@ mod dataset;
 static BENCH_TABLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static BENCH_IPC_COUNTER: AtomicU64 = AtomicU64::new(0);
 const ODBC_TABLE_PLACEHOLDER: &str = "__ARROW_TIBERIUS_ODBC_TABLE__";
+const DEFAULT_SQLSERVER_PROFILE_SAMPLE_MS: u64 = 250;
 
 pub(super) fn run(args: &[OsString]) -> Result<(), WriterBenchError> {
     if args.is_empty()
@@ -262,7 +263,7 @@ fn print_arrow_odbc_help() {
 
 fn print_compare_help() {
     println!(
-        "Usage:\n  cargo xtask writer-bench compare [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --backends <LIST>           Comma-separated backends: baseline,direct-raw,arrow-odbc,odbc-bcp [default: baseline,arrow-odbc]\n  --output <FORMAT>           Output format: human [default: human]\n  --profile-direct            Include direct-raw phase timings and counters\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --tds-packet-size <BYTES>   Requested TDS packet size for Tiberius writers\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>      Managed ODBC runner image tag\n  --keep-runner-image         Keep the managed ODBC runner image after the task exits\n  -h, --help                  Print help\n\nCompare runs use one shared Arrow IPC dataset as the fairness boundary."
+        "Usage:\n  cargo xtask writer-bench compare [OPTIONS]\n\nData Options:\n  --rows <COUNT>                    Total rows to generate [default: 100000]\n  --batch-size <COUNT>              Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>                 Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>                  Number of benchmark repeats [default: 1]\n  --backends <LIST>                 Comma-separated backends: baseline,direct-raw,arrow-odbc,odbc-bcp [default: baseline,arrow-odbc]\n  --output <FORMAT>                 Output format: human [default: human]\n  --profile-direct                  Include direct-raw phase timings and counters\n\nSQL Server Options:\n  --container-runtime <PATH>        Container runtime executable, such as docker or podman\n  --connection-string <URL>         Use an existing SQL Server instead of a local container\n  --image <IMAGE>                   SQL Server container image\n  --database <NAME>                 Benchmark database name\n  --tds-packet-size <BYTES>         Requested TDS packet size for Tiberius writers\n  --profile-sqlserver               Profile the SQL Server writer session during compare writes\n  --sqlserver-profile-sample-ms <MILLIS>\n                                    SQL Server profile sample interval [default: 250]\n  --keep-container                  Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>            Managed ODBC runner image tag\n  --keep-runner-image               Keep the managed ODBC runner image after the task exits\n  -h, --help                        Print help\n\nCompare runs use one shared Arrow IPC dataset as the fairness boundary."
     );
 }
 
@@ -930,6 +931,7 @@ impl ArrowOdbcBenchOptions {
 struct CompareBenchOptions {
     benchmark: WriterBenchOptions,
     sql_server: sqlserver::SqlServerConnectionOptions,
+    sql_server_profile: Option<SqlServerProfileOptions>,
     backends: Vec<BenchmarkBackend>,
     runner_image: String,
     keep_runner_image: bool,
@@ -937,17 +939,32 @@ struct CompareBenchOptions {
     tds_packet_size: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SqlServerProfileOptions {
+    sample_interval: Duration,
+}
+
+impl Default for SqlServerProfileOptions {
+    fn default() -> Self {
+        Self {
+            sample_interval: Duration::from_millis(DEFAULT_SQLSERVER_PROFILE_SAMPLE_MS),
+        }
+    }
+}
+
 impl CompareBenchOptions {
     fn parse(args: &[OsString]) -> Result<Self, WriterBenchError> {
         let mut options = Self {
             benchmark: WriterBenchOptions::default(),
             sql_server: sqlserver::SqlServerConnectionOptions::benchmark_default(),
+            sql_server_profile: None,
             backends: vec![BenchmarkBackend::Baseline, BenchmarkBackend::ArrowOdbc],
             runner_image: odbc_runner::DEFAULT_RUNNER_IMAGE_TAG.to_owned(),
             keep_runner_image: false,
             profile_direct: false,
             tds_packet_size: None,
         };
+        let mut sql_server_profile_sample_interval = None;
         let mut index = 0;
 
         while index < args.len() {
@@ -1011,6 +1028,19 @@ impl CompareBenchOptions {
                     )?);
                     index += 1;
                 }
+                "--profile-sqlserver" => {
+                    options
+                        .sql_server_profile
+                        .get_or_insert_with(SqlServerProfileOptions::default);
+                }
+                "--sqlserver-profile-sample-ms" => {
+                    let sample_ms = parse_positive_u64(
+                        "--sqlserver-profile-sample-ms",
+                        &required_value(args, index)?,
+                    )?;
+                    sql_server_profile_sample_interval = Some(Duration::from_millis(sample_ms));
+                    index += 1;
+                }
                 "--keep-container" => {
                     options.sql_server.keep_container = true;
                 }
@@ -1028,6 +1058,16 @@ impl CompareBenchOptions {
             }
 
             index += 1;
+        }
+
+        if let Some(sample_interval) = sql_server_profile_sample_interval {
+            let profile = options.sql_server_profile.as_mut().ok_or_else(|| {
+                WriterBenchError::Validation(
+                    "writer-bench compare --sqlserver-profile-sample-ms requires --profile-sqlserver"
+                        .to_owned(),
+                )
+            })?;
+            profile.sample_interval = sample_interval;
         }
 
         Ok(options)
@@ -3192,6 +3232,24 @@ fn parse_positive_u32(option: &'static str, value: &str) -> Result<u32, WriterBe
     Ok(parsed)
 }
 
+fn parse_positive_u64(option: &'static str, value: &str) -> Result<u64, WriterBenchError> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| WriterBenchError::InvalidPositiveInteger {
+            option,
+            value: value.to_owned(),
+        })?;
+
+    if parsed == 0 {
+        return Err(WriterBenchError::InvalidPositiveInteger {
+            option,
+            value: value.to_owned(),
+        });
+    }
+
+    Ok(parsed)
+}
+
 fn required_value(args: &[OsString], index: usize) -> Result<String, WriterBenchError> {
     let value = args
         .get(index + 1)
@@ -3697,6 +3755,72 @@ mod tests {
         );
         assert_eq!(options.benchmark.scenario.name, "narrow_numeric");
         assert!(!options.profile_direct);
+        assert!(options.sql_server_profile.is_none());
+    }
+
+    #[test]
+    fn parses_compare_sql_server_profile_options() {
+        let args = [
+            OsString::from("--profile-sqlserver"),
+            OsString::from("--sqlserver-profile-sample-ms"),
+            OsString::from("125"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+        let profile = options.sql_server_profile.unwrap();
+
+        assert_eq!(
+            profile.sample_interval,
+            std::time::Duration::from_millis(125)
+        );
+    }
+
+    #[test]
+    fn compare_rejects_sql_server_sample_interval_without_profile_flag() {
+        let args = [
+            OsString::from("--sqlserver-profile-sample-ms"),
+            OsString::from("500"),
+        ];
+
+        let err = super::CompareBenchOptions::parse(&args).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("--sqlserver-profile-sample-ms")
+                    && message.contains("--profile-sqlserver")
+        ));
+    }
+
+    #[test]
+    fn compare_sql_server_profile_uses_default_sample_interval() {
+        let args = [OsString::from("--profile-sqlserver")];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+        let profile = options.sql_server_profile.unwrap();
+
+        assert_eq!(
+            profile.sample_interval,
+            std::time::Duration::from_millis(super::DEFAULT_SQLSERVER_PROFILE_SAMPLE_MS)
+        );
+    }
+
+    #[test]
+    fn compare_rejects_zero_sql_server_profile_sample_interval() {
+        let args = [
+            OsString::from("--sqlserver-profile-sample-ms"),
+            OsString::from("0"),
+        ];
+
+        let err = super::CompareBenchOptions::parse(&args).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::InvalidPositiveInteger {
+                option: "--sqlserver-profile-sample-ms",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -3927,6 +4051,7 @@ mod tests {
                 output: BenchmarkOutput::Human,
             },
             sql_server: crate::sqlserver::SqlServerConnectionOptions::benchmark_default(),
+            sql_server_profile: None,
             backends: vec![super::BenchmarkBackend::Baseline],
             runner_image: crate::odbc_runner::DEFAULT_RUNNER_IMAGE_TAG.to_owned(),
             keep_runner_image: false,
