@@ -250,7 +250,7 @@ fn print_help() {
 
 fn print_baseline_help() {
     println!(
-        "Usage:\n  cargo xtask writer-bench baseline [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep the container after the task exits\n  -h, --help                  Print help"
+        "Usage:\n  cargo xtask writer-bench baseline [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --output <FORMAT>           Output format: human [default: human]\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --tds-packet-size <BYTES>   Requested TDS packet size for Tiberius writers\n  --keep-container            Keep the container after the task exits\n  -h, --help                  Print help"
     );
 }
 
@@ -262,7 +262,7 @@ fn print_arrow_odbc_help() {
 
 fn print_compare_help() {
     println!(
-        "Usage:\n  cargo xtask writer-bench compare [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --backends <LIST>           Comma-separated backends: baseline,direct-raw,arrow-odbc,odbc-bcp [default: baseline,arrow-odbc]\n  --output <FORMAT>           Output format: human [default: human]\n  --profile-direct            Include direct-raw phase timings and counters\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>      Managed ODBC runner image tag\n  --keep-runner-image         Keep the managed ODBC runner image after the task exits\n  -h, --help                  Print help\n\nCompare runs use one shared Arrow IPC dataset as the fairness boundary."
+        "Usage:\n  cargo xtask writer-bench compare [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --backends <LIST>           Comma-separated backends: baseline,direct-raw,arrow-odbc,odbc-bcp [default: baseline,arrow-odbc]\n  --output <FORMAT>           Output format: human [default: human]\n  --profile-direct            Include direct-raw phase timings and counters\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --tds-packet-size <BYTES>   Requested TDS packet size for Tiberius writers\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>      Managed ODBC runner image tag\n  --keep-runner-image         Keep the managed ODBC runner image after the task exits\n  -h, --help                  Print help\n\nCompare runs use one shared Arrow IPC dataset as the fairness boundary."
     );
 }
 
@@ -589,6 +589,7 @@ impl IpcDatasetOptions {
 struct BaselineBenchOptions {
     benchmark: WriterBenchOptions,
     sql_server: sqlserver::SqlServerConnectionOptions,
+    tds_packet_size: Option<u32>,
 }
 
 impl BaselineBenchOptions {
@@ -596,6 +597,7 @@ impl BaselineBenchOptions {
         let mut options = Self {
             benchmark: WriterBenchOptions::default(),
             sql_server: sqlserver::SqlServerConnectionOptions::benchmark_default(),
+            tds_packet_size: None,
         };
         let mut index = 0;
 
@@ -649,6 +651,13 @@ impl BaselineBenchOptions {
                     options.sql_server.database = required_value(args, index)?;
                     index += 1;
                 }
+                "--tds-packet-size" => {
+                    options.tds_packet_size = Some(parse_positive_u32(
+                        "--tds-packet-size",
+                        &required_value(args, index)?,
+                    )?);
+                    index += 1;
+                }
                 "--keep-container" => {
                     options.sql_server.keep_container = true;
                 }
@@ -684,6 +693,7 @@ struct CompareBenchOptions {
     runner_image: String,
     keep_runner_image: bool,
     profile_direct: bool,
+    tds_packet_size: Option<u32>,
 }
 
 impl CompareBenchOptions {
@@ -695,6 +705,7 @@ impl CompareBenchOptions {
             runner_image: odbc_runner::DEFAULT_RUNNER_IMAGE_TAG.to_owned(),
             keep_runner_image: false,
             profile_direct: false,
+            tds_packet_size: None,
         };
         let mut index = 0;
 
@@ -750,6 +761,13 @@ impl CompareBenchOptions {
                 }
                 "--database" => {
                     options.sql_server.database = required_value(args, index)?;
+                    index += 1;
+                }
+                "--tds-packet-size" => {
+                    options.tds_packet_size = Some(parse_positive_u32(
+                        "--tds-packet-size",
+                        &required_value(args, index)?,
+                    )?);
                     index += 1;
                 }
                 "--keep-container" => {
@@ -1641,6 +1659,7 @@ async fn run_baseline_async(
         &ipc_dataset.host_path,
         WriteBackend::BaselineTokenRow,
         false,
+        options.tds_packet_size,
     )
     .await;
     let dataset_cleanup_result = ipc_dataset.cleanup();
@@ -1693,6 +1712,7 @@ fn run_compare_benchmark(
                     &ipc_dataset.host_path,
                     WriteBackend::BaselineTokenRow,
                     false,
+                    options.tds_packet_size,
                 )
                 .await?;
                 report.timings.total = backend_start.elapsed();
@@ -1710,6 +1730,7 @@ fn run_compare_benchmark(
                     &ipc_dataset.host_path,
                     WriteBackend::DirectRawBulk,
                     options.profile_direct,
+                    options.tds_packet_size,
                 )
                 .await?;
                 report.timings.total = backend_start.elapsed();
@@ -1775,11 +1796,17 @@ async fn run_tiberius_benchmark_from_ipc(
     ipc_path: &Path,
     backend: WriteBackend,
     profile_direct: bool,
+    tds_packet_size: Option<u32>,
 ) -> Result<TiberiusBenchReport, WriterBenchError> {
     let mut report = TiberiusBenchReport::default();
 
     let setup_start = Instant::now();
-    let mut client = connect(&connection.connection_string, &connection.database).await?;
+    let mut client = connect(
+        &connection.connection_string,
+        &connection.database,
+        tds_packet_size,
+    )
+    .await?;
     let schema = (benchmark.scenario.schema)();
     let mappings = benchmark_mappings_for_schema(Arc::clone(&schema))?;
     report.timings.setup += setup_start.elapsed();
@@ -2000,8 +2027,13 @@ fn merge_direct_profile(
         .saturating_add(source.finalized_packet_payload_bytes);
 }
 
-async fn connect(connection_string: &str, database: &str) -> Result<BenchClient, WriterBenchError> {
-    let connection_string = format!("{connection_string};database={database}");
+async fn connect(
+    connection_string: &str,
+    database: &str,
+    tds_packet_size: Option<u32>,
+) -> Result<BenchClient, WriterBenchError> {
+    let connection_string =
+        tiberius_connection_string(connection_string, database, tds_packet_size);
     let config = tiberius::Config::from_ado_string(&connection_string)
         .map_err(WriterBenchError::Tiberius)?;
     let tcp = TcpStream::connect(config.get_addr())
@@ -2011,6 +2043,18 @@ async fn connect(connection_string: &str, database: &str) -> Result<BenchClient,
     tiberius::Client::connect(config, tcp.compat_write())
         .await
         .map_err(WriterBenchError::Tiberius)
+}
+
+fn tiberius_connection_string(
+    connection_string: &str,
+    database: &str,
+    tds_packet_size: Option<u32>,
+) -> String {
+    let mut connection_string = format!("{connection_string};database={database}");
+    if let Some(tds_packet_size) = tds_packet_size {
+        connection_string.push_str(&format!(";Packet Size={tds_packet_size}"));
+    }
+    connection_string
 }
 
 async fn execute_sql(client: &mut BenchClient, sql: String) -> Result<(), WriterBenchError> {
@@ -2733,6 +2777,24 @@ fn parse_positive_usize(option: &'static str, value: &str) -> Result<usize, Writ
     Ok(parsed)
 }
 
+fn parse_positive_u32(option: &'static str, value: &str) -> Result<u32, WriterBenchError> {
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_| WriterBenchError::InvalidPositiveInteger {
+            option,
+            value: value.to_owned(),
+        })?;
+
+    if parsed == 0 {
+        return Err(WriterBenchError::InvalidPositiveInteger {
+            option,
+            value: value.to_owned(),
+        });
+    }
+
+    Ok(parsed)
+}
+
 fn required_value(args: &[OsString], index: usize) -> Result<String, WriterBenchError> {
     let value = args
         .get(index + 1)
@@ -2919,6 +2981,8 @@ mod tests {
             OsString::from("server=tcp:127.0.0.1,1433;password=secret"),
             OsString::from("--database"),
             OsString::from("bench_db"),
+            OsString::from("--tds-packet-size"),
+            OsString::from("32767"),
         ];
 
         let options = super::BaselineBenchOptions::parse(&args).unwrap();
@@ -2928,6 +2992,7 @@ mod tests {
         assert_eq!(options.benchmark.scenario.name, "mixed_nullable");
         assert_eq!(options.sql_server.database, "bench_db");
         assert!(options.sql_server.connection_string.is_some());
+        assert_eq!(options.tds_packet_size, Some(32767));
     }
 
     #[test]
@@ -2970,6 +3035,8 @@ mod tests {
             OsString::from("server=tcp:127.0.0.1,1433;password=secret"),
             OsString::from("--database"),
             OsString::from("bench_db"),
+            OsString::from("--tds-packet-size"),
+            OsString::from("32767"),
         ];
 
         let options = super::CompareBenchOptions::parse(&args).unwrap();
@@ -2989,6 +3056,27 @@ mod tests {
         assert!(options.keep_runner_image);
         assert_eq!(options.sql_server.database, "bench_db");
         assert!(options.sql_server.connection_string.is_some());
+        assert_eq!(options.tds_packet_size, Some(32767));
+    }
+
+    #[test]
+    fn rejects_invalid_tds_packet_size() {
+        let args = [
+            OsString::from("--backends"),
+            OsString::from("direct-raw"),
+            OsString::from("--tds-packet-size"),
+            OsString::from("0"),
+        ];
+
+        let err = super::CompareBenchOptions::parse(&args).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::InvalidPositiveInteger {
+                option: "--tds-packet-size",
+                value
+            } if value == "0"
+        ));
     }
 
     #[test]
@@ -3243,6 +3331,7 @@ mod tests {
                 output: BenchmarkOutput::Human,
             },
             sql_server: crate::sqlserver::SqlServerConnectionOptions::benchmark_default(),
+            tds_packet_size: None,
         };
 
         let dataset = super::prepare_baseline_ipc_dataset(&options).unwrap();
@@ -3272,6 +3361,7 @@ mod tests {
             runner_image: crate::odbc_runner::DEFAULT_RUNNER_IMAGE_TAG.to_owned(),
             keep_runner_image: false,
             profile_direct: false,
+            tds_packet_size: None,
         };
 
         let dataset = super::prepare_compare_ipc_dataset(&options).unwrap();
@@ -3657,6 +3747,31 @@ odbc-bcp runner
 
         assert!(
             matches!(err, WriterBenchError::Validation(message) if message.contains("password"))
+        );
+    }
+
+    #[test]
+    fn tiberius_connection_string_appends_database_and_optional_packet_size() {
+        let connection_string = super::tiberius_connection_string(
+            "server=tcp:127.0.0.1,1433;User ID=sa;Password=secret",
+            "bench",
+            Some(32767),
+        );
+
+        assert_eq!(
+            connection_string,
+            "server=tcp:127.0.0.1,1433;User ID=sa;Password=secret;database=bench;Packet Size=32767"
+        );
+
+        let connection_string = super::tiberius_connection_string(
+            "server=tcp:127.0.0.1,1433;User ID=sa;Password=secret",
+            "bench",
+            None,
+        );
+
+        assert_eq!(
+            connection_string,
+            "server=tcp:127.0.0.1,1433;User ID=sa;Password=secret;database=bench"
         );
     }
 

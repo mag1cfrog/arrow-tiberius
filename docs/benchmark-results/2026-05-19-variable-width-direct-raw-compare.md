@@ -219,6 +219,59 @@ directly: this path writes 460,812 bulk-load packets with a maximum payload of
 negotiation or packet coalescing in the Tiberius fork before changing the Arrow
 encoder again.
 
+After publishing `tiberius-raw-bulk` `0.12.3-raw-bulk.6`, the same profile was
+rerun with a larger requested TDS packet size.
+
+```sh
+cargo xtask writer-bench compare \
+  --container-runtime podman \
+  --scenario string_heavy \
+  --rows 300000 \
+  --batch-size 8192 \
+  --repeat 1 \
+  --backends direct-raw \
+  --profile-direct \
+  --tds-packet-size 32767
+```
+
+| Backend | Rows | Write | Finish | Total | Rows/sec | Peak RSS KiB | Peak RSS MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `direct-raw` packet-size rerun | 300,000 | 117.129s | 0.006s | 117.207s | 2,561.14 | 105,368 | 102.90 |
+
+Direct packet-size profile:
+
+| Phase or counter | Value |
+| --- | ---: |
+| `measure_batch` | 9.119s |
+| `row_range_split` | 0.004s |
+| `append_encode` | 22.092s |
+| `send_total` | 107.171s |
+| `send_without_append_encode` | 85.079s |
+| rows | 300,000 |
+| batches | 37 |
+| row ranges | 256 |
+| encoded bytes | 1,883,800,622 |
+| max row range bytes | 8,388,567 |
+| nvarchar UTF-16 bytes | 950,022,348 |
+| varbinary bytes | 902,553,858 |
+| null cells | 34,448 |
+| packet write calls | 257 |
+| packets written before finalization | 57,842 |
+| packet payload bytes before finalization | 1,883,798,256 |
+| max packet payload bytes | 32,568 |
+| max buffered bytes before write | 8,420,360 |
+| buffered bytes after last write | 2,565 |
+| finalized packet payload bytes | 2,565 |
+
+Requesting a larger TDS packet size reduced complete packet writes by about
+87.4 percent and raised max packet payload from 4,088 bytes to 32,568 bytes.
+However, write time only improved by about 3.3 percent compared with the
+packet-profile rerun above. That suggests packet count was part of the cost, but
+not the dominant remaining gap. The next investigation should focus on the
+server-ingestion side of `send_without_append_encode`, Tiberius flush/write
+behavior, or PLP/max-type encoding shape rather than assuming packet size alone
+can close the gap.
+
 Interpretation:
 
 - `direct-raw` is faster than `baseline` on large variable-width rows, but only
