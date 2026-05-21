@@ -1,5 +1,6 @@
 use std::ffi::OsString;
 use std::fmt;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -742,6 +743,7 @@ fn print_sql_server_profile_target(prefix: &str, target: Option<&SqlServerProfil
             "{prefix}  initial waiting tasks: {}",
             target.initial_activity.waiting_tasks.len()
         );
+        println!("{prefix}  write samples: {}", target.write_samples.len());
     }
 }
 
@@ -1982,11 +1984,18 @@ struct SqlServerProfileTarget {
     observer_session_id: i32,
     sample_interval: Duration,
     initial_activity: sqlserver_profile::ActivitySnapshot,
+    write_samples: Vec<SqlServerProfileSample>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqlServerProfileSample {
+    elapsed: Duration,
+    activity: sqlserver_profile::ActivitySnapshot,
 }
 
 struct SqlServerProfileSession {
     target: SqlServerProfileTarget,
-    _observer: BenchClient,
+    observer: BenchClient,
 }
 
 impl SqlServerProfileSession {
@@ -2008,13 +2017,42 @@ impl SqlServerProfileSession {
                 observer_session_id,
                 sample_interval: options.sample_interval,
                 initial_activity,
+                write_samples: Vec::new(),
             },
-            _observer: observer,
+            observer,
         })
     }
 
     fn target(&self) -> SqlServerProfileTarget {
         self.target.clone()
+    }
+
+    async fn sample_write<T, F>(&mut self, write: F) -> Result<T, WriterBenchError>
+    where
+        F: Future<Output = Result<T, WriterBenchError>>,
+    {
+        let started_at = Instant::now();
+        let mut sample_interval = tokio::time::interval(self.target.sample_interval);
+        sample_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        sample_interval.tick().await;
+        tokio::pin!(write);
+
+        loop {
+            tokio::select! {
+                result = &mut write => return result,
+                _ = sample_interval.tick() => {
+                    let activity = sqlserver_profile::current_activity_snapshot(
+                        &mut self.observer,
+                        self.target.writer_session_id,
+                    )
+                    .await?;
+                    self.target.write_samples.push(SqlServerProfileSample {
+                        elapsed: started_at.elapsed(),
+                        activity,
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -2081,6 +2119,7 @@ fn run_compare_benchmark(
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
+        .enable_time()
         .build()
         .map_err(WriterBenchError::Io)?;
     let ipc_dataset = prepare_compare_ipc_dataset(options)?;
@@ -2194,16 +2233,13 @@ async fn run_tiberius_benchmark_from_ipc(
         tds_packet_size,
     )
     .await?;
-    let sql_server_profile_session = if let Some(options) = sql_server_profile {
+    let mut sql_server_profile_session = if let Some(options) = sql_server_profile {
         Some(SqlServerProfileSession::start(&mut client, connection, options).await?)
     } else {
         None
     };
     let schema = (benchmark.scenario.schema)();
     let mappings = benchmark_mappings_for_schema(Arc::clone(&schema))?;
-    report.sql_server_profile_target = sql_server_profile_session
-        .as_ref()
-        .map(SqlServerProfileSession::target);
     report.timings.setup += setup_start.elapsed();
 
     for _repeat_index in 0..benchmark.repeat {
@@ -2217,6 +2253,7 @@ async fn run_tiberius_benchmark_from_ipc(
                     ipc_path,
                     backend,
                     profile_direct,
+                    sql_server_profile_session.as_mut(),
                 )
                 .await;
             let cleanup_start = Instant::now();
@@ -2259,6 +2296,9 @@ async fn run_tiberius_benchmark_from_ipc(
     }
 
     report.peak_rss_kib = current_process_peak_rss_kib();
+    report.sql_server_profile_target = sql_server_profile_session
+        .as_ref()
+        .map(SqlServerProfileSession::target);
 
     Ok(report)
 }
@@ -2298,12 +2338,21 @@ async fn run_tiberius_repeat_from_ipc(
     ipc_path: &Path,
     backend: WriteBackend,
     profile_direct: bool,
+    sql_server_profile_session: Option<&mut SqlServerProfileSession>,
 ) -> Result<TiberiusBenchReport, WriterBenchError> {
     let batches =
         dataset::ipc_dataset_reader(ipc_path)?.map(|batch| batch.map_err(WriterBenchError::Arrow));
 
-    run_tiberius_repeat_with_batches(client, mappings, table, batches, backend, profile_direct)
-        .await
+    run_tiberius_repeat_with_batches(
+        client,
+        mappings,
+        table,
+        batches,
+        backend,
+        profile_direct,
+        sql_server_profile_session,
+    )
+    .await
 }
 
 async fn run_tiberius_repeat_with_batches(
@@ -2313,6 +2362,7 @@ async fn run_tiberius_repeat_with_batches(
     batches: impl IntoIterator<Item = Result<RecordBatch, WriterBenchError>>,
     backend: WriteBackend,
     profile_direct: bool,
+    mut sql_server_profile_session: Option<&mut SqlServerProfileSession>,
 ) -> Result<TiberiusBenchReport, WriterBenchError> {
     let mut report = TiberiusBenchReport::default();
     let setup_start = Instant::now();
@@ -2341,13 +2391,22 @@ async fn run_tiberius_repeat_with_batches(
         arrow_tiberius::write::profile::start_direct_write_profile();
     }
 
+    let write_batches = async {
+        for batch in batches {
+            let batch = batch?;
+            report.stats = writer
+                .write_batch(&batch)
+                .await
+                .map_err(WriterBenchError::ArrowTiberius)?;
+        }
+
+        Ok(())
+    };
     let write_start = Instant::now();
-    for batch in batches {
-        let batch = batch?;
-        report.stats = writer
-            .write_batch(&batch)
-            .await
-            .map_err(WriterBenchError::ArrowTiberius)?;
+    if let Some(profile_session) = sql_server_profile_session.as_mut() {
+        profile_session.sample_write(write_batches).await?;
+    } else {
+        write_batches.await?;
     }
     report.timings.write += write_start.elapsed();
 
