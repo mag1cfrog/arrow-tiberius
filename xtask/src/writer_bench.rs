@@ -719,12 +719,28 @@ fn print_sql_server_profile_target(prefix: &str, target: Option<&SqlServerProfil
         );
         println!(
             "{prefix}  writer connection: {} {} encrypted={} packet_size={} reads={} writes={}",
-            target.initial_connection.net_transport,
-            target.initial_connection.protocol_type,
-            target.initial_connection.encrypt_option,
-            target.initial_connection.net_packet_size,
-            target.initial_connection.num_reads,
-            target.initial_connection.num_writes
+            target.initial_activity.connection.net_transport,
+            target.initial_activity.connection.protocol_type,
+            target.initial_activity.connection.encrypt_option,
+            target.initial_activity.connection.net_packet_size,
+            target.initial_activity.connection.num_reads,
+            target.initial_activity.connection.num_writes
+        );
+        match &target.initial_activity.request {
+            Some(request) => println!(
+                "{prefix}  initial request: status={} command={} wait={} wait_ms={} cpu_ms={} elapsed_ms={}",
+                request.status,
+                request.command,
+                request.wait_type.as_deref().unwrap_or("<none>"),
+                request.wait_time_ms,
+                request.cpu_time_ms,
+                request.total_elapsed_time_ms
+            ),
+            None => println!("{prefix}  initial request: <none>"),
+        }
+        println!(
+            "{prefix}  initial waiting tasks: {}",
+            target.initial_activity.waiting_tasks.len()
         );
     }
 }
@@ -1965,7 +1981,7 @@ struct SqlServerProfileTarget {
     writer_session_id: i32,
     observer_session_id: i32,
     sample_interval: Duration,
-    initial_connection: sqlserver_profile::ConnectionSnapshot,
+    initial_activity: sqlserver_profile::ActivitySnapshot,
 }
 
 struct SqlServerProfileSession {
@@ -1983,15 +1999,15 @@ impl SqlServerProfileSession {
         let mut observer =
             connect(&connection.connection_string, &connection.database, None).await?;
         let observer_session_id = select_session_id(&mut observer).await?;
-        let initial_connection =
-            sqlserver_profile::connection_snapshot(&mut observer, writer_session_id).await?;
+        let initial_activity =
+            sqlserver_profile::current_activity_snapshot(&mut observer, writer_session_id).await?;
 
         Ok(Self {
             target: SqlServerProfileTarget {
                 writer_session_id,
                 observer_session_id,
                 sample_interval: options.sample_interval,
-                initial_connection,
+                initial_activity,
             },
             _observer: observer,
         })
