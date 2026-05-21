@@ -510,6 +510,30 @@ fn print_direct_profile(prefix: &str, profile: DirectWriteProfile) {
         profile.bulk_direct_packet_header_bytes
     );
     println!(
+        "{prefix}  bulk direct packet max payload bytes: {}",
+        profile.bulk_direct_packet_max_payload_bytes
+    );
+    println!(
+        "{prefix}  bulk direct packet final calls: {}",
+        profile.bulk_direct_packet_final_calls
+    );
+    println!(
+        "{prefix}  bulk direct packet final payload bytes: {}",
+        profile.bulk_direct_packet_final_payload_bytes
+    );
+    println!(
+        "{prefix}  bulk direct packet final header bytes: {}",
+        profile.bulk_direct_packet_final_header_bytes
+    );
+    println!(
+        "{prefix}  bulk direct packet raw stream calls: {}",
+        profile.bulk_direct_packet_raw_stream_calls
+    );
+    println!(
+        "{prefix}  bulk direct packet TLS stream calls: {}",
+        profile.bulk_direct_packet_tls_stream_calls
+    );
+    println!(
         "{prefix}  bulk direct packet low-level write calls: {}",
         profile.bulk_direct_packet_low_level_write_calls
     );
@@ -530,6 +554,82 @@ fn print_direct_profile(prefix: &str, profile: DirectWriteProfile) {
         format_duration(profile.bulk_direct_packet_max_write_elapsed)
     );
     println!(
+        "{prefix}  bulk direct packet header write calls: {}",
+        profile.bulk_direct_packet_header_write_calls
+    );
+    println!(
+        "{prefix}  bulk direct packet header write bytes: {}",
+        profile.bulk_direct_packet_header_write_bytes
+    );
+    println!(
+        "{prefix}  bulk direct packet header max write bytes: {}",
+        profile.bulk_direct_packet_header_max_write_bytes
+    );
+    println!(
+        "{prefix}  bulk direct packet header write elapsed: {}",
+        format_duration(profile.bulk_direct_packet_header_write_elapsed)
+    );
+    println!(
+        "{prefix}  bulk direct packet header max write elapsed: {}",
+        format_duration(profile.bulk_direct_packet_header_max_write_elapsed)
+    );
+    println!(
+        "{prefix}  bulk direct packet header partial writes: {}",
+        profile.bulk_direct_packet_header_partial_writes
+    );
+    println!(
+        "{prefix}  bulk direct packet payload write calls: {}",
+        profile.bulk_direct_packet_payload_write_calls
+    );
+    println!(
+        "{prefix}  bulk direct packet payload write bytes: {}",
+        profile.bulk_direct_packet_payload_write_bytes
+    );
+    println!(
+        "{prefix}  bulk direct packet payload max write bytes: {}",
+        profile.bulk_direct_packet_payload_max_write_bytes
+    );
+    println!(
+        "{prefix}  bulk direct packet payload write elapsed: {}",
+        format_duration(profile.bulk_direct_packet_payload_write_elapsed)
+    );
+    println!(
+        "{prefix}  bulk direct packet payload max write elapsed: {}",
+        format_duration(profile.bulk_direct_packet_payload_max_write_elapsed)
+    );
+    println!(
+        "{prefix}  bulk direct packet payload partial writes: {}",
+        profile.bulk_direct_packet_payload_partial_writes
+    );
+    println!(
+        "{prefix}  bulk direct packet poll_write polls: {}",
+        profile.bulk_direct_packet_poll_write_polls
+    );
+    println!(
+        "{prefix}  bulk direct packet poll_write pending count: {}",
+        profile.bulk_direct_packet_poll_write_pending_count
+    );
+    println!(
+        "{prefix}  bulk direct packet poll_write pending elapsed: {}",
+        format_duration(profile.bulk_direct_packet_poll_write_pending_elapsed)
+    );
+    println!(
+        "{prefix}  bulk direct packet poll_write max pending elapsed: {}",
+        format_duration(profile.bulk_direct_packet_poll_write_max_pending_elapsed)
+    );
+    println!(
+        "{prefix}  bulk direct packet poll_write ready count: {}",
+        profile.bulk_direct_packet_poll_write_ready_count
+    );
+    println!(
+        "{prefix}  bulk direct packet poll_write ready elapsed: {}",
+        format_duration(profile.bulk_direct_packet_poll_write_ready_elapsed)
+    );
+    println!(
+        "{prefix}  bulk direct packet poll_write max ready elapsed: {}",
+        format_duration(profile.bulk_direct_packet_poll_write_max_ready_elapsed)
+    );
+    println!(
         "{prefix}  bulk direct packet flush calls: {}",
         profile.bulk_direct_packet_flush_calls
     );
@@ -540,6 +640,18 @@ fn print_direct_profile(prefix: &str, profile: DirectWriteProfile) {
     println!(
         "{prefix}  bulk direct packet max flush elapsed: {}",
         format_duration(profile.bulk_direct_packet_max_flush_elapsed)
+    );
+    println!(
+        "{prefix}  bulk direct packet flush pending count: {}",
+        profile.bulk_direct_packet_flush_pending_count
+    );
+    println!(
+        "{prefix}  bulk direct packet flush pending elapsed: {}",
+        format_duration(profile.bulk_direct_packet_flush_pending_elapsed)
+    );
+    println!(
+        "{prefix}  bulk direct packet flush max pending elapsed: {}",
+        format_duration(profile.bulk_direct_packet_flush_max_pending_elapsed)
     );
 }
 
@@ -2211,6 +2323,24 @@ fn merge_direct_profile(
     target.bulk_direct_packet_header_bytes = target
         .bulk_direct_packet_header_bytes
         .saturating_add(source.bulk_direct_packet_header_bytes);
+    target.bulk_direct_packet_max_payload_bytes = target
+        .bulk_direct_packet_max_payload_bytes
+        .max(source.bulk_direct_packet_max_payload_bytes);
+    target.bulk_direct_packet_final_calls = target
+        .bulk_direct_packet_final_calls
+        .saturating_add(source.bulk_direct_packet_final_calls);
+    target.bulk_direct_packet_final_payload_bytes = target
+        .bulk_direct_packet_final_payload_bytes
+        .saturating_add(source.bulk_direct_packet_final_payload_bytes);
+    target.bulk_direct_packet_final_header_bytes = target
+        .bulk_direct_packet_final_header_bytes
+        .saturating_add(source.bulk_direct_packet_final_header_bytes);
+    target.bulk_direct_packet_raw_stream_calls = target
+        .bulk_direct_packet_raw_stream_calls
+        .saturating_add(source.bulk_direct_packet_raw_stream_calls);
+    target.bulk_direct_packet_tls_stream_calls = target
+        .bulk_direct_packet_tls_stream_calls
+        .saturating_add(source.bulk_direct_packet_tls_stream_calls);
     target.bulk_direct_packet_low_level_write_calls = target
         .bulk_direct_packet_low_level_write_calls
         .saturating_add(source.bulk_direct_packet_low_level_write_calls);
@@ -2224,6 +2354,59 @@ fn merge_direct_profile(
     target.bulk_direct_packet_max_write_elapsed = target
         .bulk_direct_packet_max_write_elapsed
         .max(source.bulk_direct_packet_max_write_elapsed);
+    target.bulk_direct_packet_header_write_calls = target
+        .bulk_direct_packet_header_write_calls
+        .saturating_add(source.bulk_direct_packet_header_write_calls);
+    target.bulk_direct_packet_header_write_bytes = target
+        .bulk_direct_packet_header_write_bytes
+        .saturating_add(source.bulk_direct_packet_header_write_bytes);
+    target.bulk_direct_packet_header_max_write_bytes = target
+        .bulk_direct_packet_header_max_write_bytes
+        .max(source.bulk_direct_packet_header_max_write_bytes);
+    target.bulk_direct_packet_header_write_elapsed +=
+        source.bulk_direct_packet_header_write_elapsed;
+    target.bulk_direct_packet_header_max_write_elapsed = target
+        .bulk_direct_packet_header_max_write_elapsed
+        .max(source.bulk_direct_packet_header_max_write_elapsed);
+    target.bulk_direct_packet_header_partial_writes = target
+        .bulk_direct_packet_header_partial_writes
+        .saturating_add(source.bulk_direct_packet_header_partial_writes);
+    target.bulk_direct_packet_payload_write_calls = target
+        .bulk_direct_packet_payload_write_calls
+        .saturating_add(source.bulk_direct_packet_payload_write_calls);
+    target.bulk_direct_packet_payload_write_bytes = target
+        .bulk_direct_packet_payload_write_bytes
+        .saturating_add(source.bulk_direct_packet_payload_write_bytes);
+    target.bulk_direct_packet_payload_max_write_bytes = target
+        .bulk_direct_packet_payload_max_write_bytes
+        .max(source.bulk_direct_packet_payload_max_write_bytes);
+    target.bulk_direct_packet_payload_write_elapsed +=
+        source.bulk_direct_packet_payload_write_elapsed;
+    target.bulk_direct_packet_payload_max_write_elapsed = target
+        .bulk_direct_packet_payload_max_write_elapsed
+        .max(source.bulk_direct_packet_payload_max_write_elapsed);
+    target.bulk_direct_packet_payload_partial_writes = target
+        .bulk_direct_packet_payload_partial_writes
+        .saturating_add(source.bulk_direct_packet_payload_partial_writes);
+    target.bulk_direct_packet_poll_write_polls = target
+        .bulk_direct_packet_poll_write_polls
+        .saturating_add(source.bulk_direct_packet_poll_write_polls);
+    target.bulk_direct_packet_poll_write_pending_count = target
+        .bulk_direct_packet_poll_write_pending_count
+        .saturating_add(source.bulk_direct_packet_poll_write_pending_count);
+    target.bulk_direct_packet_poll_write_pending_elapsed +=
+        source.bulk_direct_packet_poll_write_pending_elapsed;
+    target.bulk_direct_packet_poll_write_max_pending_elapsed = target
+        .bulk_direct_packet_poll_write_max_pending_elapsed
+        .max(source.bulk_direct_packet_poll_write_max_pending_elapsed);
+    target.bulk_direct_packet_poll_write_ready_count = target
+        .bulk_direct_packet_poll_write_ready_count
+        .saturating_add(source.bulk_direct_packet_poll_write_ready_count);
+    target.bulk_direct_packet_poll_write_ready_elapsed +=
+        source.bulk_direct_packet_poll_write_ready_elapsed;
+    target.bulk_direct_packet_poll_write_max_ready_elapsed = target
+        .bulk_direct_packet_poll_write_max_ready_elapsed
+        .max(source.bulk_direct_packet_poll_write_max_ready_elapsed);
     target.bulk_direct_packet_flush_calls = target
         .bulk_direct_packet_flush_calls
         .saturating_add(source.bulk_direct_packet_flush_calls);
@@ -2231,6 +2414,14 @@ fn merge_direct_profile(
     target.bulk_direct_packet_max_flush_elapsed = target
         .bulk_direct_packet_max_flush_elapsed
         .max(source.bulk_direct_packet_max_flush_elapsed);
+    target.bulk_direct_packet_flush_pending_count = target
+        .bulk_direct_packet_flush_pending_count
+        .saturating_add(source.bulk_direct_packet_flush_pending_count);
+    target.bulk_direct_packet_flush_pending_elapsed +=
+        source.bulk_direct_packet_flush_pending_elapsed;
+    target.bulk_direct_packet_flush_max_pending_elapsed = target
+        .bulk_direct_packet_flush_max_pending_elapsed
+        .max(source.bulk_direct_packet_flush_max_pending_elapsed);
 }
 
 async fn connect(
@@ -3326,28 +3517,84 @@ mod tests {
             bulk_direct_packet_write_calls: 2,
             bulk_direct_packet_payload_bytes: 3,
             bulk_direct_packet_header_bytes: 5,
+            bulk_direct_packet_max_payload_bytes: 7,
+            bulk_direct_packet_final_calls: 11,
+            bulk_direct_packet_final_payload_bytes: 13,
+            bulk_direct_packet_final_header_bytes: 17,
+            bulk_direct_packet_raw_stream_calls: 19,
+            bulk_direct_packet_tls_stream_calls: 23,
             bulk_direct_packet_low_level_write_calls: 7,
             bulk_direct_packet_low_level_write_bytes: 11,
             bulk_direct_packet_max_low_level_write_bytes: 13,
             bulk_direct_packet_write_elapsed: Duration::from_millis(17),
             bulk_direct_packet_max_write_elapsed: Duration::from_millis(19),
+            bulk_direct_packet_header_write_calls: 29,
+            bulk_direct_packet_header_write_bytes: 31,
+            bulk_direct_packet_header_max_write_bytes: 37,
+            bulk_direct_packet_header_write_elapsed: Duration::from_millis(41),
+            bulk_direct_packet_header_max_write_elapsed: Duration::from_millis(43),
+            bulk_direct_packet_header_partial_writes: 47,
+            bulk_direct_packet_payload_write_calls: 53,
+            bulk_direct_packet_payload_write_bytes: 59,
+            bulk_direct_packet_payload_max_write_bytes: 61,
+            bulk_direct_packet_payload_write_elapsed: Duration::from_millis(67),
+            bulk_direct_packet_payload_max_write_elapsed: Duration::from_millis(71),
+            bulk_direct_packet_payload_partial_writes: 73,
+            bulk_direct_packet_poll_write_polls: 79,
+            bulk_direct_packet_poll_write_pending_count: 83,
+            bulk_direct_packet_poll_write_pending_elapsed: Duration::from_millis(89),
+            bulk_direct_packet_poll_write_max_pending_elapsed: Duration::from_millis(97),
+            bulk_direct_packet_poll_write_ready_count: 101,
+            bulk_direct_packet_poll_write_ready_elapsed: Duration::from_millis(103),
+            bulk_direct_packet_poll_write_max_ready_elapsed: Duration::from_millis(107),
             bulk_direct_packet_flush_calls: 23,
             bulk_direct_packet_flush_elapsed: Duration::from_millis(29),
             bulk_direct_packet_max_flush_elapsed: Duration::from_millis(31),
+            bulk_direct_packet_flush_pending_count: 109,
+            bulk_direct_packet_flush_pending_elapsed: Duration::from_millis(113),
+            bulk_direct_packet_flush_max_pending_elapsed: Duration::from_millis(127),
             ..DirectWriteProfile::default()
         });
         let source = DirectWriteProfile {
             bulk_direct_packet_write_calls: 37,
             bulk_direct_packet_payload_bytes: 41,
             bulk_direct_packet_header_bytes: 43,
+            bulk_direct_packet_max_payload_bytes: 47,
+            bulk_direct_packet_final_calls: 53,
+            bulk_direct_packet_final_payload_bytes: 59,
+            bulk_direct_packet_final_header_bytes: 61,
+            bulk_direct_packet_raw_stream_calls: 67,
+            bulk_direct_packet_tls_stream_calls: 71,
             bulk_direct_packet_low_level_write_calls: 47,
             bulk_direct_packet_low_level_write_bytes: 53,
             bulk_direct_packet_max_low_level_write_bytes: 59,
             bulk_direct_packet_write_elapsed: Duration::from_millis(61),
             bulk_direct_packet_max_write_elapsed: Duration::from_millis(67),
+            bulk_direct_packet_header_write_calls: 73,
+            bulk_direct_packet_header_write_bytes: 79,
+            bulk_direct_packet_header_max_write_bytes: 83,
+            bulk_direct_packet_header_write_elapsed: Duration::from_millis(89),
+            bulk_direct_packet_header_max_write_elapsed: Duration::from_millis(97),
+            bulk_direct_packet_header_partial_writes: 101,
+            bulk_direct_packet_payload_write_calls: 103,
+            bulk_direct_packet_payload_write_bytes: 107,
+            bulk_direct_packet_payload_max_write_bytes: 109,
+            bulk_direct_packet_payload_write_elapsed: Duration::from_millis(113),
+            bulk_direct_packet_payload_max_write_elapsed: Duration::from_millis(127),
+            bulk_direct_packet_payload_partial_writes: 131,
+            bulk_direct_packet_poll_write_polls: 137,
+            bulk_direct_packet_poll_write_pending_count: 139,
+            bulk_direct_packet_poll_write_pending_elapsed: Duration::from_millis(149),
+            bulk_direct_packet_poll_write_max_pending_elapsed: Duration::from_millis(151),
+            bulk_direct_packet_poll_write_ready_count: 157,
+            bulk_direct_packet_poll_write_ready_elapsed: Duration::from_millis(163),
+            bulk_direct_packet_poll_write_max_ready_elapsed: Duration::from_millis(167),
             bulk_direct_packet_flush_calls: 71,
             bulk_direct_packet_flush_elapsed: Duration::from_millis(73),
             bulk_direct_packet_max_flush_elapsed: Duration::from_millis(79),
+            bulk_direct_packet_flush_pending_count: 173,
+            bulk_direct_packet_flush_pending_elapsed: Duration::from_millis(179),
+            bulk_direct_packet_flush_max_pending_elapsed: Duration::from_millis(181),
             ..DirectWriteProfile::default()
         };
 
@@ -3357,6 +3604,12 @@ mod tests {
         assert_eq!(profile.bulk_direct_packet_write_calls, 39);
         assert_eq!(profile.bulk_direct_packet_payload_bytes, 44);
         assert_eq!(profile.bulk_direct_packet_header_bytes, 48);
+        assert_eq!(profile.bulk_direct_packet_max_payload_bytes, 47);
+        assert_eq!(profile.bulk_direct_packet_final_calls, 64);
+        assert_eq!(profile.bulk_direct_packet_final_payload_bytes, 72);
+        assert_eq!(profile.bulk_direct_packet_final_header_bytes, 78);
+        assert_eq!(profile.bulk_direct_packet_raw_stream_calls, 86);
+        assert_eq!(profile.bulk_direct_packet_tls_stream_calls, 94);
         assert_eq!(profile.bulk_direct_packet_low_level_write_calls, 54);
         assert_eq!(profile.bulk_direct_packet_low_level_write_bytes, 64);
         assert_eq!(profile.bulk_direct_packet_max_low_level_write_bytes, 59);
@@ -3368,6 +3621,49 @@ mod tests {
             profile.bulk_direct_packet_max_write_elapsed,
             Duration::from_millis(67)
         );
+        assert_eq!(profile.bulk_direct_packet_header_write_calls, 102);
+        assert_eq!(profile.bulk_direct_packet_header_write_bytes, 110);
+        assert_eq!(profile.bulk_direct_packet_header_max_write_bytes, 83);
+        assert_eq!(
+            profile.bulk_direct_packet_header_write_elapsed,
+            Duration::from_millis(130)
+        );
+        assert_eq!(
+            profile.bulk_direct_packet_header_max_write_elapsed,
+            Duration::from_millis(97)
+        );
+        assert_eq!(profile.bulk_direct_packet_header_partial_writes, 148);
+        assert_eq!(profile.bulk_direct_packet_payload_write_calls, 156);
+        assert_eq!(profile.bulk_direct_packet_payload_write_bytes, 166);
+        assert_eq!(profile.bulk_direct_packet_payload_max_write_bytes, 109);
+        assert_eq!(
+            profile.bulk_direct_packet_payload_write_elapsed,
+            Duration::from_millis(180)
+        );
+        assert_eq!(
+            profile.bulk_direct_packet_payload_max_write_elapsed,
+            Duration::from_millis(127)
+        );
+        assert_eq!(profile.bulk_direct_packet_payload_partial_writes, 204);
+        assert_eq!(profile.bulk_direct_packet_poll_write_polls, 216);
+        assert_eq!(profile.bulk_direct_packet_poll_write_pending_count, 222);
+        assert_eq!(
+            profile.bulk_direct_packet_poll_write_pending_elapsed,
+            Duration::from_millis(238)
+        );
+        assert_eq!(
+            profile.bulk_direct_packet_poll_write_max_pending_elapsed,
+            Duration::from_millis(151)
+        );
+        assert_eq!(profile.bulk_direct_packet_poll_write_ready_count, 258);
+        assert_eq!(
+            profile.bulk_direct_packet_poll_write_ready_elapsed,
+            Duration::from_millis(266)
+        );
+        assert_eq!(
+            profile.bulk_direct_packet_poll_write_max_ready_elapsed,
+            Duration::from_millis(167)
+        );
         assert_eq!(profile.bulk_direct_packet_flush_calls, 94);
         assert_eq!(
             profile.bulk_direct_packet_flush_elapsed,
@@ -3376,6 +3672,15 @@ mod tests {
         assert_eq!(
             profile.bulk_direct_packet_max_flush_elapsed,
             Duration::from_millis(79)
+        );
+        assert_eq!(profile.bulk_direct_packet_flush_pending_count, 282);
+        assert_eq!(
+            profile.bulk_direct_packet_flush_pending_elapsed,
+            Duration::from_millis(292)
+        );
+        assert_eq!(
+            profile.bulk_direct_packet_flush_max_pending_elapsed,
+            Duration::from_millis(181)
         );
     }
 
