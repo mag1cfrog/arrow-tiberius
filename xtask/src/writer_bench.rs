@@ -763,6 +763,7 @@ fn print_sql_server_profile_target(prefix: &str, target: Option<&SqlServerProfil
             &sample_summary.waiting_task_waits,
         );
         print_sql_server_session_wait_deltas(prefix, &target.session_wait_deltas);
+        print_sql_server_database_file_io_deltas(prefix, &target.database_file_io_deltas);
     }
 }
 
@@ -814,6 +815,28 @@ fn print_sql_server_session_wait_deltas(prefix: &str, waits: &[SqlServerSessionW
             wait.waiting_tasks_count,
             wait.max_wait_time_ms,
             wait.signal_wait_time_ms
+        );
+    }
+}
+
+fn print_sql_server_database_file_io_deltas(prefix: &str, files: &[SqlServerDatabaseFileIoDelta]) {
+    if files.is_empty() {
+        println!("{prefix}  database file IO deltas: <none>");
+        return;
+    }
+
+    println!("{prefix}  database file IO deltas:");
+    for file in files {
+        println!(
+            "{prefix}    {} {}: reads={} read_bytes={} read_stall_ms={} writes={} write_bytes={} write_stall_ms={}",
+            file.file_type,
+            file.logical_name,
+            file.read_count,
+            file.read_bytes,
+            file.read_stall_ms,
+            file.write_count,
+            file.write_bytes,
+            file.write_stall_ms
         );
     }
 }
@@ -2057,6 +2080,7 @@ struct SqlServerProfileTarget {
     initial_activity: sqlserver_profile::ActivitySnapshot,
     write_samples: Vec<SqlServerProfileSample>,
     session_wait_deltas: Vec<SqlServerSessionWaitDelta>,
+    database_file_io_deltas: Vec<SqlServerDatabaseFileIoDelta>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2074,6 +2098,19 @@ struct SqlServerSessionWaitDelta {
     wait_time_ms: i64,
     max_wait_time_ms: i64,
     signal_wait_time_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqlServerDatabaseFileIoDelta {
+    file_id: i32,
+    logical_name: String,
+    file_type: String,
+    read_count: i64,
+    read_bytes: i64,
+    read_stall_ms: i64,
+    write_count: i64,
+    write_bytes: i64,
+    write_stall_ms: i64,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -2161,11 +2198,64 @@ fn counter_delta(initial: i64, final_value: i64) -> i64 {
     final_value.saturating_sub(initial)
 }
 
+fn sql_server_database_file_io_deltas(
+    initial: &[sqlserver_profile::DatabaseFileIoSnapshot],
+    final_files: &[sqlserver_profile::DatabaseFileIoSnapshot],
+) -> Vec<SqlServerDatabaseFileIoDelta> {
+    let initial_files = initial
+        .iter()
+        .map(|file| (file.file_id, file))
+        .collect::<BTreeMap<_, _>>();
+    let mut deltas = final_files
+        .iter()
+        .map(|final_file| {
+            let initial_file = initial_files.get(&final_file.file_id).copied();
+            SqlServerDatabaseFileIoDelta {
+                file_id: final_file.file_id,
+                logical_name: final_file.logical_name.clone(),
+                file_type: final_file.file_type.clone(),
+                read_count: counter_delta(
+                    initial_file.map_or(0, |file| file.read_count),
+                    final_file.read_count,
+                ),
+                read_bytes: counter_delta(
+                    initial_file.map_or(0, |file| file.read_bytes),
+                    final_file.read_bytes,
+                ),
+                read_stall_ms: counter_delta(
+                    initial_file.map_or(0, |file| file.read_stall_ms),
+                    final_file.read_stall_ms,
+                ),
+                write_count: counter_delta(
+                    initial_file.map_or(0, |file| file.write_count),
+                    final_file.write_count,
+                ),
+                write_bytes: counter_delta(
+                    initial_file.map_or(0, |file| file.write_bytes),
+                    final_file.write_bytes,
+                ),
+                write_stall_ms: counter_delta(
+                    initial_file.map_or(0, |file| file.write_stall_ms),
+                    final_file.write_stall_ms,
+                ),
+            }
+        })
+        .collect::<Vec<_>>();
+    deltas.sort_by(|left, right| {
+        left.file_type
+            .cmp(&right.file_type)
+            .then_with(|| left.logical_name.cmp(&right.logical_name))
+            .then_with(|| left.file_id.cmp(&right.file_id))
+    });
+    deltas
+}
+
 struct SqlServerProfileSession {
     target: SqlServerProfileTarget,
     observer: BenchClient,
     next_repeat_index: usize,
     initial_session_waits: Vec<sqlserver_profile::SessionWaitSnapshot>,
+    initial_database_file_io: Vec<sqlserver_profile::DatabaseFileIoSnapshot>,
 }
 
 impl SqlServerProfileSession {
@@ -2182,6 +2272,8 @@ impl SqlServerProfileSession {
             sqlserver_profile::current_activity_snapshot(&mut observer, writer_session_id).await?;
         let initial_session_waits =
             sqlserver_profile::session_wait_snapshots(&mut observer, writer_session_id).await?;
+        let initial_database_file_io =
+            sqlserver_profile::database_file_io_snapshots(&mut observer).await?;
 
         Ok(Self {
             target: SqlServerProfileTarget {
@@ -2191,10 +2283,12 @@ impl SqlServerProfileSession {
                 initial_activity,
                 write_samples: Vec::new(),
                 session_wait_deltas: Vec::new(),
+                database_file_io_deltas: Vec::new(),
             },
             observer,
             next_repeat_index: 0,
             initial_session_waits,
+            initial_database_file_io,
         })
     }
 
@@ -2210,6 +2304,12 @@ impl SqlServerProfileSession {
         .await?;
         self.target.session_wait_deltas =
             sql_server_session_wait_deltas(&self.initial_session_waits, &final_session_waits);
+        let final_database_file_io =
+            sqlserver_profile::database_file_io_snapshots(&mut self.observer).await?;
+        self.target.database_file_io_deltas = sql_server_database_file_io_deltas(
+            &self.initial_database_file_io,
+            &final_database_file_io,
+        );
         Ok(())
     }
 
@@ -3873,6 +3973,73 @@ mod tests {
             wait_time_ms,
             max_wait_time_ms,
             signal_wait_time_ms,
+        }
+    }
+
+    #[test]
+    fn sql_server_profile_file_io_deltas_preserve_file_metadata() {
+        let initial = [
+            sqlserver_profile_file_io(2, "bench_log", "LOG", 1, 8, 2, 3, 64, 5),
+            sqlserver_profile_file_io(1, "bench_data", "ROWS", 5, 40, 3, 7, 96, 11),
+        ];
+        let final_files = [
+            sqlserver_profile_file_io(2, "bench_log", "LOG", 1, 8, 2, 9, 192, 17),
+            sqlserver_profile_file_io(1, "bench_data", "ROWS", 8, 88, 7, 11, 160, 19),
+        ];
+
+        let files = super::sql_server_database_file_io_deltas(&initial, &final_files);
+
+        assert_eq!(
+            files,
+            [
+                super::SqlServerDatabaseFileIoDelta {
+                    file_id: 2,
+                    logical_name: "bench_log".to_owned(),
+                    file_type: "LOG".to_owned(),
+                    read_count: 0,
+                    read_bytes: 0,
+                    read_stall_ms: 0,
+                    write_count: 6,
+                    write_bytes: 128,
+                    write_stall_ms: 12,
+                },
+                super::SqlServerDatabaseFileIoDelta {
+                    file_id: 1,
+                    logical_name: "bench_data".to_owned(),
+                    file_type: "ROWS".to_owned(),
+                    read_count: 3,
+                    read_bytes: 48,
+                    read_stall_ms: 4,
+                    write_count: 4,
+                    write_bytes: 64,
+                    write_stall_ms: 8,
+                },
+            ]
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sqlserver_profile_file_io(
+        file_id: i32,
+        logical_name: &str,
+        file_type: &str,
+        read_count: i64,
+        read_bytes: i64,
+        read_stall_ms: i64,
+        write_count: i64,
+        write_bytes: i64,
+        write_stall_ms: i64,
+    ) -> sqlserver_profile::DatabaseFileIoSnapshot {
+        sqlserver_profile::DatabaseFileIoSnapshot {
+            file_id,
+            logical_name: logical_name.to_owned(),
+            file_type: file_type.to_owned(),
+            read_count,
+            read_bytes,
+            read_stall_ms,
+            write_count,
+            write_bytes,
+            write_stall_ms,
         }
     }
 

@@ -52,6 +52,19 @@ pub(super) struct SessionWaitSnapshot {
     pub(super) signal_wait_time_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DatabaseFileIoSnapshot {
+    pub(super) file_id: i32,
+    pub(super) logical_name: String,
+    pub(super) file_type: String,
+    pub(super) read_count: i64,
+    pub(super) read_bytes: i64,
+    pub(super) read_stall_ms: i64,
+    pub(super) write_count: i64,
+    pub(super) write_bytes: i64,
+    pub(super) write_stall_ms: i64,
+}
+
 pub(super) async fn current_activity_snapshot(
     observer: &mut BenchClient,
     writer_session_id: i32,
@@ -103,6 +116,20 @@ pub(super) async fn session_wait_snapshots(
         .map_err(WriterBenchError::Tiberius)?;
 
     rows.iter().map(session_wait_from_row).collect()
+}
+
+pub(super) async fn database_file_io_snapshots(
+    observer: &mut BenchClient,
+) -> Result<Vec<DatabaseFileIoSnapshot>, WriterBenchError> {
+    let rows = observer
+        .simple_query(database_file_io_query())
+        .await
+        .map_err(WriterBenchError::Tiberius)?
+        .into_first_result()
+        .await
+        .map_err(WriterBenchError::Tiberius)?;
+
+    rows.iter().map(database_file_io_from_row).collect()
 }
 
 async fn request_snapshot(
@@ -172,6 +199,22 @@ fn session_wait_from_row(row: &tiberius::Row) -> Result<SessionWaitSnapshot, Wri
     })
 }
 
+fn database_file_io_from_row(
+    row: &tiberius::Row,
+) -> Result<DatabaseFileIoSnapshot, WriterBenchError> {
+    Ok(DatabaseFileIoSnapshot {
+        file_id: required_i32(row, "file_id")?,
+        logical_name: required_string(row, "logical_name")?,
+        file_type: required_string(row, "file_type")?,
+        read_count: required_i64(row, "read_count")?,
+        read_bytes: required_i64(row, "read_bytes")?,
+        read_stall_ms: required_i64(row, "read_stall_ms")?,
+        write_count: required_i64(row, "write_count")?,
+        write_bytes: required_i64(row, "write_bytes")?,
+        write_stall_ms: required_i64(row, "write_stall_ms")?,
+    })
+}
+
 fn connection_snapshot_query(writer_session_id: i32) -> String {
     format!(
         "SELECT \
@@ -235,6 +278,23 @@ fn session_waits_query(writer_session_id: i32) -> String {
     )
 }
 
+fn database_file_io_query() -> &'static str {
+    "SELECT \
+        CONVERT(int, f.file_id) AS file_id, \
+        CONVERT(nvarchar(128), f.name) AS logical_name, \
+        CONVERT(nvarchar(60), f.type_desc) AS file_type, \
+        CONVERT(bigint, vfs.num_of_reads) AS read_count, \
+        CONVERT(bigint, vfs.num_of_bytes_read) AS read_bytes, \
+        CONVERT(bigint, vfs.io_stall_read_ms) AS read_stall_ms, \
+        CONVERT(bigint, vfs.num_of_writes) AS write_count, \
+        CONVERT(bigint, vfs.num_of_bytes_written) AS write_bytes, \
+        CONVERT(bigint, vfs.io_stall_write_ms) AS write_stall_ms \
+    FROM sys.dm_io_virtual_file_stats(DB_ID(), NULL) AS vfs \
+    INNER JOIN sys.database_files AS f \
+        ON f.file_id = vfs.file_id \
+    ORDER BY f.type, f.file_id"
+}
+
 fn required_i32(row: &tiberius::Row, column: &'static str) -> Result<i32, WriterBenchError> {
     row.try_get::<i32, _>(column)
         .map_err(WriterBenchError::Tiberius)?
@@ -280,7 +340,8 @@ fn null_snapshot_column(column: &'static str) -> WriterBenchError {
 #[cfg(test)]
 mod tests {
     use super::{
-        connection_snapshot_query, request_snapshot_query, session_waits_query, waiting_tasks_query,
+        connection_snapshot_query, database_file_io_query, request_snapshot_query,
+        session_waits_query, waiting_tasks_query,
     };
 
     #[test]
@@ -322,5 +383,15 @@ mod tests {
         assert!(query.contains("WHERE CONVERT(int, s.session_id) = 47"));
         assert!(query.contains("AS wait_time_ms"));
         assert!(query.contains("AS signal_wait_time_ms"));
+    }
+
+    #[test]
+    fn database_file_io_query_targets_current_database_files() {
+        let query = database_file_io_query();
+
+        assert!(query.contains("sys.dm_io_virtual_file_stats(DB_ID(), NULL)"));
+        assert!(query.contains("INNER JOIN sys.database_files AS f"));
+        assert!(query.contains("AS logical_name"));
+        assert!(query.contains("AS write_stall_ms"));
     }
 }
