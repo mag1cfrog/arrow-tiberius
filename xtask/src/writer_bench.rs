@@ -497,6 +497,50 @@ fn print_direct_profile(prefix: &str, profile: DirectWriteProfile) {
         "{prefix}  bulk connection write max payload bytes: {}",
         profile.bulk_connection_write_max_payload_bytes
     );
+    println!(
+        "{prefix}  bulk direct packet write calls: {}",
+        profile.bulk_direct_packet_write_calls
+    );
+    println!(
+        "{prefix}  bulk direct packet payload bytes: {}",
+        profile.bulk_direct_packet_payload_bytes
+    );
+    println!(
+        "{prefix}  bulk direct packet header bytes: {}",
+        profile.bulk_direct_packet_header_bytes
+    );
+    println!(
+        "{prefix}  bulk direct packet low-level write calls: {}",
+        profile.bulk_direct_packet_low_level_write_calls
+    );
+    println!(
+        "{prefix}  bulk direct packet low-level write bytes: {}",
+        profile.bulk_direct_packet_low_level_write_bytes
+    );
+    println!(
+        "{prefix}  bulk direct packet max low-level write bytes: {}",
+        profile.bulk_direct_packet_max_low_level_write_bytes
+    );
+    println!(
+        "{prefix}  bulk direct packet write elapsed: {}",
+        format_duration(profile.bulk_direct_packet_write_elapsed)
+    );
+    println!(
+        "{prefix}  bulk direct packet max write elapsed: {}",
+        format_duration(profile.bulk_direct_packet_max_write_elapsed)
+    );
+    println!(
+        "{prefix}  bulk direct packet flush calls: {}",
+        profile.bulk_direct_packet_flush_calls
+    );
+    println!(
+        "{prefix}  bulk direct packet flush elapsed: {}",
+        format_duration(profile.bulk_direct_packet_flush_elapsed)
+    );
+    println!(
+        "{prefix}  bulk direct packet max flush elapsed: {}",
+        format_duration(profile.bulk_direct_packet_max_flush_elapsed)
+    );
 }
 
 fn print_compare_summary(options: &CompareBenchOptions, report: &CompareBenchReport) {
@@ -2158,6 +2202,35 @@ fn merge_direct_profile(
     target.bulk_connection_write_max_payload_bytes = target
         .bulk_connection_write_max_payload_bytes
         .max(source.bulk_connection_write_max_payload_bytes);
+    target.bulk_direct_packet_write_calls = target
+        .bulk_direct_packet_write_calls
+        .saturating_add(source.bulk_direct_packet_write_calls);
+    target.bulk_direct_packet_payload_bytes = target
+        .bulk_direct_packet_payload_bytes
+        .saturating_add(source.bulk_direct_packet_payload_bytes);
+    target.bulk_direct_packet_header_bytes = target
+        .bulk_direct_packet_header_bytes
+        .saturating_add(source.bulk_direct_packet_header_bytes);
+    target.bulk_direct_packet_low_level_write_calls = target
+        .bulk_direct_packet_low_level_write_calls
+        .saturating_add(source.bulk_direct_packet_low_level_write_calls);
+    target.bulk_direct_packet_low_level_write_bytes = target
+        .bulk_direct_packet_low_level_write_bytes
+        .saturating_add(source.bulk_direct_packet_low_level_write_bytes);
+    target.bulk_direct_packet_max_low_level_write_bytes = target
+        .bulk_direct_packet_max_low_level_write_bytes
+        .max(source.bulk_direct_packet_max_low_level_write_bytes);
+    target.bulk_direct_packet_write_elapsed += source.bulk_direct_packet_write_elapsed;
+    target.bulk_direct_packet_max_write_elapsed = target
+        .bulk_direct_packet_max_write_elapsed
+        .max(source.bulk_direct_packet_max_write_elapsed);
+    target.bulk_direct_packet_flush_calls = target
+        .bulk_direct_packet_flush_calls
+        .saturating_add(source.bulk_direct_packet_flush_calls);
+    target.bulk_direct_packet_flush_elapsed += source.bulk_direct_packet_flush_elapsed;
+    target.bulk_direct_packet_max_flush_elapsed = target
+        .bulk_direct_packet_max_flush_elapsed
+        .max(source.bulk_direct_packet_max_flush_elapsed);
 }
 
 async fn connect(
@@ -3010,15 +3083,15 @@ fn scenario_names() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{BenchmarkOutput, WriterBenchError, WriterBenchOptions};
+    use super::{BenchmarkOutput, DirectWriteProfile, WriterBenchError, WriterBenchOptions};
     use arrow_array::{
         Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int32Array,
         Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
     };
     use arrow_schema::{DataType, TimeUnit};
-    use std::ffi::OsString;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{ffi::OsString, time::Duration};
 
     static TEST_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -3245,6 +3318,65 @@ mod tests {
         let options = super::CompareBenchOptions::parse(&args).unwrap();
 
         assert!(options.profile_direct);
+    }
+
+    #[test]
+    fn merge_direct_profile_preserves_direct_packet_stats() {
+        let mut target = Some(DirectWriteProfile {
+            bulk_direct_packet_write_calls: 2,
+            bulk_direct_packet_payload_bytes: 3,
+            bulk_direct_packet_header_bytes: 5,
+            bulk_direct_packet_low_level_write_calls: 7,
+            bulk_direct_packet_low_level_write_bytes: 11,
+            bulk_direct_packet_max_low_level_write_bytes: 13,
+            bulk_direct_packet_write_elapsed: Duration::from_millis(17),
+            bulk_direct_packet_max_write_elapsed: Duration::from_millis(19),
+            bulk_direct_packet_flush_calls: 23,
+            bulk_direct_packet_flush_elapsed: Duration::from_millis(29),
+            bulk_direct_packet_max_flush_elapsed: Duration::from_millis(31),
+            ..DirectWriteProfile::default()
+        });
+        let source = DirectWriteProfile {
+            bulk_direct_packet_write_calls: 37,
+            bulk_direct_packet_payload_bytes: 41,
+            bulk_direct_packet_header_bytes: 43,
+            bulk_direct_packet_low_level_write_calls: 47,
+            bulk_direct_packet_low_level_write_bytes: 53,
+            bulk_direct_packet_max_low_level_write_bytes: 59,
+            bulk_direct_packet_write_elapsed: Duration::from_millis(61),
+            bulk_direct_packet_max_write_elapsed: Duration::from_millis(67),
+            bulk_direct_packet_flush_calls: 71,
+            bulk_direct_packet_flush_elapsed: Duration::from_millis(73),
+            bulk_direct_packet_max_flush_elapsed: Duration::from_millis(79),
+            ..DirectWriteProfile::default()
+        };
+
+        super::merge_direct_profile(&mut target, Some(source));
+
+        let profile = target.unwrap();
+        assert_eq!(profile.bulk_direct_packet_write_calls, 39);
+        assert_eq!(profile.bulk_direct_packet_payload_bytes, 44);
+        assert_eq!(profile.bulk_direct_packet_header_bytes, 48);
+        assert_eq!(profile.bulk_direct_packet_low_level_write_calls, 54);
+        assert_eq!(profile.bulk_direct_packet_low_level_write_bytes, 64);
+        assert_eq!(profile.bulk_direct_packet_max_low_level_write_bytes, 59);
+        assert_eq!(
+            profile.bulk_direct_packet_write_elapsed,
+            Duration::from_millis(78)
+        );
+        assert_eq!(
+            profile.bulk_direct_packet_max_write_elapsed,
+            Duration::from_millis(67)
+        );
+        assert_eq!(profile.bulk_direct_packet_flush_calls, 94);
+        assert_eq!(
+            profile.bulk_direct_packet_flush_elapsed,
+            Duration::from_millis(102)
+        );
+        assert_eq!(
+            profile.bulk_direct_packet_max_flush_elapsed,
+            Duration::from_millis(79)
+        );
     }
 
     #[test]

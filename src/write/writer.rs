@@ -149,7 +149,7 @@ where
             options.plan_options,
             mappings,
         )?;
-        let request = match state.backend() {
+        let mut request = match state.backend() {
             WriteBackend::BaselineTokenRow | WriteBackend::DirectRawBulk => {
                 let table_sql = bulk_insert_table_sql(&table);
                 let columns = client
@@ -177,6 +177,10 @@ where
                 return Err(execution_unavailable(state.backend()));
             }
         };
+
+        if state.backend() == WriteBackend::DirectRawBulk {
+            request.enable_direct_packet_writes();
+        }
 
         Ok(Self { state, request })
     }
@@ -541,6 +545,8 @@ where
         measured: &MeasuredDirectBatch,
         range: MeasuredRowRange,
     ) -> Result<()> {
+        self.enable_direct_packet_writes();
+
         let encoded_bytes = measured.range_payload_len(range.start, range.len)?;
         profile::record_row_range(encoded_bytes);
 

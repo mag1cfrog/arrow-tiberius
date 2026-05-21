@@ -504,8 +504,88 @@ Interpretation:
 - `direct-raw` uses about twice the peak RSS of `baseline` on this scenario.
 - `arrow-odbc` is much faster on this large-payload workload, but with much
   higher memory use.
-- `odbc-bcp` is also much faster than `direct-raw` and uses the least memory of
-  the four backends.
+- `direct-raw` is faster than `odbc-bcp` in this run, while `odbc-bcp` uses the
+  least memory of the four backends.
+
+## Results After Raw Direct Packet Writes
+
+After publishing `tiberius-raw-bulk` `0.12.3-raw-bulk.9`, `arrow-tiberius`
+was updated to opt the direct raw backend into the fork's experimental direct
+packet writer. The same release-mode `string_heavy` compare was rerun:
+
+```sh
+cargo run --release -p xtask -- writer-bench compare \
+  --container-runtime podman \
+  --scenario string_heavy \
+  --rows 300000 \
+  --batch-size 8192 \
+  --repeat 1 \
+  --backends baseline,direct-raw,arrow-odbc,odbc-bcp \
+  --tds-packet-size 32767
+```
+
+| Backend | Rows | Write | Finish | Total | Rows/sec | Peak RSS KiB | Peak RSS MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `baseline` | 300,000 | 34.888s | 0.293s | 35.257s | 8,527.27 | 96,780 | 94.51 |
+| `direct-raw` | 300,000 | 28.483s | 0.181s | 28.730s | 10,465.85 | 101,300 | 98.93 |
+| `arrow-odbc` | 300,000 | 22.375s | n/a | n/a | 13,407.82 | 1,452,724 | 1,418.68 |
+| `odbc-bcp` | 300,000 | 32.232s | n/a | n/a | 9,307.52 | 50,452 | 49.27 |
+
+Relative rows/sec:
+
+| Comparison | Ratio |
+| --- | ---: |
+| `direct-raw` / `baseline` | 1.23x |
+| `arrow-odbc` / `direct-raw` | 1.28x |
+| `direct-raw` / `odbc-bcp` | 1.12x |
+
+The direct profile for the same run shape was:
+
+```sh
+cargo run --release -p xtask -- writer-bench compare \
+  --container-runtime podman \
+  --scenario string_heavy \
+  --rows 300000 \
+  --batch-size 8192 \
+  --repeat 1 \
+  --backends direct-raw \
+  --profile-direct \
+  --tds-packet-size 32767
+```
+
+Selected profile counters:
+
+| Metric | Value |
+| --- | ---: |
+| Write rows/sec | 8,416.47 |
+| Write elapsed | 35.298s |
+| Finish elapsed | 0.347s |
+| Peak RSS KiB | 101,280 |
+| Encoded bytes | 1,883,800,622 |
+| Bulk write_to_wire calls | 57,843 |
+| Bulk write_to_wire elapsed | 31.546s |
+| Bulk connection write calls | 0 |
+| Bulk direct packet write calls | 57,843 |
+| Bulk direct packet payload bytes | 1,883,800,821 |
+| Bulk direct packet header bytes | 462,744 |
+| Bulk direct packet low-level write calls | 116,448 |
+| Bulk direct packet low-level write bytes | 1,884,263,565 |
+| Bulk direct packet write elapsed | 31.525s |
+| Bulk direct packet flush calls | 57,843 |
+| Bulk direct packet flush elapsed | 0.002s |
+
+Interpretation:
+
+- The opt-in direct packet path is active: framed connection write calls are
+  zero and direct packet write calls match the bulk packet count.
+- The direct packet path does not materially improve `string_heavy` throughput.
+  Its end-to-end result is within normal run-to-run noise compared with the
+  previous release-mode direct result.
+- The remaining dominant cost is still per-packet low-level writes: about
+  31.5s of the 35.3s write phase.
+- This argues against more blind packet-wrapper changes. The next optimization
+  should be data-driven around reducing packet/write call count or changing the
+  lower-level write strategy.
 
 ## Results: mixed_nullable
 
