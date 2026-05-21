@@ -2009,6 +2009,13 @@ const STRING_HEAVY_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefi
     columns: string_heavy_columns,
 };
 
+const STRING_HEAVY_UNICODE_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
+    name: "string_heavy_unicode",
+    description: "Large BMP Unicode text and binary payload rows",
+    schema: string_heavy_schema,
+    columns: string_heavy_unicode_columns,
+};
+
 const WIDE_SPARSE_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
     name: "wide_sparse",
     description: "Thirty-two mixed columns with sparse nullable values",
@@ -2027,6 +2034,7 @@ const DIRECT_RAW_SUPPORTED_SCENARIOS: &[&str] = &[
     NARROW_NUMERIC_SCENARIO.name,
     MIXED_NULLABLE_SCENARIO.name,
     STRING_HEAVY_SCENARIO.name,
+    STRING_HEAVY_UNICODE_SCENARIO.name,
     WIDE_SPARSE_SCENARIO.name,
 ];
 
@@ -2036,6 +2044,7 @@ const SCENARIOS: &[BenchmarkScenarioDefinition] = &[
     WIDE_MIXED_SCENARIO,
     DECIMAL_TEMPORAL_SCENARIO,
     STRING_HEAVY_SCENARIO,
+    STRING_HEAVY_UNICODE_SCENARIO,
     WIDE_SPARSE_SCENARIO,
     TPCH_LINEITEM_LIKE_SCENARIO,
 ];
@@ -3660,19 +3669,39 @@ fn string_heavy_schema() -> SchemaRef {
 }
 
 fn string_heavy_columns(offset: usize, len: usize) -> Result<Vec<ArrayRef>, WriterBenchError> {
-    let document_types = ["invoice", "event", "profile", "message", "audit"];
+    string_heavy_columns_with_text(offset, len, StringHeavyText::Ascii)
+}
+
+fn string_heavy_unicode_columns(
+    offset: usize,
+    len: usize,
+) -> Result<Vec<ArrayRef>, WriterBenchError> {
+    string_heavy_columns_with_text(offset, len, StringHeavyText::Unicode)
+}
+
+#[derive(Clone, Copy)]
+enum StringHeavyText {
+    Ascii,
+    Unicode,
+}
+
+fn string_heavy_columns_with_text(
+    offset: usize,
+    len: usize,
+    text: StringHeavyText,
+) -> Result<Vec<ArrayRef>, WriterBenchError> {
     let id = (offset..offset + len)
         .map(|row| 900_000_000_i64 + row as i64)
         .collect::<Int64Array>();
     let tenant = (offset..offset + len)
-        .map(|row| Some(format!("tenant-{:04}", row % 512)))
+        .map(|row| Some(text.tenant(row)))
         .collect::<StringArray>();
     let document_type = (offset..offset + len)
         .map(|row| {
             if row % 37 == 0 {
                 None
             } else {
-                Some(document_types[row % document_types.len()].to_owned())
+                Some(text.document_type(row))
             }
         })
         .collect::<StringArray>();
@@ -3681,7 +3710,7 @@ fn string_heavy_columns(offset: usize, len: usize) -> Result<Vec<ArrayRef>, Writ
             if row % 41 == 0 {
                 None
             } else {
-                Some(format!("document title {row:012}"))
+                Some(text.title(row))
             }
         })
         .collect::<StringArray>();
@@ -3690,7 +3719,7 @@ fn string_heavy_columns(offset: usize, len: usize) -> Result<Vec<ArrayRef>, Writ
             if row % 43 == 0 {
                 None
             } else {
-                Some(deterministic_text(row, 512 + row % 2_048))
+                Some(text.body(row, 512 + row % 2_048))
             }
         })
         .collect::<StringArray>();
@@ -3699,11 +3728,7 @@ fn string_heavy_columns(offset: usize, len: usize) -> Result<Vec<ArrayRef>, Writ
             if row % 47 == 0 {
                 None
             } else {
-                Some(format!(
-                    "{{\"tenant\":{},\"source\":{},\"sequence\":{row}}}",
-                    row % 512,
-                    row % 17
-                ))
+                Some(text.metadata(row))
             }
         })
         .collect::<StringArray>();
@@ -3726,6 +3751,61 @@ fn string_heavy_columns(offset: usize, len: usize) -> Result<Vec<ArrayRef>, Writ
         Arc::new(metadata),
         Arc::new(payload),
     ])
+}
+
+impl StringHeavyText {
+    fn tenant(self, row: usize) -> String {
+        match self {
+            Self::Ascii => format!("tenant-{:04}", row % 512),
+            Self::Unicode => format!("\u{79df}\u{6237}-{:04}", row % 512),
+        }
+    }
+
+    fn document_type(self, row: usize) -> String {
+        const ASCII_TYPES: &[&str] = &["invoice", "event", "profile", "message", "audit"];
+        const UNICODE_TYPES: &[&str] = &[
+            "\u{53d1}\u{7968}",
+            "\u{4e8b}\u{4ef6}",
+            "\u{6863}\u{6848}",
+            "\u{6d88}\u{606f}",
+            "\u{5ba1}\u{8ba1}",
+        ];
+
+        let values = match self {
+            Self::Ascii => ASCII_TYPES,
+            Self::Unicode => UNICODE_TYPES,
+        };
+        values[row % values.len()].to_owned()
+    }
+
+    fn title(self, row: usize) -> String {
+        match self {
+            Self::Ascii => format!("document title {row:012}"),
+            Self::Unicode => format!("\u{6587}\u{6863} title {row:012}"),
+        }
+    }
+
+    fn body(self, row: usize, len: usize) -> String {
+        match self {
+            Self::Ascii => deterministic_text(row, len),
+            Self::Unicode => deterministic_unicode_text(row, len),
+        }
+    }
+
+    fn metadata(self, row: usize) -> String {
+        match self {
+            Self::Ascii => format!(
+                "{{\"tenant\":{},\"source\":{},\"sequence\":{row}}}",
+                row % 512,
+                row % 17
+            ),
+            Self::Unicode => format!(
+                "{{\"tenant\":\"\u{79df}\u{6237}-{:04}\",\"source\":\"\u{6765}\u{6e90}-{}\",\"sequence\":{row}}}",
+                row % 512,
+                row % 17
+            ),
+        }
+    }
 }
 
 fn wide_sparse_schema() -> SchemaRef {
@@ -3961,6 +4041,20 @@ fn deterministic_text(row: usize, len: usize) -> String {
     for index in 0..len {
         let byte = ALPHABET[(row.wrapping_mul(31) + index.wrapping_mul(7)) % ALPHABET.len()];
         value.push(char::from(byte));
+    }
+
+    value
+}
+
+fn deterministic_unicode_text(row: usize, len: usize) -> String {
+    const ALPHABET: &[char] = &[
+        '\u{6570}', '\u{636e}', '\u{5199}', '\u{5165}', '\u{6d4b}', '\u{8bd5}', '\u{00e9}',
+        '\u{00f1}', '\u{03bb}', '\u{03a9}', '0', '1', '2', '3', ' ',
+    ];
+    let mut value = String::with_capacity(len);
+
+    for index in 0..len {
+        value.push(ALPHABET[(row.wrapping_mul(31) + index.wrapping_mul(7)) % ALPHABET.len()]);
     }
 
     value
@@ -4858,7 +4952,12 @@ mod tests {
 
     #[test]
     fn compare_allows_direct_raw_for_variable_width_supported_scenarios() {
-        for scenario in ["mixed_nullable", "string_heavy", "wide_sparse"] {
+        for scenario in [
+            "mixed_nullable",
+            "string_heavy",
+            "string_heavy_unicode",
+            "wide_sparse",
+        ] {
             let args = [
                 OsString::from("--scenario"),
                 OsString::from(scenario),
@@ -4893,6 +4992,7 @@ mod tests {
                         && message.contains("narrow_numeric")
                         && message.contains("mixed_nullable")
                         && message.contains("string_heavy")
+                        && message.contains("string_heavy_unicode")
                         && message.contains("wide_sparse")
                         && message.contains(scenario)
             ));
@@ -5942,6 +6042,68 @@ odbc-bcp runner
     }
 
     #[test]
+    fn string_heavy_unicode_keeps_string_heavy_shape_with_bmp_text() {
+        let string_heavy = WriterBenchOptions {
+            rows: 128,
+            batch_size: 128,
+            scenario: super::scenario_by_name("string_heavy").unwrap(),
+            repeat: 1,
+            output: BenchmarkOutput::Human,
+        };
+        let unicode = WriterBenchOptions {
+            scenario: super::scenario_by_name("string_heavy_unicode").unwrap(),
+            ..string_heavy.clone()
+        };
+
+        let ascii_batch = &generated_batches(&string_heavy)[0];
+        let unicode_batch = &generated_batches(&unicode)[0];
+        let ascii_body = ascii_batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let unicode_tenant = unicode_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let unicode_body = unicode_batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let unicode_payload = unicode_batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+
+        assert_eq!(unicode_batch.schema(), ascii_batch.schema());
+        assert_eq!(unicode_body.null_count(), ascii_body.null_count());
+        assert_eq!(
+            unicode_body.value(1).chars().count(),
+            ascii_body.value(1).chars().count()
+        );
+        assert!(!unicode_tenant.value(0).is_ascii());
+        assert!(!unicode_body.value(1).is_ascii());
+        assert!(
+            unicode_body
+                .value(1)
+                .chars()
+                .all(|ch| (ch as u32) <= 0xffff)
+        );
+        assert_eq!(
+            unicode_payload.value(1),
+            ascii_batch
+                .column(6)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .value(1)
+        );
+    }
+
+    #[test]
     fn wide_sparse_has_many_columns_and_sparse_nulls() {
         let options = WriterBenchOptions {
             rows: 256,
@@ -6000,6 +6162,7 @@ odbc-bcp runner
             "wide_mixed",
             "decimal_temporal",
             "string_heavy",
+            "string_heavy_unicode",
             "wide_sparse",
             "tpch_lineitem_like",
         ] {
@@ -6107,6 +6270,7 @@ odbc-bcp runner
                 "wide_mixed",
                 "decimal_temporal",
                 "string_heavy",
+                "string_heavy_unicode",
                 "wide_sparse",
                 "tpch_lineitem_like"
             ]
