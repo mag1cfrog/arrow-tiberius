@@ -14,6 +14,9 @@ use arrow_odbc::odbc_api::{Connection, Cursor, Environment};
 const CONNECTION_STRING_ENV: &str = "ARROW_TIBERIUS_BENCH_ODBC_CONNECTION_STRING";
 const DATABASE_ENV: &str = "ARROW_TIBERIUS_BENCH_DATABASE";
 const TABLE_PLACEHOLDER: &str = "__ARROW_TIBERIUS_ODBC_TABLE__";
+const STRING_HEAVY_UNICODE_SCENARIO: &str = "string_heavy_unicode";
+const STRING_HEAVY_UNICODE_TENANT_FIRST_CODEPOINT: u32 = 0x79df;
+const STRING_HEAVY_UNICODE_TENANT_SECOND_CODEPOINT: u32 = 0x6237;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let command = env::args().nth(1);
@@ -162,6 +165,7 @@ fn run_repeat(
         )
         .into());
     }
+    validate_scenario_contents(connection, table, &options.scenario, actual)?;
 
     if let Some(profile) = sql_server_profile {
         profile.snapshot_table_pages(connection, table)?;
@@ -208,14 +212,98 @@ fn execute_sql(connection: &Connection<'_>, sql: &str) -> Result<(), Box<dyn Err
 }
 
 fn select_count(connection: &Connection<'_>, table: &str) -> Result<u64, Box<dyn Error>> {
-    let sql = format!("SELECT COUNT_BIG(*) FROM {table}");
+    select_count_query(
+        connection,
+        &format!("SELECT COUNT_BIG(*) FROM {table}"),
+        "SELECT COUNT_BIG(*)",
+    )
+}
+
+fn validate_scenario_contents(
+    connection: &Connection<'_>,
+    table: &str,
+    scenario: &str,
+    expected_rows: u64,
+) -> Result<(), Box<dyn Error>> {
+    if scenario == STRING_HEAVY_UNICODE_SCENARIO {
+        validate_string_heavy_unicode_contents(connection, table, expected_rows)?;
+    }
+
+    Ok(())
+}
+
+fn validate_string_heavy_unicode_contents(
+    connection: &Connection<'_>,
+    table: &str,
+    expected_rows: u64,
+) -> Result<(), Box<dyn Error>> {
+    let actual = select_count_query(
+        connection,
+        &string_heavy_unicode_tenant_sentinel_count_sql(table),
+        "string_heavy_unicode tenant sentinel count",
+    )?;
+
+    if actual != expected_rows {
+        let sample = select_text_query(
+            connection,
+            &string_heavy_unicode_tenant_sample_sql(table),
+            "string_heavy_unicode tenant sample",
+        )?;
+        return Err(format!(
+            "string_heavy_unicode tenant sentinel validation failed: expected {expected_rows}, got {actual}; first tenant sample: {sample}"
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+fn string_heavy_unicode_tenant_sentinel_count_sql(table: &str) -> String {
+    format!(
+        "SELECT COUNT_BIG(*) FROM {table} \
+         WHERE UNICODE(SUBSTRING([tenant], 1, 1)) = {STRING_HEAVY_UNICODE_TENANT_FIRST_CODEPOINT} \
+         AND UNICODE(SUBSTRING([tenant], 2, 1)) = {STRING_HEAVY_UNICODE_TENANT_SECOND_CODEPOINT}"
+    )
+}
+
+fn string_heavy_unicode_tenant_sample_sql(table: &str) -> String {
+    format!(
+        "SELECT TOP (1) \
+            CONCAT(\
+                CONVERT(varchar(16), UNICODE(SUBSTRING([tenant], 1, 1))), ',', \
+                CONVERT(varchar(16), UNICODE(SUBSTRING([tenant], 2, 1))), ',', \
+                CONVERT(varchar(16), UNICODE(SUBSTRING([tenant], 3, 1))), \
+                ';len=', CONVERT(varchar(16), LEN([tenant])), \
+                ';bytes=', CONVERT(varchar(16), DATALENGTH([tenant]))\
+            ) \
+         FROM {table} ORDER BY [id]"
+    )
+}
+
+fn select_count_query(
+    connection: &Connection<'_>,
+    sql: &str,
+    label: &'static str,
+) -> Result<u64, Box<dyn Error>> {
     let cursor = connection
-        .execute(&sql, (), None)?
-        .ok_or("SELECT COUNT_BIG(*) did not return a cursor")?;
+        .execute(sql, (), None)?
+        .ok_or_else(|| format!("{label} did not return a cursor"))?;
     let text = cursor_to_string(cursor)?;
     let count = text.trim().parse::<u64>()?;
 
     Ok(count)
+}
+
+fn select_text_query(
+    connection: &Connection<'_>,
+    sql: &str,
+    label: &'static str,
+) -> Result<String, Box<dyn Error>> {
+    let cursor = connection
+        .execute(sql, (), None)?
+        .ok_or_else(|| format!("{label} did not return a cursor"))?;
+
+    cursor_to_string(cursor)
 }
 
 fn cursor_to_string(mut cursor: impl Cursor) -> Result<String, Box<dyn Error>> {
@@ -871,7 +959,7 @@ mod tests {
     use super::{
         BenchOptions, DatabaseFileIoDelta, DatabaseFileIoSnapshot, SessionWaitDelta,
         SessionWaitSnapshot, TABLE_PLACEHOLDER, database_file_io_deltas, ipc_batches,
-        rows_per_second, session_wait_deltas,
+        rows_per_second, session_wait_deltas, string_heavy_unicode_tenant_sentinel_count_sql,
     };
     use arrow_ipc::writer::FileWriter;
     use arrow_odbc::arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
@@ -944,6 +1032,15 @@ mod tests {
 
         assert!(options.autocommit);
         assert_eq!(options.transaction_policy(), "ODBC autocommit");
+    }
+
+    #[test]
+    fn string_heavy_unicode_sentinel_query_checks_tenant_codepoints() {
+        let sql = string_heavy_unicode_tenant_sentinel_count_sql("[dbo].[target]");
+
+        assert!(sql.contains("COUNT_BIG(*) FROM [dbo].[target]"));
+        assert!(sql.contains("UNICODE(SUBSTRING([tenant], 1, 1)) = 31199"));
+        assert!(sql.contains("UNICODE(SUBSTRING([tenant], 2, 1)) = 25143"));
     }
 
     #[test]

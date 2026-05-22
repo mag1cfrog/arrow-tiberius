@@ -23,6 +23,9 @@ const BCP_LIBRARY_ENV: &str = "ARROW_TIBERIUS_BENCH_BCP_LIBRARY";
 const DEFAULT_ODBC_LIBRARY: &str = "libodbc.so.2";
 const DEFAULT_BCP_LIBRARY: &str = "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.6.so.2.1";
 const TABLE_PLACEHOLDER: &str = "__ARROW_TIBERIUS_ODBC_TABLE__";
+const STRING_HEAVY_UNICODE_SCENARIO: &str = "string_heavy_unicode";
+const STRING_HEAVY_UNICODE_TENANT_FIRST_CODEPOINT: u32 = 0x79df;
+const STRING_HEAVY_UNICODE_TENANT_SECOND_CODEPOINT: u32 = 0x6237;
 
 const SQL_SUCCESS: SqlReturn = 0;
 const SQL_SUCCESS_WITH_INFO: SqlReturn = 1;
@@ -209,6 +212,7 @@ fn run_repeat(
         )
         .into());
     }
+    validate_scenario_contents(connection, table, &options.scenario, actual)?;
 
     if let Some(profile) = sql_server_profile {
         profile.snapshot_table_pages(table)?;
@@ -1104,10 +1108,61 @@ fn execute_sql(connection: &RawBcpConnection<'_>, sql: &str) -> Result<(), Box<d
 }
 
 fn select_count(connection: &RawBcpConnection<'_>, table: &str) -> Result<u64, Box<dyn Error>> {
-    let sql = c_string(
-        "count SQL statement",
+    select_count_query(
+        connection,
         &format!("SELECT COUNT_BIG(*) FROM {table}"),
+        "SELECT COUNT_BIG(*)",
+    )
+}
+
+fn validate_scenario_contents(
+    connection: &RawBcpConnection<'_>,
+    table: &str,
+    scenario: &str,
+    expected_rows: u64,
+) -> Result<(), Box<dyn Error>> {
+    if scenario == STRING_HEAVY_UNICODE_SCENARIO {
+        validate_string_heavy_unicode_contents(connection, table, expected_rows)?;
+    }
+
+    Ok(())
+}
+
+fn validate_string_heavy_unicode_contents(
+    connection: &RawBcpConnection<'_>,
+    table: &str,
+    expected_rows: u64,
+) -> Result<(), Box<dyn Error>> {
+    let actual = select_count_query(
+        connection,
+        &string_heavy_unicode_tenant_sentinel_count_sql(table),
+        "string_heavy_unicode tenant sentinel count",
     )?;
+
+    if actual != expected_rows {
+        return Err(format!(
+            "string_heavy_unicode tenant sentinel validation failed: expected {expected_rows}, got {actual}"
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+fn string_heavy_unicode_tenant_sentinel_count_sql(table: &str) -> String {
+    format!(
+        "SELECT COUNT_BIG(*) FROM {table} \
+         WHERE UNICODE(SUBSTRING([tenant], 1, 1)) = {STRING_HEAVY_UNICODE_TENANT_FIRST_CODEPOINT} \
+         AND UNICODE(SUBSTRING([tenant], 2, 1)) = {STRING_HEAVY_UNICODE_TENANT_SECOND_CODEPOINT}"
+    )
+}
+
+fn select_count_query(
+    connection: &RawBcpConnection<'_>,
+    sql: &str,
+    label: &'static str,
+) -> Result<u64, Box<dyn Error>> {
+    let sql = c_string("count SQL statement", sql)?;
     let statement = connection.allocate_statement()?;
     let exec_result = unsafe {
         (connection.odbc.sql_exec_direct)(
@@ -1116,10 +1171,10 @@ fn select_count(connection: &RawBcpConnection<'_>, table: &str) -> Result<u64, B
             SQL_NTS.into(),
         )
     };
-    require_odbc_success("SQLExecDirect count", exec_result)?;
+    require_odbc_success(label, exec_result)?;
 
     let fetch_result = unsafe { (connection.odbc.sql_fetch)(statement.hstmt) };
-    require_odbc_success("SQLFetch count", fetch_result)?;
+    require_odbc_success(label, fetch_result)?;
 
     let mut buffer = [0_u8; 64];
     let mut indicator = 0;
@@ -1133,10 +1188,10 @@ fn select_count(connection: &RawBcpConnection<'_>, table: &str) -> Result<u64, B
             &mut indicator,
         )
     };
-    require_odbc_success("SQLGetData count", get_result)?;
+    require_odbc_success(label, get_result)?;
 
     if indicator < 0 {
-        return Err("COUNT_BIG returned NULL".into());
+        return Err(format!("{label} returned NULL").into());
     }
     let nul_position = buffer
         .iter()
@@ -1146,7 +1201,7 @@ fn select_count(connection: &RawBcpConnection<'_>, table: &str) -> Result<u64, B
 
     let no_more_rows = unsafe { (connection.odbc.sql_fetch)(statement.hstmt) };
     if no_more_rows != SQL_NO_DATA {
-        return Err("COUNT_BIG returned more than one row".into());
+        return Err(format!("{label} returned more than one row").into());
     }
 
     Ok(text.trim().parse::<u64>()?)
@@ -1821,7 +1876,8 @@ mod tests {
         BcpColumnBindings, BcpColumnBuffer, BenchOptions, DatabaseFileIoDelta,
         DatabaseFileIoSnapshot, SessionWaitDelta, SessionWaitSnapshot, TABLE_PLACEHOLDER, c_string,
         database_file_io_deltas, format_date32, format_decimal, format_timestamp_millis,
-        push_utf16le, rows_per_second, session_wait_deltas, validate_ipc_schema_and_count,
+        push_utf16le, rows_per_second, session_wait_deltas,
+        string_heavy_unicode_tenant_sentinel_count_sql, validate_ipc_schema_and_count,
     };
     use arrow_array::{
         ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
@@ -1920,6 +1976,15 @@ mod tests {
             options.transaction_policy(),
             "bcp_batch every 8 rows plus bcp_done"
         );
+    }
+
+    #[test]
+    fn string_heavy_unicode_sentinel_query_checks_tenant_codepoints() {
+        let sql = string_heavy_unicode_tenant_sentinel_count_sql("[dbo].[target]");
+
+        assert!(sql.contains("COUNT_BIG(*) FROM [dbo].[target]"));
+        assert!(sql.contains("UNICODE(SUBSTRING([tenant], 1, 1)) = 31199"));
+        assert!(sql.contains("UNICODE(SUBSTRING([tenant], 2, 1)) = 25143"));
     }
 
     #[test]

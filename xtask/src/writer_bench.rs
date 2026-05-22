@@ -2009,12 +2009,29 @@ const STRING_HEAVY_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefi
     columns: string_heavy_columns,
 };
 
+const STRING_HEAVY_TEXT_ONLY_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
+    name: "string_heavy_text_only",
+    description: "Large variable text rows with minimal binary payloads",
+    schema: string_heavy_schema,
+    columns: string_heavy_text_only_columns,
+};
+
+const STRING_HEAVY_BINARY_ONLY_SCENARIO: BenchmarkScenarioDefinition =
+    BenchmarkScenarioDefinition {
+        name: "string_heavy_binary_only",
+        description: "Large variable binary rows with minimal text payloads",
+        schema: string_heavy_schema,
+        columns: string_heavy_binary_only_columns,
+    };
+
 const STRING_HEAVY_UNICODE_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
     name: "string_heavy_unicode",
     description: "Large BMP Unicode text and binary payload rows",
     schema: string_heavy_schema,
     columns: string_heavy_unicode_columns,
 };
+const STRING_HEAVY_UNICODE_TENANT_FIRST_CODEPOINT: u32 = 0x79df;
+const STRING_HEAVY_UNICODE_TENANT_SECOND_CODEPOINT: u32 = 0x6237;
 
 const WIDE_SPARSE_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
     name: "wide_sparse",
@@ -2034,6 +2051,8 @@ const DIRECT_RAW_SUPPORTED_SCENARIOS: &[&str] = &[
     NARROW_NUMERIC_SCENARIO.name,
     MIXED_NULLABLE_SCENARIO.name,
     STRING_HEAVY_SCENARIO.name,
+    STRING_HEAVY_TEXT_ONLY_SCENARIO.name,
+    STRING_HEAVY_BINARY_ONLY_SCENARIO.name,
     STRING_HEAVY_UNICODE_SCENARIO.name,
     WIDE_SPARSE_SCENARIO.name,
 ];
@@ -2044,6 +2063,8 @@ const SCENARIOS: &[BenchmarkScenarioDefinition] = &[
     WIDE_MIXED_SCENARIO,
     DECIMAL_TEMPORAL_SCENARIO,
     STRING_HEAVY_SCENARIO,
+    STRING_HEAVY_TEXT_ONLY_SCENARIO,
+    STRING_HEAVY_BINARY_ONLY_SCENARIO,
     STRING_HEAVY_UNICODE_SCENARIO,
     WIDE_SPARSE_SCENARIO,
     TPCH_LINEITEM_LIKE_SCENARIO,
@@ -2151,6 +2172,13 @@ struct TiberiusBenchTimings {
     validate: Duration,
     cleanup: Duration,
     total: Duration,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TiberiusRepeatConfig {
+    scenario: &'static BenchmarkScenarioDefinition,
+    backend: WriteBackend,
+    profile_direct: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2833,11 +2861,14 @@ async fn run_tiberius_benchmark_from_ipc(
             let repeat_report =
                 run_tiberius_repeat_from_ipc(
                     &mut client,
+                    TiberiusRepeatConfig {
+                        scenario: benchmark.scenario,
+                        backend,
+                        profile_direct,
+                    },
                     &mappings,
                     &table,
                     ipc_path,
-                    backend,
-                    profile_direct,
                     sql_server_profile_session.as_mut(),
                 )
                 .await;
@@ -2918,11 +2949,10 @@ fn prepare_baseline_ipc_dataset(
 
 async fn run_tiberius_repeat_from_ipc(
     client: &mut BenchClient,
+    config: TiberiusRepeatConfig,
     mappings: &[arrow_tiberius::SchemaMapping],
     table: &TableName,
     ipc_path: &Path,
-    backend: WriteBackend,
-    profile_direct: bool,
     sql_server_profile_session: Option<&mut SqlServerProfileSession>,
 ) -> Result<TiberiusBenchReport, WriterBenchError> {
     let batches =
@@ -2930,11 +2960,10 @@ async fn run_tiberius_repeat_from_ipc(
 
     run_tiberius_repeat_with_batches(
         client,
+        config,
         mappings,
         table,
         batches,
-        backend,
-        profile_direct,
         sql_server_profile_session,
     )
     .await
@@ -2942,11 +2971,10 @@ async fn run_tiberius_repeat_from_ipc(
 
 async fn run_tiberius_repeat_with_batches(
     client: &mut BenchClient,
+    config: TiberiusRepeatConfig,
     mappings: &[arrow_tiberius::SchemaMapping],
     table: &TableName,
     batches: impl IntoIterator<Item = Result<RecordBatch, WriterBenchError>>,
-    backend: WriteBackend,
-    profile_direct: bool,
     mut sql_server_profile_session: Option<&mut SqlServerProfileSession>,
 ) -> Result<TiberiusBenchReport, WriterBenchError> {
     let mut report = TiberiusBenchReport::default();
@@ -2963,7 +2991,7 @@ async fn run_tiberius_repeat_with_batches(
         table.clone(),
         mappings.to_vec(),
         WriteOptions {
-            backend,
+            backend: config.backend,
             ..WriteOptions::default()
         },
     )
@@ -2971,7 +2999,7 @@ async fn run_tiberius_repeat_with_batches(
     .map_err(WriterBenchError::ArrowTiberius)?;
     report.timings.setup += setup_start.elapsed();
 
-    let profiling_direct = profile_direct && backend == WriteBackend::DirectRawBulk;
+    let profiling_direct = config.profile_direct && config.backend == WriteBackend::DirectRawBulk;
     if profiling_direct {
         arrow_tiberius::write::profile::start_direct_write_profile();
     }
@@ -3030,6 +3058,7 @@ async fn run_tiberius_repeat_with_batches(
             actual: report.validated_rows,
         });
     }
+    validate_scenario_contents(client, table, config.scenario, report.validated_rows).await?;
 
     if let Some(profile_session) = sql_server_profile_session.as_mut() {
         profile_session.snapshot_table_pages(table).await?;
@@ -3315,24 +3344,75 @@ async fn select_count(
     client: &mut BenchClient,
     table: &TableName,
 ) -> Result<u64, WriterBenchError> {
+    select_count_query(
+        client,
+        format!("SELECT COUNT_BIG(*) FROM {}", table.quoted_sql()),
+        "SELECT COUNT_BIG(*)",
+    )
+    .await
+}
+
+async fn validate_scenario_contents(
+    client: &mut BenchClient,
+    table: &TableName,
+    scenario: &BenchmarkScenarioDefinition,
+    expected_rows: u64,
+) -> Result<(), WriterBenchError> {
+    if scenario.name == STRING_HEAVY_UNICODE_SCENARIO.name {
+        validate_string_heavy_unicode_contents(client, table, expected_rows).await?;
+    }
+
+    Ok(())
+}
+
+async fn validate_string_heavy_unicode_contents(
+    client: &mut BenchClient,
+    table: &TableName,
+    expected_rows: u64,
+) -> Result<(), WriterBenchError> {
+    let actual = select_count_query(
+        client,
+        string_heavy_unicode_tenant_sentinel_count_sql(&table.quoted_sql()),
+        "string_heavy_unicode tenant sentinel count",
+    )
+    .await?;
+
+    if actual != expected_rows {
+        return Err(WriterBenchError::Validation(format!(
+            "string_heavy_unicode tenant sentinel validation failed: expected {expected_rows}, got {actual}"
+        )));
+    }
+
+    Ok(())
+}
+
+fn string_heavy_unicode_tenant_sentinel_count_sql(table: &str) -> String {
+    format!(
+        "SELECT COUNT_BIG(*) FROM {table} \
+         WHERE UNICODE(SUBSTRING([tenant], 1, 1)) = {STRING_HEAVY_UNICODE_TENANT_FIRST_CODEPOINT} \
+         AND UNICODE(SUBSTRING([tenant], 2, 1)) = {STRING_HEAVY_UNICODE_TENANT_SECOND_CODEPOINT}"
+    )
+}
+
+async fn select_count_query(
+    client: &mut BenchClient,
+    sql: String,
+    label: &'static str,
+) -> Result<u64, WriterBenchError> {
     let row = client
-        .simple_query(format!("SELECT COUNT_BIG(*) FROM {}", table.quoted_sql()))
+        .simple_query(sql)
         .await
         .map_err(WriterBenchError::Tiberius)?
         .into_row()
         .await
         .map_err(WriterBenchError::Tiberius)?
-        .ok_or_else(|| {
-            WriterBenchError::Validation("SELECT COUNT_BIG(*) returned no row".to_owned())
-        })?;
-    let count = row.get::<i64, _>(0).ok_or_else(|| {
-        WriterBenchError::Validation("SELECT COUNT_BIG(*) did not return bigint".to_owned())
-    })?;
+        .ok_or_else(|| WriterBenchError::Validation(format!("{label} returned no row")))?;
+    let count = row
+        .get::<i64, _>(0)
+        .ok_or_else(|| WriterBenchError::Validation(format!("{label} did not return bigint")))?;
 
     u64::try_from(count).map_err(|_| {
-        WriterBenchError::Validation(format!(
-            "SELECT COUNT_BIG(*) returned negative count {count}"
-        ))
+        WriterBenchError::Validation(format!("{label} returned negative count {count}"))
     })
 }
 
@@ -3669,14 +3749,43 @@ fn string_heavy_schema() -> SchemaRef {
 }
 
 fn string_heavy_columns(offset: usize, len: usize) -> Result<Vec<ArrayRef>, WriterBenchError> {
-    string_heavy_columns_with_text(offset, len, StringHeavyText::Ascii)
+    string_heavy_columns_with_shape(offset, len, StringHeavyText::Ascii, StringHeavyShape::Full)
+}
+
+fn string_heavy_text_only_columns(
+    offset: usize,
+    len: usize,
+) -> Result<Vec<ArrayRef>, WriterBenchError> {
+    string_heavy_columns_with_shape(
+        offset,
+        len,
+        StringHeavyText::Ascii,
+        StringHeavyShape::TextOnly,
+    )
+}
+
+fn string_heavy_binary_only_columns(
+    offset: usize,
+    len: usize,
+) -> Result<Vec<ArrayRef>, WriterBenchError> {
+    string_heavy_columns_with_shape(
+        offset,
+        len,
+        StringHeavyText::Ascii,
+        StringHeavyShape::BinaryOnly,
+    )
 }
 
 fn string_heavy_unicode_columns(
     offset: usize,
     len: usize,
 ) -> Result<Vec<ArrayRef>, WriterBenchError> {
-    string_heavy_columns_with_text(offset, len, StringHeavyText::Unicode)
+    string_heavy_columns_with_shape(
+        offset,
+        len,
+        StringHeavyText::Unicode,
+        StringHeavyShape::Full,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -3685,10 +3794,18 @@ enum StringHeavyText {
     Unicode,
 }
 
-fn string_heavy_columns_with_text(
+#[derive(Clone, Copy)]
+enum StringHeavyShape {
+    Full,
+    TextOnly,
+    BinaryOnly,
+}
+
+fn string_heavy_columns_with_shape(
     offset: usize,
     len: usize,
     text: StringHeavyText,
+    shape: StringHeavyShape,
 ) -> Result<Vec<ArrayRef>, WriterBenchError> {
     let id = (offset..offset + len)
         .map(|row| 900_000_000_i64 + row as i64)
@@ -3719,7 +3836,7 @@ fn string_heavy_columns_with_text(
             if row % 43 == 0 {
                 None
             } else {
-                Some(text.body(row, 512 + row % 2_048))
+                Some(text.body(row, shape.body_len(row)))
             }
         })
         .collect::<StringArray>();
@@ -3737,7 +3854,7 @@ fn string_heavy_columns_with_text(
             if row % 53 == 0 {
                 None
             } else {
-                Some(deterministic_payload_with_len(row, 1_024 + row % 4_096))
+                Some(deterministic_payload_with_len(row, shape.payload_len(row)))
             }
         })
         .collect::<BinaryArray>();
@@ -3751,6 +3868,22 @@ fn string_heavy_columns_with_text(
         Arc::new(metadata),
         Arc::new(payload),
     ])
+}
+
+impl StringHeavyShape {
+    fn body_len(self, row: usize) -> usize {
+        match self {
+            Self::Full | Self::TextOnly => 512 + row % 2_048,
+            Self::BinaryOnly => 24 + row % 96,
+        }
+    }
+
+    fn payload_len(self, row: usize) -> usize {
+        match self {
+            Self::Full | Self::BinaryOnly => 1_024 + row % 4_096,
+            Self::TextOnly => 8 + row % 32,
+        }
+    }
 }
 
 impl StringHeavyText {
@@ -4955,6 +5088,8 @@ mod tests {
         for scenario in [
             "mixed_nullable",
             "string_heavy",
+            "string_heavy_text_only",
+            "string_heavy_binary_only",
             "string_heavy_unicode",
             "wide_sparse",
         ] {
@@ -4992,6 +5127,8 @@ mod tests {
                         && message.contains("narrow_numeric")
                         && message.contains("mixed_nullable")
                         && message.contains("string_heavy")
+                        && message.contains("string_heavy_text_only")
+                        && message.contains("string_heavy_binary_only")
                         && message.contains("string_heavy_unicode")
                         && message.contains("wide_sparse")
                         && message.contains(scenario)
@@ -6104,6 +6241,57 @@ odbc-bcp runner
     }
 
     #[test]
+    fn string_heavy_text_and_binary_variants_split_large_payload_shape() {
+        let full = WriterBenchOptions {
+            rows: 128,
+            batch_size: 128,
+            scenario: super::scenario_by_name("string_heavy").unwrap(),
+            repeat: 1,
+            output: BenchmarkOutput::Human,
+        };
+        let text_only = WriterBenchOptions {
+            scenario: super::scenario_by_name("string_heavy_text_only").unwrap(),
+            ..full.clone()
+        };
+        let binary_only = WriterBenchOptions {
+            scenario: super::scenario_by_name("string_heavy_binary_only").unwrap(),
+            ..full.clone()
+        };
+
+        let full_batch = &generated_batches(&full)[0];
+        let text_batch = &generated_batches(&text_only)[0];
+        let binary_batch = &generated_batches(&binary_only)[0];
+
+        let full_body = string_column(full_batch, 4);
+        let full_payload = binary_column(full_batch, 6);
+        let text_body = string_column(text_batch, 4);
+        let text_payload = binary_column(text_batch, 6);
+        let binary_body = string_column(binary_batch, 4);
+        let binary_payload = binary_column(binary_batch, 6);
+
+        assert_eq!(text_batch.schema(), full_batch.schema());
+        assert_eq!(binary_batch.schema(), full_batch.schema());
+        assert_eq!(text_body.null_count(), full_body.null_count());
+        assert_eq!(text_payload.null_count(), full_payload.null_count());
+        assert_eq!(binary_body.null_count(), full_body.null_count());
+        assert_eq!(binary_payload.null_count(), full_payload.null_count());
+
+        assert_eq!(text_body.value(1).len(), full_body.value(1).len());
+        assert_eq!(binary_payload.value(1).len(), full_payload.value(1).len());
+        assert!(text_payload.value(1).len() < full_payload.value(1).len() / 16);
+        assert!(binary_body.value(1).len() < full_body.value(1).len() / 4);
+    }
+
+    #[test]
+    fn string_heavy_unicode_sentinel_query_checks_tenant_codepoints() {
+        let sql = super::string_heavy_unicode_tenant_sentinel_count_sql("[dbo].[target]");
+
+        assert!(sql.contains("COUNT_BIG(*) FROM [dbo].[target]"));
+        assert!(sql.contains("UNICODE(SUBSTRING([tenant], 1, 1)) = 31199"));
+        assert!(sql.contains("UNICODE(SUBSTRING([tenant], 2, 1)) = 25143"));
+    }
+
+    #[test]
     fn wide_sparse_has_many_columns_and_sparse_nulls() {
         let options = WriterBenchOptions {
             rows: 256,
@@ -6162,6 +6350,8 @@ odbc-bcp runner
             "wide_mixed",
             "decimal_temporal",
             "string_heavy",
+            "string_heavy_text_only",
+            "string_heavy_binary_only",
             "string_heavy_unicode",
             "wide_sparse",
             "tpch_lineitem_like",
@@ -6270,6 +6460,8 @@ odbc-bcp runner
                 "wide_mixed",
                 "decimal_temporal",
                 "string_heavy",
+                "string_heavy_text_only",
+                "string_heavy_binary_only",
                 "string_heavy_unicode",
                 "wide_sparse",
                 "tpch_lineitem_like"
@@ -6285,6 +6477,22 @@ odbc-bcp runner
     fn generated_batches(options: &WriterBenchOptions) -> Vec<RecordBatch> {
         super::GeneratedBatchReader::new(options)
             .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn string_column(batch: &RecordBatch, index: usize) -> &StringArray {
+        batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+    }
+
+    fn binary_column(batch: &RecordBatch, index: usize) -> &BinaryArray {
+        batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
             .unwrap()
     }
 
