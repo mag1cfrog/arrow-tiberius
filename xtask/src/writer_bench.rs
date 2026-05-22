@@ -1240,6 +1240,19 @@ impl FromStr for SqlServerRecoveryModel {
     }
 }
 
+impl SqlServerRecoveryModel {
+    fn from_sql_server_desc(value: &str) -> Result<Self, WriterBenchError> {
+        match value {
+            "FULL" => Ok(Self::Full),
+            "BULK_LOGGED" => Ok(Self::BulkLogged),
+            "SIMPLE" => Ok(Self::Simple),
+            _ => Err(WriterBenchError::Validation(format!(
+                "unknown SQL Server recovery model reported by server `{value}`"
+            ))),
+        }
+    }
+}
+
 impl Default for SqlServerProfileOptions {
     fn default() -> Self {
         Self {
@@ -3030,10 +3043,36 @@ fn run_compare_benchmark(
         .enable_time()
         .build()
         .map_err(WriterBenchError::Io)?;
-    if let Some(recovery_model) = options.sql_server_recovery_model {
-        runtime.block_on(set_sql_server_recovery_model(&connection, recovery_model))?;
-    }
     let ipc_dataset = prepare_compare_ipc_dataset(options)?;
+    let original_recovery_model = if let Some(recovery_model) = options.sql_server_recovery_model {
+        match runtime.block_on(current_sql_server_recovery_model(&connection)) {
+            Ok(original_recovery_model) => {
+                if let Err(error) =
+                    runtime.block_on(set_sql_server_recovery_model(&connection, recovery_model))
+                {
+                    let dataset_cleanup_result = ipc_dataset.cleanup();
+                    return match dataset_cleanup_result {
+                        Ok(()) => Err(error),
+                        Err(cleanup_error) => Err(WriterBenchError::Validation(format!(
+                            "SQL Server recovery model setup failed and IPC dataset cleanup also failed; setup error: {error}; cleanup error: {cleanup_error}"
+                        ))),
+                    };
+                }
+                Some(original_recovery_model)
+            }
+            Err(error) => {
+                let dataset_cleanup_result = ipc_dataset.cleanup();
+                return match dataset_cleanup_result {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(WriterBenchError::Validation(format!(
+                        "SQL Server recovery model snapshot failed and IPC dataset cleanup also failed; snapshot error: {error}; cleanup error: {cleanup_error}"
+                    ))),
+                };
+            }
+        }
+    } else {
+        None
+    };
     let run_result = (|| {
         let mut backends = Vec::new();
 
@@ -3151,13 +3190,27 @@ fn run_compare_benchmark(
             backends,
         })
     })();
+    let recovery_restore_result = if let Some(recovery_model) = original_recovery_model {
+        runtime.block_on(set_sql_server_recovery_model(&connection, recovery_model))
+    } else {
+        Ok(())
+    };
     let dataset_cleanup_result = ipc_dataset.cleanup();
     let runner_cleanup_result = if let Some(runner_image) = runner_image.as_mut() {
         runner_image.cleanup().map_err(WriterBenchError::OdbcRunner)
     } else {
         Ok(())
     };
-    let report = run_result?;
+    let report = match (run_result, recovery_restore_result) {
+        (Ok(report), Ok(())) => report,
+        (Ok(_), Err(restore_error)) => return Err(restore_error),
+        (Err(run_error), Ok(())) => return Err(run_error),
+        (Err(run_error), Err(restore_error)) => {
+            return Err(WriterBenchError::Validation(format!(
+                "writer-bench compare failed and SQL Server recovery model restore also failed; benchmark error: {run_error}; restore error: {restore_error}"
+            )));
+        }
+    };
     dataset_cleanup_result?;
     runner_cleanup_result?;
 
@@ -3667,6 +3720,14 @@ async fn set_sql_server_recovery_model(
         ),
     )
     .await
+}
+
+async fn current_sql_server_recovery_model(
+    connection: &sqlserver::SqlServerConnection,
+) -> Result<SqlServerRecoveryModel, WriterBenchError> {
+    let mut client = connect(&connection.connection_string, &connection.database, None).await?;
+    let recovery_model = sqlserver_profile::recovery_model(&mut client).await?;
+    SqlServerRecoveryModel::from_sql_server_desc(&recovery_model)
 }
 
 async fn select_session_id(client: &mut BenchClient) -> Result<i32, WriterBenchError> {
@@ -5248,6 +5309,29 @@ mod tests {
             WriterBenchError::Validation(message)
                 if message.contains("recovery model `minimal`")
                     && message.contains("bulk-logged")
+        ));
+    }
+
+    #[test]
+    fn parses_sql_server_reported_recovery_models() {
+        assert_eq!(
+            super::SqlServerRecoveryModel::from_sql_server_desc("FULL").unwrap(),
+            super::SqlServerRecoveryModel::Full
+        );
+        assert_eq!(
+            super::SqlServerRecoveryModel::from_sql_server_desc("BULK_LOGGED").unwrap(),
+            super::SqlServerRecoveryModel::BulkLogged
+        );
+        assert_eq!(
+            super::SqlServerRecoveryModel::from_sql_server_desc("SIMPLE").unwrap(),
+            super::SqlServerRecoveryModel::Simple
+        );
+
+        let err = super::SqlServerRecoveryModel::from_sql_server_desc("UNKNOWN").unwrap_err();
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("recovery model reported by server `UNKNOWN`")
         ));
     }
 

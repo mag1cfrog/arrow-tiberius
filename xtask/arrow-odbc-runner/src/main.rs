@@ -52,7 +52,9 @@ fn bench(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         connection.set_autocommit(false)?;
     }
     let mut sql_server_profile = if options.profile_sqlserver {
-        Some(SqlServerProfile::start(&connection)?)
+        let observer =
+            environment.connect_with_connection_string(&connection_string, Default::default())?;
+        Some(SqlServerProfile::start(&connection, observer)?)
     } else {
         None
     };
@@ -63,7 +65,7 @@ fn bench(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         // ODBC already completed each execute under its connection autocommit policy.
     } else if total_rows_result.is_ok() {
         if let Some(profile) = sql_server_profile.as_mut() {
-            profile.capture_phase(&connection, "commit", || {
+            profile.capture_phase("commit", || {
                 connection.commit()?;
                 Ok(())
             })?;
@@ -75,7 +77,7 @@ fn bench(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     }
     let write_elapsed = write_start.elapsed();
     if let Some(profile) = sql_server_profile.as_mut() {
-        profile.finish(&connection)?;
+        profile.finish()?;
     }
     let total_rows = total_rows_result?;
 
@@ -149,7 +151,7 @@ fn run_repeat(
     let input = ipc_batches(&options.input_ipc, options.rows)?;
     let mut reader = RecordBatchIterator::new(input.batches.into_iter().map(Ok), input.schema);
     if let Some(profile) = sql_server_profile.as_mut() {
-        profile.capture_phase(connection, "insert", || {
+        profile.capture_phase("insert", || {
             insert_into_table(connection, &mut reader, table, options.batch_size)?;
             Ok(())
         })?;
@@ -166,10 +168,6 @@ fn run_repeat(
         .into());
     }
     validate_scenario_contents(connection, table, &options.scenario, actual)?;
-
-    if let Some(profile) = sql_server_profile {
-        profile.snapshot_table_pages(connection, table)?;
-    }
 
     Ok(actual)
 }
@@ -347,7 +345,8 @@ fn required_env(name: &str) -> Result<String, Box<dyn Error>> {
 }
 
 #[derive(Debug)]
-struct SqlServerProfile {
+struct SqlServerProfile<'a> {
+    observer: Connection<'a>,
     writer_session_id: i32,
     recovery_model: String,
     initial_session_waits: Vec<SessionWaitSnapshot>,
@@ -355,31 +354,34 @@ struct SqlServerProfile {
     session_wait_deltas: Vec<SessionWaitDelta>,
     database_file_io_deltas: Vec<DatabaseFileIoDelta>,
     phase_deltas: Vec<SqlServerProfilePhaseDelta>,
-    table_page_snapshots: Vec<TablePageSnapshot>,
 }
 
-impl SqlServerProfile {
-    fn start(connection: &Connection<'_>) -> Result<Self, Box<dyn Error>> {
+impl<'a> SqlServerProfile<'a> {
+    fn start(
+        writer: &Connection<'_>,
+        observer: Connection<'a>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let writer_session_id = select_session_id(writer)?;
         Ok(Self {
-            writer_session_id: select_session_id(connection)?,
-            recovery_model: recovery_model(connection)?,
-            initial_session_waits: session_wait_snapshots(connection)?,
-            initial_database_file_io: database_file_io_snapshots(connection)?,
+            recovery_model: recovery_model(&observer)?,
+            initial_session_waits: session_wait_snapshots(&observer, writer_session_id)?,
+            initial_database_file_io: database_file_io_snapshots(&observer)?,
+            observer,
+            writer_session_id,
             session_wait_deltas: Vec::new(),
             database_file_io_deltas: Vec::new(),
             phase_deltas: Vec::new(),
-            table_page_snapshots: Vec::new(),
         })
     }
 
-    fn finish(&mut self, connection: &Connection<'_>) -> Result<(), Box<dyn Error>> {
+    fn finish(&mut self) -> Result<(), Box<dyn Error>> {
         self.session_wait_deltas = session_wait_deltas(
             &self.initial_session_waits,
-            &session_wait_snapshots(connection)?,
+            &session_wait_snapshots(&self.observer, self.writer_session_id)?,
         );
         self.database_file_io_deltas = database_file_io_deltas(
             &self.initial_database_file_io,
-            &database_file_io_snapshots(connection)?,
+            &database_file_io_snapshots(&self.observer)?,
         );
         Ok(())
     }
@@ -391,41 +393,31 @@ impl SqlServerProfile {
         print_session_wait_deltas(prefix, &self.session_wait_deltas);
         print_database_file_io_deltas(prefix, &self.database_file_io_deltas);
         print_phase_deltas(prefix, &self.phase_deltas);
-        print_table_page_snapshots(prefix, &self.table_page_snapshots);
     }
 
     fn capture_phase<T>(
         &mut self,
-        connection: &Connection<'_>,
         phase: &str,
         work: impl FnOnce() -> Result<T, Box<dyn Error>>,
     ) -> Result<T, Box<dyn Error>> {
-        let initial_session_waits = session_wait_snapshots(connection)?;
-        let initial_database_file_io = database_file_io_snapshots(connection)?;
+        let initial_session_waits =
+            session_wait_snapshots(&self.observer, self.writer_session_id)?;
+        let initial_database_file_io = database_file_io_snapshots(&self.observer)?;
         let result = work();
         self.phase_deltas.push(SqlServerProfilePhaseDelta {
             phase: phase.to_owned(),
             session_wait_deltas: session_wait_deltas(
                 &initial_session_waits,
-                &session_wait_snapshots(connection)?,
+                &session_wait_snapshots(&self.observer, self.writer_session_id)?,
             ),
             database_file_io_deltas: database_file_io_deltas(
                 &initial_database_file_io,
-                &database_file_io_snapshots(connection)?,
+                &database_file_io_snapshots(&self.observer)?,
             ),
         });
         result
     }
 
-    fn snapshot_table_pages(
-        &mut self,
-        connection: &Connection<'_>,
-        table: &str,
-    ) -> Result<(), Box<dyn Error>> {
-        self.table_page_snapshots
-            .push(table_page_snapshot(connection, table)?);
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -475,16 +467,6 @@ struct SqlServerProfilePhaseDelta {
     phase: String,
     session_wait_deltas: Vec<SessionWaitDelta>,
     database_file_io_deltas: Vec<DatabaseFileIoDelta>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TablePageSnapshot {
-    table: String,
-    row_count: i64,
-    in_row_used_page_count: i64,
-    lob_used_page_count: i64,
-    row_overflow_used_page_count: i64,
-    used_page_count: i64,
 }
 
 fn print_session_wait_deltas(prefix: &str, waits: &[SessionWaitDelta]) {
@@ -538,26 +520,6 @@ fn print_phase_deltas(prefix: &str, phases: &[SqlServerProfilePhaseDelta]) {
     }
 }
 
-fn print_table_page_snapshots(prefix: &str, tables: &[TablePageSnapshot]) {
-    if tables.is_empty() {
-        println!("{prefix}  table page snapshots: <none>");
-        return;
-    }
-
-    println!("{prefix}  table page snapshots:");
-    for table in tables {
-        println!(
-            "{prefix}    {}: rows={} used_pages={} in_row_used_pages={} lob_used_pages={} row_overflow_used_pages={}",
-            table.table,
-            table.row_count,
-            table.used_page_count,
-            table.in_row_used_page_count,
-            table.lob_used_page_count,
-            table.row_overflow_used_page_count
-        );
-    }
-}
-
 fn select_session_id(connection: &Connection<'_>) -> Result<i32, Box<dyn Error>> {
     let cursor = connection
         .execute("SELECT CONVERT(nvarchar(16), @@SPID)", (), None)?
@@ -579,52 +541,22 @@ fn recovery_model(connection: &Connection<'_>) -> Result<String, Box<dyn Error>>
     Ok(required_profile_column(row, 0, "recovery_model")?.to_owned())
 }
 
-fn table_page_snapshot(
-    connection: &Connection<'_>,
-    table: &str,
-) -> Result<TablePageSnapshot, Box<dyn Error>> {
-    let table_literal = table.replace('\'', "''");
-    let rows = text_rows(
-        connection,
-        &format!(
-            "SELECT \
-                CONVERT(nvarchar(32), COALESCE(SUM(s.row_count), 0)), \
-                CONVERT(nvarchar(32), COALESCE(SUM(s.in_row_used_page_count), 0)), \
-                CONVERT(nvarchar(32), COALESCE(SUM(s.lob_used_page_count), 0)), \
-                CONVERT(nvarchar(32), COALESCE(SUM(s.row_overflow_used_page_count), 0)), \
-                CONVERT(nvarchar(32), COALESCE(SUM(s.used_page_count), 0)) \
-            FROM sys.dm_db_partition_stats AS s \
-            WHERE s.object_id = OBJECT_ID(N'{table_literal}')"
-        ),
-        5,
-    )?;
-    let row = rows
-        .first()
-        .ok_or_else(|| format!("SQL Server table page snapshot found no row for {table}"))?;
-
-    Ok(TablePageSnapshot {
-        table: table.to_owned(),
-        row_count: parse_profile_column(row, 0, "row_count")?,
-        in_row_used_page_count: parse_profile_column(row, 1, "in_row_used_page_count")?,
-        lob_used_page_count: parse_profile_column(row, 2, "lob_used_page_count")?,
-        row_overflow_used_page_count: parse_profile_column(row, 3, "row_overflow_used_page_count")?,
-        used_page_count: parse_profile_column(row, 4, "used_page_count")?,
-    })
-}
-
 fn session_wait_snapshots(
     connection: &Connection<'_>,
+    writer_session_id: i32,
 ) -> Result<Vec<SessionWaitSnapshot>, Box<dyn Error>> {
     text_rows(
         connection,
-        "SELECT \
-            CONVERT(nvarchar(60), s.wait_type), \
-            CONVERT(nvarchar(32), CONVERT(bigint, s.waiting_tasks_count)), \
-            CONVERT(nvarchar(32), CONVERT(bigint, s.wait_time_ms)), \
-            CONVERT(nvarchar(32), CONVERT(bigint, s.signal_wait_time_ms)) \
-        FROM sys.dm_exec_session_wait_stats AS s \
-        WHERE CONVERT(int, s.session_id) = @@SPID \
-        ORDER BY s.wait_time_ms DESC, s.wait_type",
+        &format!(
+            "SELECT \
+                CONVERT(nvarchar(60), s.wait_type), \
+                CONVERT(nvarchar(32), CONVERT(bigint, s.waiting_tasks_count)), \
+                CONVERT(nvarchar(32), CONVERT(bigint, s.wait_time_ms)), \
+                CONVERT(nvarchar(32), CONVERT(bigint, s.signal_wait_time_ms)) \
+            FROM sys.dm_exec_session_wait_stats AS s \
+            WHERE CONVERT(int, s.session_id) = {writer_session_id} \
+            ORDER BY s.wait_time_ms DESC, s.wait_type"
+        ),
         4,
     )?
     .into_iter()
