@@ -1306,8 +1306,10 @@ struct SqlServerProfile<'a> {
     observer: RawBcpConnection<'a>,
     writer_session_id: i32,
     recovery_model: String,
+    initial_connection: ConnectionSnapshot,
     initial_session_waits: Vec<SessionWaitSnapshot>,
     initial_database_file_io: Vec<DatabaseFileIoSnapshot>,
+    connection_deltas: Vec<ConnectionDelta>,
     session_wait_deltas: Vec<SessionWaitDelta>,
     database_file_io_deltas: Vec<DatabaseFileIoDelta>,
     phase_deltas: Vec<SqlServerProfilePhaseDelta>,
@@ -1322,10 +1324,12 @@ impl<'a> SqlServerProfile<'a> {
         let writer_session_id = select_session_id(writer)?;
         Ok(Self {
             recovery_model: recovery_model(&observer)?,
+            initial_connection: connection_snapshot(&observer, writer_session_id)?,
             initial_session_waits: session_wait_snapshots(&observer, writer_session_id)?,
             initial_database_file_io: database_file_io_snapshots(&observer)?,
             observer,
             writer_session_id,
+            connection_deltas: Vec::new(),
             session_wait_deltas: Vec::new(),
             database_file_io_deltas: Vec::new(),
             phase_deltas: Vec::new(),
@@ -1342,6 +1346,10 @@ impl<'a> SqlServerProfile<'a> {
             &self.initial_database_file_io,
             &database_file_io_snapshots(&self.observer)?,
         );
+        self.connection_deltas = vec![connection_delta(
+            &self.initial_connection,
+            &connection_snapshot(&self.observer, self.writer_session_id)?,
+        )];
         Ok(())
     }
 
@@ -1351,6 +1359,7 @@ impl<'a> SqlServerProfile<'a> {
         println!("{prefix}  recovery model: {}", self.recovery_model);
         print_session_wait_deltas(prefix, &self.session_wait_deltas);
         print_database_file_io_deltas(prefix, &self.database_file_io_deltas);
+        print_connection_deltas(prefix, &self.connection_deltas);
         print_phase_deltas(prefix, &self.phase_deltas);
         print_table_page_snapshots(prefix, &self.table_page_snapshots);
     }
@@ -1362,6 +1371,7 @@ impl<'a> SqlServerProfile<'a> {
     ) -> Result<T, Box<dyn Error>> {
         let initial_session_waits = session_wait_snapshots(&self.observer, self.writer_session_id)?;
         let initial_database_file_io = database_file_io_snapshots(&self.observer)?;
+        let initial_connection = connection_snapshot(&self.observer, self.writer_session_id)?;
         let result = work();
         self.phase_deltas.push(SqlServerProfilePhaseDelta {
             phase: phase.to_owned(),
@@ -1373,6 +1383,10 @@ impl<'a> SqlServerProfile<'a> {
                 &initial_database_file_io,
                 &database_file_io_snapshots(&self.observer)?,
             ),
+            connection_deltas: vec![connection_delta(
+                &initial_connection,
+                &connection_snapshot(&self.observer, self.writer_session_id)?,
+            )],
         });
         result
     }
@@ -1390,6 +1404,30 @@ struct SessionWaitSnapshot {
     waiting_tasks_count: i64,
     wait_time_ms: i64,
     signal_wait_time_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConnectionSnapshot {
+    net_transport: String,
+    protocol_type: String,
+    encrypt_option: String,
+    net_packet_size: i32,
+    num_reads: i64,
+    num_writes: i64,
+    last_read: Option<String>,
+    last_write: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConnectionDelta {
+    net_transport: String,
+    protocol_type: String,
+    encrypt_option: String,
+    net_packet_size: i32,
+    num_reads: i64,
+    num_writes: i64,
+    last_read: Option<String>,
+    last_write: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1431,6 +1469,7 @@ struct SqlServerProfilePhaseDelta {
     phase: String,
     session_wait_deltas: Vec<SessionWaitDelta>,
     database_file_io_deltas: Vec<DatabaseFileIoDelta>,
+    connection_deltas: Vec<ConnectionDelta>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1480,6 +1519,28 @@ fn print_database_file_io_deltas(prefix: &str, files: &[DatabaseFileIoDelta]) {
     }
 }
 
+fn print_connection_deltas(prefix: &str, connections: &[ConnectionDelta]) {
+    if connections.is_empty() {
+        println!("{prefix}  connection deltas: <none>");
+        return;
+    }
+
+    println!("{prefix}  connection deltas:");
+    for connection in connections {
+        println!(
+            "{prefix}    {} {} encrypted={} packet_size={} reads={} writes={} last_read={} last_write={}",
+            connection.net_transport,
+            connection.protocol_type,
+            connection.encrypt_option,
+            connection.net_packet_size,
+            connection.num_reads,
+            connection.num_writes,
+            connection.last_read.as_deref().unwrap_or("<none>"),
+            connection.last_write.as_deref().unwrap_or("<none>")
+        );
+    }
+}
+
 fn print_phase_deltas(prefix: &str, phases: &[SqlServerProfilePhaseDelta]) {
     if phases.is_empty() {
         println!("{prefix}  phase deltas: <none>");
@@ -1491,6 +1552,7 @@ fn print_phase_deltas(prefix: &str, phases: &[SqlServerProfilePhaseDelta]) {
         println!("{prefix}    {}:", phase.phase);
         print_session_wait_deltas(&format!("{prefix}    "), &phase.session_wait_deltas);
         print_database_file_io_deltas(&format!("{prefix}    "), &phase.database_file_io_deltas);
+        print_connection_deltas(&format!("{prefix}    "), &phase.connection_deltas);
     }
 }
 
@@ -1534,6 +1596,43 @@ fn recovery_model(connection: &RawBcpConnection<'_>) -> Result<String, Box<dyn E
         .first()
         .ok_or("SQL Server recovery model snapshot found no current database")?;
     Ok(required_profile_column(row, 0, "recovery_model")?.to_owned())
+}
+
+fn connection_snapshot(
+    connection: &RawBcpConnection<'_>,
+    writer_session_id: i32,
+) -> Result<ConnectionSnapshot, Box<dyn Error>> {
+    let rows = text_rows(
+        connection,
+        &format!(
+            "SELECT \
+                CONVERT(nvarchar(60), c.net_transport), \
+                CONVERT(nvarchar(60), c.protocol_type), \
+                CONVERT(nvarchar(60), c.encrypt_option), \
+                CONVERT(nvarchar(16), CONVERT(int, c.net_packet_size)), \
+                CONVERT(nvarchar(32), CONVERT(bigint, c.num_reads)), \
+                CONVERT(nvarchar(32), CONVERT(bigint, c.num_writes)), \
+                CONVERT(nvarchar(33), c.last_read, 126), \
+                CONVERT(nvarchar(33), c.last_write, 126) \
+            FROM sys.dm_exec_connections AS c \
+            WHERE CONVERT(int, c.session_id) = {writer_session_id}"
+        ),
+        8,
+    )?;
+    let row = rows.first().ok_or_else(|| {
+        format!("SQL Server connection snapshot found no connection for writer session id {writer_session_id}")
+    })?;
+
+    Ok(ConnectionSnapshot {
+        net_transport: required_profile_column(row, 0, "net_transport")?.to_owned(),
+        protocol_type: required_profile_column(row, 1, "protocol_type")?.to_owned(),
+        encrypt_option: required_profile_column(row, 2, "encrypt_option")?.to_owned(),
+        net_packet_size: parse_profile_column(row, 3, "net_packet_size")?,
+        num_reads: parse_profile_column(row, 4, "num_reads")?,
+        num_writes: parse_profile_column(row, 5, "num_writes")?,
+        last_read: row[6].clone(),
+        last_write: row[7].clone(),
+    })
 }
 
 fn table_page_snapshot(
@@ -1751,6 +1850,19 @@ fn database_file_io_deltas(
     deltas
 }
 
+fn connection_delta(initial: &ConnectionSnapshot, final_connection: &ConnectionSnapshot) -> ConnectionDelta {
+    ConnectionDelta {
+        net_transport: final_connection.net_transport.clone(),
+        protocol_type: final_connection.protocol_type.clone(),
+        encrypt_option: final_connection.encrypt_option.clone(),
+        net_packet_size: final_connection.net_packet_size,
+        num_reads: counter_delta(initial.num_reads, final_connection.num_reads),
+        num_writes: counter_delta(initial.num_writes, final_connection.num_writes),
+        last_read: final_connection.last_read.clone(),
+        last_write: final_connection.last_write.clone(),
+    }
+}
+
 fn counter_delta(initial: i64, final_value: i64) -> i64 {
     final_value.saturating_sub(initial)
 }
@@ -1873,10 +1985,10 @@ fn required_arg<'a>(option: &str, value: Option<&'a String>) -> Result<&'a str, 
 #[cfg(test)]
 mod tests {
     use super::{
-        BcpColumnBindings, BcpColumnBuffer, BenchOptions, DatabaseFileIoDelta,
-        DatabaseFileIoSnapshot, SessionWaitDelta, SessionWaitSnapshot, TABLE_PLACEHOLDER, c_string,
-        database_file_io_deltas, format_date32, format_decimal, format_timestamp_millis,
-        push_utf16le, rows_per_second, session_wait_deltas,
+        BcpColumnBindings, BcpColumnBuffer, BenchOptions, ConnectionSnapshot, DatabaseFileIoDelta,
+        DatabaseFileIoSnapshot, SessionWaitDelta, SessionWaitSnapshot, TABLE_PLACEHOLDER,
+        c_string, connection_delta, database_file_io_deltas, format_date32, format_decimal,
+        format_timestamp_millis, push_utf16le, rows_per_second, session_wait_deltas,
         string_heavy_unicode_tenant_sentinel_count_sql, validate_ipc_schema_and_count,
     };
     use arrow_array::{
@@ -2018,6 +2130,43 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn sql_server_connection_delta_counts_packet_counters() {
+        let initial = connection_snapshot(3, 5, Some("2026-05-21T12:00:00"), None);
+        let final_connection = connection_snapshot(
+            23,
+            11,
+            Some("2026-05-21T12:00:03"),
+            Some("2026-05-21T12:00:04"),
+        );
+
+        let delta = connection_delta(&initial, &final_connection);
+
+        assert_eq!(delta.num_reads, 20);
+        assert_eq!(delta.num_writes, 6);
+        assert_eq!(delta.net_packet_size, 4096);
+        assert_eq!(delta.last_read.as_deref(), Some("2026-05-21T12:00:03"));
+        assert_eq!(delta.last_write.as_deref(), Some("2026-05-21T12:00:04"));
+    }
+
+    fn connection_snapshot(
+        num_reads: i64,
+        num_writes: i64,
+        last_read: Option<&str>,
+        last_write: Option<&str>,
+    ) -> ConnectionSnapshot {
+        ConnectionSnapshot {
+            net_transport: "TCP".to_owned(),
+            protocol_type: "TSQL".to_owned(),
+            encrypt_option: "FALSE".to_owned(),
+            net_packet_size: 4096,
+            num_reads,
+            num_writes,
+            last_read: last_read.map(ToOwned::to_owned),
+            last_write: last_write.map(ToOwned::to_owned),
+        }
     }
 
     fn session_wait(

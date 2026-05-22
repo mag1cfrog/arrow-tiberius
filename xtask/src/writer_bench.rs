@@ -780,26 +780,70 @@ fn print_sql_server_profile_target(prefix: &str, target: Option<&SqlServerProfil
         );
         print_sql_server_session_wait_deltas(prefix, &target.session_wait_deltas);
         print_sql_server_database_file_io_deltas(prefix, &target.database_file_io_deltas);
+        print_sql_server_connection_deltas(prefix, &target.connection_deltas);
         print_sql_server_profile_phase_deltas(prefix, &target.phase_deltas);
         print_sql_server_table_page_snapshots(prefix, &target.table_page_snapshots);
     }
 }
 
 fn print_sql_server_profile_sample_coverage(prefix: &str, samples: &[SqlServerProfileSample]) {
-    let (Some(first), Some(last)) = (samples.first(), samples.last()) else {
+    let coverages = sql_server_profile_sample_coverages(samples);
+    if coverages.is_empty() {
         println!("{prefix}  write sample coverage: <none>");
         return;
-    };
+    }
 
-    println!(
-        "{prefix}  write sample coverage: first=repeat {} {}..{} last=repeat {} {}..{}",
-        first.repeat_index + 1,
-        format_duration(first.write_elapsed_start),
-        format_duration(first.write_elapsed_end),
-        last.repeat_index + 1,
-        format_duration(last.write_elapsed_start),
-        format_duration(last.write_elapsed_end),
-    );
+    println!("{prefix}  write sample coverage:");
+    for coverage in coverages {
+        println!(
+            "{prefix}    {}: first=repeat {} {}..{} last=repeat {} {}..{}",
+            coverage.phase,
+            coverage.first_repeat_index + 1,
+            format_duration(coverage.first_elapsed_start),
+            format_duration(coverage.first_elapsed_end),
+            coverage.last_repeat_index + 1,
+            format_duration(coverage.last_elapsed_start),
+            format_duration(coverage.last_elapsed_end),
+        );
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqlServerProfileSampleCoverage {
+    phase: String,
+    first_repeat_index: usize,
+    first_elapsed_start: Duration,
+    first_elapsed_end: Duration,
+    last_repeat_index: usize,
+    last_elapsed_start: Duration,
+    last_elapsed_end: Duration,
+}
+
+fn sql_server_profile_sample_coverages(
+    samples: &[SqlServerProfileSample],
+) -> Vec<SqlServerProfileSampleCoverage> {
+    let mut by_phase: BTreeMap<&str, SqlServerProfileSampleCoverage> = BTreeMap::new();
+
+    for sample in samples {
+        by_phase
+            .entry(sample.phase.as_str())
+            .and_modify(|coverage| {
+                coverage.last_repeat_index = sample.repeat_index;
+                coverage.last_elapsed_start = sample.write_elapsed_start;
+                coverage.last_elapsed_end = sample.write_elapsed_end;
+            })
+            .or_insert_with(|| SqlServerProfileSampleCoverage {
+                phase: sample.phase.clone(),
+                first_repeat_index: sample.repeat_index,
+                first_elapsed_start: sample.write_elapsed_start,
+                first_elapsed_end: sample.write_elapsed_end,
+                last_repeat_index: sample.repeat_index,
+                last_elapsed_start: sample.write_elapsed_start,
+                last_elapsed_end: sample.write_elapsed_end,
+            });
+    }
+
+    by_phase.into_values().collect()
 }
 
 fn print_sql_server_profile_sample_distribution(
@@ -855,6 +899,28 @@ fn print_sql_server_database_file_io_deltas(prefix: &str, files: &[SqlServerData
     }
 }
 
+fn print_sql_server_connection_deltas(prefix: &str, connections: &[SqlServerConnectionDelta]) {
+    if connections.is_empty() {
+        println!("{prefix}  connection deltas: <none>");
+        return;
+    }
+
+    println!("{prefix}  connection deltas:");
+    for connection in connections {
+        println!(
+            "{prefix}    {} {} encrypted={} packet_size={} reads={} writes={} last_read={} last_write={}",
+            connection.net_transport,
+            connection.protocol_type,
+            connection.encrypt_option,
+            connection.net_packet_size,
+            connection.num_reads,
+            connection.num_writes,
+            connection.last_read.as_deref().unwrap_or("<none>"),
+            connection.last_write.as_deref().unwrap_or("<none>")
+        );
+    }
+}
+
 fn print_sql_server_profile_phase_deltas(prefix: &str, phases: &[SqlServerProfilePhaseDelta]) {
     if phases.is_empty() {
         println!("{prefix}  phase deltas: <none>");
@@ -869,6 +935,7 @@ fn print_sql_server_profile_phase_deltas(prefix: &str, phases: &[SqlServerProfil
             &format!("{prefix}    "),
             &phase.database_file_io_deltas,
         );
+        print_sql_server_connection_deltas(&format!("{prefix}    "), &phase.connection_deltas);
     }
 }
 
@@ -2226,12 +2293,14 @@ struct SqlServerProfileTarget {
     write_samples: Vec<SqlServerProfileSample>,
     session_wait_deltas: Vec<SqlServerSessionWaitDelta>,
     database_file_io_deltas: Vec<SqlServerDatabaseFileIoDelta>,
+    connection_deltas: Vec<SqlServerConnectionDelta>,
     phase_deltas: Vec<SqlServerProfilePhaseDelta>,
     table_page_snapshots: Vec<sqlserver_profile::TablePageSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SqlServerProfileSample {
+    phase: String,
     repeat_index: usize,
     write_elapsed_start: Duration,
     write_elapsed_end: Duration,
@@ -2260,10 +2329,23 @@ struct SqlServerDatabaseFileIoDelta {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct SqlServerConnectionDelta {
+    net_transport: String,
+    protocol_type: String,
+    encrypt_option: String,
+    net_packet_size: i32,
+    num_reads: i64,
+    num_writes: i64,
+    last_read: Option<String>,
+    last_write: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SqlServerProfilePhaseDelta {
     phase: String,
     session_wait_deltas: Vec<SqlServerSessionWaitDelta>,
     database_file_io_deltas: Vec<SqlServerDatabaseFileIoDelta>,
+    connection_deltas: Vec<SqlServerConnectionDelta>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -2402,6 +2484,22 @@ fn sql_server_database_file_io_deltas(
     deltas
 }
 
+fn sql_server_connection_delta(
+    initial: &sqlserver_profile::ConnectionSnapshot,
+    final_connection: &sqlserver_profile::ConnectionSnapshot,
+) -> SqlServerConnectionDelta {
+    SqlServerConnectionDelta {
+        net_transport: final_connection.net_transport.clone(),
+        protocol_type: final_connection.protocol_type.clone(),
+        encrypt_option: final_connection.encrypt_option.clone(),
+        net_packet_size: final_connection.net_packet_size,
+        num_reads: counter_delta(initial.num_reads, final_connection.num_reads),
+        num_writes: counter_delta(initial.num_writes, final_connection.num_writes),
+        last_read: final_connection.last_read.clone(),
+        last_write: final_connection.last_write.clone(),
+    }
+}
+
 fn merge_sql_server_session_wait_deltas(
     target: &mut Vec<SqlServerSessionWaitDelta>,
     source: Vec<SqlServerSessionWaitDelta>,
@@ -2481,11 +2579,62 @@ fn merge_sql_server_database_file_io_deltas(
     });
 }
 
+fn merge_sql_server_connection_deltas(
+    target: &mut Vec<SqlServerConnectionDelta>,
+    source: Vec<SqlServerConnectionDelta>,
+) {
+    let mut merged = target
+        .drain(..)
+        .map(|connection| {
+            (
+                (
+                    connection.net_transport.clone(),
+                    connection.protocol_type.clone(),
+                    connection.encrypt_option.clone(),
+                    connection.net_packet_size,
+                ),
+                connection,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    for connection in source {
+        let merged_connection = merged
+            .entry((
+                connection.net_transport.clone(),
+                connection.protocol_type.clone(),
+                connection.encrypt_option.clone(),
+                connection.net_packet_size,
+            ))
+            .or_insert(SqlServerConnectionDelta {
+                net_transport: connection.net_transport,
+                protocol_type: connection.protocol_type,
+                encrypt_option: connection.encrypt_option,
+                net_packet_size: connection.net_packet_size,
+                num_reads: 0,
+                num_writes: 0,
+                last_read: None,
+                last_write: None,
+            });
+        merged_connection.num_reads = merged_connection
+            .num_reads
+            .saturating_add(connection.num_reads);
+        merged_connection.num_writes = merged_connection
+            .num_writes
+            .saturating_add(connection.num_writes);
+        merged_connection.last_read = connection.last_read;
+        merged_connection.last_write = connection.last_write;
+    }
+
+    *target = merged.into_values().collect();
+}
+
 fn merge_sql_server_profile_phase_delta(
     target: &mut Vec<SqlServerProfilePhaseDelta>,
     phase: &str,
     session_wait_deltas: Vec<SqlServerSessionWaitDelta>,
     database_file_io_deltas: Vec<SqlServerDatabaseFileIoDelta>,
+    connection_deltas: Vec<SqlServerConnectionDelta>,
 ) {
     if let Some(phase_delta) = target.iter_mut().find(|delta| delta.phase == phase) {
         merge_sql_server_session_wait_deltas(
@@ -2496,6 +2645,7 @@ fn merge_sql_server_profile_phase_delta(
             &mut phase_delta.database_file_io_deltas,
             database_file_io_deltas,
         );
+        merge_sql_server_connection_deltas(&mut phase_delta.connection_deltas, connection_deltas);
         return;
     }
 
@@ -2503,6 +2653,7 @@ fn merge_sql_server_profile_phase_delta(
         phase: phase.to_owned(),
         session_wait_deltas,
         database_file_io_deltas,
+        connection_deltas,
     });
 }
 
@@ -2536,6 +2687,7 @@ impl SqlServerProfileSession {
                 write_samples: Vec::new(),
                 session_wait_deltas: Vec::new(),
                 database_file_io_deltas: Vec::new(),
+                connection_deltas: Vec::new(),
                 phase_deltas: Vec::new(),
                 table_page_snapshots: Vec::new(),
             },
@@ -2577,10 +2729,15 @@ impl SqlServerProfileSession {
         .await?;
         let initial_database_file_io =
             sqlserver_profile::database_file_io_snapshots(&mut self.observer).await?;
+        let initial_connection = sqlserver_profile::connection_snapshot(
+            &mut self.observer,
+            self.target.writer_session_id,
+        )
+        .await?;
         let started_at = Instant::now();
 
         let write_result = {
-            let sample_activity = self.sample_write_activity(repeat_index, started_at);
+            let sample_activity = self.sample_write_activity(repeat_index, phase, started_at);
             tokio::pin!(sample_activity);
             tokio::pin!(write);
 
@@ -2611,11 +2768,22 @@ impl SqlServerProfileSession {
             &mut self.target.database_file_io_deltas,
             sql_server_database_file_io_deltas(&initial_database_file_io, &final_database_file_io),
         );
+        let final_connection = sqlserver_profile::connection_snapshot(
+            &mut self.observer,
+            self.target.writer_session_id,
+        )
+        .await?;
+        let connection_delta = sql_server_connection_delta(&initial_connection, &final_connection);
+        merge_sql_server_connection_deltas(
+            &mut self.target.connection_deltas,
+            vec![connection_delta.clone()],
+        );
         merge_sql_server_profile_phase_delta(
             &mut self.target.phase_deltas,
             phase,
             sql_server_session_wait_deltas(&initial_session_waits, &final_session_waits),
             sql_server_database_file_io_deltas(&initial_database_file_io, &final_database_file_io),
+            vec![connection_delta],
         );
 
         write_result
@@ -2624,6 +2792,7 @@ impl SqlServerProfileSession {
     async fn sample_write_activity(
         &mut self,
         repeat_index: usize,
+        phase: &str,
         started_at: Instant,
     ) -> Result<(), WriterBenchError> {
         let mut sample_interval = tokio::time::interval(self.target.sample_interval);
@@ -2639,6 +2808,7 @@ impl SqlServerProfileSession {
             )
             .await?;
             self.target.write_samples.push(SqlServerProfileSample {
+                phase: phase.to_owned(),
                 repeat_index,
                 write_elapsed_start,
                 write_elapsed_end: started_at.elapsed(),
@@ -4364,10 +4534,27 @@ mod tests {
         status_and_wait: Option<(&str, Option<&str>)>,
         waiting_task_waits: &[&str],
     ) -> SqlServerProfileSample {
+        sql_server_profile_sample_with_phase(
+            "write_batch",
+            10,
+            11,
+            status_and_wait,
+            waiting_task_waits,
+        )
+    }
+
+    fn sql_server_profile_sample_with_phase(
+        phase: &str,
+        write_elapsed_start_ms: u64,
+        write_elapsed_end_ms: u64,
+        status_and_wait: Option<(&str, Option<&str>)>,
+        waiting_task_waits: &[&str],
+    ) -> SqlServerProfileSample {
         SqlServerProfileSample {
+            phase: phase.to_owned(),
             repeat_index: 0,
-            write_elapsed_start: Duration::from_millis(10),
-            write_elapsed_end: Duration::from_millis(11),
+            write_elapsed_start: Duration::from_millis(write_elapsed_start_ms),
+            write_elapsed_end: Duration::from_millis(write_elapsed_end_ms),
             activity: sqlserver_profile::ActivitySnapshot {
                 connection: sqlserver_profile::ConnectionSnapshot {
                     net_transport: "TCP".to_owned(),
@@ -4413,6 +4600,24 @@ mod tests {
         }
     }
 
+    fn connection_snapshot(
+        num_reads: i64,
+        num_writes: i64,
+        last_read: Option<&str>,
+        last_write: Option<&str>,
+    ) -> sqlserver_profile::ConnectionSnapshot {
+        sqlserver_profile::ConnectionSnapshot {
+            net_transport: "TCP".to_owned(),
+            protocol_type: "TSQL".to_owned(),
+            encrypt_option: "FALSE".to_owned(),
+            net_packet_size: 4096,
+            num_reads,
+            num_writes,
+            last_read: last_read.map(ToOwned::to_owned),
+            last_write: last_write.map(ToOwned::to_owned),
+        }
+    }
+
     #[test]
     fn parses_writer_bench_defaults() {
         let options = WriterBenchOptions::parse(&[]).unwrap();
@@ -4444,6 +4649,25 @@ mod tests {
         assert_eq!(summary.request_waits.get("<no request>"), Some(&1));
         assert_eq!(summary.waiting_task_waits.get("ASYNC_NETWORK_IO"), Some(&2));
         assert_eq!(summary.waiting_task_waits.get("WRITELOG"), Some(&1));
+    }
+
+    #[test]
+    fn sql_server_profile_sample_coverage_is_grouped_by_phase() {
+        let samples = [
+            sql_server_profile_sample_with_phase("write_batch", 10, 11, None, &[]),
+            sql_server_profile_sample_with_phase("finish", 1, 2, None, &[]),
+            sql_server_profile_sample_with_phase("write_batch", 20, 21, None, &[]),
+        ];
+
+        let coverages = super::sql_server_profile_sample_coverages(&samples);
+
+        assert_eq!(coverages.len(), 2);
+        assert_eq!(coverages[0].phase, "finish");
+        assert_eq!(coverages[0].first_elapsed_start, Duration::from_millis(1));
+        assert_eq!(coverages[0].last_elapsed_end, Duration::from_millis(2));
+        assert_eq!(coverages[1].phase, "write_batch");
+        assert_eq!(coverages[1].first_elapsed_start, Duration::from_millis(10));
+        assert_eq!(coverages[1].last_elapsed_end, Duration::from_millis(21));
     }
 
     #[test]
@@ -4489,6 +4713,25 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn sql_server_profile_connection_delta_counts_packet_counters() {
+        let initial = connection_snapshot(3, 5, Some("2026-05-21T12:00:00"), None);
+        let final_connection = connection_snapshot(
+            23,
+            11,
+            Some("2026-05-21T12:00:03"),
+            Some("2026-05-21T12:00:04"),
+        );
+
+        let delta = super::sql_server_connection_delta(&initial, &final_connection);
+
+        assert_eq!(delta.num_reads, 20);
+        assert_eq!(delta.num_writes, 6);
+        assert_eq!(delta.net_packet_size, 4096);
+        assert_eq!(delta.last_read.as_deref(), Some("2026-05-21T12:00:03"));
+        assert_eq!(delta.last_write.as_deref(), Some("2026-05-21T12:00:04"));
     }
 
     fn sqlserver_profile_wait(
