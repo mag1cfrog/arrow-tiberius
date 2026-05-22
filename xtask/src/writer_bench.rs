@@ -2091,6 +2091,27 @@ const STRING_HEAVY_BINARY_ONLY_SCENARIO: BenchmarkScenarioDefinition =
         columns: string_heavy_binary_only_columns,
     };
 
+const STRING_HEAVY_INLINE_4K_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
+    name: "string_heavy_inline_4k",
+    description: "Fixed string-heavy rows with about 4 KiB of SQL variable payload bytes",
+    schema: string_heavy_schema,
+    columns: string_heavy_inline_4k_columns,
+};
+
+const STRING_HEAVY_EDGE_7K_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
+    name: "string_heavy_edge_7k",
+    description: "Fixed string-heavy rows near the SQL Server in-row payload boundary",
+    schema: string_heavy_schema,
+    columns: string_heavy_edge_7k_columns,
+};
+
+const STRING_HEAVY_LOB_9K_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
+    name: "string_heavy_lob_9k",
+    description: "Fixed string-heavy rows above the SQL Server in-row payload boundary",
+    schema: string_heavy_schema,
+    columns: string_heavy_lob_9k_columns,
+};
+
 const STRING_HEAVY_UNICODE_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
     name: "string_heavy_unicode",
     description: "Large BMP Unicode text and binary payload rows",
@@ -2120,6 +2141,9 @@ const DIRECT_RAW_SUPPORTED_SCENARIOS: &[&str] = &[
     STRING_HEAVY_SCENARIO.name,
     STRING_HEAVY_TEXT_ONLY_SCENARIO.name,
     STRING_HEAVY_BINARY_ONLY_SCENARIO.name,
+    STRING_HEAVY_INLINE_4K_SCENARIO.name,
+    STRING_HEAVY_EDGE_7K_SCENARIO.name,
+    STRING_HEAVY_LOB_9K_SCENARIO.name,
     STRING_HEAVY_UNICODE_SCENARIO.name,
     WIDE_SPARSE_SCENARIO.name,
 ];
@@ -2132,6 +2156,9 @@ const SCENARIOS: &[BenchmarkScenarioDefinition] = &[
     STRING_HEAVY_SCENARIO,
     STRING_HEAVY_TEXT_ONLY_SCENARIO,
     STRING_HEAVY_BINARY_ONLY_SCENARIO,
+    STRING_HEAVY_INLINE_4K_SCENARIO,
+    STRING_HEAVY_EDGE_7K_SCENARIO,
+    STRING_HEAVY_LOB_9K_SCENARIO,
     STRING_HEAVY_UNICODE_SCENARIO,
     WIDE_SPARSE_SCENARIO,
     TPCH_LINEITEM_LIKE_SCENARIO,
@@ -3946,6 +3973,51 @@ fn string_heavy_binary_only_columns(
     )
 }
 
+fn string_heavy_inline_4k_columns(
+    offset: usize,
+    len: usize,
+) -> Result<Vec<ArrayRef>, WriterBenchError> {
+    string_heavy_columns_with_shape(
+        offset,
+        len,
+        StringHeavyText::Ascii,
+        StringHeavyShape::Fixed {
+            body_chars: 1_024,
+            payload_bytes: 2_048,
+        },
+    )
+}
+
+fn string_heavy_edge_7k_columns(
+    offset: usize,
+    len: usize,
+) -> Result<Vec<ArrayRef>, WriterBenchError> {
+    string_heavy_columns_with_shape(
+        offset,
+        len,
+        StringHeavyText::Ascii,
+        StringHeavyShape::Fixed {
+            body_chars: 1_536,
+            payload_bytes: 4_096,
+        },
+    )
+}
+
+fn string_heavy_lob_9k_columns(
+    offset: usize,
+    len: usize,
+) -> Result<Vec<ArrayRef>, WriterBenchError> {
+    string_heavy_columns_with_shape(
+        offset,
+        len,
+        StringHeavyText::Ascii,
+        StringHeavyShape::Fixed {
+            body_chars: 2_048,
+            payload_bytes: 5_120,
+        },
+    )
+}
+
 fn string_heavy_unicode_columns(
     offset: usize,
     len: usize,
@@ -3969,6 +4041,10 @@ enum StringHeavyShape {
     Full,
     TextOnly,
     BinaryOnly,
+    Fixed {
+        body_chars: usize,
+        payload_bytes: usize,
+    },
 }
 
 fn string_heavy_columns_with_shape(
@@ -4045,6 +4121,7 @@ impl StringHeavyShape {
         match self {
             Self::Full | Self::TextOnly => 512 + row % 2_048,
             Self::BinaryOnly => 24 + row % 96,
+            Self::Fixed { body_chars, .. } => body_chars,
         }
     }
 
@@ -4052,6 +4129,7 @@ impl StringHeavyShape {
         match self {
             Self::Full | Self::BinaryOnly => 1_024 + row % 4_096,
             Self::TextOnly => 8 + row % 32,
+            Self::Fixed { payload_bytes, .. } => payload_bytes,
         }
     }
 }
@@ -5333,6 +5411,9 @@ mod tests {
             "string_heavy",
             "string_heavy_text_only",
             "string_heavy_binary_only",
+            "string_heavy_inline_4k",
+            "string_heavy_edge_7k",
+            "string_heavy_lob_9k",
             "string_heavy_unicode",
             "wide_sparse",
         ] {
@@ -6526,6 +6607,39 @@ odbc-bcp runner
     }
 
     #[test]
+    fn string_heavy_threshold_variants_hold_fixed_combined_payload_sizes() {
+        for (scenario_name, body_chars, payload_bytes, nominal_sql_bytes) in [
+            ("string_heavy_inline_4k", 1_024, 2_048, 4_096),
+            ("string_heavy_edge_7k", 1_536, 4_096, 7_168),
+            ("string_heavy_lob_9k", 2_048, 5_120, 9_216),
+        ] {
+            let options = WriterBenchOptions {
+                rows: 128,
+                batch_size: 128,
+                scenario: super::scenario_by_name(scenario_name).unwrap(),
+                repeat: 1,
+                output: BenchmarkOutput::Human,
+            };
+
+            let batch = &generated_batches(&options)[0];
+            let body = string_column(batch, 4);
+            let payload = binary_column(batch, 6);
+
+            assert_eq!(batch.schema(), (super::string_heavy_schema)());
+            assert_eq!(body.null_count(), 3);
+            assert_eq!(payload.null_count(), 3);
+            assert_eq!(body.value(1).len(), body_chars);
+            assert_eq!(body.value(2).len(), body_chars);
+            assert_eq!(payload.value(1).len(), payload_bytes);
+            assert_eq!(payload.value(2).len(), payload_bytes);
+            assert_eq!(
+                body.value(1).len() * 2 + payload.value(1).len(),
+                nominal_sql_bytes
+            );
+        }
+    }
+
+    #[test]
     fn string_heavy_unicode_sentinel_query_checks_tenant_codepoints() {
         let sql = super::string_heavy_unicode_tenant_sentinel_count_sql("[dbo].[target]");
 
@@ -6595,6 +6709,9 @@ odbc-bcp runner
             "string_heavy",
             "string_heavy_text_only",
             "string_heavy_binary_only",
+            "string_heavy_inline_4k",
+            "string_heavy_edge_7k",
+            "string_heavy_lob_9k",
             "string_heavy_unicode",
             "wide_sparse",
             "tpch_lineitem_like",
@@ -6705,6 +6822,9 @@ odbc-bcp runner
                 "string_heavy",
                 "string_heavy_text_only",
                 "string_heavy_binary_only",
+                "string_heavy_inline_4k",
+                "string_heavy_edge_7k",
+                "string_heavy_lob_9k",
                 "string_heavy_unicode",
                 "wide_sparse",
                 "tpch_lineitem_like"
