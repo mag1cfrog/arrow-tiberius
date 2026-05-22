@@ -266,7 +266,7 @@ fn print_arrow_odbc_help() {
 
 fn print_compare_help() {
     println!(
-        "Usage:\n  cargo xtask writer-bench compare [OPTIONS]\n\nData Options:\n  --rows <COUNT>                    Total rows to generate [default: 100000]\n  --batch-size <COUNT>              Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>                 Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>                  Number of benchmark repeats [default: 1]\n  --backends <LIST>                 Comma-separated backends: baseline,direct-raw,arrow-odbc,odbc-bcp [default: baseline,arrow-odbc]\n  --output <FORMAT>                 Output format: human [default: human]\n  --profile-direct                  Include direct-raw phase timings and counters\n\nSQL Server Options:\n  --container-runtime <PATH>        Container runtime executable, such as docker or podman\n  --connection-string <URL>         Use an existing SQL Server instead of a local container\n  --image <IMAGE>                   SQL Server container image\n  --database <NAME>                 Benchmark database name\n  --tds-packet-size <BYTES>         Requested TDS packet size for Tiberius writers\n  --profile-sqlserver               Profile the SQL Server writer session during compare writes\n  --sqlserver-profile-sample-ms <MILLIS>\n                                    SQL Server profile sample interval [default: 250]\n  --keep-container                  Keep managed containers after the task exits\n\nODBC Runner Options:\n  --arrow-odbc-autocommit           Use ODBC autocommit for arrow-odbc compares\n  --odbc-bcp-defer-batches          Defer odbc-bcp commits to bcp_done\n  --runner-image <IMAGE>            Managed ODBC runner image tag\n  --keep-runner-image               Keep the managed ODBC runner image after the task exits\n  -h, --help                        Print help\n\nCompare runs use one shared Arrow IPC dataset as the fairness boundary."
+        "Usage:\n  cargo xtask writer-bench compare [OPTIONS]\n\nData Options:\n  --rows <COUNT>                    Total rows to generate [default: 100000]\n  --batch-size <COUNT>              Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>                 Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>                  Number of benchmark repeats [default: 1]\n  --backends <LIST>                 Comma-separated backends: baseline,direct-framed,direct-raw,arrow-odbc,odbc-bcp [default: baseline,arrow-odbc]\n  --output <FORMAT>                 Output format: human [default: human]\n  --profile-direct                  Include direct backend phase timings and counters\n\nSQL Server Options:\n  --container-runtime <PATH>        Container runtime executable, such as docker or podman\n  --connection-string <URL>         Use an existing SQL Server instead of a local container\n  --image <IMAGE>                   SQL Server container image\n  --database <NAME>                 Benchmark database name\n  --tds-packet-size <BYTES>         Requested TDS packet size for Tiberius writers\n  --profile-sqlserver               Profile the SQL Server writer session during compare writes\n  --sqlserver-profile-sample-ms <MILLIS>\n                                    SQL Server profile sample interval [default: 250]\n  --keep-container                  Keep managed containers after the task exits\n\nODBC Runner Options:\n  --arrow-odbc-autocommit           Use ODBC autocommit for arrow-odbc compares\n  --odbc-bcp-defer-batches          Defer odbc-bcp commits to bcp_done\n  --runner-image <IMAGE>            Managed ODBC runner image tag\n  --keep-runner-image               Keep the managed ODBC runner image after the task exits\n  -h, --help                        Print help\n\nCompare runs use one shared Arrow IPC dataset as the fairness boundary."
     );
 }
 
@@ -674,6 +674,7 @@ fn print_compare_summary(options: &CompareBenchOptions, report: &CompareBenchRep
         println!("  backend: {}", backend.backend());
         match backend {
             CompareBackendBenchReport::Baseline { report }
+            | CompareBackendBenchReport::DirectFramed { report }
             | CompareBackendBenchReport::DirectRaw { report } => {
                 print_tiberius_backend_summary(report);
             }
@@ -1346,6 +1347,7 @@ impl CompareBenchOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BenchmarkBackend {
     Baseline,
+    DirectFramed,
     DirectRaw,
     ArrowOdbc,
     OdbcBcp,
@@ -1353,7 +1355,11 @@ enum BenchmarkBackend {
 
 impl BenchmarkBackend {
     fn is_tiberius(&self) -> bool {
-        matches!(self, Self::Baseline | Self::DirectRaw)
+        matches!(self, Self::Baseline | Self::DirectFramed | Self::DirectRaw)
+    }
+
+    fn is_direct(&self) -> bool {
+        matches!(self, Self::DirectFramed | Self::DirectRaw)
     }
 
     fn supports_sql_server_profile(&self) -> bool {
@@ -1365,6 +1371,7 @@ impl fmt::Display for BenchmarkBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Baseline => f.write_str("baseline"),
+            Self::DirectFramed => f.write_str("direct-framed"),
             Self::DirectRaw => f.write_str("direct-raw"),
             Self::ArrowOdbc => f.write_str("arrow-odbc"),
             Self::OdbcBcp => f.write_str("odbc-bcp"),
@@ -1378,11 +1385,12 @@ impl FromStr for BenchmarkBackend {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "baseline" => Ok(Self::Baseline),
+            "direct-framed" => Ok(Self::DirectFramed),
             "direct-raw" => Ok(Self::DirectRaw),
             "arrow-odbc" => Ok(Self::ArrowOdbc),
             "odbc-bcp" => Ok(Self::OdbcBcp),
             other => Err(WriterBenchError::Validation(format!(
-                "unknown writer-bench compare backend `{other}`; expected baseline, direct-raw, arrow-odbc, or odbc-bcp"
+                "unknown writer-bench compare backend `{other}`; expected baseline, direct-framed, direct-raw, arrow-odbc, or odbc-bcp"
             ))),
         }
     }
@@ -1426,7 +1434,7 @@ fn ensure_direct_raw_supported_scenario(
     }
 
     Err(WriterBenchError::Validation(format!(
-        "writer-bench compare backend `direct-raw` currently supports only scenarios {}; scenario `{}` contains column types that are not implemented by the direct TDS encoder yet",
+        "writer-bench compare direct backends currently support only scenarios {}; scenario `{}` contains column types that are not implemented by the direct TDS encoder yet",
         DIRECT_RAW_SUPPORTED_SCENARIOS.join(", "),
         benchmark.scenario.name
     )))
@@ -2285,6 +2293,7 @@ struct CompareBenchReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CompareBackendBenchReport {
     Baseline { report: TiberiusBenchReport },
+    DirectFramed { report: TiberiusBenchReport },
     DirectRaw { report: TiberiusBenchReport },
     ArrowOdbc { report: OdbcRunnerBenchReport },
     OdbcBcp { report: OdbcRunnerBenchReport },
@@ -2294,6 +2303,7 @@ impl CompareBackendBenchReport {
     fn backend(&self) -> BenchmarkBackend {
         match self {
             Self::Baseline { .. } => BenchmarkBackend::Baseline,
+            Self::DirectFramed { .. } => BenchmarkBackend::DirectFramed,
             Self::DirectRaw { .. } => BenchmarkBackend::DirectRaw,
             Self::ArrowOdbc { .. } => BenchmarkBackend::ArrowOdbc,
             Self::OdbcBcp { .. } => BenchmarkBackend::OdbcBcp,
@@ -2875,9 +2885,9 @@ async fn run_baseline_async(
 fn run_compare_benchmark(
     options: &CompareBenchOptions,
 ) -> Result<CompareBenchReport, WriterBenchError> {
-    if options.profile_direct && !options.backends.contains(&BenchmarkBackend::DirectRaw) {
+    if options.profile_direct && !options.backends.iter().any(BenchmarkBackend::is_direct) {
         return Err(WriterBenchError::Validation(
-            "writer-bench compare --profile-direct requires the direct-raw backend".to_owned(),
+            "writer-bench compare --profile-direct requires direct-framed or direct-raw".to_owned(),
         ));
     }
 
@@ -2902,12 +2912,12 @@ fn run_compare_benchmark(
             .any(BenchmarkBackend::supports_sql_server_profile)
     {
         return Err(WriterBenchError::Validation(
-            "writer-bench compare --profile-sqlserver requires the baseline, direct-raw, arrow-odbc, or odbc-bcp backend"
+            "writer-bench compare --profile-sqlserver requires the baseline, direct-framed, direct-raw, arrow-odbc, or odbc-bcp backend"
                 .to_owned(),
         ));
     }
 
-    if options.backends.contains(&BenchmarkBackend::DirectRaw) {
+    if options.backends.iter().any(BenchmarkBackend::is_direct) {
         ensure_direct_raw_supported_scenario(&options.benchmark)?;
     }
 
@@ -2949,6 +2959,25 @@ fn run_compare_benchmark(
                 Ok::<_, WriterBenchError>(report)
             })?;
             backends.push(CompareBackendBenchReport::Baseline { report });
+        }
+
+        if options.backends.contains(&BenchmarkBackend::DirectFramed) {
+            let report = runtime.block_on(async {
+                let backend_start = Instant::now();
+                let mut report = run_tiberius_benchmark_from_ipc(
+                    &options.benchmark,
+                    &connection,
+                    &ipc_dataset.host_path,
+                    WriteBackend::DirectFramedBulk,
+                    options.profile_direct,
+                    options.tds_packet_size,
+                    options.sql_server_profile,
+                )
+                .await?;
+                report.timings.total = backend_start.elapsed();
+                Ok::<_, WriterBenchError>(report)
+            })?;
+            backends.push(CompareBackendBenchReport::DirectFramed { report });
         }
 
         if options.backends.contains(&BenchmarkBackend::DirectRaw) {
@@ -3196,7 +3225,11 @@ async fn run_tiberius_repeat_with_batches(
     .map_err(WriterBenchError::ArrowTiberius)?;
     report.timings.setup += setup_start.elapsed();
 
-    let profiling_direct = config.profile_direct && config.backend == WriteBackend::DirectRawBulk;
+    let profiling_direct = config.profile_direct
+        && matches!(
+            config.backend,
+            WriteBackend::DirectFramedBulk | WriteBackend::DirectRawBulk
+        );
     if profiling_direct {
         arrow_tiberius::write::profile::start_direct_write_profile();
     }
@@ -5082,7 +5115,7 @@ mod tests {
             OsString::from("--scenario"),
             OsString::from("narrow_numeric"),
             OsString::from("--backends"),
-            OsString::from("baseline,direct-raw,arrow-odbc,odbc-bcp"),
+            OsString::from("baseline,direct-framed,direct-raw,arrow-odbc,odbc-bcp"),
             OsString::from("--odbc-bcp-defer-batches"),
         ];
 
@@ -5092,6 +5125,7 @@ mod tests {
             options.backends,
             [
                 super::BenchmarkBackend::Baseline,
+                super::BenchmarkBackend::DirectFramed,
                 super::BenchmarkBackend::DirectRaw,
                 super::BenchmarkBackend::ArrowOdbc,
                 super::BenchmarkBackend::OdbcBcp
@@ -5405,6 +5439,21 @@ mod tests {
     }
 
     #[test]
+    fn compare_allows_direct_framed_for_narrow_numeric() {
+        let args = [
+            OsString::from("--scenario"),
+            OsString::from("narrow_numeric"),
+            OsString::from("--backends"),
+            OsString::from("direct-framed"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+
+        assert_eq!(options.backends, [super::BenchmarkBackend::DirectFramed]);
+        super::ensure_direct_raw_supported_scenario(&options.benchmark).unwrap();
+    }
+
+    #[test]
     fn compare_allows_direct_raw_for_variable_width_supported_scenarios() {
         for scenario in [
             "mixed_nullable",
@@ -5421,12 +5470,18 @@ mod tests {
                 OsString::from("--scenario"),
                 OsString::from(scenario),
                 OsString::from("--backends"),
-                OsString::from("direct-raw"),
+                OsString::from("direct-framed,direct-raw"),
             ];
 
             let options = super::CompareBenchOptions::parse(&args).unwrap();
 
-            assert_eq!(options.backends, [super::BenchmarkBackend::DirectRaw]);
+            assert_eq!(
+                options.backends,
+                [
+                    super::BenchmarkBackend::DirectFramed,
+                    super::BenchmarkBackend::DirectRaw
+                ]
+            );
             super::ensure_direct_raw_supported_scenario(&options.benchmark).unwrap();
         }
     }
@@ -5447,7 +5502,7 @@ mod tests {
             assert!(matches!(
                 err,
                 WriterBenchError::Validation(message)
-                    if message.contains("direct-raw")
+                    if message.contains("direct backends")
                         && message.contains("narrow_numeric")
                         && message.contains("mixed_nullable")
                         && message.contains("string_heavy")
@@ -5514,6 +5569,7 @@ mod tests {
             err,
             WriterBenchError::Validation(message)
                 if message.contains("--profile-direct")
+                    && message.contains("direct-framed")
                     && message.contains("direct-raw")
         ));
     }
