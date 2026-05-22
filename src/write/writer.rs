@@ -34,6 +34,8 @@ pub enum WriteBackend {
     Auto,
     /// Use Tiberius' row-oriented `TokenRow` bulk-load path.
     BaselineTokenRow,
+    /// Use direct bulk-row payload encoding through Tiberius' framed sink.
+    DirectFramedBulk,
     /// Use the raw bulk-row payload path exposed by the Tiberius fork.
     DirectRawBulk,
 }
@@ -77,7 +79,9 @@ impl WriterState {
     ) -> Result<Self> {
         let backend = resolve_backend(requested_backend)?;
         let direct_encoder = match backend {
-            WriteBackend::DirectRawBulk => Some(DirectEncoder::new(&mappings)?),
+            WriteBackend::DirectFramedBulk | WriteBackend::DirectRawBulk => {
+                Some(DirectEncoder::new(&mappings)?)
+            }
             WriteBackend::Auto | WriteBackend::BaselineTokenRow => None,
         };
 
@@ -150,20 +154,25 @@ where
             mappings,
         )?;
         let mut request = match state.backend() {
-            WriteBackend::BaselineTokenRow | WriteBackend::DirectRawBulk => {
+            WriteBackend::BaselineTokenRow
+            | WriteBackend::DirectFramedBulk
+            | WriteBackend::DirectRawBulk => {
                 let table_sql = bulk_insert_table_sql(&table);
                 let columns = client
                     .bulk_insert_columns(&table_sql)
                     .await
                     .map_err(|source| crate::Error::Tiberius { source })?;
                 validate_bulk_target_columns(columns.iter(), state.mappings())?;
-                if state.backend() == WriteBackend::DirectRawBulk {
+                if matches!(
+                    state.backend(),
+                    WriteBackend::DirectFramedBulk | WriteBackend::DirectRawBulk
+                ) {
                     let encoder =
                         state
                             .direct_encoder()
                             .ok_or_else(|| crate::Error::BackendUnavailable {
-                                backend: WriteBackend::DirectRawBulk,
-                                reason: "direct raw bulk encoder is not available for this writer"
+                                backend: state.backend(),
+                                reason: "direct bulk encoder is not available for this writer"
                                     .to_owned(),
                             })?;
                     validate_direct_bulk_target_column_types(columns.iter(), encoder.plan())?;
@@ -191,7 +200,7 @@ where
             WriteBackend::BaselineTokenRow => {
                 write_batch_to_sink(&mut self.state, &mut self.request, batch).await
             }
-            WriteBackend::DirectRawBulk => {
+            WriteBackend::DirectFramedBulk | WriteBackend::DirectRawBulk => {
                 write_direct_batch_to_sink(&mut self.state, &mut self.request, batch).await
             }
             WriteBackend::Auto => Err(execution_unavailable(WriteBackend::Auto)),
@@ -503,8 +512,8 @@ where
     let encoder = state
         .direct_encoder()
         .ok_or_else(|| crate::Error::BackendUnavailable {
-            backend: WriteBackend::DirectRawBulk,
-            reason: "direct raw bulk encoder is not available for this writer".to_owned(),
+            backend: state.backend(),
+            reason: "direct bulk encoder is not available for this writer".to_owned(),
         })?;
     let measure_start = std::time::Instant::now();
     let measured = encoder.measure_batch(batch);
@@ -545,8 +554,6 @@ where
         measured: &MeasuredDirectBatch,
         range: MeasuredRowRange,
     ) -> Result<()> {
-        self.enable_direct_packet_writes();
-
         let encoded_bytes = measured.range_payload_len(range.start, range.len)?;
         profile::record_row_range(encoded_bytes);
 
@@ -607,6 +614,7 @@ fn usize_to_u64_saturating(value: usize) -> u64 {
 fn resolve_backend(requested_backend: WriteBackend) -> Result<WriteBackend> {
     match requested_backend {
         WriteBackend::Auto | WriteBackend::BaselineTokenRow => Ok(WriteBackend::BaselineTokenRow),
+        WriteBackend::DirectFramedBulk => Ok(WriteBackend::DirectFramedBulk),
         WriteBackend::DirectRawBulk => Ok(WriteBackend::DirectRawBulk),
     }
 }
@@ -663,6 +671,7 @@ mod tests {
         for backend in [
             WriteBackend::Auto,
             WriteBackend::BaselineTokenRow,
+            WriteBackend::DirectFramedBulk,
             WriteBackend::DirectRawBulk,
         ] {
             let options = WriteOptions {
@@ -697,7 +706,11 @@ mod tests {
     }
 
     #[test]
-    fn direct_raw_bulk_resolves_to_direct_backend() {
+    fn direct_bulk_backends_resolve_to_requested_backend() {
+        assert_eq!(
+            resolve_backend(WriteBackend::DirectFramedBulk).unwrap(),
+            WriteBackend::DirectFramedBulk
+        );
         assert_eq!(
             resolve_backend(WriteBackend::DirectRawBulk).unwrap(),
             WriteBackend::DirectRawBulk
@@ -742,16 +755,18 @@ mod tests {
             ),
         ];
 
-        let state = WriterState::new(
-            WriteBackend::DirectRawBulk,
-            SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
-        )
-        .unwrap();
+        for backend in [WriteBackend::DirectFramedBulk, WriteBackend::DirectRawBulk] {
+            let state = WriterState::new(
+                backend,
+                SchemaCheck::Strict,
+                PlanOptions::default(),
+                mappings.clone(),
+            )
+            .unwrap();
 
-        assert_eq!(state.backend(), WriteBackend::DirectRawBulk);
-        assert!(state.direct_encoder().is_some());
+            assert_eq!(state.backend(), backend);
+            assert!(state.direct_encoder().is_some());
+        }
     }
 
     #[test]

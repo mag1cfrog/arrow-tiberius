@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -21,10 +23,12 @@ use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 mod dataset;
+mod sqlserver_profile;
 
 static BENCH_TABLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static BENCH_IPC_COUNTER: AtomicU64 = AtomicU64::new(0);
 const ODBC_TABLE_PLACEHOLDER: &str = "__ARROW_TIBERIUS_ODBC_TABLE__";
+const DEFAULT_SQLSERVER_PROFILE_SAMPLE_MS: u64 = 250;
 
 pub(super) fn run(args: &[OsString]) -> Result<(), WriterBenchError> {
     if args.is_empty()
@@ -262,7 +266,7 @@ fn print_arrow_odbc_help() {
 
 fn print_compare_help() {
     println!(
-        "Usage:\n  cargo xtask writer-bench compare [OPTIONS]\n\nData Options:\n  --rows <COUNT>              Total rows to generate [default: 100000]\n  --batch-size <COUNT>        Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>           Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>            Number of benchmark repeats [default: 1]\n  --backends <LIST>           Comma-separated backends: baseline,direct-raw,arrow-odbc,odbc-bcp [default: baseline,arrow-odbc]\n  --output <FORMAT>           Output format: human [default: human]\n  --profile-direct            Include direct-raw phase timings and counters\n\nSQL Server Options:\n  --container-runtime <PATH>  Container runtime executable, such as docker or podman\n  --connection-string <URL>   Use an existing SQL Server instead of a local container\n  --image <IMAGE>             SQL Server container image\n  --database <NAME>           Benchmark database name\n  --tds-packet-size <BYTES>   Requested TDS packet size for Tiberius writers\n  --keep-container            Keep managed containers after the task exits\n\nODBC Runner Options:\n  --runner-image <IMAGE>      Managed ODBC runner image tag\n  --keep-runner-image         Keep the managed ODBC runner image after the task exits\n  -h, --help                  Print help\n\nCompare runs use one shared Arrow IPC dataset as the fairness boundary."
+        "Usage:\n  cargo xtask writer-bench compare [OPTIONS]\n\nData Options:\n  --rows <COUNT>                    Total rows to generate [default: 100000]\n  --batch-size <COUNT>              Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>                 Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>                  Number of benchmark repeats [default: 1]\n  --backends <LIST>                 Comma-separated backends: baseline,direct-framed,direct-raw,arrow-odbc,odbc-bcp [default: baseline,arrow-odbc]\n  --output <FORMAT>                 Output format: human [default: human]\n  --profile-direct                  Include direct backend phase timings and counters\n\nSQL Server Options:\n  --container-runtime <PATH>        Container runtime executable, such as docker or podman\n  --connection-string <URL>         Use an existing SQL Server instead of a local container\n  --image <IMAGE>                   SQL Server container image\n  --database <NAME>                 Benchmark database name\n  --tds-packet-size <BYTES>         Requested TDS packet size for Tiberius writers\n  --sqlserver-recovery-model <MODEL>\n                                    Set compare database recovery model: full, bulk-logged, or simple\n  --sqlserver-bulk-table-lock       Enable table lock on bulk load for compare benchmark tables\n  --profile-sqlserver               Profile the SQL Server writer session during compare writes\n  --sqlserver-profile-sample-ms <MILLIS>\n                                    SQL Server profile sample interval [default: 250]\n  --keep-container                  Keep managed containers after the task exits\n\nODBC Runner Options:\n  --arrow-odbc-autocommit           Use ODBC autocommit for arrow-odbc compares\n  --odbc-bcp-defer-batches          Defer odbc-bcp commits to bcp_done\n  --runner-image <IMAGE>            Managed ODBC runner image tag\n  --keep-runner-image               Keep the managed ODBC runner image after the task exits\n  -h, --help                        Print help\n\nCompare runs use one shared Arrow IPC dataset as the fairness boundary."
     );
 }
 
@@ -346,6 +350,7 @@ fn print_tiberius_backend_summary(report: &TiberiusBenchReport) {
     println!("    cleanup: {}", format_duration(report.timings.cleanup));
     println!("    total: {}", format_duration(report.timings.total));
     print_peak_rss("    ", report.peak_rss_kib);
+    print_sql_server_profile_target("    ", report.sql_server_profile_target.as_ref());
     if let Some(profile) = report.direct_profile {
         print_direct_profile("    ", profile);
     }
@@ -669,6 +674,7 @@ fn print_compare_summary(options: &CompareBenchOptions, report: &CompareBenchRep
         println!("  backend: {}", backend.backend());
         match backend {
             CompareBackendBenchReport::Baseline { report }
+            | CompareBackendBenchReport::DirectFramed { report }
             | CompareBackendBenchReport::DirectRaw { report } => {
                 print_tiberius_backend_summary(report);
             }
@@ -699,6 +705,261 @@ fn print_compare_summary(options: &CompareBenchOptions, report: &CompareBenchRep
 fn print_peak_rss(prefix: &str, peak_rss_kib: Option<u64>) {
     if let Some(peak_rss_kib) = peak_rss_kib {
         println!("{prefix}peak rss KiB: {peak_rss_kib}");
+    }
+}
+
+fn print_sql_server_profile_target(prefix: &str, target: Option<&SqlServerProfileTarget>) {
+    if let Some(target) = target {
+        println!("{prefix}sql server profile:");
+        println!(
+            "{prefix}  sample interval: {} ms",
+            target.sample_interval.as_millis()
+        );
+        println!("{prefix}  writer session id: {}", target.writer_session_id);
+        println!(
+            "{prefix}  observer session id: {}",
+            target.observer_session_id
+        );
+        println!("{prefix}  recovery model: {}", target.recovery_model);
+        println!(
+            "{prefix}  transaction policy: bulk writer request without explicit benchmark transaction"
+        );
+        println!(
+            "{prefix}  writer connection: {} {} encrypted={} packet_size={} reads={} writes={} last_read={} last_write={}",
+            target.initial_activity.connection.net_transport,
+            target.initial_activity.connection.protocol_type,
+            target.initial_activity.connection.encrypt_option,
+            target.initial_activity.connection.net_packet_size,
+            target.initial_activity.connection.num_reads,
+            target.initial_activity.connection.num_writes,
+            target
+                .initial_activity
+                .connection
+                .last_read
+                .as_deref()
+                .unwrap_or("<none>"),
+            target
+                .initial_activity
+                .connection
+                .last_write
+                .as_deref()
+                .unwrap_or("<none>")
+        );
+        match &target.initial_activity.request {
+            Some(request) => println!(
+                "{prefix}  initial request: status={} command={} wait={} wait_ms={} cpu_ms={} elapsed_ms={}",
+                request.status,
+                request.command,
+                request.wait_type.as_deref().unwrap_or("<none>"),
+                request.wait_time_ms,
+                request.cpu_time_ms,
+                request.total_elapsed_time_ms
+            ),
+            None => println!("{prefix}  initial request: <none>"),
+        }
+        println!(
+            "{prefix}  initial waiting tasks: {}",
+            target.initial_activity.waiting_tasks.len()
+        );
+        println!("{prefix}  write samples: {}", target.write_samples.len());
+        print_sql_server_profile_sample_coverage(prefix, &target.write_samples);
+        let sample_summary = SqlServerProfileSampleSummary::from_samples(&target.write_samples);
+        print_sql_server_profile_sample_distribution(
+            prefix,
+            "request status samples",
+            &sample_summary.request_statuses,
+        );
+        print_sql_server_profile_sample_distribution(
+            prefix,
+            "request wait samples",
+            &sample_summary.request_waits,
+        );
+        print_sql_server_profile_sample_distribution(
+            prefix,
+            "waiting task wait samples",
+            &sample_summary.waiting_task_waits,
+        );
+        print_sql_server_session_wait_deltas(prefix, &target.session_wait_deltas);
+        print_sql_server_database_file_io_deltas(prefix, &target.database_file_io_deltas);
+        print_sql_server_connection_deltas(prefix, &target.connection_deltas);
+        print_sql_server_profile_phase_deltas(prefix, &target.phase_deltas);
+        print_sql_server_table_page_snapshots(prefix, &target.table_page_snapshots);
+    }
+}
+
+fn print_sql_server_profile_sample_coverage(prefix: &str, samples: &[SqlServerProfileSample]) {
+    let coverages = sql_server_profile_sample_coverages(samples);
+    if coverages.is_empty() {
+        println!("{prefix}  write sample coverage: <none>");
+        return;
+    }
+
+    println!("{prefix}  write sample coverage:");
+    for coverage in coverages {
+        println!(
+            "{prefix}    {}: first=repeat {} {}..{} last=repeat {} {}..{}",
+            coverage.phase,
+            coverage.first_repeat_index + 1,
+            format_duration(coverage.first_elapsed_start),
+            format_duration(coverage.first_elapsed_end),
+            coverage.last_repeat_index + 1,
+            format_duration(coverage.last_elapsed_start),
+            format_duration(coverage.last_elapsed_end),
+        );
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqlServerProfileSampleCoverage {
+    phase: String,
+    first_repeat_index: usize,
+    first_elapsed_start: Duration,
+    first_elapsed_end: Duration,
+    last_repeat_index: usize,
+    last_elapsed_start: Duration,
+    last_elapsed_end: Duration,
+}
+
+fn sql_server_profile_sample_coverages(
+    samples: &[SqlServerProfileSample],
+) -> Vec<SqlServerProfileSampleCoverage> {
+    let mut by_phase: BTreeMap<&str, SqlServerProfileSampleCoverage> = BTreeMap::new();
+
+    for sample in samples {
+        by_phase
+            .entry(sample.phase.as_str())
+            .and_modify(|coverage| {
+                coverage.last_repeat_index = sample.repeat_index;
+                coverage.last_elapsed_start = sample.write_elapsed_start;
+                coverage.last_elapsed_end = sample.write_elapsed_end;
+            })
+            .or_insert_with(|| SqlServerProfileSampleCoverage {
+                phase: sample.phase.clone(),
+                first_repeat_index: sample.repeat_index,
+                first_elapsed_start: sample.write_elapsed_start,
+                first_elapsed_end: sample.write_elapsed_end,
+                last_repeat_index: sample.repeat_index,
+                last_elapsed_start: sample.write_elapsed_start,
+                last_elapsed_end: sample.write_elapsed_end,
+            });
+    }
+
+    by_phase.into_values().collect()
+}
+
+fn print_sql_server_profile_sample_distribution(
+    prefix: &str,
+    label: &str,
+    distribution: &BTreeMap<String, usize>,
+) {
+    if distribution.is_empty() {
+        println!("{prefix}  {label}: <none>");
+        return;
+    }
+
+    println!("{prefix}  {label}:");
+    for (value, count) in distribution {
+        println!("{prefix}    {value}: {count}");
+    }
+}
+
+fn print_sql_server_session_wait_deltas(prefix: &str, waits: &[SqlServerSessionWaitDelta]) {
+    if waits.is_empty() {
+        println!("{prefix}  session wait deltas: <none>");
+        return;
+    }
+
+    println!("{prefix}  session wait deltas:");
+    for wait in waits {
+        println!(
+            "{prefix}    {}: wait_ms={} tasks={} signal_wait_ms={}",
+            wait.wait_type, wait.wait_time_ms, wait.waiting_tasks_count, wait.signal_wait_time_ms
+        );
+    }
+}
+
+fn print_sql_server_database_file_io_deltas(prefix: &str, files: &[SqlServerDatabaseFileIoDelta]) {
+    if files.is_empty() {
+        println!("{prefix}  database file IO deltas: <none>");
+        return;
+    }
+
+    println!("{prefix}  database file IO deltas:");
+    for file in files {
+        println!(
+            "{prefix}    {} {}: reads={} read_bytes={} read_stall_ms={} writes={} write_bytes={} write_stall_ms={}",
+            file.file_type,
+            file.logical_name,
+            file.read_count,
+            file.read_bytes,
+            file.read_stall_ms,
+            file.write_count,
+            file.write_bytes,
+            file.write_stall_ms
+        );
+    }
+}
+
+fn print_sql_server_connection_deltas(prefix: &str, connections: &[SqlServerConnectionDelta]) {
+    if connections.is_empty() {
+        println!("{prefix}  connection deltas: <none>");
+        return;
+    }
+
+    println!("{prefix}  connection deltas:");
+    for connection in connections {
+        println!(
+            "{prefix}    {} {} encrypted={} packet_size={} reads={} writes={} last_read={} last_write={}",
+            connection.net_transport,
+            connection.protocol_type,
+            connection.encrypt_option,
+            connection.net_packet_size,
+            connection.num_reads,
+            connection.num_writes,
+            connection.last_read.as_deref().unwrap_or("<none>"),
+            connection.last_write.as_deref().unwrap_or("<none>")
+        );
+    }
+}
+
+fn print_sql_server_profile_phase_deltas(prefix: &str, phases: &[SqlServerProfilePhaseDelta]) {
+    if phases.is_empty() {
+        println!("{prefix}  phase deltas: <none>");
+        return;
+    }
+
+    println!("{prefix}  phase deltas:");
+    for phase in phases {
+        println!("{prefix}    {}:", phase.phase);
+        print_sql_server_session_wait_deltas(&format!("{prefix}    "), &phase.session_wait_deltas);
+        print_sql_server_database_file_io_deltas(
+            &format!("{prefix}    "),
+            &phase.database_file_io_deltas,
+        );
+        print_sql_server_connection_deltas(&format!("{prefix}    "), &phase.connection_deltas);
+    }
+}
+
+fn print_sql_server_table_page_snapshots(
+    prefix: &str,
+    tables: &[sqlserver_profile::TablePageSnapshot],
+) {
+    if tables.is_empty() {
+        println!("{prefix}  table page snapshots: <none>");
+        return;
+    }
+
+    println!("{prefix}  table page snapshots:");
+    for table in tables {
+        println!(
+            "{prefix}    {}: rows={} used_pages={} in_row_used_pages={} lob_used_pages={} row_overflow_used_pages={}",
+            table.table,
+            table.row_count,
+            table.used_page_count,
+            table.in_row_used_page_count,
+            table.lob_used_page_count,
+            table.row_overflow_used_page_count
+        );
     }
 }
 
@@ -930,11 +1191,74 @@ impl ArrowOdbcBenchOptions {
 struct CompareBenchOptions {
     benchmark: WriterBenchOptions,
     sql_server: sqlserver::SqlServerConnectionOptions,
+    sql_server_profile: Option<SqlServerProfileOptions>,
+    sql_server_recovery_model: Option<SqlServerRecoveryModel>,
+    sql_server_bulk_table_lock: bool,
     backends: Vec<BenchmarkBackend>,
     runner_image: String,
     keep_runner_image: bool,
     profile_direct: bool,
     tds_packet_size: Option<u32>,
+    arrow_odbc_autocommit: bool,
+    odbc_bcp_defer_batches: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SqlServerProfileOptions {
+    sample_interval: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlServerRecoveryModel {
+    Full,
+    BulkLogged,
+    Simple,
+}
+
+impl fmt::Display for SqlServerRecoveryModel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Full => f.write_str("FULL"),
+            Self::BulkLogged => f.write_str("BULK_LOGGED"),
+            Self::Simple => f.write_str("SIMPLE"),
+        }
+    }
+}
+
+impl FromStr for SqlServerRecoveryModel {
+    type Err = WriterBenchError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "full" => Ok(Self::Full),
+            "bulk-logged" => Ok(Self::BulkLogged),
+            "simple" => Ok(Self::Simple),
+            _ => Err(WriterBenchError::Validation(format!(
+                "unknown writer-bench compare SQL Server recovery model `{value}`; expected full, bulk-logged, or simple"
+            ))),
+        }
+    }
+}
+
+impl SqlServerRecoveryModel {
+    fn from_sql_server_desc(value: &str) -> Result<Self, WriterBenchError> {
+        match value {
+            "FULL" => Ok(Self::Full),
+            "BULK_LOGGED" => Ok(Self::BulkLogged),
+            "SIMPLE" => Ok(Self::Simple),
+            _ => Err(WriterBenchError::Validation(format!(
+                "unknown SQL Server recovery model reported by server `{value}`"
+            ))),
+        }
+    }
+}
+
+impl Default for SqlServerProfileOptions {
+    fn default() -> Self {
+        Self {
+            sample_interval: Duration::from_millis(DEFAULT_SQLSERVER_PROFILE_SAMPLE_MS),
+        }
+    }
 }
 
 impl CompareBenchOptions {
@@ -942,12 +1266,18 @@ impl CompareBenchOptions {
         let mut options = Self {
             benchmark: WriterBenchOptions::default(),
             sql_server: sqlserver::SqlServerConnectionOptions::benchmark_default(),
+            sql_server_profile: None,
+            sql_server_recovery_model: None,
+            sql_server_bulk_table_lock: false,
             backends: vec![BenchmarkBackend::Baseline, BenchmarkBackend::ArrowOdbc],
             runner_image: odbc_runner::DEFAULT_RUNNER_IMAGE_TAG.to_owned(),
             keep_runner_image: false,
             profile_direct: false,
             tds_packet_size: None,
+            arrow_odbc_autocommit: false,
+            odbc_bcp_defer_batches: false,
         };
+        let mut sql_server_profile_sample_interval = None;
         let mut index = 0;
 
         while index < args.len() {
@@ -1011,6 +1341,26 @@ impl CompareBenchOptions {
                     )?);
                     index += 1;
                 }
+                "--sqlserver-recovery-model" => {
+                    options.sql_server_recovery_model = Some(required_value(args, index)?.parse()?);
+                    index += 1;
+                }
+                "--sqlserver-bulk-table-lock" => {
+                    options.sql_server_bulk_table_lock = true;
+                }
+                "--profile-sqlserver" => {
+                    options
+                        .sql_server_profile
+                        .get_or_insert_with(SqlServerProfileOptions::default);
+                }
+                "--sqlserver-profile-sample-ms" => {
+                    let sample_ms = parse_positive_u64(
+                        "--sqlserver-profile-sample-ms",
+                        &required_value(args, index)?,
+                    )?;
+                    sql_server_profile_sample_interval = Some(Duration::from_millis(sample_ms));
+                    index += 1;
+                }
                 "--keep-container" => {
                     options.sql_server.keep_container = true;
                 }
@@ -1021,6 +1371,12 @@ impl CompareBenchOptions {
                 "--keep-runner-image" => {
                     options.keep_runner_image = true;
                 }
+                "--arrow-odbc-autocommit" => {
+                    options.arrow_odbc_autocommit = true;
+                }
+                "--odbc-bcp-defer-batches" => {
+                    options.odbc_bcp_defer_batches = true;
+                }
                 "--profile-direct" => {
                     options.profile_direct = true;
                 }
@@ -1030,6 +1386,16 @@ impl CompareBenchOptions {
             index += 1;
         }
 
+        if let Some(sample_interval) = sql_server_profile_sample_interval {
+            let profile = options.sql_server_profile.as_mut().ok_or_else(|| {
+                WriterBenchError::Validation(
+                    "writer-bench compare --sqlserver-profile-sample-ms requires --profile-sqlserver"
+                        .to_owned(),
+                )
+            })?;
+            profile.sample_interval = sample_interval;
+        }
+
         Ok(options)
     }
 }
@@ -1037,15 +1403,31 @@ impl CompareBenchOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BenchmarkBackend {
     Baseline,
+    DirectFramed,
     DirectRaw,
     ArrowOdbc,
     OdbcBcp,
+}
+
+impl BenchmarkBackend {
+    fn is_tiberius(&self) -> bool {
+        matches!(self, Self::Baseline | Self::DirectFramed | Self::DirectRaw)
+    }
+
+    fn is_direct(&self) -> bool {
+        matches!(self, Self::DirectFramed | Self::DirectRaw)
+    }
+
+    fn supports_sql_server_profile(&self) -> bool {
+        self.is_tiberius() || matches!(self, Self::ArrowOdbc | Self::OdbcBcp)
+    }
 }
 
 impl fmt::Display for BenchmarkBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Baseline => f.write_str("baseline"),
+            Self::DirectFramed => f.write_str("direct-framed"),
             Self::DirectRaw => f.write_str("direct-raw"),
             Self::ArrowOdbc => f.write_str("arrow-odbc"),
             Self::OdbcBcp => f.write_str("odbc-bcp"),
@@ -1059,11 +1441,12 @@ impl FromStr for BenchmarkBackend {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "baseline" => Ok(Self::Baseline),
+            "direct-framed" => Ok(Self::DirectFramed),
             "direct-raw" => Ok(Self::DirectRaw),
             "arrow-odbc" => Ok(Self::ArrowOdbc),
             "odbc-bcp" => Ok(Self::OdbcBcp),
             other => Err(WriterBenchError::Validation(format!(
-                "unknown writer-bench compare backend `{other}`; expected baseline, direct-raw, arrow-odbc, or odbc-bcp"
+                "unknown writer-bench compare backend `{other}`; expected baseline, direct-framed, direct-raw, arrow-odbc, or odbc-bcp"
             ))),
         }
     }
@@ -1107,7 +1490,7 @@ fn ensure_direct_raw_supported_scenario(
     }
 
     Err(WriterBenchError::Validation(format!(
-        "writer-bench compare backend `direct-raw` currently supports only scenarios {}; scenario `{}` contains column types that are not implemented by the direct TDS encoder yet",
+        "writer-bench compare direct backends currently support only scenarios {}; scenario `{}` contains column types that are not implemented by the direct TDS encoder yet",
         DIRECT_RAW_SUPPORTED_SCENARIOS.join(", "),
         benchmark.scenario.name
     )))
@@ -1307,6 +1690,11 @@ fn run_arrow_odbc_runner_for_benchmark(
         network,
         connection,
         ipc_dataset,
+        ArrowOdbcRunnerBenchOptions {
+            profile_sql_server: false,
+            autocommit: false,
+            bulk_table_lock: false,
+        },
     )?;
 
     odbc_runner::run_runner_command(&command_options).map_err(WriterBenchError::OdbcRunner)
@@ -1318,6 +1706,7 @@ fn run_arrow_odbc_runner_for_benchmark_capture(
     network: Option<&sqlserver::ManagedNetwork>,
     connection: &sqlserver::SqlServerConnection,
     ipc_dataset: &ManagedIpcDataset,
+    options: ArrowOdbcRunnerBenchOptions,
 ) -> Result<OdbcRunnerBenchReport, WriterBenchError> {
     println!("  action: run_arrow_odbc_runner");
     let command_options = arrow_odbc_runner_command_options(
@@ -1326,6 +1715,7 @@ fn run_arrow_odbc_runner_for_benchmark_capture(
         network,
         connection,
         ipc_dataset,
+        options,
     )?;
     let output = odbc_runner::run_runner_command_capture(&command_options)
         .map_err(WriterBenchError::OdbcRunner)?;
@@ -1342,10 +1732,17 @@ fn run_odbc_bcp_runner_for_benchmark_capture(
     network: Option<&sqlserver::ManagedNetwork>,
     connection: &sqlserver::SqlServerConnection,
     ipc_dataset: &ManagedIpcDataset,
+    options: OdbcBcpRunnerBenchOptions,
 ) -> Result<OdbcRunnerBenchReport, WriterBenchError> {
     println!("  action: run_odbc_bcp_runner");
-    let command_options =
-        odbc_bcp_runner_command_options(benchmark, runner_image, network, connection, ipc_dataset)?;
+    let command_options = odbc_bcp_runner_command_options(
+        benchmark,
+        runner_image,
+        network,
+        connection,
+        ipc_dataset,
+        options,
+    )?;
     let output = odbc_runner::run_runner_command_capture(&command_options)
         .map_err(WriterBenchError::OdbcRunner)?;
 
@@ -1361,6 +1758,7 @@ fn arrow_odbc_runner_command_options(
     network: Option<&sqlserver::ManagedNetwork>,
     connection: &sqlserver::SqlServerConnection,
     ipc_dataset: &ManagedIpcDataset,
+    options: ArrowOdbcRunnerBenchOptions,
 ) -> Result<odbc_runner::RunnerCommandOptions, WriterBenchError> {
     let container_path = ipc_dataset.container_path.as_deref().ok_or_else(|| {
         WriterBenchError::Validation(
@@ -1386,17 +1784,27 @@ fn arrow_odbc_runner_command_options(
         ],
         Some(repository_root()?),
         Some("/workspace".to_owned()),
-        arrow_odbc_runner_args(benchmark, container_path)?,
+        arrow_odbc_runner_args(
+            benchmark,
+            container_path,
+            options.profile_sql_server,
+            options.autocommit,
+            options.bulk_table_lock,
+        )?,
     ))
 }
 
 fn arrow_odbc_runner_args(
     benchmark: &WriterBenchOptions,
     input_ipc: &str,
+    profile_sql_server: bool,
+    autocommit: bool,
+    bulk_table_lock: bool,
 ) -> Result<Vec<String>, WriterBenchError> {
-    let create_table_sql_template = arrow_odbc_create_table_sql_template(benchmark)?;
+    let create_table_sql_template =
+        arrow_odbc_create_table_sql_template(benchmark, bulk_table_lock)?;
 
-    Ok(vec![
+    let mut args = vec![
         "cargo".to_owned(),
         "run".to_owned(),
         "--release".to_owned(),
@@ -1418,7 +1826,15 @@ fn arrow_odbc_runner_args(
         input_ipc.to_owned(),
         "--create-table-sql-template".to_owned(),
         create_table_sql_template,
-    ])
+    ];
+    if profile_sql_server {
+        args.push("--profile-sqlserver".to_owned());
+    }
+    if autocommit {
+        args.push("--autocommit".to_owned());
+    }
+
+    Ok(args)
 }
 
 fn odbc_bcp_runner_command_options(
@@ -1427,6 +1843,7 @@ fn odbc_bcp_runner_command_options(
     network: Option<&sqlserver::ManagedNetwork>,
     connection: &sqlserver::SqlServerConnection,
     ipc_dataset: &ManagedIpcDataset,
+    options: OdbcBcpRunnerBenchOptions,
 ) -> Result<odbc_runner::RunnerCommandOptions, WriterBenchError> {
     let container_path = ipc_dataset.container_path.as_deref().ok_or_else(|| {
         WriterBenchError::Validation(
@@ -1448,17 +1865,27 @@ fn odbc_bcp_runner_command_options(
         ],
         Some(repository_root()?),
         Some("/workspace".to_owned()),
-        odbc_bcp_runner_args(benchmark, container_path)?,
+        odbc_bcp_runner_args(
+            benchmark,
+            container_path,
+            options.profile_sql_server,
+            options.defer_batches,
+            options.bulk_table_lock,
+        )?,
     ))
 }
 
 fn odbc_bcp_runner_args(
     benchmark: &WriterBenchOptions,
     input_ipc: &str,
+    profile_sql_server: bool,
+    defer_batches: bool,
+    bulk_table_lock: bool,
 ) -> Result<Vec<String>, WriterBenchError> {
-    let create_table_sql_template = arrow_odbc_create_table_sql_template(benchmark)?;
+    let create_table_sql_template =
+        arrow_odbc_create_table_sql_template(benchmark, bulk_table_lock)?;
 
-    Ok(vec![
+    let mut args = vec![
         "cargo".to_owned(),
         "run".to_owned(),
         "--release".to_owned(),
@@ -1480,11 +1907,20 @@ fn odbc_bcp_runner_args(
         input_ipc.to_owned(),
         "--create-table-sql-template".to_owned(),
         create_table_sql_template,
-    ])
+    ];
+    if profile_sql_server {
+        args.push("--profile-sqlserver".to_owned());
+    }
+    if defer_batches {
+        args.push("--defer-batches".to_owned());
+    }
+
+    Ok(args)
 }
 
 fn arrow_odbc_create_table_sql_template(
     benchmark: &WriterBenchOptions,
+    bulk_table_lock: bool,
 ) -> Result<String, WriterBenchError> {
     let placeholder_table =
         TableName::new("dbo", ODBC_TABLE_PLACEHOLDER).map_err(WriterBenchError::ArrowTiberius)?;
@@ -1492,6 +1928,14 @@ fn arrow_odbc_create_table_sql_template(
     let mappings = benchmark_mappings_for_schema(schema)?;
     let sql = benchmark_table_sql(&placeholder_table, &mappings);
     let quoted_placeholder = placeholder_table.quoted_sql();
+    let sql = if bulk_table_lock {
+        format!(
+            "{sql}\n{}",
+            benchmark_bulk_table_lock_sql(&placeholder_table)
+        )
+    } else {
+        sql
+    };
 
     Ok(sql.replace(&quoted_placeholder, ODBC_TABLE_PLACEHOLDER))
 }
@@ -1718,6 +2162,51 @@ const STRING_HEAVY_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefi
     columns: string_heavy_columns,
 };
 
+const STRING_HEAVY_TEXT_ONLY_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
+    name: "string_heavy_text_only",
+    description: "Large variable text rows with minimal binary payloads",
+    schema: string_heavy_schema,
+    columns: string_heavy_text_only_columns,
+};
+
+const STRING_HEAVY_BINARY_ONLY_SCENARIO: BenchmarkScenarioDefinition =
+    BenchmarkScenarioDefinition {
+        name: "string_heavy_binary_only",
+        description: "Large variable binary rows with minimal text payloads",
+        schema: string_heavy_schema,
+        columns: string_heavy_binary_only_columns,
+    };
+
+const STRING_HEAVY_INLINE_4K_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
+    name: "string_heavy_inline_4k",
+    description: "Fixed string-heavy rows with about 4 KiB of SQL variable payload bytes",
+    schema: string_heavy_schema,
+    columns: string_heavy_inline_4k_columns,
+};
+
+const STRING_HEAVY_EDGE_7K_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
+    name: "string_heavy_edge_7k",
+    description: "Fixed string-heavy rows near the SQL Server in-row payload boundary",
+    schema: string_heavy_schema,
+    columns: string_heavy_edge_7k_columns,
+};
+
+const STRING_HEAVY_LOB_9K_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
+    name: "string_heavy_lob_9k",
+    description: "Fixed string-heavy rows above the SQL Server in-row payload boundary",
+    schema: string_heavy_schema,
+    columns: string_heavy_lob_9k_columns,
+};
+
+const STRING_HEAVY_UNICODE_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
+    name: "string_heavy_unicode",
+    description: "Large BMP Unicode text and binary payload rows",
+    schema: string_heavy_schema,
+    columns: string_heavy_unicode_columns,
+};
+const STRING_HEAVY_UNICODE_TENANT_FIRST_CODEPOINT: u32 = 0x79df;
+const STRING_HEAVY_UNICODE_TENANT_SECOND_CODEPOINT: u32 = 0x6237;
+
 const WIDE_SPARSE_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
     name: "wide_sparse",
     description: "Thirty-two mixed columns with sparse nullable values",
@@ -1736,6 +2225,12 @@ const DIRECT_RAW_SUPPORTED_SCENARIOS: &[&str] = &[
     NARROW_NUMERIC_SCENARIO.name,
     MIXED_NULLABLE_SCENARIO.name,
     STRING_HEAVY_SCENARIO.name,
+    STRING_HEAVY_TEXT_ONLY_SCENARIO.name,
+    STRING_HEAVY_BINARY_ONLY_SCENARIO.name,
+    STRING_HEAVY_INLINE_4K_SCENARIO.name,
+    STRING_HEAVY_EDGE_7K_SCENARIO.name,
+    STRING_HEAVY_LOB_9K_SCENARIO.name,
+    STRING_HEAVY_UNICODE_SCENARIO.name,
     WIDE_SPARSE_SCENARIO.name,
 ];
 
@@ -1745,6 +2240,12 @@ const SCENARIOS: &[BenchmarkScenarioDefinition] = &[
     WIDE_MIXED_SCENARIO,
     DECIMAL_TEMPORAL_SCENARIO,
     STRING_HEAVY_SCENARIO,
+    STRING_HEAVY_TEXT_ONLY_SCENARIO,
+    STRING_HEAVY_BINARY_ONLY_SCENARIO,
+    STRING_HEAVY_INLINE_4K_SCENARIO,
+    STRING_HEAVY_EDGE_7K_SCENARIO,
+    STRING_HEAVY_LOB_9K_SCENARIO,
+    STRING_HEAVY_UNICODE_SCENARIO,
     WIDE_SPARSE_SCENARIO,
     TPCH_LINEITEM_LIKE_SCENARIO,
 ];
@@ -1833,12 +2334,13 @@ struct GeneratedBatchSummary {
     rows: usize,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct TiberiusBenchReport {
     stats: arrow_tiberius::WriteStats,
     validated_rows: u64,
     peak_rss_kib: Option<u64>,
     timings: TiberiusBenchTimings,
+    sql_server_profile_target: Option<SqlServerProfileTarget>,
     direct_profile: Option<DirectWriteProfile>,
 }
 
@@ -1852,6 +2354,37 @@ struct TiberiusBenchTimings {
     total: Duration,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TiberiusRepeatConfig {
+    scenario: &'static BenchmarkScenarioDefinition,
+    backend: WriteBackend,
+    profile_direct: bool,
+    bulk_table_lock: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TiberiusBenchmarkConfig {
+    backend: WriteBackend,
+    profile_direct: bool,
+    tds_packet_size: Option<u32>,
+    sql_server_profile: Option<SqlServerProfileOptions>,
+    bulk_table_lock: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ArrowOdbcRunnerBenchOptions {
+    profile_sql_server: bool,
+    autocommit: bool,
+    bulk_table_lock: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OdbcBcpRunnerBenchOptions {
+    profile_sql_server: bool,
+    defer_batches: bool,
+    bulk_table_lock: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CompareBenchReport {
     ipc_dataset: PathBuf,
@@ -1859,9 +2392,10 @@ struct CompareBenchReport {
     backends: Vec<CompareBackendBenchReport>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CompareBackendBenchReport {
     Baseline { report: TiberiusBenchReport },
+    DirectFramed { report: TiberiusBenchReport },
     DirectRaw { report: TiberiusBenchReport },
     ArrowOdbc { report: OdbcRunnerBenchReport },
     OdbcBcp { report: OdbcRunnerBenchReport },
@@ -1871,6 +2405,7 @@ impl CompareBackendBenchReport {
     fn backend(&self) -> BenchmarkBackend {
         match self {
             Self::Baseline { .. } => BenchmarkBackend::Baseline,
+            Self::DirectFramed { .. } => BenchmarkBackend::DirectFramed,
             Self::DirectRaw { .. } => BenchmarkBackend::DirectRaw,
             Self::ArrowOdbc { .. } => BenchmarkBackend::ArrowOdbc,
             Self::OdbcBcp { .. } => BenchmarkBackend::OdbcBcp,
@@ -1887,6 +2422,541 @@ struct OdbcRunnerBenchReport {
 
 type BenchClient = tiberius::Client<Compat<TcpStream>>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqlServerProfileTarget {
+    writer_session_id: i32,
+    observer_session_id: i32,
+    recovery_model: String,
+    sample_interval: Duration,
+    initial_activity: sqlserver_profile::ActivitySnapshot,
+    write_samples: Vec<SqlServerProfileSample>,
+    session_wait_deltas: Vec<SqlServerSessionWaitDelta>,
+    database_file_io_deltas: Vec<SqlServerDatabaseFileIoDelta>,
+    connection_deltas: Vec<SqlServerConnectionDelta>,
+    phase_deltas: Vec<SqlServerProfilePhaseDelta>,
+    table_page_snapshots: Vec<sqlserver_profile::TablePageSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqlServerProfileSample {
+    phase: String,
+    repeat_index: usize,
+    write_elapsed_start: Duration,
+    write_elapsed_end: Duration,
+    activity: sqlserver_profile::ActivitySnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqlServerSessionWaitDelta {
+    wait_type: String,
+    waiting_tasks_count: i64,
+    wait_time_ms: i64,
+    signal_wait_time_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqlServerDatabaseFileIoDelta {
+    file_id: i32,
+    logical_name: String,
+    file_type: String,
+    read_count: i64,
+    read_bytes: i64,
+    read_stall_ms: i64,
+    write_count: i64,
+    write_bytes: i64,
+    write_stall_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqlServerConnectionDelta {
+    net_transport: String,
+    protocol_type: String,
+    encrypt_option: String,
+    net_packet_size: i32,
+    num_reads: i64,
+    num_writes: i64,
+    last_read: Option<String>,
+    last_write: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqlServerProfilePhaseDelta {
+    phase: String,
+    session_wait_deltas: Vec<SqlServerSessionWaitDelta>,
+    database_file_io_deltas: Vec<SqlServerDatabaseFileIoDelta>,
+    connection_deltas: Vec<SqlServerConnectionDelta>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct SqlServerProfileSampleSummary {
+    request_statuses: BTreeMap<String, usize>,
+    request_waits: BTreeMap<String, usize>,
+    waiting_task_waits: BTreeMap<String, usize>,
+}
+
+impl SqlServerProfileSampleSummary {
+    fn from_samples(samples: &[SqlServerProfileSample]) -> Self {
+        let mut summary = Self::default();
+
+        for sample in samples {
+            match &sample.activity.request {
+                Some(request) => {
+                    increment_sample_count(&mut summary.request_statuses, &request.status);
+                    increment_sample_count(
+                        &mut summary.request_waits,
+                        request.wait_type.as_deref().unwrap_or("<none>"),
+                    );
+                }
+                None => {
+                    increment_sample_count(&mut summary.request_statuses, "<no request>");
+                    increment_sample_count(&mut summary.request_waits, "<no request>");
+                }
+            }
+
+            for waiting_task in &sample.activity.waiting_tasks {
+                increment_sample_count(&mut summary.waiting_task_waits, &waiting_task.wait_type);
+            }
+        }
+
+        summary
+    }
+}
+
+fn increment_sample_count(distribution: &mut BTreeMap<String, usize>, value: &str) {
+    let count = distribution.entry(value.to_owned()).or_default();
+    *count = count.saturating_add(1);
+}
+
+fn sql_server_session_wait_deltas(
+    initial: &[sqlserver_profile::SessionWaitSnapshot],
+    final_waits: &[sqlserver_profile::SessionWaitSnapshot],
+) -> Vec<SqlServerSessionWaitDelta> {
+    let initial_waits = initial
+        .iter()
+        .map(|wait| (wait.wait_type.as_str(), wait))
+        .collect::<BTreeMap<_, _>>();
+    let mut deltas = final_waits
+        .iter()
+        .filter_map(|final_wait| {
+            let initial_wait = initial_waits.get(final_wait.wait_type.as_str()).copied();
+            let delta = SqlServerSessionWaitDelta {
+                wait_type: final_wait.wait_type.clone(),
+                waiting_tasks_count: counter_delta(
+                    initial_wait.map_or(0, |wait| wait.waiting_tasks_count),
+                    final_wait.waiting_tasks_count,
+                ),
+                wait_time_ms: counter_delta(
+                    initial_wait.map_or(0, |wait| wait.wait_time_ms),
+                    final_wait.wait_time_ms,
+                ),
+                signal_wait_time_ms: counter_delta(
+                    initial_wait.map_or(0, |wait| wait.signal_wait_time_ms),
+                    final_wait.signal_wait_time_ms,
+                ),
+            };
+
+            (delta.waiting_tasks_count > 0 || delta.wait_time_ms > 0).then_some(delta)
+        })
+        .collect::<Vec<_>>();
+    deltas.sort_by(|left, right| {
+        right
+            .wait_time_ms
+            .cmp(&left.wait_time_ms)
+            .then_with(|| left.wait_type.cmp(&right.wait_type))
+    });
+    deltas
+}
+
+fn counter_delta(initial: i64, final_value: i64) -> i64 {
+    final_value.saturating_sub(initial)
+}
+
+fn sql_server_database_file_io_deltas(
+    initial: &[sqlserver_profile::DatabaseFileIoSnapshot],
+    final_files: &[sqlserver_profile::DatabaseFileIoSnapshot],
+) -> Vec<SqlServerDatabaseFileIoDelta> {
+    let initial_files = initial
+        .iter()
+        .map(|file| (file.file_id, file))
+        .collect::<BTreeMap<_, _>>();
+    let mut deltas = final_files
+        .iter()
+        .map(|final_file| {
+            let initial_file = initial_files.get(&final_file.file_id).copied();
+            SqlServerDatabaseFileIoDelta {
+                file_id: final_file.file_id,
+                logical_name: final_file.logical_name.clone(),
+                file_type: final_file.file_type.clone(),
+                read_count: counter_delta(
+                    initial_file.map_or(0, |file| file.read_count),
+                    final_file.read_count,
+                ),
+                read_bytes: counter_delta(
+                    initial_file.map_or(0, |file| file.read_bytes),
+                    final_file.read_bytes,
+                ),
+                read_stall_ms: counter_delta(
+                    initial_file.map_or(0, |file| file.read_stall_ms),
+                    final_file.read_stall_ms,
+                ),
+                write_count: counter_delta(
+                    initial_file.map_or(0, |file| file.write_count),
+                    final_file.write_count,
+                ),
+                write_bytes: counter_delta(
+                    initial_file.map_or(0, |file| file.write_bytes),
+                    final_file.write_bytes,
+                ),
+                write_stall_ms: counter_delta(
+                    initial_file.map_or(0, |file| file.write_stall_ms),
+                    final_file.write_stall_ms,
+                ),
+            }
+        })
+        .collect::<Vec<_>>();
+    deltas.sort_by(|left, right| {
+        left.file_type
+            .cmp(&right.file_type)
+            .then_with(|| left.logical_name.cmp(&right.logical_name))
+            .then_with(|| left.file_id.cmp(&right.file_id))
+    });
+    deltas
+}
+
+fn sql_server_connection_delta(
+    initial: &sqlserver_profile::ConnectionSnapshot,
+    final_connection: &sqlserver_profile::ConnectionSnapshot,
+) -> SqlServerConnectionDelta {
+    SqlServerConnectionDelta {
+        net_transport: final_connection.net_transport.clone(),
+        protocol_type: final_connection.protocol_type.clone(),
+        encrypt_option: final_connection.encrypt_option.clone(),
+        net_packet_size: final_connection.net_packet_size,
+        num_reads: counter_delta(initial.num_reads, final_connection.num_reads),
+        num_writes: counter_delta(initial.num_writes, final_connection.num_writes),
+        last_read: final_connection.last_read.clone(),
+        last_write: final_connection.last_write.clone(),
+    }
+}
+
+fn merge_sql_server_session_wait_deltas(
+    target: &mut Vec<SqlServerSessionWaitDelta>,
+    source: Vec<SqlServerSessionWaitDelta>,
+) {
+    let mut merged = target
+        .drain(..)
+        .map(|wait| (wait.wait_type.clone(), wait))
+        .collect::<BTreeMap<_, _>>();
+
+    for wait in source {
+        let merged_wait =
+            merged
+                .entry(wait.wait_type.clone())
+                .or_insert(SqlServerSessionWaitDelta {
+                    wait_type: wait.wait_type,
+                    waiting_tasks_count: 0,
+                    wait_time_ms: 0,
+                    signal_wait_time_ms: 0,
+                });
+        merged_wait.waiting_tasks_count = merged_wait
+            .waiting_tasks_count
+            .saturating_add(wait.waiting_tasks_count);
+        merged_wait.wait_time_ms = merged_wait.wait_time_ms.saturating_add(wait.wait_time_ms);
+        merged_wait.signal_wait_time_ms = merged_wait
+            .signal_wait_time_ms
+            .saturating_add(wait.signal_wait_time_ms);
+    }
+
+    *target = merged.into_values().collect();
+    target.sort_by(|left, right| {
+        right
+            .wait_time_ms
+            .cmp(&left.wait_time_ms)
+            .then_with(|| left.wait_type.cmp(&right.wait_type))
+    });
+}
+
+fn merge_sql_server_database_file_io_deltas(
+    target: &mut Vec<SqlServerDatabaseFileIoDelta>,
+    source: Vec<SqlServerDatabaseFileIoDelta>,
+) {
+    let mut merged = target
+        .drain(..)
+        .map(|file| (file.file_id, file))
+        .collect::<BTreeMap<_, _>>();
+
+    for file in source {
+        let merged_file = merged
+            .entry(file.file_id)
+            .or_insert(SqlServerDatabaseFileIoDelta {
+                file_id: file.file_id,
+                logical_name: file.logical_name,
+                file_type: file.file_type,
+                read_count: 0,
+                read_bytes: 0,
+                read_stall_ms: 0,
+                write_count: 0,
+                write_bytes: 0,
+                write_stall_ms: 0,
+            });
+        merged_file.read_count = merged_file.read_count.saturating_add(file.read_count);
+        merged_file.read_bytes = merged_file.read_bytes.saturating_add(file.read_bytes);
+        merged_file.read_stall_ms = merged_file.read_stall_ms.saturating_add(file.read_stall_ms);
+        merged_file.write_count = merged_file.write_count.saturating_add(file.write_count);
+        merged_file.write_bytes = merged_file.write_bytes.saturating_add(file.write_bytes);
+        merged_file.write_stall_ms = merged_file
+            .write_stall_ms
+            .saturating_add(file.write_stall_ms);
+    }
+
+    *target = merged.into_values().collect();
+    target.sort_by(|left, right| {
+        left.file_type
+            .cmp(&right.file_type)
+            .then_with(|| left.logical_name.cmp(&right.logical_name))
+            .then_with(|| left.file_id.cmp(&right.file_id))
+    });
+}
+
+fn merge_sql_server_connection_deltas(
+    target: &mut Vec<SqlServerConnectionDelta>,
+    source: Vec<SqlServerConnectionDelta>,
+) {
+    let mut merged = target
+        .drain(..)
+        .map(|connection| {
+            (
+                (
+                    connection.net_transport.clone(),
+                    connection.protocol_type.clone(),
+                    connection.encrypt_option.clone(),
+                    connection.net_packet_size,
+                ),
+                connection,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    for connection in source {
+        let merged_connection = merged
+            .entry((
+                connection.net_transport.clone(),
+                connection.protocol_type.clone(),
+                connection.encrypt_option.clone(),
+                connection.net_packet_size,
+            ))
+            .or_insert(SqlServerConnectionDelta {
+                net_transport: connection.net_transport,
+                protocol_type: connection.protocol_type,
+                encrypt_option: connection.encrypt_option,
+                net_packet_size: connection.net_packet_size,
+                num_reads: 0,
+                num_writes: 0,
+                last_read: None,
+                last_write: None,
+            });
+        merged_connection.num_reads = merged_connection
+            .num_reads
+            .saturating_add(connection.num_reads);
+        merged_connection.num_writes = merged_connection
+            .num_writes
+            .saturating_add(connection.num_writes);
+        merged_connection.last_read = connection.last_read;
+        merged_connection.last_write = connection.last_write;
+    }
+
+    *target = merged.into_values().collect();
+}
+
+fn merge_sql_server_profile_phase_delta(
+    target: &mut Vec<SqlServerProfilePhaseDelta>,
+    phase: &str,
+    session_wait_deltas: Vec<SqlServerSessionWaitDelta>,
+    database_file_io_deltas: Vec<SqlServerDatabaseFileIoDelta>,
+    connection_deltas: Vec<SqlServerConnectionDelta>,
+) {
+    if let Some(phase_delta) = target.iter_mut().find(|delta| delta.phase == phase) {
+        merge_sql_server_session_wait_deltas(
+            &mut phase_delta.session_wait_deltas,
+            session_wait_deltas,
+        );
+        merge_sql_server_database_file_io_deltas(
+            &mut phase_delta.database_file_io_deltas,
+            database_file_io_deltas,
+        );
+        merge_sql_server_connection_deltas(&mut phase_delta.connection_deltas, connection_deltas);
+        return;
+    }
+
+    target.push(SqlServerProfilePhaseDelta {
+        phase: phase.to_owned(),
+        session_wait_deltas,
+        database_file_io_deltas,
+        connection_deltas,
+    });
+}
+
+struct SqlServerProfileSession {
+    target: SqlServerProfileTarget,
+    observer: BenchClient,
+    next_repeat_index: usize,
+}
+
+impl SqlServerProfileSession {
+    async fn start(
+        writer: &mut BenchClient,
+        connection: &sqlserver::SqlServerConnection,
+        options: SqlServerProfileOptions,
+    ) -> Result<Self, WriterBenchError> {
+        let writer_session_id = select_session_id(writer).await?;
+        let mut observer =
+            connect(&connection.connection_string, &connection.database, None).await?;
+        let observer_session_id = select_session_id(&mut observer).await?;
+        let recovery_model = sqlserver_profile::recovery_model(&mut observer).await?;
+        let initial_activity =
+            sqlserver_profile::current_activity_snapshot(&mut observer, writer_session_id).await?;
+
+        Ok(Self {
+            target: SqlServerProfileTarget {
+                writer_session_id,
+                observer_session_id,
+                recovery_model,
+                sample_interval: options.sample_interval,
+                initial_activity,
+                write_samples: Vec::new(),
+                session_wait_deltas: Vec::new(),
+                database_file_io_deltas: Vec::new(),
+                connection_deltas: Vec::new(),
+                phase_deltas: Vec::new(),
+                table_page_snapshots: Vec::new(),
+            },
+            observer,
+            next_repeat_index: 0,
+        })
+    }
+
+    fn target(&self) -> SqlServerProfileTarget {
+        self.target.clone()
+    }
+
+    async fn snapshot_table_pages(&mut self, table: &TableName) -> Result<(), WriterBenchError> {
+        self.target.table_page_snapshots.push(
+            sqlserver_profile::table_page_snapshot(&mut self.observer, &table.quoted_sql()).await?,
+        );
+        Ok(())
+    }
+
+    fn next_repeat_index(&mut self) -> usize {
+        let repeat_index = self.next_repeat_index;
+        self.next_repeat_index = self.next_repeat_index.saturating_add(1);
+        repeat_index
+    }
+
+    async fn sample_phase<T, F>(
+        &mut self,
+        repeat_index: usize,
+        phase: &str,
+        write: F,
+    ) -> Result<T, WriterBenchError>
+    where
+        F: Future<Output = Result<T, WriterBenchError>>,
+    {
+        let initial_session_waits = sqlserver_profile::session_wait_snapshots(
+            &mut self.observer,
+            self.target.writer_session_id,
+        )
+        .await?;
+        let initial_database_file_io =
+            sqlserver_profile::database_file_io_snapshots(&mut self.observer).await?;
+        let initial_connection = sqlserver_profile::connection_snapshot(
+            &mut self.observer,
+            self.target.writer_session_id,
+        )
+        .await?;
+        let started_at = Instant::now();
+
+        let write_result = {
+            let sample_activity = self.sample_write_activity(repeat_index, phase, started_at);
+            tokio::pin!(sample_activity);
+            tokio::pin!(write);
+
+            tokio::select! {
+                result = &mut write => result,
+                result = &mut sample_activity => {
+                    result?;
+                    Err(WriterBenchError::Validation(
+                        "SQL Server write sampler stopped before the measured write finished"
+                            .to_owned(),
+                    ))
+                }
+            }
+        };
+
+        let final_session_waits = sqlserver_profile::session_wait_snapshots(
+            &mut self.observer,
+            self.target.writer_session_id,
+        )
+        .await?;
+        merge_sql_server_session_wait_deltas(
+            &mut self.target.session_wait_deltas,
+            sql_server_session_wait_deltas(&initial_session_waits, &final_session_waits),
+        );
+        let final_database_file_io =
+            sqlserver_profile::database_file_io_snapshots(&mut self.observer).await?;
+        merge_sql_server_database_file_io_deltas(
+            &mut self.target.database_file_io_deltas,
+            sql_server_database_file_io_deltas(&initial_database_file_io, &final_database_file_io),
+        );
+        let final_connection = sqlserver_profile::connection_snapshot(
+            &mut self.observer,
+            self.target.writer_session_id,
+        )
+        .await?;
+        let connection_delta = sql_server_connection_delta(&initial_connection, &final_connection);
+        merge_sql_server_connection_deltas(
+            &mut self.target.connection_deltas,
+            vec![connection_delta.clone()],
+        );
+        merge_sql_server_profile_phase_delta(
+            &mut self.target.phase_deltas,
+            phase,
+            sql_server_session_wait_deltas(&initial_session_waits, &final_session_waits),
+            sql_server_database_file_io_deltas(&initial_database_file_io, &final_database_file_io),
+            vec![connection_delta],
+        );
+
+        write_result
+    }
+
+    async fn sample_write_activity(
+        &mut self,
+        repeat_index: usize,
+        phase: &str,
+        started_at: Instant,
+    ) -> Result<(), WriterBenchError> {
+        let mut sample_interval = tokio::time::interval(self.target.sample_interval);
+        sample_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        sample_interval.tick().await;
+
+        loop {
+            sample_interval.tick().await;
+            let write_elapsed_start = started_at.elapsed();
+            let activity = sqlserver_profile::current_activity_snapshot(
+                &mut self.observer,
+                self.target.writer_session_id,
+            )
+            .await?;
+            self.target.write_samples.push(SqlServerProfileSample {
+                phase: phase.to_owned(),
+                repeat_index,
+                write_elapsed_start,
+                write_elapsed_end: started_at.elapsed(),
+                activity,
+            });
+        }
+    }
+}
+
 async fn run_baseline_async(
     options: &BaselineBenchOptions,
     connection: &sqlserver::SqlServerConnection,
@@ -1900,9 +2970,13 @@ async fn run_baseline_async(
         &options.benchmark,
         connection,
         &ipc_dataset.host_path,
-        WriteBackend::BaselineTokenRow,
-        false,
-        options.tds_packet_size,
+        TiberiusBenchmarkConfig {
+            backend: WriteBackend::BaselineTokenRow,
+            profile_direct: false,
+            tds_packet_size: options.tds_packet_size,
+            sql_server_profile: None,
+            bulk_table_lock: false,
+        },
     )
     .await;
     let dataset_cleanup_result = ipc_dataset.cleanup();
@@ -1916,13 +2990,39 @@ async fn run_baseline_async(
 fn run_compare_benchmark(
     options: &CompareBenchOptions,
 ) -> Result<CompareBenchReport, WriterBenchError> {
-    if options.profile_direct && !options.backends.contains(&BenchmarkBackend::DirectRaw) {
+    if options.profile_direct && !options.backends.iter().any(BenchmarkBackend::is_direct) {
         return Err(WriterBenchError::Validation(
-            "writer-bench compare --profile-direct requires the direct-raw backend".to_owned(),
+            "writer-bench compare --profile-direct requires direct-framed or direct-raw".to_owned(),
         ));
     }
 
-    if options.backends.contains(&BenchmarkBackend::DirectRaw) {
+    if options.arrow_odbc_autocommit && !options.backends.contains(&BenchmarkBackend::ArrowOdbc) {
+        return Err(WriterBenchError::Validation(
+            "writer-bench compare --arrow-odbc-autocommit requires the arrow-odbc backend"
+                .to_owned(),
+        ));
+    }
+
+    if options.odbc_bcp_defer_batches && !options.backends.contains(&BenchmarkBackend::OdbcBcp) {
+        return Err(WriterBenchError::Validation(
+            "writer-bench compare --odbc-bcp-defer-batches requires the odbc-bcp backend"
+                .to_owned(),
+        ));
+    }
+
+    if options.sql_server_profile.is_some()
+        && !options
+            .backends
+            .iter()
+            .any(BenchmarkBackend::supports_sql_server_profile)
+    {
+        return Err(WriterBenchError::Validation(
+            "writer-bench compare --profile-sqlserver requires the baseline, direct-framed, direct-raw, arrow-odbc, or odbc-bcp backend"
+                .to_owned(),
+        ));
+    }
+
+    if options.backends.iter().any(BenchmarkBackend::is_direct) {
         ensure_direct_raw_supported_scenario(&options.benchmark)?;
     }
 
@@ -1940,9 +3040,39 @@ fn run_compare_benchmark(
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
+        .enable_time()
         .build()
         .map_err(WriterBenchError::Io)?;
     let ipc_dataset = prepare_compare_ipc_dataset(options)?;
+    let original_recovery_model = if let Some(recovery_model) = options.sql_server_recovery_model {
+        match runtime.block_on(current_sql_server_recovery_model(&connection)) {
+            Ok(original_recovery_model) => {
+                if let Err(error) =
+                    runtime.block_on(set_sql_server_recovery_model(&connection, recovery_model))
+                {
+                    let dataset_cleanup_result = ipc_dataset.cleanup();
+                    return match dataset_cleanup_result {
+                        Ok(()) => Err(error),
+                        Err(cleanup_error) => Err(WriterBenchError::Validation(format!(
+                            "SQL Server recovery model setup failed and IPC dataset cleanup also failed; setup error: {error}; cleanup error: {cleanup_error}"
+                        ))),
+                    };
+                }
+                Some(original_recovery_model)
+            }
+            Err(error) => {
+                let dataset_cleanup_result = ipc_dataset.cleanup();
+                return match dataset_cleanup_result {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(WriterBenchError::Validation(format!(
+                        "SQL Server recovery model snapshot failed and IPC dataset cleanup also failed; snapshot error: {error}; cleanup error: {cleanup_error}"
+                    ))),
+                };
+            }
+        }
+    } else {
+        None
+    };
     let run_result = (|| {
         let mut backends = Vec::new();
 
@@ -1953,15 +3083,41 @@ fn run_compare_benchmark(
                     &options.benchmark,
                     &connection,
                     &ipc_dataset.host_path,
-                    WriteBackend::BaselineTokenRow,
-                    false,
-                    options.tds_packet_size,
+                    TiberiusBenchmarkConfig {
+                        backend: WriteBackend::BaselineTokenRow,
+                        profile_direct: false,
+                        tds_packet_size: options.tds_packet_size,
+                        sql_server_profile: options.sql_server_profile,
+                        bulk_table_lock: options.sql_server_bulk_table_lock,
+                    },
                 )
                 .await?;
                 report.timings.total = backend_start.elapsed();
                 Ok::<_, WriterBenchError>(report)
             })?;
             backends.push(CompareBackendBenchReport::Baseline { report });
+        }
+
+        if options.backends.contains(&BenchmarkBackend::DirectFramed) {
+            let report = runtime.block_on(async {
+                let backend_start = Instant::now();
+                let mut report = run_tiberius_benchmark_from_ipc(
+                    &options.benchmark,
+                    &connection,
+                    &ipc_dataset.host_path,
+                    TiberiusBenchmarkConfig {
+                        backend: WriteBackend::DirectFramedBulk,
+                        profile_direct: options.profile_direct,
+                        tds_packet_size: options.tds_packet_size,
+                        sql_server_profile: options.sql_server_profile,
+                        bulk_table_lock: options.sql_server_bulk_table_lock,
+                    },
+                )
+                .await?;
+                report.timings.total = backend_start.elapsed();
+                Ok::<_, WriterBenchError>(report)
+            })?;
+            backends.push(CompareBackendBenchReport::DirectFramed { report });
         }
 
         if options.backends.contains(&BenchmarkBackend::DirectRaw) {
@@ -1971,9 +3127,13 @@ fn run_compare_benchmark(
                     &options.benchmark,
                     &connection,
                     &ipc_dataset.host_path,
-                    WriteBackend::DirectRawBulk,
-                    options.profile_direct,
-                    options.tds_packet_size,
+                    TiberiusBenchmarkConfig {
+                        backend: WriteBackend::DirectRawBulk,
+                        profile_direct: options.profile_direct,
+                        tds_packet_size: options.tds_packet_size,
+                        sql_server_profile: options.sql_server_profile,
+                        bulk_table_lock: options.sql_server_bulk_table_lock,
+                    },
                 )
                 .await?;
                 report.timings.total = backend_start.elapsed();
@@ -1994,6 +3154,11 @@ fn run_compare_benchmark(
                 network.as_ref(),
                 &connection,
                 &ipc_dataset,
+                ArrowOdbcRunnerBenchOptions {
+                    profile_sql_server: options.sql_server_profile.is_some(),
+                    autocommit: options.arrow_odbc_autocommit,
+                    bulk_table_lock: options.sql_server_bulk_table_lock,
+                },
             )?;
             backends.push(CompareBackendBenchReport::ArrowOdbc { report });
         }
@@ -2010,6 +3175,11 @@ fn run_compare_benchmark(
                 network.as_ref(),
                 &connection,
                 &ipc_dataset,
+                OdbcBcpRunnerBenchOptions {
+                    profile_sql_server: options.sql_server_profile.is_some(),
+                    defer_batches: options.odbc_bcp_defer_batches,
+                    bulk_table_lock: options.sql_server_bulk_table_lock,
+                },
             )?;
             backends.push(CompareBackendBenchReport::OdbcBcp { report });
         }
@@ -2020,13 +3190,27 @@ fn run_compare_benchmark(
             backends,
         })
     })();
+    let recovery_restore_result = if let Some(recovery_model) = original_recovery_model {
+        runtime.block_on(set_sql_server_recovery_model(&connection, recovery_model))
+    } else {
+        Ok(())
+    };
     let dataset_cleanup_result = ipc_dataset.cleanup();
     let runner_cleanup_result = if let Some(runner_image) = runner_image.as_mut() {
         runner_image.cleanup().map_err(WriterBenchError::OdbcRunner)
     } else {
         Ok(())
     };
-    let report = run_result?;
+    let report = match (run_result, recovery_restore_result) {
+        (Ok(report), Ok(())) => report,
+        (Ok(_), Err(restore_error)) => return Err(restore_error),
+        (Err(run_error), Ok(())) => return Err(run_error),
+        (Err(run_error), Err(restore_error)) => {
+            return Err(WriterBenchError::Validation(format!(
+                "writer-bench compare failed and SQL Server recovery model restore also failed; benchmark error: {run_error}; restore error: {restore_error}"
+            )));
+        }
+    };
     dataset_cleanup_result?;
     runner_cleanup_result?;
 
@@ -2037,9 +3221,7 @@ async fn run_tiberius_benchmark_from_ipc(
     benchmark: &WriterBenchOptions,
     connection: &sqlserver::SqlServerConnection,
     ipc_path: &Path,
-    backend: WriteBackend,
-    profile_direct: bool,
-    tds_packet_size: Option<u32>,
+    config: TiberiusBenchmarkConfig,
 ) -> Result<TiberiusBenchReport, WriterBenchError> {
     let mut report = TiberiusBenchReport::default();
 
@@ -2047,9 +3229,14 @@ async fn run_tiberius_benchmark_from_ipc(
     let mut client = connect(
         &connection.connection_string,
         &connection.database,
-        tds_packet_size,
+        config.tds_packet_size,
     )
     .await?;
+    let mut sql_server_profile_session = if let Some(options) = config.sql_server_profile {
+        Some(SqlServerProfileSession::start(&mut client, connection, options).await?)
+    } else {
+        None
+    };
     let schema = (benchmark.scenario.schema)();
     let mappings = benchmark_mappings_for_schema(Arc::clone(&schema))?;
     report.timings.setup += setup_start.elapsed();
@@ -2060,11 +3247,16 @@ async fn run_tiberius_benchmark_from_ipc(
             let repeat_report =
                 run_tiberius_repeat_from_ipc(
                     &mut client,
+                    TiberiusRepeatConfig {
+                        scenario: benchmark.scenario,
+                        backend: config.backend,
+                        profile_direct: config.profile_direct,
+                        bulk_table_lock: config.bulk_table_lock,
+                    },
                     &mappings,
                     &table,
                     ipc_path,
-                    backend,
-                    profile_direct,
+                    sql_server_profile_session.as_mut(),
                 )
                 .await;
             let cleanup_start = Instant::now();
@@ -2107,6 +3299,9 @@ async fn run_tiberius_benchmark_from_ipc(
     }
 
     report.peak_rss_kib = current_process_peak_rss_kib();
+    report.sql_server_profile_target = sql_server_profile_session
+        .as_ref()
+        .map(SqlServerProfileSession::target);
 
     Ok(report)
 }
@@ -2141,26 +3336,33 @@ fn prepare_baseline_ipc_dataset(
 
 async fn run_tiberius_repeat_from_ipc(
     client: &mut BenchClient,
+    config: TiberiusRepeatConfig,
     mappings: &[arrow_tiberius::SchemaMapping],
     table: &TableName,
     ipc_path: &Path,
-    backend: WriteBackend,
-    profile_direct: bool,
+    sql_server_profile_session: Option<&mut SqlServerProfileSession>,
 ) -> Result<TiberiusBenchReport, WriterBenchError> {
     let batches =
         dataset::ipc_dataset_reader(ipc_path)?.map(|batch| batch.map_err(WriterBenchError::Arrow));
 
-    run_tiberius_repeat_with_batches(client, mappings, table, batches, backend, profile_direct)
-        .await
+    run_tiberius_repeat_with_batches(
+        client,
+        config,
+        mappings,
+        table,
+        batches,
+        sql_server_profile_session,
+    )
+    .await
 }
 
 async fn run_tiberius_repeat_with_batches(
     client: &mut BenchClient,
+    config: TiberiusRepeatConfig,
     mappings: &[arrow_tiberius::SchemaMapping],
     table: &TableName,
     batches: impl IntoIterator<Item = Result<RecordBatch, WriterBenchError>>,
-    backend: WriteBackend,
-    profile_direct: bool,
+    mut sql_server_profile_session: Option<&mut SqlServerProfileSession>,
 ) -> Result<TiberiusBenchReport, WriterBenchError> {
     let mut report = TiberiusBenchReport::default();
     let setup_start = Instant::now();
@@ -2171,12 +3373,15 @@ async fn run_tiberius_repeat_with_batches(
     )
     .await?;
     execute_sql(client, benchmark_table_sql(table, mappings)).await?;
+    if config.bulk_table_lock {
+        execute_sql(client, benchmark_bulk_table_lock_sql(table)).await?;
+    }
     let mut writer = BulkWriter::new(
         client,
         table.clone(),
         mappings.to_vec(),
         WriteOptions {
-            backend,
+            backend: config.backend,
             ..WriteOptions::default()
         },
     )
@@ -2184,27 +3389,58 @@ async fn run_tiberius_repeat_with_batches(
     .map_err(WriterBenchError::ArrowTiberius)?;
     report.timings.setup += setup_start.elapsed();
 
-    let profiling_direct = profile_direct && backend == WriteBackend::DirectRawBulk;
+    let profiling_direct = config.profile_direct
+        && matches!(
+            config.backend,
+            WriteBackend::DirectFramedBulk | WriteBackend::DirectRawBulk
+        );
     if profiling_direct {
         arrow_tiberius::write::profile::start_direct_write_profile();
     }
 
-    let write_start = Instant::now();
-    for batch in batches {
-        let batch = batch?;
+    let write_batches = async {
+        let write_start = Instant::now();
+        for batch in batches {
+            let batch = batch?;
+            report.stats = writer
+                .write_batch(&batch)
+                .await
+                .map_err(WriterBenchError::ArrowTiberius)?;
+        }
+        report.timings.write += write_start.elapsed();
+        Ok(())
+    };
+    let repeat_index = sql_server_profile_session
+        .as_mut()
+        .map(|profile_session| profile_session.next_repeat_index());
+    if let (Some(profile_session), Some(repeat_index)) =
+        (sql_server_profile_session.as_mut(), repeat_index)
+    {
+        profile_session
+            .sample_phase(repeat_index, "write_batch", write_batches)
+            .await?;
+    } else {
+        write_batches.await?;
+    }
+
+    let finish_writer = async {
+        let finish_start = Instant::now();
         report.stats = writer
-            .write_batch(&batch)
+            .finish()
             .await
             .map_err(WriterBenchError::ArrowTiberius)?;
+        report.timings.finish += finish_start.elapsed();
+        Ok(())
+    };
+    if let (Some(profile_session), Some(repeat_index)) =
+        (sql_server_profile_session.as_mut(), repeat_index)
+    {
+        profile_session
+            .sample_phase(repeat_index, "finish", finish_writer)
+            .await?;
+    } else {
+        finish_writer.await?;
     }
-    report.timings.write += write_start.elapsed();
-
-    let finish_start = Instant::now();
-    report.stats = writer
-        .finish()
-        .await
-        .map_err(WriterBenchError::ArrowTiberius)?;
-    report.timings.finish += finish_start.elapsed();
 
     let validate_start = Instant::now();
     report.validated_rows = select_count(client, table).await?;
@@ -2215,6 +3451,11 @@ async fn run_tiberius_repeat_with_batches(
             expected: report.stats.rows_written,
             actual: report.validated_rows,
         });
+    }
+    validate_scenario_contents(client, table, config.scenario, report.validated_rows).await?;
+
+    if let Some(profile_session) = sql_server_profile_session.as_mut() {
+        profile_session.snapshot_table_pages(table).await?;
     }
 
     if profiling_direct {
@@ -2466,6 +3707,46 @@ async fn execute_sql(client: &mut BenchClient, sql: String) -> Result<(), Writer
     Ok(())
 }
 
+async fn set_sql_server_recovery_model(
+    connection: &sqlserver::SqlServerConnection,
+    recovery_model: SqlServerRecoveryModel,
+) -> Result<(), WriterBenchError> {
+    let mut client = connect(&connection.connection_string, &connection.database, None).await?;
+    execute_sql(
+        &mut client,
+        format!(
+            "ALTER DATABASE [{}] SET RECOVERY {recovery_model}",
+            connection.database.replace(']', "]]")
+        ),
+    )
+    .await
+}
+
+async fn current_sql_server_recovery_model(
+    connection: &sqlserver::SqlServerConnection,
+) -> Result<SqlServerRecoveryModel, WriterBenchError> {
+    let mut client = connect(&connection.connection_string, &connection.database, None).await?;
+    let recovery_model = sqlserver_profile::recovery_model(&mut client).await?;
+    SqlServerRecoveryModel::from_sql_server_desc(&recovery_model)
+}
+
+async fn select_session_id(client: &mut BenchClient) -> Result<i32, WriterBenchError> {
+    let row = client
+        .simple_query("SELECT CONVERT(int, @@SPID)")
+        .await
+        .map_err(WriterBenchError::Tiberius)?
+        .into_row()
+        .await
+        .map_err(WriterBenchError::Tiberius)?
+        .ok_or_else(|| {
+            WriterBenchError::Validation("session id query returned no row".to_owned())
+        })?;
+
+    row.try_get::<i32, _>(0)
+        .map_err(WriterBenchError::Tiberius)?
+        .ok_or_else(|| WriterBenchError::Validation("session id query returned null".to_owned()))
+}
+
 async fn drop_table(client: &mut BenchClient, table: &TableName) -> tiberius::Result<()> {
     client
         .simple_query(format!("DROP TABLE IF EXISTS {}", table.quoted_sql()))
@@ -2480,24 +3761,75 @@ async fn select_count(
     client: &mut BenchClient,
     table: &TableName,
 ) -> Result<u64, WriterBenchError> {
+    select_count_query(
+        client,
+        format!("SELECT COUNT_BIG(*) FROM {}", table.quoted_sql()),
+        "SELECT COUNT_BIG(*)",
+    )
+    .await
+}
+
+async fn validate_scenario_contents(
+    client: &mut BenchClient,
+    table: &TableName,
+    scenario: &BenchmarkScenarioDefinition,
+    expected_rows: u64,
+) -> Result<(), WriterBenchError> {
+    if scenario.name == STRING_HEAVY_UNICODE_SCENARIO.name {
+        validate_string_heavy_unicode_contents(client, table, expected_rows).await?;
+    }
+
+    Ok(())
+}
+
+async fn validate_string_heavy_unicode_contents(
+    client: &mut BenchClient,
+    table: &TableName,
+    expected_rows: u64,
+) -> Result<(), WriterBenchError> {
+    let actual = select_count_query(
+        client,
+        string_heavy_unicode_tenant_sentinel_count_sql(&table.quoted_sql()),
+        "string_heavy_unicode tenant sentinel count",
+    )
+    .await?;
+
+    if actual != expected_rows {
+        return Err(WriterBenchError::Validation(format!(
+            "string_heavy_unicode tenant sentinel validation failed: expected {expected_rows}, got {actual}"
+        )));
+    }
+
+    Ok(())
+}
+
+fn string_heavy_unicode_tenant_sentinel_count_sql(table: &str) -> String {
+    format!(
+        "SELECT COUNT_BIG(*) FROM {table} \
+         WHERE UNICODE(SUBSTRING([tenant], 1, 1)) = {STRING_HEAVY_UNICODE_TENANT_FIRST_CODEPOINT} \
+         AND UNICODE(SUBSTRING([tenant], 2, 1)) = {STRING_HEAVY_UNICODE_TENANT_SECOND_CODEPOINT}"
+    )
+}
+
+async fn select_count_query(
+    client: &mut BenchClient,
+    sql: String,
+    label: &'static str,
+) -> Result<u64, WriterBenchError> {
     let row = client
-        .simple_query(format!("SELECT COUNT_BIG(*) FROM {}", table.quoted_sql()))
+        .simple_query(sql)
         .await
         .map_err(WriterBenchError::Tiberius)?
         .into_row()
         .await
         .map_err(WriterBenchError::Tiberius)?
-        .ok_or_else(|| {
-            WriterBenchError::Validation("SELECT COUNT_BIG(*) returned no row".to_owned())
-        })?;
-    let count = row.get::<i64, _>(0).ok_or_else(|| {
-        WriterBenchError::Validation("SELECT COUNT_BIG(*) did not return bigint".to_owned())
-    })?;
+        .ok_or_else(|| WriterBenchError::Validation(format!("{label} returned no row")))?;
+    let count = row
+        .get::<i64, _>(0)
+        .ok_or_else(|| WriterBenchError::Validation(format!("{label} did not return bigint")))?;
 
     u64::try_from(count).map_err(|_| {
-        WriterBenchError::Validation(format!(
-            "SELECT COUNT_BIG(*) returned negative count {count}"
-        ))
+        WriterBenchError::Validation(format!("{label} returned negative count {count}"))
     })
 }
 
@@ -2510,6 +3842,17 @@ fn unique_benchmark_table_name() -> Result<TableName, WriterBenchError> {
 
 fn benchmark_table_sql(table: &TableName, mappings: &[SchemaMapping]) -> String {
     create_table_sql_from_mappings(table, mappings)
+}
+
+fn benchmark_bulk_table_lock_sql(table: &TableName) -> String {
+    format!(
+        "EXEC sys.sp_tableoption N'{}', 'table lock on bulk load', 'ON';",
+        escape_sql_string_literal(&table.quoted_sql())
+    )
+}
+
+fn escape_sql_string_literal(value: &str) -> String {
+    value.replace('\'', "''")
 }
 
 fn benchmark_mappings_for_schema(
@@ -2834,19 +4177,125 @@ fn string_heavy_schema() -> SchemaRef {
 }
 
 fn string_heavy_columns(offset: usize, len: usize) -> Result<Vec<ArrayRef>, WriterBenchError> {
-    let document_types = ["invoice", "event", "profile", "message", "audit"];
+    string_heavy_columns_with_shape(offset, len, StringHeavyText::Ascii, StringHeavyShape::Full)
+}
+
+fn string_heavy_text_only_columns(
+    offset: usize,
+    len: usize,
+) -> Result<Vec<ArrayRef>, WriterBenchError> {
+    string_heavy_columns_with_shape(
+        offset,
+        len,
+        StringHeavyText::Ascii,
+        StringHeavyShape::TextOnly,
+    )
+}
+
+fn string_heavy_binary_only_columns(
+    offset: usize,
+    len: usize,
+) -> Result<Vec<ArrayRef>, WriterBenchError> {
+    string_heavy_columns_with_shape(
+        offset,
+        len,
+        StringHeavyText::Ascii,
+        StringHeavyShape::BinaryOnly,
+    )
+}
+
+fn string_heavy_inline_4k_columns(
+    offset: usize,
+    len: usize,
+) -> Result<Vec<ArrayRef>, WriterBenchError> {
+    string_heavy_columns_with_shape(
+        offset,
+        len,
+        StringHeavyText::Ascii,
+        StringHeavyShape::Fixed {
+            body_chars: 1_024,
+            payload_bytes: 2_048,
+        },
+    )
+}
+
+fn string_heavy_edge_7k_columns(
+    offset: usize,
+    len: usize,
+) -> Result<Vec<ArrayRef>, WriterBenchError> {
+    string_heavy_columns_with_shape(
+        offset,
+        len,
+        StringHeavyText::Ascii,
+        StringHeavyShape::Fixed {
+            body_chars: 1_536,
+            payload_bytes: 4_096,
+        },
+    )
+}
+
+fn string_heavy_lob_9k_columns(
+    offset: usize,
+    len: usize,
+) -> Result<Vec<ArrayRef>, WriterBenchError> {
+    string_heavy_columns_with_shape(
+        offset,
+        len,
+        StringHeavyText::Ascii,
+        StringHeavyShape::Fixed {
+            body_chars: 2_048,
+            payload_bytes: 5_120,
+        },
+    )
+}
+
+fn string_heavy_unicode_columns(
+    offset: usize,
+    len: usize,
+) -> Result<Vec<ArrayRef>, WriterBenchError> {
+    string_heavy_columns_with_shape(
+        offset,
+        len,
+        StringHeavyText::Unicode,
+        StringHeavyShape::Full,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum StringHeavyText {
+    Ascii,
+    Unicode,
+}
+
+#[derive(Clone, Copy)]
+enum StringHeavyShape {
+    Full,
+    TextOnly,
+    BinaryOnly,
+    Fixed {
+        body_chars: usize,
+        payload_bytes: usize,
+    },
+}
+
+fn string_heavy_columns_with_shape(
+    offset: usize,
+    len: usize,
+    text: StringHeavyText,
+    shape: StringHeavyShape,
+) -> Result<Vec<ArrayRef>, WriterBenchError> {
     let id = (offset..offset + len)
         .map(|row| 900_000_000_i64 + row as i64)
         .collect::<Int64Array>();
     let tenant = (offset..offset + len)
-        .map(|row| Some(format!("tenant-{:04}", row % 512)))
+        .map(|row| Some(text.tenant(row)))
         .collect::<StringArray>();
     let document_type = (offset..offset + len)
         .map(|row| {
             if row % 37 == 0 {
                 None
             } else {
-                Some(document_types[row % document_types.len()].to_owned())
+                Some(text.document_type(row))
             }
         })
         .collect::<StringArray>();
@@ -2855,7 +4304,7 @@ fn string_heavy_columns(offset: usize, len: usize) -> Result<Vec<ArrayRef>, Writ
             if row % 41 == 0 {
                 None
             } else {
-                Some(format!("document title {row:012}"))
+                Some(text.title(row))
             }
         })
         .collect::<StringArray>();
@@ -2864,7 +4313,7 @@ fn string_heavy_columns(offset: usize, len: usize) -> Result<Vec<ArrayRef>, Writ
             if row % 43 == 0 {
                 None
             } else {
-                Some(deterministic_text(row, 512 + row % 2_048))
+                Some(text.body(row, shape.body_len(row)))
             }
         })
         .collect::<StringArray>();
@@ -2873,11 +4322,7 @@ fn string_heavy_columns(offset: usize, len: usize) -> Result<Vec<ArrayRef>, Writ
             if row % 47 == 0 {
                 None
             } else {
-                Some(format!(
-                    "{{\"tenant\":{},\"source\":{},\"sequence\":{row}}}",
-                    row % 512,
-                    row % 17
-                ))
+                Some(text.metadata(row))
             }
         })
         .collect::<StringArray>();
@@ -2886,7 +4331,7 @@ fn string_heavy_columns(offset: usize, len: usize) -> Result<Vec<ArrayRef>, Writ
             if row % 53 == 0 {
                 None
             } else {
-                Some(deterministic_payload_with_len(row, 1_024 + row % 4_096))
+                Some(deterministic_payload_with_len(row, shape.payload_len(row)))
             }
         })
         .collect::<BinaryArray>();
@@ -2900,6 +4345,79 @@ fn string_heavy_columns(offset: usize, len: usize) -> Result<Vec<ArrayRef>, Writ
         Arc::new(metadata),
         Arc::new(payload),
     ])
+}
+
+impl StringHeavyShape {
+    fn body_len(self, row: usize) -> usize {
+        match self {
+            Self::Full | Self::TextOnly => 512 + row % 2_048,
+            Self::BinaryOnly => 24 + row % 96,
+            Self::Fixed { body_chars, .. } => body_chars,
+        }
+    }
+
+    fn payload_len(self, row: usize) -> usize {
+        match self {
+            Self::Full | Self::BinaryOnly => 1_024 + row % 4_096,
+            Self::TextOnly => 8 + row % 32,
+            Self::Fixed { payload_bytes, .. } => payload_bytes,
+        }
+    }
+}
+
+impl StringHeavyText {
+    fn tenant(self, row: usize) -> String {
+        match self {
+            Self::Ascii => format!("tenant-{:04}", row % 512),
+            Self::Unicode => format!("\u{79df}\u{6237}-{:04}", row % 512),
+        }
+    }
+
+    fn document_type(self, row: usize) -> String {
+        const ASCII_TYPES: &[&str] = &["invoice", "event", "profile", "message", "audit"];
+        const UNICODE_TYPES: &[&str] = &[
+            "\u{53d1}\u{7968}",
+            "\u{4e8b}\u{4ef6}",
+            "\u{6863}\u{6848}",
+            "\u{6d88}\u{606f}",
+            "\u{5ba1}\u{8ba1}",
+        ];
+
+        let values = match self {
+            Self::Ascii => ASCII_TYPES,
+            Self::Unicode => UNICODE_TYPES,
+        };
+        values[row % values.len()].to_owned()
+    }
+
+    fn title(self, row: usize) -> String {
+        match self {
+            Self::Ascii => format!("document title {row:012}"),
+            Self::Unicode => format!("\u{6587}\u{6863} title {row:012}"),
+        }
+    }
+
+    fn body(self, row: usize, len: usize) -> String {
+        match self {
+            Self::Ascii => deterministic_text(row, len),
+            Self::Unicode => deterministic_unicode_text(row, len),
+        }
+    }
+
+    fn metadata(self, row: usize) -> String {
+        match self {
+            Self::Ascii => format!(
+                "{{\"tenant\":{},\"source\":{},\"sequence\":{row}}}",
+                row % 512,
+                row % 17
+            ),
+            Self::Unicode => format!(
+                "{{\"tenant\":\"\u{79df}\u{6237}-{:04}\",\"source\":\"\u{6765}\u{6e90}-{}\",\"sequence\":{row}}}",
+                row % 512,
+                row % 17
+            ),
+        }
+    }
 }
 
 fn wide_sparse_schema() -> SchemaRef {
@@ -3140,6 +4658,20 @@ fn deterministic_text(row: usize, len: usize) -> String {
     value
 }
 
+fn deterministic_unicode_text(row: usize, len: usize) -> String {
+    const ALPHABET: &[char] = &[
+        '\u{6570}', '\u{636e}', '\u{5199}', '\u{5165}', '\u{6d4b}', '\u{8bd5}', '\u{00e9}',
+        '\u{00f1}', '\u{03bb}', '\u{03a9}', '0', '1', '2', '3', ' ',
+    ];
+    let mut value = String::with_capacity(len);
+
+    for index in 0..len {
+        value.push(ALPHABET[(row.wrapping_mul(31) + index.wrapping_mul(7)) % ALPHABET.len()]);
+    }
+
+    value
+}
+
 fn deterministic_payload_with_len(row: usize, len: usize) -> Vec<u8> {
     (0..len)
         .map(|index| ((row.wrapping_mul(131) + index.wrapping_mul(29)) % 251) as u8)
@@ -3177,6 +4709,24 @@ fn parse_positive_usize(option: &'static str, value: &str) -> Result<usize, Writ
 fn parse_positive_u32(option: &'static str, value: &str) -> Result<u32, WriterBenchError> {
     let parsed = value
         .parse::<u32>()
+        .map_err(|_| WriterBenchError::InvalidPositiveInteger {
+            option,
+            value: value.to_owned(),
+        })?;
+
+    if parsed == 0 {
+        return Err(WriterBenchError::InvalidPositiveInteger {
+            option,
+            value: value.to_owned(),
+        });
+    }
+
+    Ok(parsed)
+}
+
+fn parse_positive_u64(option: &'static str, value: &str) -> Result<u64, WriterBenchError> {
+    let parsed = value
+        .parse::<u64>()
         .map_err(|_| WriterBenchError::InvalidPositiveInteger {
             option,
             value: value.to_owned(),
@@ -3274,7 +4824,10 @@ fn scenario_names() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{BenchmarkOutput, DirectWriteProfile, WriterBenchError, WriterBenchOptions};
+    use super::{
+        BenchmarkOutput, DirectWriteProfile, SqlServerProfileSample, SqlServerProfileSampleSummary,
+        WriterBenchError, WriterBenchOptions, sqlserver_profile,
+    };
     use arrow_array::{
         Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int32Array,
         Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
@@ -3286,6 +4839,94 @@ mod tests {
 
     static TEST_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    fn sql_server_profile_sample(
+        status_and_wait: Option<(&str, Option<&str>)>,
+        waiting_task_waits: &[&str],
+    ) -> SqlServerProfileSample {
+        sql_server_profile_sample_with_phase(
+            "write_batch",
+            10,
+            11,
+            status_and_wait,
+            waiting_task_waits,
+        )
+    }
+
+    fn sql_server_profile_sample_with_phase(
+        phase: &str,
+        write_elapsed_start_ms: u64,
+        write_elapsed_end_ms: u64,
+        status_and_wait: Option<(&str, Option<&str>)>,
+        waiting_task_waits: &[&str],
+    ) -> SqlServerProfileSample {
+        SqlServerProfileSample {
+            phase: phase.to_owned(),
+            repeat_index: 0,
+            write_elapsed_start: Duration::from_millis(write_elapsed_start_ms),
+            write_elapsed_end: Duration::from_millis(write_elapsed_end_ms),
+            activity: sqlserver_profile::ActivitySnapshot {
+                connection: sqlserver_profile::ConnectionSnapshot {
+                    net_transport: "TCP".to_owned(),
+                    protocol_type: "TSQL".to_owned(),
+                    encrypt_option: "FALSE".to_owned(),
+                    net_packet_size: 4096,
+                    num_reads: 3,
+                    num_writes: 5,
+                    last_read: Some("2026-05-21T12:00:00".to_owned()),
+                    last_write: Some("2026-05-21T12:00:01".to_owned()),
+                },
+                request: status_and_wait.map(|(status, wait_type)| {
+                    sqlserver_profile::RequestSnapshot {
+                        status: status.to_owned(),
+                        command: "INSERT BULK".to_owned(),
+                        wait_type: wait_type.map(ToOwned::to_owned),
+                        wait_time_ms: 0,
+                        last_wait_type: "SOS_SCHEDULER_YIELD".to_owned(),
+                        wait_resource: String::new(),
+                        blocking_session_id: 0,
+                        cpu_time_ms: 7,
+                        total_elapsed_time_ms: 9,
+                        reads: 11,
+                        writes: 13,
+                        logical_reads: 17,
+                        open_transaction_count: 1,
+                    }
+                }),
+                waiting_tasks: waiting_task_waits
+                    .iter()
+                    .enumerate()
+                    .map(
+                        |(exec_context_id, wait_type)| sqlserver_profile::WaitingTaskSnapshot {
+                            exec_context_id: exec_context_id as i32,
+                            wait_type: (*wait_type).to_owned(),
+                            wait_duration_ms: 19,
+                            blocking_session_id: None,
+                            resource_description: None,
+                        },
+                    )
+                    .collect(),
+            },
+        }
+    }
+
+    fn connection_snapshot(
+        num_reads: i64,
+        num_writes: i64,
+        last_read: Option<&str>,
+        last_write: Option<&str>,
+    ) -> sqlserver_profile::ConnectionSnapshot {
+        sqlserver_profile::ConnectionSnapshot {
+            net_transport: "TCP".to_owned(),
+            protocol_type: "TSQL".to_owned(),
+            encrypt_option: "FALSE".to_owned(),
+            net_packet_size: 4096,
+            num_reads,
+            num_writes,
+            last_read: last_read.map(ToOwned::to_owned),
+            last_write: last_write.map(ToOwned::to_owned),
+        }
+    }
+
     #[test]
     fn parses_writer_bench_defaults() {
         let options = WriterBenchOptions::parse(&[]).unwrap();
@@ -3295,6 +4936,194 @@ mod tests {
         assert_eq!(options.scenario.name, "narrow_numeric");
         assert_eq!(options.repeat, 1);
         assert_eq!(options.output, BenchmarkOutput::Human);
+    }
+
+    #[test]
+    fn sql_server_profile_summary_counts_request_and_task_wait_samples() {
+        let samples = [
+            sql_server_profile_sample(
+                Some(("running", Some("ASYNC_NETWORK_IO"))),
+                &["ASYNC_NETWORK_IO", "WRITELOG"],
+            ),
+            sql_server_profile_sample(Some(("running", None)), &["ASYNC_NETWORK_IO"]),
+            sql_server_profile_sample(None, &[]),
+        ];
+
+        let summary = SqlServerProfileSampleSummary::from_samples(&samples);
+
+        assert_eq!(summary.request_statuses.get("running"), Some(&2));
+        assert_eq!(summary.request_statuses.get("<no request>"), Some(&1));
+        assert_eq!(summary.request_waits.get("ASYNC_NETWORK_IO"), Some(&1));
+        assert_eq!(summary.request_waits.get("<none>"), Some(&1));
+        assert_eq!(summary.request_waits.get("<no request>"), Some(&1));
+        assert_eq!(summary.waiting_task_waits.get("ASYNC_NETWORK_IO"), Some(&2));
+        assert_eq!(summary.waiting_task_waits.get("WRITELOG"), Some(&1));
+    }
+
+    #[test]
+    fn sql_server_profile_sample_coverage_is_grouped_by_phase() {
+        let samples = [
+            sql_server_profile_sample_with_phase("write_batch", 10, 11, None, &[]),
+            sql_server_profile_sample_with_phase("finish", 1, 2, None, &[]),
+            sql_server_profile_sample_with_phase("write_batch", 20, 21, None, &[]),
+        ];
+
+        let coverages = super::sql_server_profile_sample_coverages(&samples);
+
+        assert_eq!(coverages.len(), 2);
+        assert_eq!(coverages[0].phase, "finish");
+        assert_eq!(coverages[0].first_elapsed_start, Duration::from_millis(1));
+        assert_eq!(coverages[0].last_elapsed_end, Duration::from_millis(2));
+        assert_eq!(coverages[1].phase, "write_batch");
+        assert_eq!(coverages[1].first_elapsed_start, Duration::from_millis(10));
+        assert_eq!(coverages[1].last_elapsed_end, Duration::from_millis(21));
+    }
+
+    #[test]
+    fn sql_server_profile_wait_deltas_exclude_initial_session_totals() {
+        let initial = [
+            sqlserver_profile::SessionWaitSnapshot {
+                wait_type: "ASYNC_NETWORK_IO".to_owned(),
+                waiting_tasks_count: 3,
+                wait_time_ms: 5,
+                max_wait_time_ms: 4,
+                signal_wait_time_ms: 1,
+            },
+            sqlserver_profile::SessionWaitSnapshot {
+                wait_type: "UNCHANGED".to_owned(),
+                waiting_tasks_count: 8,
+                wait_time_ms: 13,
+                max_wait_time_ms: 9,
+                signal_wait_time_ms: 2,
+            },
+        ];
+        let final_waits = [
+            sqlserver_profile_wait("WRITELOG", 4, 23, 17, 3),
+            sqlserver_profile_wait("ASYNC_NETWORK_IO", 5, 16, 7, 4),
+            sqlserver_profile_wait("UNCHANGED", 8, 13, 9, 2),
+        ];
+
+        let waits = super::sql_server_session_wait_deltas(&initial, &final_waits);
+
+        assert_eq!(
+            waits,
+            [
+                super::SqlServerSessionWaitDelta {
+                    wait_type: "WRITELOG".to_owned(),
+                    waiting_tasks_count: 4,
+                    wait_time_ms: 23,
+                    signal_wait_time_ms: 3,
+                },
+                super::SqlServerSessionWaitDelta {
+                    wait_type: "ASYNC_NETWORK_IO".to_owned(),
+                    waiting_tasks_count: 2,
+                    wait_time_ms: 11,
+                    signal_wait_time_ms: 3,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn sql_server_profile_connection_delta_counts_packet_counters() {
+        let initial = connection_snapshot(3, 5, Some("2026-05-21T12:00:00"), None);
+        let final_connection = connection_snapshot(
+            23,
+            11,
+            Some("2026-05-21T12:00:03"),
+            Some("2026-05-21T12:00:04"),
+        );
+
+        let delta = super::sql_server_connection_delta(&initial, &final_connection);
+
+        assert_eq!(delta.num_reads, 20);
+        assert_eq!(delta.num_writes, 6);
+        assert_eq!(delta.net_packet_size, 4096);
+        assert_eq!(delta.last_read.as_deref(), Some("2026-05-21T12:00:03"));
+        assert_eq!(delta.last_write.as_deref(), Some("2026-05-21T12:00:04"));
+    }
+
+    fn sqlserver_profile_wait(
+        wait_type: &str,
+        waiting_tasks_count: i64,
+        wait_time_ms: i64,
+        max_wait_time_ms: i64,
+        signal_wait_time_ms: i64,
+    ) -> sqlserver_profile::SessionWaitSnapshot {
+        sqlserver_profile::SessionWaitSnapshot {
+            wait_type: wait_type.to_owned(),
+            waiting_tasks_count,
+            wait_time_ms,
+            max_wait_time_ms,
+            signal_wait_time_ms,
+        }
+    }
+
+    #[test]
+    fn sql_server_profile_file_io_deltas_preserve_file_metadata() {
+        let initial = [
+            sqlserver_profile_file_io(2, "bench_log", "LOG", 1, 8, 2, 3, 64, 5),
+            sqlserver_profile_file_io(1, "bench_data", "ROWS", 5, 40, 3, 7, 96, 11),
+        ];
+        let final_files = [
+            sqlserver_profile_file_io(2, "bench_log", "LOG", 1, 8, 2, 9, 192, 17),
+            sqlserver_profile_file_io(1, "bench_data", "ROWS", 8, 88, 7, 11, 160, 19),
+        ];
+
+        let files = super::sql_server_database_file_io_deltas(&initial, &final_files);
+
+        assert_eq!(
+            files,
+            [
+                super::SqlServerDatabaseFileIoDelta {
+                    file_id: 2,
+                    logical_name: "bench_log".to_owned(),
+                    file_type: "LOG".to_owned(),
+                    read_count: 0,
+                    read_bytes: 0,
+                    read_stall_ms: 0,
+                    write_count: 6,
+                    write_bytes: 128,
+                    write_stall_ms: 12,
+                },
+                super::SqlServerDatabaseFileIoDelta {
+                    file_id: 1,
+                    logical_name: "bench_data".to_owned(),
+                    file_type: "ROWS".to_owned(),
+                    read_count: 3,
+                    read_bytes: 48,
+                    read_stall_ms: 4,
+                    write_count: 4,
+                    write_bytes: 64,
+                    write_stall_ms: 8,
+                },
+            ]
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sqlserver_profile_file_io(
+        file_id: i32,
+        logical_name: &str,
+        file_type: &str,
+        read_count: i64,
+        read_bytes: i64,
+        read_stall_ms: i64,
+        write_count: i64,
+        write_bytes: i64,
+        write_stall_ms: i64,
+    ) -> sqlserver_profile::DatabaseFileIoSnapshot {
+        sqlserver_profile::DatabaseFileIoSnapshot {
+            file_id,
+            logical_name: logical_name.to_owned(),
+            file_type: file_type.to_owned(),
+            read_count,
+            read_bytes,
+            read_stall_ms,
+            write_count,
+            write_bytes,
+            write_stall_ms,
+        }
     }
 
     #[test]
@@ -3432,8 +5261,12 @@ mod tests {
             OsString::from("server=tcp:127.0.0.1,1433;password=secret"),
             OsString::from("--database"),
             OsString::from("bench_db"),
+            OsString::from("--sqlserver-recovery-model"),
+            OsString::from("simple"),
+            OsString::from("--sqlserver-bulk-table-lock"),
             OsString::from("--tds-packet-size"),
             OsString::from("32767"),
+            OsString::from("--arrow-odbc-autocommit"),
         ];
 
         let options = super::CompareBenchOptions::parse(&args).unwrap();
@@ -3453,7 +5286,53 @@ mod tests {
         assert!(options.keep_runner_image);
         assert_eq!(options.sql_server.database, "bench_db");
         assert!(options.sql_server.connection_string.is_some());
+        assert_eq!(
+            options.sql_server_recovery_model,
+            Some(super::SqlServerRecoveryModel::Simple)
+        );
+        assert!(options.sql_server_bulk_table_lock);
         assert_eq!(options.tds_packet_size, Some(32767));
+        assert!(options.arrow_odbc_autocommit);
+    }
+
+    #[test]
+    fn compare_rejects_unknown_sql_server_recovery_model() {
+        let args = [
+            OsString::from("--sqlserver-recovery-model"),
+            OsString::from("minimal"),
+        ];
+
+        let err = super::CompareBenchOptions::parse(&args).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("recovery model `minimal`")
+                    && message.contains("bulk-logged")
+        ));
+    }
+
+    #[test]
+    fn parses_sql_server_reported_recovery_models() {
+        assert_eq!(
+            super::SqlServerRecoveryModel::from_sql_server_desc("FULL").unwrap(),
+            super::SqlServerRecoveryModel::Full
+        );
+        assert_eq!(
+            super::SqlServerRecoveryModel::from_sql_server_desc("BULK_LOGGED").unwrap(),
+            super::SqlServerRecoveryModel::BulkLogged
+        );
+        assert_eq!(
+            super::SqlServerRecoveryModel::from_sql_server_desc("SIMPLE").unwrap(),
+            super::SqlServerRecoveryModel::Simple
+        );
+
+        let err = super::SqlServerRecoveryModel::from_sql_server_desc("UNKNOWN").unwrap_err();
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("recovery model reported by server `UNKNOWN`")
+        ));
     }
 
     #[test]
@@ -3482,7 +5361,8 @@ mod tests {
             OsString::from("--scenario"),
             OsString::from("narrow_numeric"),
             OsString::from("--backends"),
-            OsString::from("baseline,direct-raw,arrow-odbc,odbc-bcp"),
+            OsString::from("baseline,direct-framed,direct-raw,arrow-odbc,odbc-bcp"),
+            OsString::from("--odbc-bcp-defer-batches"),
         ];
 
         let options = super::CompareBenchOptions::parse(&args).unwrap();
@@ -3491,11 +5371,13 @@ mod tests {
             options.backends,
             [
                 super::BenchmarkBackend::Baseline,
+                super::BenchmarkBackend::DirectFramed,
                 super::BenchmarkBackend::DirectRaw,
                 super::BenchmarkBackend::ArrowOdbc,
                 super::BenchmarkBackend::OdbcBcp
             ]
         );
+        assert!(options.odbc_bcp_defer_batches);
     }
 
     #[test]
@@ -3697,6 +5579,72 @@ mod tests {
         );
         assert_eq!(options.benchmark.scenario.name, "narrow_numeric");
         assert!(!options.profile_direct);
+        assert!(options.sql_server_profile.is_none());
+    }
+
+    #[test]
+    fn parses_compare_sql_server_profile_options() {
+        let args = [
+            OsString::from("--profile-sqlserver"),
+            OsString::from("--sqlserver-profile-sample-ms"),
+            OsString::from("125"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+        let profile = options.sql_server_profile.unwrap();
+
+        assert_eq!(
+            profile.sample_interval,
+            std::time::Duration::from_millis(125)
+        );
+    }
+
+    #[test]
+    fn compare_rejects_sql_server_sample_interval_without_profile_flag() {
+        let args = [
+            OsString::from("--sqlserver-profile-sample-ms"),
+            OsString::from("500"),
+        ];
+
+        let err = super::CompareBenchOptions::parse(&args).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("--sqlserver-profile-sample-ms")
+                    && message.contains("--profile-sqlserver")
+        ));
+    }
+
+    #[test]
+    fn compare_sql_server_profile_uses_default_sample_interval() {
+        let args = [OsString::from("--profile-sqlserver")];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+        let profile = options.sql_server_profile.unwrap();
+
+        assert_eq!(
+            profile.sample_interval,
+            std::time::Duration::from_millis(super::DEFAULT_SQLSERVER_PROFILE_SAMPLE_MS)
+        );
+    }
+
+    #[test]
+    fn compare_rejects_zero_sql_server_profile_sample_interval() {
+        let args = [
+            OsString::from("--sqlserver-profile-sample-ms"),
+            OsString::from("0"),
+        ];
+
+        let err = super::CompareBenchOptions::parse(&args).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::InvalidPositiveInteger {
+                option: "--sqlserver-profile-sample-ms",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -3737,18 +5685,49 @@ mod tests {
     }
 
     #[test]
+    fn compare_allows_direct_framed_for_narrow_numeric() {
+        let args = [
+            OsString::from("--scenario"),
+            OsString::from("narrow_numeric"),
+            OsString::from("--backends"),
+            OsString::from("direct-framed"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+
+        assert_eq!(options.backends, [super::BenchmarkBackend::DirectFramed]);
+        super::ensure_direct_raw_supported_scenario(&options.benchmark).unwrap();
+    }
+
+    #[test]
     fn compare_allows_direct_raw_for_variable_width_supported_scenarios() {
-        for scenario in ["mixed_nullable", "string_heavy", "wide_sparse"] {
+        for scenario in [
+            "mixed_nullable",
+            "string_heavy",
+            "string_heavy_text_only",
+            "string_heavy_binary_only",
+            "string_heavy_inline_4k",
+            "string_heavy_edge_7k",
+            "string_heavy_lob_9k",
+            "string_heavy_unicode",
+            "wide_sparse",
+        ] {
             let args = [
                 OsString::from("--scenario"),
                 OsString::from(scenario),
                 OsString::from("--backends"),
-                OsString::from("direct-raw"),
+                OsString::from("direct-framed,direct-raw"),
             ];
 
             let options = super::CompareBenchOptions::parse(&args).unwrap();
 
-            assert_eq!(options.backends, [super::BenchmarkBackend::DirectRaw]);
+            assert_eq!(
+                options.backends,
+                [
+                    super::BenchmarkBackend::DirectFramed,
+                    super::BenchmarkBackend::DirectRaw
+                ]
+            );
             super::ensure_direct_raw_supported_scenario(&options.benchmark).unwrap();
         }
     }
@@ -3769,10 +5748,13 @@ mod tests {
             assert!(matches!(
                 err,
                 WriterBenchError::Validation(message)
-                    if message.contains("direct-raw")
+                    if message.contains("direct backends")
                         && message.contains("narrow_numeric")
                         && message.contains("mixed_nullable")
                         && message.contains("string_heavy")
+                        && message.contains("string_heavy_text_only")
+                        && message.contains("string_heavy_binary_only")
+                        && message.contains("string_heavy_unicode")
                         && message.contains("wide_sparse")
                         && message.contains(scenario)
             ));
@@ -3833,8 +5815,52 @@ mod tests {
             err,
             WriterBenchError::Validation(message)
                 if message.contains("--profile-direct")
+                    && message.contains("direct-framed")
                     && message.contains("direct-raw")
         ));
+    }
+
+    #[test]
+    fn compare_rejects_bcp_deferred_batches_without_bcp_backend() {
+        let args = [
+            OsString::from("--backends"),
+            OsString::from("baseline"),
+            OsString::from("--odbc-bcp-defer-batches"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+        let err = super::run_compare_benchmark(&options).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("--odbc-bcp-defer-batches")
+                    && message.contains("odbc-bcp")
+        ));
+    }
+
+    #[test]
+    fn compare_rejects_arrow_odbc_autocommit_without_arrow_odbc_backend() {
+        let args = [
+            OsString::from("--backends"),
+            OsString::from("baseline"),
+            OsString::from("--arrow-odbc-autocommit"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+        let err = super::run_compare_benchmark(&options).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("--arrow-odbc-autocommit")
+                    && message.contains("arrow-odbc")
+        ));
+    }
+
+    #[test]
+    fn odbc_bcp_supports_sql_server_profile() {
+        assert!(super::BenchmarkBackend::OdbcBcp.supports_sql_server_profile());
     }
 
     #[test]
@@ -3927,11 +5953,16 @@ mod tests {
                 output: BenchmarkOutput::Human,
             },
             sql_server: crate::sqlserver::SqlServerConnectionOptions::benchmark_default(),
+            sql_server_profile: None,
+            sql_server_recovery_model: None,
+            sql_server_bulk_table_lock: false,
             backends: vec![super::BenchmarkBackend::Baseline],
             runner_image: crate::odbc_runner::DEFAULT_RUNNER_IMAGE_TAG.to_owned(),
             keep_runner_image: false,
             profile_direct: false,
             tds_packet_size: None,
+            arrow_odbc_autocommit: false,
+            odbc_bcp_defer_batches: false,
         };
 
         let dataset = super::prepare_compare_ipc_dataset(&options).unwrap();
@@ -4001,6 +6032,16 @@ mod tests {
         assert_eq!(
             sql,
             "CREATE TABLE [dbo].[bench] (\n    [id32] int NOT NULL,\n    [maybe_id64] bigint NULL,\n    [maybe_score] float(53) NULL,\n    [category] nvarchar(max) NULL\n);"
+        );
+    }
+
+    #[test]
+    fn renders_bulk_table_lock_sql_for_benchmark_table() {
+        let table = arrow_tiberius::TableName::new("dbo", "bench'o").unwrap();
+
+        assert_eq!(
+            super::benchmark_bulk_table_lock_sql(&table),
+            "EXEC sys.sp_tableoption N'[dbo].[bench''o]', 'table lock on bulk load', 'ON';"
         );
     }
 
@@ -4097,9 +6138,14 @@ mod tests {
             keep_runner_image: false,
         };
 
-        let args =
-            super::arrow_odbc_runner_args(&options.benchmark, "/workspace/target/bench.arrow")
-                .unwrap();
+        let args = super::arrow_odbc_runner_args(
+            &options.benchmark,
+            "/workspace/target/bench.arrow",
+            false,
+            false,
+            false,
+        )
+        .unwrap();
 
         assert!(args.iter().any(|arg| arg == "--release"));
         assert!(args.windows(2).any(|pair| pair == ["--rows", "25"]));
@@ -4122,6 +6168,50 @@ mod tests {
     }
 
     #[test]
+    fn arrow_odbc_runner_args_pass_sql_server_profile_flag() {
+        let benchmark = WriterBenchOptions {
+            rows: 25,
+            batch_size: 5,
+            scenario: super::scenario_by_name("mixed_nullable").unwrap(),
+            repeat: 3,
+            output: BenchmarkOutput::Human,
+        };
+
+        let args = super::arrow_odbc_runner_args(
+            &benchmark,
+            "/workspace/target/bench.arrow",
+            true,
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert!(args.iter().any(|arg| arg == "--profile-sqlserver"));
+    }
+
+    #[test]
+    fn arrow_odbc_runner_args_pass_autocommit_flag() {
+        let benchmark = WriterBenchOptions {
+            rows: 25,
+            batch_size: 5,
+            scenario: super::scenario_by_name("mixed_nullable").unwrap(),
+            repeat: 3,
+            output: BenchmarkOutput::Human,
+        };
+
+        let args = super::arrow_odbc_runner_args(
+            &benchmark,
+            "/workspace/target/bench.arrow",
+            false,
+            true,
+            false,
+        )
+        .unwrap();
+
+        assert!(args.iter().any(|arg| arg == "--autocommit"));
+    }
+
+    #[test]
     fn odbc_bcp_runner_args_include_shared_ipc_dataset() {
         let benchmark = WriterBenchOptions {
             rows: 25,
@@ -4131,8 +6221,14 @@ mod tests {
             output: BenchmarkOutput::Human,
         };
 
-        let args =
-            super::odbc_bcp_runner_args(&benchmark, "/workspace/target/bench.arrow").unwrap();
+        let args = super::odbc_bcp_runner_args(
+            &benchmark,
+            "/workspace/target/bench.arrow",
+            false,
+            false,
+            false,
+        )
+        .unwrap();
 
         assert!(args.iter().any(|arg| arg == "--release"));
         assert!(
@@ -4162,13 +6258,89 @@ mod tests {
             output: BenchmarkOutput::Human,
         };
 
-        let args =
-            super::odbc_bcp_runner_args(&benchmark, "/workspace/target/bench.arrow").unwrap();
+        let args = super::odbc_bcp_runner_args(
+            &benchmark,
+            "/workspace/target/bench.arrow",
+            false,
+            false,
+            false,
+        )
+        .unwrap();
 
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--scenario", "mixed_nullable"])
         );
+    }
+
+    #[test]
+    fn odbc_bcp_runner_args_pass_sql_server_profile_flag() {
+        let benchmark = WriterBenchOptions {
+            rows: 25,
+            batch_size: 5,
+            scenario: super::scenario_by_name("narrow_numeric").unwrap(),
+            repeat: 3,
+            output: BenchmarkOutput::Human,
+        };
+
+        let args = super::odbc_bcp_runner_args(
+            &benchmark,
+            "/workspace/target/bench.arrow",
+            true,
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert!(args.iter().any(|arg| arg == "--profile-sqlserver"));
+    }
+
+    #[test]
+    fn odbc_bcp_runner_args_pass_deferred_batch_flag() {
+        let benchmark = WriterBenchOptions {
+            rows: 25,
+            batch_size: 5,
+            scenario: super::scenario_by_name("narrow_numeric").unwrap(),
+            repeat: 3,
+            output: BenchmarkOutput::Human,
+        };
+
+        let args = super::odbc_bcp_runner_args(
+            &benchmark,
+            "/workspace/target/bench.arrow",
+            false,
+            true,
+            false,
+        )
+        .unwrap();
+
+        assert!(args.iter().any(|arg| arg == "--defer-batches"));
+    }
+
+    #[test]
+    fn odbc_bcp_runner_args_pass_bulk_table_lock_table_option() {
+        let benchmark = WriterBenchOptions {
+            rows: 25,
+            batch_size: 5,
+            scenario: super::scenario_by_name("narrow_numeric").unwrap(),
+            repeat: 3,
+            output: BenchmarkOutput::Human,
+        };
+
+        let args = super::odbc_bcp_runner_args(
+            &benchmark,
+            "/workspace/target/bench.arrow",
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == "--create-table-sql-template"
+                && pair[1].contains("table lock on bulk load")
+                && pair[1].contains(super::ODBC_TABLE_PLACEHOLDER)
+        }));
     }
 
     #[test]
@@ -4702,6 +6874,152 @@ odbc-bcp runner
     }
 
     #[test]
+    fn string_heavy_unicode_keeps_string_heavy_shape_with_bmp_text() {
+        let string_heavy = WriterBenchOptions {
+            rows: 128,
+            batch_size: 128,
+            scenario: super::scenario_by_name("string_heavy").unwrap(),
+            repeat: 1,
+            output: BenchmarkOutput::Human,
+        };
+        let unicode = WriterBenchOptions {
+            scenario: super::scenario_by_name("string_heavy_unicode").unwrap(),
+            ..string_heavy.clone()
+        };
+
+        let ascii_batch = &generated_batches(&string_heavy)[0];
+        let unicode_batch = &generated_batches(&unicode)[0];
+        let ascii_body = ascii_batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let unicode_tenant = unicode_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let unicode_body = unicode_batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let unicode_payload = unicode_batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+
+        assert_eq!(unicode_batch.schema(), ascii_batch.schema());
+        assert_eq!(unicode_body.null_count(), ascii_body.null_count());
+        assert_eq!(
+            unicode_body.value(1).chars().count(),
+            ascii_body.value(1).chars().count()
+        );
+        assert!(!unicode_tenant.value(0).is_ascii());
+        assert!(!unicode_body.value(1).is_ascii());
+        assert!(
+            unicode_body
+                .value(1)
+                .chars()
+                .all(|ch| (ch as u32) <= 0xffff)
+        );
+        assert_eq!(
+            unicode_payload.value(1),
+            ascii_batch
+                .column(6)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .value(1)
+        );
+    }
+
+    #[test]
+    fn string_heavy_text_and_binary_variants_split_large_payload_shape() {
+        let full = WriterBenchOptions {
+            rows: 128,
+            batch_size: 128,
+            scenario: super::scenario_by_name("string_heavy").unwrap(),
+            repeat: 1,
+            output: BenchmarkOutput::Human,
+        };
+        let text_only = WriterBenchOptions {
+            scenario: super::scenario_by_name("string_heavy_text_only").unwrap(),
+            ..full.clone()
+        };
+        let binary_only = WriterBenchOptions {
+            scenario: super::scenario_by_name("string_heavy_binary_only").unwrap(),
+            ..full.clone()
+        };
+
+        let full_batch = &generated_batches(&full)[0];
+        let text_batch = &generated_batches(&text_only)[0];
+        let binary_batch = &generated_batches(&binary_only)[0];
+
+        let full_body = string_column(full_batch, 4);
+        let full_payload = binary_column(full_batch, 6);
+        let text_body = string_column(text_batch, 4);
+        let text_payload = binary_column(text_batch, 6);
+        let binary_body = string_column(binary_batch, 4);
+        let binary_payload = binary_column(binary_batch, 6);
+
+        assert_eq!(text_batch.schema(), full_batch.schema());
+        assert_eq!(binary_batch.schema(), full_batch.schema());
+        assert_eq!(text_body.null_count(), full_body.null_count());
+        assert_eq!(text_payload.null_count(), full_payload.null_count());
+        assert_eq!(binary_body.null_count(), full_body.null_count());
+        assert_eq!(binary_payload.null_count(), full_payload.null_count());
+
+        assert_eq!(text_body.value(1).len(), full_body.value(1).len());
+        assert_eq!(binary_payload.value(1).len(), full_payload.value(1).len());
+        assert!(text_payload.value(1).len() < full_payload.value(1).len() / 16);
+        assert!(binary_body.value(1).len() < full_body.value(1).len() / 4);
+    }
+
+    #[test]
+    fn string_heavy_threshold_variants_hold_fixed_combined_payload_sizes() {
+        for (scenario_name, body_chars, payload_bytes, nominal_sql_bytes) in [
+            ("string_heavy_inline_4k", 1_024, 2_048, 4_096),
+            ("string_heavy_edge_7k", 1_536, 4_096, 7_168),
+            ("string_heavy_lob_9k", 2_048, 5_120, 9_216),
+        ] {
+            let options = WriterBenchOptions {
+                rows: 128,
+                batch_size: 128,
+                scenario: super::scenario_by_name(scenario_name).unwrap(),
+                repeat: 1,
+                output: BenchmarkOutput::Human,
+            };
+
+            let batch = &generated_batches(&options)[0];
+            let body = string_column(batch, 4);
+            let payload = binary_column(batch, 6);
+
+            assert_eq!(batch.schema(), (super::string_heavy_schema)());
+            assert_eq!(body.null_count(), 3);
+            assert_eq!(payload.null_count(), 3);
+            assert_eq!(body.value(1).len(), body_chars);
+            assert_eq!(body.value(2).len(), body_chars);
+            assert_eq!(payload.value(1).len(), payload_bytes);
+            assert_eq!(payload.value(2).len(), payload_bytes);
+            assert_eq!(
+                body.value(1).len() * 2 + payload.value(1).len(),
+                nominal_sql_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn string_heavy_unicode_sentinel_query_checks_tenant_codepoints() {
+        let sql = super::string_heavy_unicode_tenant_sentinel_count_sql("[dbo].[target]");
+
+        assert!(sql.contains("COUNT_BIG(*) FROM [dbo].[target]"));
+        assert!(sql.contains("UNICODE(SUBSTRING([tenant], 1, 1)) = 31199"));
+        assert!(sql.contains("UNICODE(SUBSTRING([tenant], 2, 1)) = 25143"));
+    }
+
+    #[test]
     fn wide_sparse_has_many_columns_and_sparse_nulls() {
         let options = WriterBenchOptions {
             rows: 256,
@@ -4760,6 +7078,12 @@ odbc-bcp runner
             "wide_mixed",
             "decimal_temporal",
             "string_heavy",
+            "string_heavy_text_only",
+            "string_heavy_binary_only",
+            "string_heavy_inline_4k",
+            "string_heavy_edge_7k",
+            "string_heavy_lob_9k",
+            "string_heavy_unicode",
             "wide_sparse",
             "tpch_lineitem_like",
         ] {
@@ -4867,6 +7191,12 @@ odbc-bcp runner
                 "wide_mixed",
                 "decimal_temporal",
                 "string_heavy",
+                "string_heavy_text_only",
+                "string_heavy_binary_only",
+                "string_heavy_inline_4k",
+                "string_heavy_edge_7k",
+                "string_heavy_lob_9k",
+                "string_heavy_unicode",
                 "wide_sparse",
                 "tpch_lineitem_like"
             ]
@@ -4881,6 +7211,22 @@ odbc-bcp runner
     fn generated_batches(options: &WriterBenchOptions) -> Vec<RecordBatch> {
         super::GeneratedBatchReader::new(options)
             .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn string_column(batch: &RecordBatch, index: usize) -> &StringArray {
+        batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+    }
+
+    fn binary_column(batch: &RecordBatch, index: usize) -> &BinaryArray {
+        batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
             .unwrap()
     }
 
