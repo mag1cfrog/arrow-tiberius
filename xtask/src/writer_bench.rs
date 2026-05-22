@@ -266,7 +266,7 @@ fn print_arrow_odbc_help() {
 
 fn print_compare_help() {
     println!(
-        "Usage:\n  cargo xtask writer-bench compare [OPTIONS]\n\nData Options:\n  --rows <COUNT>                    Total rows to generate [default: 100000]\n  --batch-size <COUNT>              Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>                 Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>                  Number of benchmark repeats [default: 1]\n  --backends <LIST>                 Comma-separated backends: baseline,direct-framed,direct-raw,arrow-odbc,odbc-bcp [default: baseline,arrow-odbc]\n  --output <FORMAT>                 Output format: human [default: human]\n  --profile-direct                  Include direct backend phase timings and counters\n\nSQL Server Options:\n  --container-runtime <PATH>        Container runtime executable, such as docker or podman\n  --connection-string <URL>         Use an existing SQL Server instead of a local container\n  --image <IMAGE>                   SQL Server container image\n  --database <NAME>                 Benchmark database name\n  --tds-packet-size <BYTES>         Requested TDS packet size for Tiberius writers\n  --profile-sqlserver               Profile the SQL Server writer session during compare writes\n  --sqlserver-profile-sample-ms <MILLIS>\n                                    SQL Server profile sample interval [default: 250]\n  --keep-container                  Keep managed containers after the task exits\n\nODBC Runner Options:\n  --arrow-odbc-autocommit           Use ODBC autocommit for arrow-odbc compares\n  --odbc-bcp-defer-batches          Defer odbc-bcp commits to bcp_done\n  --runner-image <IMAGE>            Managed ODBC runner image tag\n  --keep-runner-image               Keep the managed ODBC runner image after the task exits\n  -h, --help                        Print help\n\nCompare runs use one shared Arrow IPC dataset as the fairness boundary."
+        "Usage:\n  cargo xtask writer-bench compare [OPTIONS]\n\nData Options:\n  --rows <COUNT>                    Total rows to generate [default: 100000]\n  --batch-size <COUNT>              Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>                 Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>                  Number of benchmark repeats [default: 1]\n  --backends <LIST>                 Comma-separated backends: baseline,direct-framed,direct-raw,arrow-odbc,odbc-bcp [default: baseline,arrow-odbc]\n  --output <FORMAT>                 Output format: human [default: human]\n  --profile-direct                  Include direct backend phase timings and counters\n\nSQL Server Options:\n  --container-runtime <PATH>        Container runtime executable, such as docker or podman\n  --connection-string <URL>         Use an existing SQL Server instead of a local container\n  --image <IMAGE>                   SQL Server container image\n  --database <NAME>                 Benchmark database name\n  --tds-packet-size <BYTES>         Requested TDS packet size for Tiberius writers\n  --sqlserver-recovery-model <MODEL>\n                                    Set compare database recovery model: full, bulk-logged, or simple\n  --sqlserver-bulk-table-lock       Enable table lock on bulk load for compare benchmark tables\n  --profile-sqlserver               Profile the SQL Server writer session during compare writes\n  --sqlserver-profile-sample-ms <MILLIS>\n                                    SQL Server profile sample interval [default: 250]\n  --keep-container                  Keep managed containers after the task exits\n\nODBC Runner Options:\n  --arrow-odbc-autocommit           Use ODBC autocommit for arrow-odbc compares\n  --odbc-bcp-defer-batches          Defer odbc-bcp commits to bcp_done\n  --runner-image <IMAGE>            Managed ODBC runner image tag\n  --keep-runner-image               Keep the managed ODBC runner image after the task exits\n  -h, --help                        Print help\n\nCompare runs use one shared Arrow IPC dataset as the fairness boundary."
     );
 }
 
@@ -1192,6 +1192,8 @@ struct CompareBenchOptions {
     benchmark: WriterBenchOptions,
     sql_server: sqlserver::SqlServerConnectionOptions,
     sql_server_profile: Option<SqlServerProfileOptions>,
+    sql_server_recovery_model: Option<SqlServerRecoveryModel>,
+    sql_server_bulk_table_lock: bool,
     backends: Vec<BenchmarkBackend>,
     runner_image: String,
     keep_runner_image: bool,
@@ -1204,6 +1206,38 @@ struct CompareBenchOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SqlServerProfileOptions {
     sample_interval: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlServerRecoveryModel {
+    Full,
+    BulkLogged,
+    Simple,
+}
+
+impl fmt::Display for SqlServerRecoveryModel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Full => f.write_str("FULL"),
+            Self::BulkLogged => f.write_str("BULK_LOGGED"),
+            Self::Simple => f.write_str("SIMPLE"),
+        }
+    }
+}
+
+impl FromStr for SqlServerRecoveryModel {
+    type Err = WriterBenchError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "full" => Ok(Self::Full),
+            "bulk-logged" => Ok(Self::BulkLogged),
+            "simple" => Ok(Self::Simple),
+            _ => Err(WriterBenchError::Validation(format!(
+                "unknown writer-bench compare SQL Server recovery model `{value}`; expected full, bulk-logged, or simple"
+            ))),
+        }
+    }
 }
 
 impl Default for SqlServerProfileOptions {
@@ -1220,6 +1254,8 @@ impl CompareBenchOptions {
             benchmark: WriterBenchOptions::default(),
             sql_server: sqlserver::SqlServerConnectionOptions::benchmark_default(),
             sql_server_profile: None,
+            sql_server_recovery_model: None,
+            sql_server_bulk_table_lock: false,
             backends: vec![BenchmarkBackend::Baseline, BenchmarkBackend::ArrowOdbc],
             runner_image: odbc_runner::DEFAULT_RUNNER_IMAGE_TAG.to_owned(),
             keep_runner_image: false,
@@ -1291,6 +1327,13 @@ impl CompareBenchOptions {
                         &required_value(args, index)?,
                     )?);
                     index += 1;
+                }
+                "--sqlserver-recovery-model" => {
+                    options.sql_server_recovery_model = Some(required_value(args, index)?.parse()?);
+                    index += 1;
+                }
+                "--sqlserver-bulk-table-lock" => {
+                    options.sql_server_bulk_table_lock = true;
                 }
                 "--profile-sqlserver" => {
                     options
@@ -1634,8 +1677,11 @@ fn run_arrow_odbc_runner_for_benchmark(
         network,
         connection,
         ipc_dataset,
-        false,
-        false,
+        ArrowOdbcRunnerBenchOptions {
+            profile_sql_server: false,
+            autocommit: false,
+            bulk_table_lock: false,
+        },
     )?;
 
     odbc_runner::run_runner_command(&command_options).map_err(WriterBenchError::OdbcRunner)
@@ -1647,8 +1693,7 @@ fn run_arrow_odbc_runner_for_benchmark_capture(
     network: Option<&sqlserver::ManagedNetwork>,
     connection: &sqlserver::SqlServerConnection,
     ipc_dataset: &ManagedIpcDataset,
-    profile_sql_server: bool,
-    autocommit: bool,
+    options: ArrowOdbcRunnerBenchOptions,
 ) -> Result<OdbcRunnerBenchReport, WriterBenchError> {
     println!("  action: run_arrow_odbc_runner");
     let command_options = arrow_odbc_runner_command_options(
@@ -1657,8 +1702,7 @@ fn run_arrow_odbc_runner_for_benchmark_capture(
         network,
         connection,
         ipc_dataset,
-        profile_sql_server,
-        autocommit,
+        options,
     )?;
     let output = odbc_runner::run_runner_command_capture(&command_options)
         .map_err(WriterBenchError::OdbcRunner)?;
@@ -1675,8 +1719,7 @@ fn run_odbc_bcp_runner_for_benchmark_capture(
     network: Option<&sqlserver::ManagedNetwork>,
     connection: &sqlserver::SqlServerConnection,
     ipc_dataset: &ManagedIpcDataset,
-    profile_sql_server: bool,
-    defer_batches: bool,
+    options: OdbcBcpRunnerBenchOptions,
 ) -> Result<OdbcRunnerBenchReport, WriterBenchError> {
     println!("  action: run_odbc_bcp_runner");
     let command_options = odbc_bcp_runner_command_options(
@@ -1685,8 +1728,7 @@ fn run_odbc_bcp_runner_for_benchmark_capture(
         network,
         connection,
         ipc_dataset,
-        profile_sql_server,
-        defer_batches,
+        options,
     )?;
     let output = odbc_runner::run_runner_command_capture(&command_options)
         .map_err(WriterBenchError::OdbcRunner)?;
@@ -1703,8 +1745,7 @@ fn arrow_odbc_runner_command_options(
     network: Option<&sqlserver::ManagedNetwork>,
     connection: &sqlserver::SqlServerConnection,
     ipc_dataset: &ManagedIpcDataset,
-    profile_sql_server: bool,
-    autocommit: bool,
+    options: ArrowOdbcRunnerBenchOptions,
 ) -> Result<odbc_runner::RunnerCommandOptions, WriterBenchError> {
     let container_path = ipc_dataset.container_path.as_deref().ok_or_else(|| {
         WriterBenchError::Validation(
@@ -1730,7 +1771,13 @@ fn arrow_odbc_runner_command_options(
         ],
         Some(repository_root()?),
         Some("/workspace".to_owned()),
-        arrow_odbc_runner_args(benchmark, container_path, profile_sql_server, autocommit)?,
+        arrow_odbc_runner_args(
+            benchmark,
+            container_path,
+            options.profile_sql_server,
+            options.autocommit,
+            options.bulk_table_lock,
+        )?,
     ))
 }
 
@@ -1739,8 +1786,10 @@ fn arrow_odbc_runner_args(
     input_ipc: &str,
     profile_sql_server: bool,
     autocommit: bool,
+    bulk_table_lock: bool,
 ) -> Result<Vec<String>, WriterBenchError> {
-    let create_table_sql_template = arrow_odbc_create_table_sql_template(benchmark)?;
+    let create_table_sql_template =
+        arrow_odbc_create_table_sql_template(benchmark, bulk_table_lock)?;
 
     let mut args = vec![
         "cargo".to_owned(),
@@ -1781,8 +1830,7 @@ fn odbc_bcp_runner_command_options(
     network: Option<&sqlserver::ManagedNetwork>,
     connection: &sqlserver::SqlServerConnection,
     ipc_dataset: &ManagedIpcDataset,
-    profile_sql_server: bool,
-    defer_batches: bool,
+    options: OdbcBcpRunnerBenchOptions,
 ) -> Result<odbc_runner::RunnerCommandOptions, WriterBenchError> {
     let container_path = ipc_dataset.container_path.as_deref().ok_or_else(|| {
         WriterBenchError::Validation(
@@ -1804,7 +1852,13 @@ fn odbc_bcp_runner_command_options(
         ],
         Some(repository_root()?),
         Some("/workspace".to_owned()),
-        odbc_bcp_runner_args(benchmark, container_path, profile_sql_server, defer_batches)?,
+        odbc_bcp_runner_args(
+            benchmark,
+            container_path,
+            options.profile_sql_server,
+            options.defer_batches,
+            options.bulk_table_lock,
+        )?,
     ))
 }
 
@@ -1813,8 +1867,10 @@ fn odbc_bcp_runner_args(
     input_ipc: &str,
     profile_sql_server: bool,
     defer_batches: bool,
+    bulk_table_lock: bool,
 ) -> Result<Vec<String>, WriterBenchError> {
-    let create_table_sql_template = arrow_odbc_create_table_sql_template(benchmark)?;
+    let create_table_sql_template =
+        arrow_odbc_create_table_sql_template(benchmark, bulk_table_lock)?;
 
     let mut args = vec![
         "cargo".to_owned(),
@@ -1851,6 +1907,7 @@ fn odbc_bcp_runner_args(
 
 fn arrow_odbc_create_table_sql_template(
     benchmark: &WriterBenchOptions,
+    bulk_table_lock: bool,
 ) -> Result<String, WriterBenchError> {
     let placeholder_table =
         TableName::new("dbo", ODBC_TABLE_PLACEHOLDER).map_err(WriterBenchError::ArrowTiberius)?;
@@ -1858,6 +1915,14 @@ fn arrow_odbc_create_table_sql_template(
     let mappings = benchmark_mappings_for_schema(schema)?;
     let sql = benchmark_table_sql(&placeholder_table, &mappings);
     let quoted_placeholder = placeholder_table.quoted_sql();
+    let sql = if bulk_table_lock {
+        format!(
+            "{sql}\n{}",
+            benchmark_bulk_table_lock_sql(&placeholder_table)
+        )
+    } else {
+        sql
+    };
 
     Ok(sql.replace(&quoted_placeholder, ODBC_TABLE_PLACEHOLDER))
 }
@@ -2281,6 +2346,30 @@ struct TiberiusRepeatConfig {
     scenario: &'static BenchmarkScenarioDefinition,
     backend: WriteBackend,
     profile_direct: bool,
+    bulk_table_lock: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TiberiusBenchmarkConfig {
+    backend: WriteBackend,
+    profile_direct: bool,
+    tds_packet_size: Option<u32>,
+    sql_server_profile: Option<SqlServerProfileOptions>,
+    bulk_table_lock: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ArrowOdbcRunnerBenchOptions {
+    profile_sql_server: bool,
+    autocommit: bool,
+    bulk_table_lock: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OdbcBcpRunnerBenchOptions {
+    profile_sql_server: bool,
+    defer_batches: bool,
+    bulk_table_lock: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2868,10 +2957,13 @@ async fn run_baseline_async(
         &options.benchmark,
         connection,
         &ipc_dataset.host_path,
-        WriteBackend::BaselineTokenRow,
-        false,
-        options.tds_packet_size,
-        None,
+        TiberiusBenchmarkConfig {
+            backend: WriteBackend::BaselineTokenRow,
+            profile_direct: false,
+            tds_packet_size: options.tds_packet_size,
+            sql_server_profile: None,
+            bulk_table_lock: false,
+        },
     )
     .await;
     let dataset_cleanup_result = ipc_dataset.cleanup();
@@ -2938,6 +3030,9 @@ fn run_compare_benchmark(
         .enable_time()
         .build()
         .map_err(WriterBenchError::Io)?;
+    if let Some(recovery_model) = options.sql_server_recovery_model {
+        runtime.block_on(set_sql_server_recovery_model(&connection, recovery_model))?;
+    }
     let ipc_dataset = prepare_compare_ipc_dataset(options)?;
     let run_result = (|| {
         let mut backends = Vec::new();
@@ -2949,10 +3044,13 @@ fn run_compare_benchmark(
                     &options.benchmark,
                     &connection,
                     &ipc_dataset.host_path,
-                    WriteBackend::BaselineTokenRow,
-                    false,
-                    options.tds_packet_size,
-                    options.sql_server_profile,
+                    TiberiusBenchmarkConfig {
+                        backend: WriteBackend::BaselineTokenRow,
+                        profile_direct: false,
+                        tds_packet_size: options.tds_packet_size,
+                        sql_server_profile: options.sql_server_profile,
+                        bulk_table_lock: options.sql_server_bulk_table_lock,
+                    },
                 )
                 .await?;
                 report.timings.total = backend_start.elapsed();
@@ -2968,10 +3066,13 @@ fn run_compare_benchmark(
                     &options.benchmark,
                     &connection,
                     &ipc_dataset.host_path,
-                    WriteBackend::DirectFramedBulk,
-                    options.profile_direct,
-                    options.tds_packet_size,
-                    options.sql_server_profile,
+                    TiberiusBenchmarkConfig {
+                        backend: WriteBackend::DirectFramedBulk,
+                        profile_direct: options.profile_direct,
+                        tds_packet_size: options.tds_packet_size,
+                        sql_server_profile: options.sql_server_profile,
+                        bulk_table_lock: options.sql_server_bulk_table_lock,
+                    },
                 )
                 .await?;
                 report.timings.total = backend_start.elapsed();
@@ -2987,10 +3088,13 @@ fn run_compare_benchmark(
                     &options.benchmark,
                     &connection,
                     &ipc_dataset.host_path,
-                    WriteBackend::DirectRawBulk,
-                    options.profile_direct,
-                    options.tds_packet_size,
-                    options.sql_server_profile,
+                    TiberiusBenchmarkConfig {
+                        backend: WriteBackend::DirectRawBulk,
+                        profile_direct: options.profile_direct,
+                        tds_packet_size: options.tds_packet_size,
+                        sql_server_profile: options.sql_server_profile,
+                        bulk_table_lock: options.sql_server_bulk_table_lock,
+                    },
                 )
                 .await?;
                 report.timings.total = backend_start.elapsed();
@@ -3011,8 +3115,11 @@ fn run_compare_benchmark(
                 network.as_ref(),
                 &connection,
                 &ipc_dataset,
-                options.sql_server_profile.is_some(),
-                options.arrow_odbc_autocommit,
+                ArrowOdbcRunnerBenchOptions {
+                    profile_sql_server: options.sql_server_profile.is_some(),
+                    autocommit: options.arrow_odbc_autocommit,
+                    bulk_table_lock: options.sql_server_bulk_table_lock,
+                },
             )?;
             backends.push(CompareBackendBenchReport::ArrowOdbc { report });
         }
@@ -3029,8 +3136,11 @@ fn run_compare_benchmark(
                 network.as_ref(),
                 &connection,
                 &ipc_dataset,
-                options.sql_server_profile.is_some(),
-                options.odbc_bcp_defer_batches,
+                OdbcBcpRunnerBenchOptions {
+                    profile_sql_server: options.sql_server_profile.is_some(),
+                    defer_batches: options.odbc_bcp_defer_batches,
+                    bulk_table_lock: options.sql_server_bulk_table_lock,
+                },
             )?;
             backends.push(CompareBackendBenchReport::OdbcBcp { report });
         }
@@ -3058,10 +3168,7 @@ async fn run_tiberius_benchmark_from_ipc(
     benchmark: &WriterBenchOptions,
     connection: &sqlserver::SqlServerConnection,
     ipc_path: &Path,
-    backend: WriteBackend,
-    profile_direct: bool,
-    tds_packet_size: Option<u32>,
-    sql_server_profile: Option<SqlServerProfileOptions>,
+    config: TiberiusBenchmarkConfig,
 ) -> Result<TiberiusBenchReport, WriterBenchError> {
     let mut report = TiberiusBenchReport::default();
 
@@ -3069,10 +3176,10 @@ async fn run_tiberius_benchmark_from_ipc(
     let mut client = connect(
         &connection.connection_string,
         &connection.database,
-        tds_packet_size,
+        config.tds_packet_size,
     )
     .await?;
-    let mut sql_server_profile_session = if let Some(options) = sql_server_profile {
+    let mut sql_server_profile_session = if let Some(options) = config.sql_server_profile {
         Some(SqlServerProfileSession::start(&mut client, connection, options).await?)
     } else {
         None
@@ -3089,8 +3196,9 @@ async fn run_tiberius_benchmark_from_ipc(
                     &mut client,
                     TiberiusRepeatConfig {
                         scenario: benchmark.scenario,
-                        backend,
-                        profile_direct,
+                        backend: config.backend,
+                        profile_direct: config.profile_direct,
+                        bulk_table_lock: config.bulk_table_lock,
                     },
                     &mappings,
                     &table,
@@ -3212,6 +3320,9 @@ async fn run_tiberius_repeat_with_batches(
     )
     .await?;
     execute_sql(client, benchmark_table_sql(table, mappings)).await?;
+    if config.bulk_table_lock {
+        execute_sql(client, benchmark_bulk_table_lock_sql(table)).await?;
+    }
     let mut writer = BulkWriter::new(
         client,
         table.clone(),
@@ -3543,6 +3654,21 @@ async fn execute_sql(client: &mut BenchClient, sql: String) -> Result<(), Writer
     Ok(())
 }
 
+async fn set_sql_server_recovery_model(
+    connection: &sqlserver::SqlServerConnection,
+    recovery_model: SqlServerRecoveryModel,
+) -> Result<(), WriterBenchError> {
+    let mut client = connect(&connection.connection_string, &connection.database, None).await?;
+    execute_sql(
+        &mut client,
+        format!(
+            "ALTER DATABASE [{}] SET RECOVERY {recovery_model}",
+            connection.database.replace(']', "]]")
+        ),
+    )
+    .await
+}
+
 async fn select_session_id(client: &mut BenchClient) -> Result<i32, WriterBenchError> {
     let row = client
         .simple_query("SELECT CONVERT(int, @@SPID)")
@@ -3655,6 +3781,17 @@ fn unique_benchmark_table_name() -> Result<TableName, WriterBenchError> {
 
 fn benchmark_table_sql(table: &TableName, mappings: &[SchemaMapping]) -> String {
     create_table_sql_from_mappings(table, mappings)
+}
+
+fn benchmark_bulk_table_lock_sql(table: &TableName) -> String {
+    format!(
+        "EXEC sys.sp_tableoption N'{}', 'table lock on bulk load', 'ON';",
+        escape_sql_string_literal(&table.quoted_sql())
+    )
+}
+
+fn escape_sql_string_literal(value: &str) -> String {
+    value.replace('\'', "''")
 }
 
 fn benchmark_mappings_for_schema(
@@ -5063,6 +5200,9 @@ mod tests {
             OsString::from("server=tcp:127.0.0.1,1433;password=secret"),
             OsString::from("--database"),
             OsString::from("bench_db"),
+            OsString::from("--sqlserver-recovery-model"),
+            OsString::from("simple"),
+            OsString::from("--sqlserver-bulk-table-lock"),
             OsString::from("--tds-packet-size"),
             OsString::from("32767"),
             OsString::from("--arrow-odbc-autocommit"),
@@ -5085,8 +5225,30 @@ mod tests {
         assert!(options.keep_runner_image);
         assert_eq!(options.sql_server.database, "bench_db");
         assert!(options.sql_server.connection_string.is_some());
+        assert_eq!(
+            options.sql_server_recovery_model,
+            Some(super::SqlServerRecoveryModel::Simple)
+        );
+        assert!(options.sql_server_bulk_table_lock);
         assert_eq!(options.tds_packet_size, Some(32767));
         assert!(options.arrow_odbc_autocommit);
+    }
+
+    #[test]
+    fn compare_rejects_unknown_sql_server_recovery_model() {
+        let args = [
+            OsString::from("--sqlserver-recovery-model"),
+            OsString::from("minimal"),
+        ];
+
+        let err = super::CompareBenchOptions::parse(&args).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("recovery model `minimal`")
+                    && message.contains("bulk-logged")
+        ));
     }
 
     #[test]
@@ -5708,6 +5870,8 @@ mod tests {
             },
             sql_server: crate::sqlserver::SqlServerConnectionOptions::benchmark_default(),
             sql_server_profile: None,
+            sql_server_recovery_model: None,
+            sql_server_bulk_table_lock: false,
             backends: vec![super::BenchmarkBackend::Baseline],
             runner_image: crate::odbc_runner::DEFAULT_RUNNER_IMAGE_TAG.to_owned(),
             keep_runner_image: false,
@@ -5784,6 +5948,16 @@ mod tests {
         assert_eq!(
             sql,
             "CREATE TABLE [dbo].[bench] (\n    [id32] int NOT NULL,\n    [maybe_id64] bigint NULL,\n    [maybe_score] float(53) NULL,\n    [category] nvarchar(max) NULL\n);"
+        );
+    }
+
+    #[test]
+    fn renders_bulk_table_lock_sql_for_benchmark_table() {
+        let table = arrow_tiberius::TableName::new("dbo", "bench'o").unwrap();
+
+        assert_eq!(
+            super::benchmark_bulk_table_lock_sql(&table),
+            "EXEC sys.sp_tableoption N'[dbo].[bench''o]', 'table lock on bulk load', 'ON';"
         );
     }
 
@@ -5885,6 +6059,7 @@ mod tests {
             "/workspace/target/bench.arrow",
             false,
             false,
+            false,
         )
         .unwrap();
 
@@ -5918,9 +6093,14 @@ mod tests {
             output: BenchmarkOutput::Human,
         };
 
-        let args =
-            super::arrow_odbc_runner_args(&benchmark, "/workspace/target/bench.arrow", true, false)
-                .unwrap();
+        let args = super::arrow_odbc_runner_args(
+            &benchmark,
+            "/workspace/target/bench.arrow",
+            true,
+            false,
+            false,
+        )
+        .unwrap();
 
         assert!(args.iter().any(|arg| arg == "--profile-sqlserver"));
     }
@@ -5935,9 +6115,14 @@ mod tests {
             output: BenchmarkOutput::Human,
         };
 
-        let args =
-            super::arrow_odbc_runner_args(&benchmark, "/workspace/target/bench.arrow", false, true)
-                .unwrap();
+        let args = super::arrow_odbc_runner_args(
+            &benchmark,
+            "/workspace/target/bench.arrow",
+            false,
+            true,
+            false,
+        )
+        .unwrap();
 
         assert!(args.iter().any(|arg| arg == "--autocommit"));
     }
@@ -5952,9 +6137,14 @@ mod tests {
             output: BenchmarkOutput::Human,
         };
 
-        let args =
-            super::odbc_bcp_runner_args(&benchmark, "/workspace/target/bench.arrow", false, false)
-                .unwrap();
+        let args = super::odbc_bcp_runner_args(
+            &benchmark,
+            "/workspace/target/bench.arrow",
+            false,
+            false,
+            false,
+        )
+        .unwrap();
 
         assert!(args.iter().any(|arg| arg == "--release"));
         assert!(
@@ -5984,9 +6174,14 @@ mod tests {
             output: BenchmarkOutput::Human,
         };
 
-        let args =
-            super::odbc_bcp_runner_args(&benchmark, "/workspace/target/bench.arrow", false, false)
-                .unwrap();
+        let args = super::odbc_bcp_runner_args(
+            &benchmark,
+            "/workspace/target/bench.arrow",
+            false,
+            false,
+            false,
+        )
+        .unwrap();
 
         assert!(
             args.windows(2)
@@ -6004,9 +6199,14 @@ mod tests {
             output: BenchmarkOutput::Human,
         };
 
-        let args =
-            super::odbc_bcp_runner_args(&benchmark, "/workspace/target/bench.arrow", true, false)
-                .unwrap();
+        let args = super::odbc_bcp_runner_args(
+            &benchmark,
+            "/workspace/target/bench.arrow",
+            true,
+            false,
+            false,
+        )
+        .unwrap();
 
         assert!(args.iter().any(|arg| arg == "--profile-sqlserver"));
     }
@@ -6021,11 +6221,42 @@ mod tests {
             output: BenchmarkOutput::Human,
         };
 
-        let args =
-            super::odbc_bcp_runner_args(&benchmark, "/workspace/target/bench.arrow", false, true)
-                .unwrap();
+        let args = super::odbc_bcp_runner_args(
+            &benchmark,
+            "/workspace/target/bench.arrow",
+            false,
+            true,
+            false,
+        )
+        .unwrap();
 
         assert!(args.iter().any(|arg| arg == "--defer-batches"));
+    }
+
+    #[test]
+    fn odbc_bcp_runner_args_pass_bulk_table_lock_table_option() {
+        let benchmark = WriterBenchOptions {
+            rows: 25,
+            batch_size: 5,
+            scenario: super::scenario_by_name("narrow_numeric").unwrap(),
+            repeat: 3,
+            output: BenchmarkOutput::Human,
+        };
+
+        let args = super::odbc_bcp_runner_args(
+            &benchmark,
+            "/workspace/target/bench.arrow",
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == "--create-table-sql-template"
+                && pair[1].contains("table lock on bulk load")
+                && pair[1].contains(super::ODBC_TABLE_PLACEHOLDER)
+        }));
     }
 
     #[test]
