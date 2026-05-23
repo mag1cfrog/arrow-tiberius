@@ -733,7 +733,7 @@ mod tests {
     };
 
     use arrow_array::{BinaryArray, Float64Array, Int32Array, RecordBatch, UInt64Array};
-    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use arrow_schema::{DataType, Field, Schema};
     use futures_util::io::{AsyncRead, AsyncWrite};
 
     use super::{
@@ -868,15 +868,10 @@ mod tests {
     #[test]
     fn direct_writer_state_rejects_unsupported_mappings() {
         let mappings = vec![SchemaMapping::new(
-            ArrowFieldRef::new(
-                0,
-                "event_time".to_owned(),
-                true,
-                DataType::Time64(TimeUnit::Nanosecond),
-            ),
+            ArrowFieldRef::new(0, "large_name".to_owned(), true, DataType::LargeUtf8),
             MssqlColumn::new(
-                Identifier::new("event_time").unwrap(),
-                MssqlType::Time(crate::MssqlTimePrecision::SEVEN),
+                Identifier::new("large_name").unwrap(),
+                MssqlType::NVarChar(MssqlTypeLength::Max),
                 true,
             ),
         )];
