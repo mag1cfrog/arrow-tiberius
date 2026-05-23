@@ -6,7 +6,7 @@ use crate::write::{
     BinaryPolicy, Date64Policy, Decimal256Policy, DecimalPolicy, PlanOptions, StringPolicy,
     TimezonePolicy, UInt64Policy,
 };
-use crate::{Diagnostic, DiagnosticCode, FieldRef, MssqlType, MssqlTypeLength};
+use crate::{Diagnostic, DiagnosticCode, FieldRef, MssqlTimePrecision, MssqlType, MssqlTypeLength};
 
 pub(crate) fn plan_arrow_data_type_as_mssql_type(
     index: usize,
@@ -49,10 +49,10 @@ pub(crate) fn plan_arrow_data_type_as_mssql_type(
         ),
         DataType::Date32 => Ok(MssqlType::Date),
         DataType::Date64 => plan_arrow_date64_as_mssql_type(options.date64_policy, index, field),
-        DataType::Time32(TimeUnit::Second) => Ok(MssqlType::Time { precision: 0 }),
-        DataType::Time32(TimeUnit::Millisecond) => Ok(MssqlType::Time { precision: 3 }),
-        DataType::Time64(TimeUnit::Microsecond) => Ok(MssqlType::Time { precision: 6 }),
-        DataType::Time64(TimeUnit::Nanosecond) => Ok(MssqlType::Time { precision: 7 }),
+        DataType::Time32(TimeUnit::Second) => Ok(MssqlType::Time(MssqlTimePrecision::ZERO)),
+        DataType::Time32(TimeUnit::Millisecond) => Ok(MssqlType::Time(MssqlTimePrecision::THREE)),
+        DataType::Time64(TimeUnit::Microsecond) => Ok(MssqlType::Time(MssqlTimePrecision::SIX)),
+        DataType::Time64(TimeUnit::Nanosecond) => Ok(MssqlType::Time(MssqlTimePrecision::SEVEN)),
         DataType::Timestamp(_, timezone) => plan_arrow_timestamp_as_mssql_type(
             timezone.as_deref(),
             options.timezone_policy,
@@ -326,8 +326,9 @@ mod tests {
 
     use super::plan_arrow_data_type_as_mssql_type;
     use crate::{
-        Date64Policy, Decimal256Policy, DecimalPolicy, Diagnostic, DiagnosticCode, MssqlType,
-        MssqlTypeLength, NanosecondPolicy, PlanOptions, StringPolicy, TimezonePolicy, UInt64Policy,
+        Date64Policy, Decimal256Policy, DecimalPolicy, Diagnostic, DiagnosticCode,
+        MssqlTimePrecision, MssqlType, MssqlTypeLength, NanosecondPolicy, PlanOptions,
+        StringPolicy, TimezonePolicy, UInt64Policy,
     };
 
     #[test]
@@ -511,19 +512,19 @@ mod tests {
             ),
             (
                 DataType::Time32(TimeUnit::Second),
-                MssqlType::Time { precision: 0 },
+                MssqlType::Time(MssqlTimePrecision::ZERO),
             ),
             (
                 DataType::Time32(TimeUnit::Millisecond),
-                MssqlType::Time { precision: 3 },
+                MssqlType::Time(MssqlTimePrecision::THREE),
             ),
             (
                 DataType::Time64(TimeUnit::Microsecond),
-                MssqlType::Time { precision: 6 },
+                MssqlType::Time(MssqlTimePrecision::SIX),
             ),
             (
                 DataType::Time64(TimeUnit::Nanosecond),
-                MssqlType::Time { precision: 7 },
+                MssqlType::Time(MssqlTimePrecision::SEVEN),
             ),
         ];
 

@@ -3,7 +3,7 @@
 use arrow_schema::{DataType, TimeUnit};
 
 use crate::{
-    DiagnosticCode, MssqlType, NanosecondPolicy, Result, SchemaMapping,
+    DiagnosticCode, MssqlTimePrecision, MssqlType, NanosecondPolicy, Result, SchemaMapping,
     arrow::cell::ArrowCell,
     mssql::cell::{MssqlCell, MssqlTime},
 };
@@ -30,7 +30,7 @@ pub(in crate::mssql::cell::from_arrow) fn mssql_time_value(
         (
             ArrowCell::Time32Second(value),
             DataType::Time32(TimeUnit::Second),
-            MssqlType::Time { precision: 0 },
+            MssqlType::Time(MssqlTimePrecision::ZERO),
         ) => mssql_time_from_i64(
             mapping,
             row_index,
@@ -42,7 +42,7 @@ pub(in crate::mssql::cell::from_arrow) fn mssql_time_value(
         (
             ArrowCell::Time32Millisecond(value),
             DataType::Time32(TimeUnit::Millisecond),
-            MssqlType::Time { precision: 3 },
+            MssqlType::Time(MssqlTimePrecision::THREE),
         ) => mssql_time_from_i64(
             mapping,
             row_index,
@@ -54,7 +54,7 @@ pub(in crate::mssql::cell::from_arrow) fn mssql_time_value(
         (
             ArrowCell::Time64Microsecond(value),
             DataType::Time64(TimeUnit::Microsecond),
-            MssqlType::Time { precision: 6 },
+            MssqlType::Time(MssqlTimePrecision::SIX),
         ) => mssql_time_from_i64(
             mapping,
             row_index,
@@ -66,7 +66,7 @@ pub(in crate::mssql::cell::from_arrow) fn mssql_time_value(
         (
             ArrowCell::Time64Nanosecond(value),
             DataType::Time64(TimeUnit::Nanosecond),
-            MssqlType::Time { precision: 7 },
+            MssqlType::Time(MssqlTimePrecision::SEVEN),
         ) => mssql_time_from_nanoseconds(
             mapping,
             row_index,
@@ -106,16 +106,16 @@ fn supports_null_time_cell(mapping: &SchemaMapping) -> bool {
         (mapping.arrow().data_type(), mapping.mssql().ty()),
         (
             DataType::Time32(TimeUnit::Second),
-            MssqlType::Time { precision: 0 }
+            MssqlType::Time(MssqlTimePrecision::ZERO)
         ) | (
             DataType::Time32(TimeUnit::Millisecond),
-            MssqlType::Time { precision: 3 }
+            MssqlType::Time(MssqlTimePrecision::THREE)
         ) | (
             DataType::Time64(TimeUnit::Microsecond),
-            MssqlType::Time { precision: 6 }
+            MssqlType::Time(MssqlTimePrecision::SIX)
         ) | (
             DataType::Time64(TimeUnit::Nanosecond),
-            MssqlType::Time { precision: 7 }
+            MssqlType::Time(MssqlTimePrecision::SEVEN)
         )
     )
 }
@@ -232,8 +232,8 @@ mod tests {
 
     use super::super::super::{ArrowToMssqlRuntimeMapping, mssql_cell_from_arrow_cell};
     use crate::{
-        ArrowFieldRef, DiagnosticCode, Identifier, MssqlColumn, MssqlProfile, MssqlType,
-        NanosecondPolicy, PlanOptions, SchemaMapping,
+        ArrowFieldRef, DiagnosticCode, Identifier, MssqlColumn, MssqlProfile, MssqlTimePrecision,
+        MssqlType, NanosecondPolicy, PlanOptions, SchemaMapping,
         arrow::cell::ArrowCell,
         mssql::cell::{MssqlCell, MssqlTime},
         plan_arrow_schema_to_mssql_mappings,
@@ -428,12 +428,38 @@ mod tests {
             ),
             MssqlColumn::new(
                 Identifier::new("time_value").unwrap(),
-                MssqlType::Time { precision: 3 },
+                MssqlType::Time(MssqlTimePrecision::THREE),
                 false,
             ),
         );
 
         let err = convert_cell(&mapping, ArrowCell::Time32Second(0), 0).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::ValueTypeMismatch,
+            Some(0),
+            Some((0, "time_value")),
+        );
+    }
+
+    #[test]
+    fn rejects_forged_time_mapping_with_valid_but_unmapped_precision() {
+        let mapping = SchemaMapping::new(
+            ArrowFieldRef::new(
+                0,
+                "time_value".to_owned(),
+                false,
+                DataType::Time64(TimeUnit::Microsecond),
+            ),
+            MssqlColumn::new(
+                Identifier::new("time_value").unwrap(),
+                MssqlType::Time(MssqlTimePrecision::new(4).unwrap()),
+                false,
+            ),
+        );
+
+        let err = convert_cell(&mapping, ArrowCell::Time64Microsecond(0), 0).unwrap_err();
 
         assert_single_diagnostic(
             err,

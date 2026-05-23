@@ -26,7 +26,8 @@ pub use diagnostic::{
 pub use error::{Error, Result};
 pub use mssql::{
     CompatibilityLevel, CreateTableOptions, Identifier, IdentifierPolicy, MssqlColumn,
-    MssqlProfile, MssqlType, MssqlTypeLength, MssqlVersion, TableName, create_table_sql,
+    MssqlProfile, MssqlTimePrecision, MssqlType, MssqlTypeLength, MssqlVersion, TableName,
+    create_table_sql,
 };
 pub use schema::{
     SchemaMapping, create_table_sql_from_mappings, mssql_columns_from_mappings,

@@ -33,8 +33,8 @@ pub fn create_table_sql(
 #[cfg(test)]
 mod tests {
     use crate::{
-        CreateTableOptions, Identifier, MssqlColumn, MssqlType, MssqlTypeLength, TableName,
-        create_table_sql,
+        CreateTableOptions, Identifier, MssqlColumn, MssqlTimePrecision, MssqlType,
+        MssqlTypeLength, TableName, create_table_sql,
     };
 
     #[test]
@@ -102,7 +102,7 @@ mod tests {
             ),
             MssqlColumn::new(
                 Identifier::new("event_time").unwrap(),
-                MssqlType::Time { precision: 7 },
+                MssqlType::Time(MssqlTimePrecision::SEVEN),
                 true,
             ),
             MssqlColumn::new(
