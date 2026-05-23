@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
     Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    Int32Array, Int64Array, RecordBatch, StringArray, Time32MillisecondArray, Time32SecondArray,
+    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
     UInt16Array, UInt32Array, UInt64Array,
 };
@@ -2076,6 +2077,138 @@ async fn baseline_writer_round_trips_timezone_aware_timestamp_datetimeoffset_val
             rows[1].get::<&str, _>(2),
             None,
             "timezone-aware datetimeoffset row 1 fixed",
+        )?;
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    let drop_result = drop_table(&mut client, &table).await;
+    result?;
+    drop_result?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn baseline_writer_round_trips_time_only_values() -> TestResult<()> {
+    let Some((connection_string, database)) = integration_config() else {
+        eprintln!(
+            "skipping SQL Server time-only round-trip integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+        );
+        return Ok(());
+    };
+
+    let mut client = connect(&connection_string, &database).await?;
+    let table = unique_table_name()?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::Int32, false),
+        Field::new("time_s", DataType::Time32(TimeUnit::Second), false),
+        Field::new("time_ms", DataType::Time32(TimeUnit::Millisecond), true),
+        Field::new("time_us", DataType::Time64(TimeUnit::Microsecond), false),
+        Field::new("time_ns", DataType::Time64(TimeUnit::Nanosecond), true),
+    ]));
+    let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
+        Arc::clone(&schema),
+        MssqlProfile::sql_server_2016_compat_100(),
+        PlanOptions::default(),
+    )?
+    .into_parts();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1_i32, 2])) as ArrayRef,
+            Arc::new(Time32SecondArray::from(vec![Some(11_111_i32), Some(0_i32)])),
+            Arc::new(Time32MillisecondArray::from(vec![
+                Some(11_111_111_i32),
+                None,
+            ])),
+            Arc::new(Time64MicrosecondArray::from(vec![
+                Some(11_111_111_111_i64),
+                Some(86_399_999_999_i64),
+            ])),
+            Arc::new(Time64NanosecondArray::from(vec![
+                Some(11_111_111_111_100_i64),
+                None,
+            ])),
+        ],
+    )?;
+
+    execute_sql(
+        &mut client,
+        create_table_sql_from_mappings(&table, &mappings),
+    )
+    .await?;
+
+    let result = async {
+        let mut writer = BulkWriter::new(
+            &mut client,
+            table.clone(),
+            mappings,
+            WriteOptions {
+                backend: WriteBackend::BaselineTokenRow,
+                ..WriteOptions::default()
+            },
+        )
+        .await?;
+        let stats = writer.write_batch(&batch).await?;
+
+        ensure_eq(stats.rows_written, 2, "time-only rows_written")?;
+        ensure_eq(stats.batches_written, 1, "time-only batches_written")?;
+        ensure_eq(writer.finish().await?, stats, "time-only finish stats")?;
+
+        let rows = client
+            .simple_query(format!(
+                "SELECT [row_id], CONVERT(varchar(30), [time_s]), CONVERT(varchar(30), [time_ms]), CONVERT(varchar(30), [time_us]), CONVERT(varchar(30), [time_ns]) FROM {} ORDER BY [row_id]",
+                table.quoted_sql()
+            ))
+            .await?
+            .into_first_result()
+            .await?;
+
+        ensure_eq(rows.len(), 2, "time-only row count")?;
+        ensure_eq(rows[0].get::<i32, _>(0), Some(1), "time-only row 0 id")?;
+        ensure_eq(
+            rows[0].get::<&str, _>(1),
+            Some("03:05:11"),
+            "time-only row 0 second",
+        )?;
+        ensure_eq(
+            rows[0].get::<&str, _>(2),
+            Some("03:05:11.111"),
+            "time-only row 0 millisecond",
+        )?;
+        ensure_eq(
+            rows[0].get::<&str, _>(3),
+            Some("03:05:11.111111"),
+            "time-only row 0 microsecond",
+        )?;
+        ensure_eq(
+            rows[0].get::<&str, _>(4),
+            Some("03:05:11.1111111"),
+            "time-only row 0 nanosecond",
+        )?;
+
+        ensure_eq(rows[1].get::<i32, _>(0), Some(2), "time-only row 1 id")?;
+        ensure_eq(
+            rows[1].get::<&str, _>(1),
+            Some("00:00:00"),
+            "time-only row 1 second",
+        )?;
+        ensure_eq(
+            rows[1].get::<&str, _>(2),
+            None,
+            "time-only row 1 millisecond",
+        )?;
+        ensure_eq(
+            rows[1].get::<&str, _>(3),
+            Some("23:59:59.999999"),
+            "time-only row 1 microsecond",
+        )?;
+        ensure_eq(
+            rows[1].get::<&str, _>(4),
+            None,
+            "time-only row 1 nanosecond",
         )?;
 
         Ok::<(), Box<dyn std::error::Error>>(())
