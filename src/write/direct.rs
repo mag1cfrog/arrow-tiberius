@@ -3561,6 +3561,181 @@ mod tests {
     }
 
     #[test]
+    fn direct_encoder_fixed_width_fast_path_is_active_for_datetimeoffset_columns() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "dto_s",
+                DataType::Timestamp(TimeUnit::Second, Some("+02:30".into())),
+                MssqlType::DateTimeOffset { precision: 7 },
+                true,
+            ),
+            mapping(
+                2,
+                "dto_ms",
+                DataType::Timestamp(TimeUnit::Millisecond, Some("-07".into())),
+                MssqlType::DateTimeOffset { precision: 7 },
+                true,
+            ),
+            mapping(
+                3,
+                "dto_us",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                MssqlType::DateTimeOffset { precision: 7 },
+                false,
+            ),
+            mapping(
+                4,
+                "dto_ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())),
+                MssqlType::DateTimeOffset { precision: 7 },
+                false,
+            ),
+        ];
+        let options = PlanOptions {
+            nanosecond_policy: NanosecondPolicy::RoundTo100ns,
+            ..PlanOptions::default()
+        };
+        let encoder = DirectEncoder::new_with_options(&mappings, options).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new(
+                    "dto_s",
+                    DataType::Timestamp(TimeUnit::Second, Some("+02:30".into())),
+                    true,
+                ),
+                Field::new(
+                    "dto_ms",
+                    DataType::Timestamp(TimeUnit::Millisecond, Some("-07".into())),
+                    true,
+                ),
+                Field::new(
+                    "dto_us",
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                    false,
+                ),
+                Field::new(
+                    "dto_ns",
+                    DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())),
+                    false,
+                ),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(TimestampSecondArray::from(vec![Some(1), None]).with_timezone("+02:30")),
+                Arc::new(
+                    TimestampMillisecondArray::from(vec![Some(1_001), None]).with_timezone("-07"),
+                ),
+                Arc::new(TimestampMicrosecondArray::from(vec![1_001_234, 0]).with_timezone("UTC")),
+                Arc::new(
+                    TimestampNanosecondArray::from(vec![1_001_234_500, 150])
+                        .with_timezone("+00:00"),
+                ),
+            ],
+        );
+
+        let payload = try_encode_fixed_width_primitive_rows(
+            &batch,
+            encoder.mappings(),
+            options,
+            encoder.plan().columns(),
+        )
+        .unwrap()
+        .expect("fixed-width datetimeoffset fast path should be active");
+
+        assert_eq!(payload.row_token_offsets(), [0, 49]);
+        assert_eq!(
+            payload.bytes(),
+            expected_rows([
+                [
+                    int32_cell(1),
+                    datetimeoffset_7_cell(719_162, 10_000_000, 150),
+                    datetimeoffset_7_cell(719_162, 10_010_000, -420),
+                    datetimeoffset_7_cell(719_162, 10_012_340, 0),
+                    datetimeoffset_7_cell(719_162, 10_012_345, 0),
+                ],
+                [
+                    int32_cell(2),
+                    null_cell(),
+                    null_cell(),
+                    datetimeoffset_7_cell(719_162, 0, 0),
+                    datetimeoffset_7_cell(719_162, 2, 0),
+                ],
+            ])
+        );
+    }
+
+    #[cfg(feature = "bench-profile")]
+    #[test]
+    fn direct_encoder_datetimeoffset_fast_path_matches_general_path() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "ny",
+                DataType::Timestamp(TimeUnit::Second, Some("America/New_York".into())),
+                MssqlType::DateTimeOffset { precision: 7 },
+                true,
+            ),
+            mapping(
+                2,
+                "precise",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())),
+                MssqlType::DateTimeOffset { precision: 7 },
+                true,
+            ),
+        ];
+        let options = PlanOptions {
+            nanosecond_policy: NanosecondPolicy::RoundTo100ns,
+            ..PlanOptions::default()
+        };
+        let encoder = DirectEncoder::new_with_options(&mappings, options).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new(
+                    "ny",
+                    DataType::Timestamp(TimeUnit::Second, Some("America/New_York".into())),
+                    true,
+                ),
+                Field::new(
+                    "precise",
+                    DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())),
+                    true,
+                ),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(
+                    TimestampSecondArray::from(vec![
+                        Some(1_738_411_200),
+                        Some(1_750_593_600),
+                        None,
+                    ])
+                    .with_timezone("America/New_York"),
+                ),
+                Arc::new(
+                    TimestampNanosecondArray::from(vec![Some(149), Some(150), None])
+                        .with_timezone("+00:00"),
+                ),
+            ],
+        );
+
+        let fast_path = encoder.encode_batch(&batch).unwrap();
+        let _disable_fast_path =
+            crate::write::profile::disable_direct_fixed_width_fast_path_for_scope();
+        let general_path = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(
+            fast_path.row_token_offsets(),
+            general_path.row_token_offsets()
+        );
+        assert_eq!(fast_path.bytes(), general_path.bytes());
+    }
+
+    #[test]
     fn direct_encoder_fast_path_rejects_invalid_timestamp_timezone_metadata_for_nulls() {
         let mappings = vec![mapping(
             0,
