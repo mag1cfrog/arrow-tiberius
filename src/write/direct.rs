@@ -21,6 +21,7 @@ pub(crate) mod layout;
 pub(crate) mod payload;
 pub(crate) mod plan;
 pub(crate) mod primitive;
+pub(crate) mod temporal;
 pub(crate) mod uint64;
 pub(crate) mod variable_width;
 
