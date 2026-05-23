@@ -1255,9 +1255,29 @@ async fn writer_rejects_uint64_checked_bigint_overflow_without_partial_insert() 
 
 #[tokio::test]
 async fn baseline_writer_round_trips_decimal_policy_values() -> TestResult<()> {
+    round_trip_decimal_policy_values(
+        WriteBackend::BaselineTokenRow,
+        "SQL Server decimal policy integration test",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn direct_raw_writer_round_trips_decimal_policy_values() -> TestResult<()> {
+    round_trip_decimal_policy_values(
+        WriteBackend::DirectRawBulk,
+        "SQL Server direct raw decimal policy integration test",
+    )
+    .await
+}
+
+async fn round_trip_decimal_policy_values(
+    backend: WriteBackend,
+    skip_context: &str,
+) -> TestResult<()> {
     let Some((connection_string, database)) = integration_config() else {
         eprintln!(
-            "skipping SQL Server decimal policy integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+            "skipping {skip_context}: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
         );
         return Ok(());
     };
@@ -1339,7 +1359,7 @@ async fn baseline_writer_round_trips_decimal_policy_values() -> TestResult<()> {
             table.clone(),
             mappings,
             WriteOptions {
-                backend: WriteBackend::BaselineTokenRow,
+                backend,
                 ..WriteOptions::default()
             },
         )
