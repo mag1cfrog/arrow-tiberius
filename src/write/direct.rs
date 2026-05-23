@@ -3,7 +3,7 @@
 
 use arrow_array::{
     BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-    Int64Array, RecordBatch, StringArray, UInt8Array, UInt16Array, UInt32Array,
+    Int64Array, RecordBatch, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 
 use crate::{
@@ -25,11 +25,12 @@ use plan::{CurrentDirectMappings, DirectColumnEncoding, DirectEncoderPlan};
 use primitive::{
     allocate_rows_payload_with_tokens, append_boolean_cell, append_float32_cell,
     append_float64_cell, append_int8_cell, append_int16_cell, append_int32_cell, append_int64_cell,
-    append_uint8_cell, append_uint16_cell, append_uint32_cell, build_fixed_width_row_layout,
-    build_fixed_width_row_range_layout, fill_boolean_column, fill_float32_column,
-    fill_float64_column, fill_int8_column, fill_int16_column, fill_int32_column, fill_int64_column,
-    fill_uint8_column, fill_uint16_column, fill_uint32_column,
-    measure_primitive_column_cell_lengths, try_encode_fixed_width_primitive_rows,
+    append_uint8_cell, append_uint16_cell, append_uint32_cell, append_uint64_checked_bigint_cell,
+    build_fixed_width_row_layout, build_fixed_width_row_range_layout, fill_boolean_column,
+    fill_float32_column, fill_float64_column, fill_int8_column, fill_int16_column,
+    fill_int32_column, fill_int64_column, fill_uint8_column, fill_uint16_column,
+    fill_uint32_column, fill_uint64_checked_bigint_column, measure_primitive_column_cell_lengths,
+    try_encode_fixed_width_primitive_rows,
 };
 use variable_width::{
     append_nvarchar_cell, append_varbinary_cell, fill_nvarchar_column, fill_varbinary_column,
@@ -342,6 +343,17 @@ impl DirectEncoder {
                     let array = downcast_direct_array::<UInt32Array>(array, column)?;
                     fill_uint32_column(array, column, column_index, column_count, layout, bytes)?;
                 }
+                DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt64ToCheckedBigInt) => {
+                    let array = downcast_direct_array::<UInt64Array>(array, column)?;
+                    fill_uint64_checked_bigint_column(
+                        array,
+                        column,
+                        column_index,
+                        column_count,
+                        layout,
+                        bytes,
+                    )?;
+                }
                 DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal) => {
                     let array = downcast_direct_array::<Float32Array>(array, column)?;
                     fill_float32_column(array, column, column_index, column_count, layout, bytes)?;
@@ -349,11 +361,6 @@ impl DirectEncoder {
                 DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => {
                     let array = downcast_direct_array::<Float64Array>(array, column)?;
                     fill_float64_column(array, column, column_index, column_count, layout, bytes)?;
-                }
-                DirectColumnEncoding::Primitive(other) => {
-                    return Err(unsupported_batch(format!(
-                        "direct primitive fill is not implemented yet for {other:?}"
-                    )));
                 }
                 DirectColumnEncoding::VariableWidth(other) => match other {
                     VariableWidthArrowToMssql::Utf8ToNVarChar { .. } => {
@@ -459,6 +466,12 @@ impl DirectEncoder {
                         array: downcast_direct_array::<UInt32Array>(array, column)?,
                     }
                 }
+                DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt64ToCheckedBigInt) => {
+                    RuntimeDirectColumn::UInt64 {
+                        column,
+                        array: downcast_direct_array::<UInt64Array>(array, column)?,
+                    }
+                }
                 DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal) => {
                     RuntimeDirectColumn::Float32 {
                         column,
@@ -470,11 +483,6 @@ impl DirectEncoder {
                         column,
                         array: downcast_direct_array::<Float64Array>(array, column)?,
                     }
-                }
-                DirectColumnEncoding::Primitive(other) => {
-                    return Err(unsupported_batch(format!(
-                        "direct primitive append is not implemented yet for {other:?}"
-                    )));
                 }
                 DirectColumnEncoding::VariableWidth(
                     VariableWidthArrowToMssql::Utf8ToNVarChar { .. },
@@ -535,6 +543,10 @@ enum RuntimeDirectColumn<'a> {
         column: &'a plan::DirectColumnPlan,
         array: &'a UInt32Array,
     },
+    UInt64 {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a UInt64Array,
+    },
     Float32 {
         column: &'a plan::DirectColumnPlan,
         array: &'a Float32Array,
@@ -584,6 +596,9 @@ impl RuntimeDirectColumn<'_> {
             }
             Self::UInt32 { column, array } => {
                 append_uint32_cell(buf, array, column, row_index, measured_len)
+            }
+            Self::UInt64 { column, array } => {
+                append_uint64_checked_bigint_cell(buf, array, column, row_index, measured_len)
             }
             Self::Float32 { column, array } => {
                 append_float32_cell(buf, array, column, row_index, measured_len)
@@ -861,7 +876,7 @@ mod tests {
 
     use arrow_array::{
         ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
-        RecordBatch, StringArray,
+        RecordBatch, StringArray, UInt64Array,
     };
     use arrow_buffer::{NullBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Schema};
@@ -1457,6 +1472,126 @@ mod tests {
 
         assert_eq!(payload.row_token_offsets(), [0, 15]);
         assert_eq!(payload.row_count(), 2);
+    }
+
+    #[test]
+    fn direct_encoder_encodes_uint64_checked_bigint_boundaries() {
+        let mappings = vec![mapping(
+            0,
+            "unsigned_huge",
+            DataType::UInt64,
+            MssqlType::BigInt,
+            true,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![Field::new("unsigned_huge", DataType::UInt64, true)],
+            vec![Arc::new(UInt64Array::from(vec![
+                Some(0),
+                Some(i64::MAX as u64),
+                None,
+            ]))],
+        );
+
+        let payload = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(payload.row_token_offsets(), [0, 10, 20]);
+        assert_eq!(
+            payload.bytes(),
+            [
+                payload::TDS_ROW_TOKEN,
+                8,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                payload::TDS_ROW_TOKEN,
+                8,
+                0xFF,
+                0xFF,
+                0xFF,
+                0xFF,
+                0xFF,
+                0xFF,
+                0xFF,
+                0x7F,
+                payload::TDS_ROW_TOKEN,
+                0,
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_encoder_rejects_uint64_checked_bigint_overflow_before_returning_payload() {
+        let mappings = vec![mapping(
+            0,
+            "unsigned_huge",
+            DataType::UInt64,
+            MssqlType::BigInt,
+            false,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![Field::new("unsigned_huge", DataType::UInt64, false)],
+            vec![Arc::new(UInt64Array::from(vec![0, (i64::MAX as u64) + 1]))],
+        );
+
+        let err = encoder
+            .encode_batch(&batch)
+            .expect_err("UInt64 checked bigint overflow must fail");
+
+        assert_value_conversion_diagnostic(
+            err,
+            DiagnosticCode::IntegerOutOfRange,
+            Some(1),
+            Some((0, "unsigned_huge")),
+        );
+    }
+
+    #[test]
+    fn direct_encoder_rejects_uint64_checked_bigint_overflow_in_append_path() {
+        let mappings = vec![
+            mapping(
+                0,
+                "unsigned_huge",
+                DataType::UInt64,
+                MssqlType::BigInt,
+                false,
+            ),
+            mapping(
+                1,
+                "label",
+                DataType::Utf8,
+                MssqlType::NVarChar(MssqlTypeLength::Max),
+                false,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("unsigned_huge", DataType::UInt64, false),
+                Field::new("label", DataType::Utf8, false),
+            ],
+            vec![
+                Arc::new(UInt64Array::from(vec![(i64::MAX as u64) + 1])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["overflow"])),
+            ],
+        );
+
+        let err = encoder
+            .encode_batch(&batch)
+            .expect_err("append path UInt64 checked bigint overflow must fail");
+
+        assert_value_conversion_diagnostic(
+            err,
+            DiagnosticCode::IntegerOutOfRange,
+            Some(0),
+            Some((0, "unsigned_huge")),
+        );
     }
 
     #[test]

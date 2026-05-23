@@ -5,7 +5,8 @@ use arrow_schema::DataType;
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, MssqlType, Result, SchemaMapping,
     conversion::arrow_to_mssql::{
-        primitive::PrimitiveArrowToMssql, variable_width::VariableWidthArrowToMssql,
+        primitive::PrimitiveArrowToMssql, uint64::UInt64ArrowToMssql,
+        variable_width::VariableWidthArrowToMssql,
     },
 };
 
@@ -62,27 +63,22 @@ pub(crate) struct CurrentDirectMappings;
 impl DirectEncoderSupport for CurrentDirectMappings {
     fn support_mapping(&self, mapping: &SchemaMapping) -> DirectMappingSupport {
         match PrimitiveArrowToMssql::classify(mapping, 0) {
-            Ok(
-                classification @ (PrimitiveArrowToMssql::BooleanToBit
-                | PrimitiveArrowToMssql::UInt8ToTinyInt
-                | PrimitiveArrowToMssql::Int8ToSmallInt
-                | PrimitiveArrowToMssql::Int16ToSmallInt
-                | PrimitiveArrowToMssql::Int32ToInt
-                | PrimitiveArrowToMssql::UInt16ToInt
-                | PrimitiveArrowToMssql::Int64ToBigInt
-                | PrimitiveArrowToMssql::UInt32ToBigInt
-                | PrimitiveArrowToMssql::Float32ToReal
-                | PrimitiveArrowToMssql::Float64ToFloat),
-            ) => DirectMappingSupport::Supported {
+            Ok(classification) => DirectMappingSupport::Supported {
                 encoding: DirectColumnEncoding::Primitive(classification),
             },
-            Ok(classification) => DirectMappingSupport::Unsupported {
-                reason: format!(
-                    "direct encoding support for primitive mapping {classification:?} is not implemented yet"
-                ),
-            },
-            Err(_) => variable_width_support(mapping),
+            Err(_) => uint64_support(mapping),
         }
+    }
+}
+
+fn uint64_support(mapping: &SchemaMapping) -> DirectMappingSupport {
+    match UInt64ArrowToMssql::classify(mapping, 0) {
+        Ok(classification) => DirectMappingSupport::Unsupported {
+            reason: format!(
+                "direct encoding support for UInt64 mapping {classification:?} is not implemented yet"
+            ),
+        },
+        Err(_) => variable_width_support(mapping),
     }
 }
 
@@ -327,9 +323,10 @@ mod tests {
             mapping(5, "unsigned_medium", DataType::UInt16, MssqlType::Int),
             mapping(6, "total", DataType::Int64, MssqlType::BigInt),
             mapping(7, "unsigned_total", DataType::UInt32, MssqlType::BigInt),
-            mapping(8, "real_value", DataType::Float32, MssqlType::Real),
+            mapping(8, "unsigned_huge", DataType::UInt64, MssqlType::BigInt),
+            mapping(9, "real_value", DataType::Float32, MssqlType::Real),
             mapping(
-                9,
+                10,
                 "ratio",
                 DataType::Float64,
                 MssqlType::Float { precision: 53 },
@@ -339,7 +336,7 @@ mod tests {
         let plan = DirectEncoderPlan::new(&mappings, &CurrentDirectMappings)
             .expect("implemented primitive mappings should be supported");
 
-        assert_eq!(plan.column_count(), 10);
+        assert_eq!(plan.column_count(), 11);
         assert_eq!(plan.columns()[0].target_type(), &MssqlType::Bit);
         assert_eq!(plan.columns()[1].target_type(), &MssqlType::TinyInt);
         assert_eq!(plan.columns()[2].target_type(), &MssqlType::SmallInt);
@@ -348,9 +345,10 @@ mod tests {
         assert_eq!(plan.columns()[5].target_type(), &MssqlType::Int);
         assert_eq!(plan.columns()[6].target_type(), &MssqlType::BigInt);
         assert_eq!(plan.columns()[7].target_type(), &MssqlType::BigInt);
-        assert_eq!(plan.columns()[8].target_type(), &MssqlType::Real);
+        assert_eq!(plan.columns()[8].target_type(), &MssqlType::BigInt);
+        assert_eq!(plan.columns()[9].target_type(), &MssqlType::Real);
         assert_eq!(
-            plan.columns()[9].target_type(),
+            plan.columns()[10].target_type(),
             &MssqlType::Float { precision: 53 }
         );
         assert_eq!(
@@ -387,25 +385,32 @@ mod tests {
         );
         assert_eq!(
             plan.columns()[8].encoding(),
-            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal)
+            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt64ToCheckedBigInt)
         );
         assert_eq!(
             plan.columns()[9].encoding(),
+            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal)
+        );
+        assert_eq!(
+            plan.columns()[10].encoding(),
             DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat)
         );
     }
 
     #[test]
-    fn current_direct_support_rejects_remaining_unimplemented_scalar_primitives() {
+    fn current_direct_support_rejects_uint64_decimal20_until_dedicated_encoder() {
         let mappings = vec![mapping(
             0,
             "unsigned_huge",
             DataType::UInt64,
-            MssqlType::BigInt,
+            MssqlType::Decimal {
+                precision: 20,
+                scale: 0,
+            },
         )];
 
         let err = DirectEncoderPlan::new(&mappings, &CurrentDirectMappings)
-            .expect_err("unimplemented primitives are still unsupported");
+            .expect_err("UInt64 decimal direct encoding is implemented in a later slice");
 
         let Error::DirectEncoding { diagnostics } = err else {
             panic!("expected direct encoding error");
@@ -421,7 +426,7 @@ mod tests {
             assert!(
                 diagnostic
                     .message()
-                    .contains("direct encoding support for primitive mapping")
+                    .contains("direct encoding support for UInt64 mapping Decimal20_0")
             );
         }
     }

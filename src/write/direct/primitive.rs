@@ -2,7 +2,7 @@
 
 use arrow_array::{
     Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    RecordBatch, UInt8Array, UInt16Array, UInt32Array,
+    RecordBatch, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 
 use crate::{
@@ -111,6 +111,15 @@ pub(crate) fn try_encode_fixed_width_primitive_rows(
                     &mut bytes,
                 );
             }
+            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt64ToCheckedBigInt) => {
+                let array = downcast_direct_array::<UInt64Array>(array, column.plan)?;
+                fill_uint64_checked_bigint_fixed_width_column(
+                    array,
+                    column.plan,
+                    &mut current_offsets,
+                    &mut bytes,
+                )?;
+            }
             DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal) => {
                 let array = downcast_direct_array::<Float32Array>(array, column.plan)?;
                 fill_float32_fixed_width_column(
@@ -128,9 +137,6 @@ pub(crate) fn try_encode_fixed_width_primitive_rows(
                     &mut current_offsets,
                     &mut bytes,
                 )?;
-            }
-            DirectColumnEncoding::Primitive(_) => {
-                return Ok(None);
             }
             DirectColumnEncoding::VariableWidth(_) => {
                 return Ok(None);
@@ -256,9 +262,9 @@ fn fixed_width_value_len(encoding: DirectColumnEncoding) -> Option<usize> {
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt16ToInt) => Some(4),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int64ToBigInt) => Some(8),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt32ToBigInt) => Some(8),
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt64ToCheckedBigInt) => Some(8),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal) => Some(4),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => Some(8),
-        DirectColumnEncoding::Primitive(_) => None,
         DirectColumnEncoding::VariableWidth(_) => None,
     }
 }
@@ -418,6 +424,35 @@ fn fill_uint32_fixed_width_column(
             |array, row_index| i64::from(array.value(row_index)).to_le_bytes(),
         );
     }
+}
+
+fn fill_uint64_checked_bigint_fixed_width_column(
+    array: &UInt64Array,
+    column: &DirectColumnPlan,
+    current_offsets: &mut [usize],
+    bytes: &mut [u8],
+) -> Result<()> {
+    for (row_index, current_offset) in current_offsets.iter_mut().enumerate().take(array.len()) {
+        let offset = *current_offset;
+        if column.nullable() && array.is_null(row_index) {
+            bytes[offset] = 0;
+            *current_offset += CELL_LEN_PREFIX_LEN;
+            continue;
+        }
+
+        let value = uint64_checked_bigint_bytes(array.value(row_index), column, row_index)?;
+        if column.nullable() {
+            bytes[offset] = 8;
+            bytes[offset + CELL_LEN_PREFIX_LEN..offset + CELL_LEN_PREFIX_LEN + 8]
+                .copy_from_slice(&value);
+            *current_offset += CELL_LEN_PREFIX_LEN + 8;
+        } else {
+            bytes[offset..offset + 8].copy_from_slice(&value);
+            *current_offset += 8;
+        }
+    }
+
+    Ok(())
 }
 
 fn fill_float32_fixed_width_column(
@@ -901,6 +936,38 @@ pub(crate) fn fill_uint32_column(
     )
 }
 
+/// Fills one UInt64-to-checked-bigint column into an already allocated rows payload.
+pub(crate) fn fill_uint64_checked_bigint_column(
+    array: &UInt64Array,
+    column: &DirectColumnPlan,
+    column_index: usize,
+    column_count: usize,
+    layout: &RowLayout,
+    bytes: &mut [u8],
+) -> Result<()> {
+    for row_index in 0..array.len() {
+        let cell = cell_position(layout, row_index, column_index, column_count)?;
+
+        if array.is_null(row_index) {
+            if !column.nullable() {
+                return Err(value_conversion_error(row_column_diagnostic(
+                    column,
+                    row_index,
+                    DiagnosticCode::NullInNonNullableColumn,
+                    "null value in non-nullable direct primitive column",
+                )));
+            }
+
+            write_null_cell(bytes, cell)?;
+        } else {
+            let value = uint64_checked_bigint_bytes(array.value(row_index), column, row_index)?;
+            write_primitive_cell(bytes, cell, column, &value)?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Fills one Float32-to-real column into an already allocated rows payload.
 pub(crate) fn fill_float32_column(
     array: &Float32Array,
@@ -1017,6 +1084,21 @@ where
     }
 
     Ok(())
+}
+
+fn uint64_checked_bigint_bytes(
+    value: u64,
+    column: &DirectColumnPlan,
+    row_index: usize,
+) -> Result<[u8; 8]> {
+    i64::try_from(value).map(i64::to_le_bytes).map_err(|_| {
+        value_conversion_error(row_column_diagnostic(
+            column,
+            row_index,
+            DiagnosticCode::IntegerOutOfRange,
+            format!("Arrow UInt64 value {value} does not fit planned SQL Server bigint"),
+        ))
+    })
 }
 
 /// Appends one Boolean-to-bit cell to a raw bulk append buffer.
@@ -1167,6 +1249,22 @@ pub(crate) fn append_uint32_cell(
         measured_len,
         |array, row_index| i64::from(array.value(row_index)).to_le_bytes(),
     )
+}
+
+/// Appends one UInt64-to-checked-bigint cell to a raw bulk append buffer.
+pub(crate) fn append_uint64_checked_bigint_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    array: &UInt64Array,
+    column: &DirectColumnPlan,
+    row_index: usize,
+    measured_len: usize,
+) -> Result<()> {
+    if array.is_null(row_index) {
+        return append_null_cell(buf, column, row_index, measured_len);
+    }
+
+    let value = uint64_checked_bigint_bytes(array.value(row_index), column, row_index)?;
+    append_primitive_cell(buf, column, measured_len, &value)
 }
 
 /// Appends one Float32-to-real cell to a raw bulk append buffer.
@@ -1418,11 +1516,9 @@ fn primitive_value_len(encoding: DirectColumnEncoding) -> Result<usize> {
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt16ToInt) => Ok(4),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int64ToBigInt) => Ok(8),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt32ToBigInt) => Ok(8),
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt64ToCheckedBigInt) => Ok(8),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal) => Ok(4),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => Ok(8),
-        DirectColumnEncoding::Primitive(other) => Err(unsupported_batch(format!(
-            "direct primitive layout is not implemented yet for {other:?}"
-        ))),
         DirectColumnEncoding::VariableWidth(other) => Err(unsupported_batch(format!(
             "direct primitive layout is not implemented for variable-width mapping {other:?}"
         ))),
