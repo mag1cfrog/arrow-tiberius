@@ -421,6 +421,9 @@ fn expected_direct_bulk_column_type(column: &DirectColumnPlan) -> Option<tiberiu
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt32ToBigInt) => {
             Some(tiberius::ColumnType::Int8)
         }
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal) => {
+            Some(tiberius::ColumnType::Float4)
+        }
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => {
             Some(tiberius::ColumnType::Float8)
         }
@@ -1058,6 +1061,36 @@ mod tests {
             bulk_target_column_with_type(3, "unsigned_medium", false, tiberius::ColumnType::Int4),
             bulk_target_column_with_type(4, "unsigned_total", false, tiberius::ColumnType::Int8),
         ];
+
+        validate_direct_bulk_target_column_types(
+            columns.into_iter(),
+            state.direct_encoder().unwrap().plan(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn direct_bulk_target_type_validation_accepts_issue_75_float32_metadata() {
+        let mappings = vec![schema_mapping_at(
+            0,
+            "real_value",
+            DataType::Float32,
+            MssqlType::Real,
+            false,
+        )];
+        let state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let columns = vec![bulk_target_column_with_type(
+            0,
+            "real_value",
+            false,
+            tiberius::ColumnType::Float4,
+        )];
 
         validate_direct_bulk_target_column_types(
             columns.into_iter(),

@@ -1,8 +1,8 @@
 //! Fixed-width primitive direct TDS row layout.
 
 use arrow_array::{
-    Array, BooleanArray, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch,
-    UInt8Array, UInt16Array, UInt32Array,
+    Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    RecordBatch, UInt8Array, UInt16Array, UInt32Array,
 };
 
 use crate::{
@@ -110,6 +110,15 @@ pub(crate) fn try_encode_fixed_width_primitive_rows(
                     &mut current_offsets,
                     &mut bytes,
                 );
+            }
+            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal) => {
+                let array = downcast_direct_array::<Float32Array>(array, column.plan)?;
+                fill_float32_fixed_width_column(
+                    array,
+                    column.plan,
+                    &mut current_offsets,
+                    &mut bytes,
+                )?;
             }
             DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => {
                 let array = downcast_direct_array::<Float64Array>(array, column.plan)?;
@@ -247,6 +256,7 @@ fn fixed_width_value_len(encoding: DirectColumnEncoding) -> Option<usize> {
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt16ToInt) => Some(4),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int64ToBigInt) => Some(8),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt32ToBigInt) => Some(8),
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal) => Some(4),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => Some(8),
         DirectColumnEncoding::Primitive(_) => None,
         DirectColumnEncoding::VariableWidth(_) => None,
@@ -410,6 +420,44 @@ fn fill_uint32_fixed_width_column(
     }
 }
 
+fn fill_float32_fixed_width_column(
+    array: &Float32Array,
+    column: &DirectColumnPlan,
+    current_offsets: &mut [usize],
+    bytes: &mut [u8],
+) -> Result<()> {
+    for (row_index, current_offset) in current_offsets.iter_mut().enumerate().take(array.len()) {
+        let offset = *current_offset;
+        if column.nullable() && array.is_null(row_index) {
+            bytes[offset] = 0;
+            *current_offset += CELL_LEN_PREFIX_LEN;
+            continue;
+        }
+
+        let value = array.value(row_index);
+        if !value.is_finite() {
+            return Err(value_conversion_error(row_column_diagnostic(
+                column,
+                row_index,
+                DiagnosticCode::NonFiniteFloat,
+                format!("non-finite floating point value {value} is not supported"),
+            )));
+        }
+
+        if column.nullable() {
+            bytes[offset] = 4;
+            bytes[offset + CELL_LEN_PREFIX_LEN..offset + CELL_LEN_PREFIX_LEN + 4]
+                .copy_from_slice(&value.to_le_bytes());
+            *current_offset += CELL_LEN_PREFIX_LEN + 4;
+        } else {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            *current_offset += 4;
+        }
+    }
+
+    Ok(())
+}
+
 fn fill_float64_fixed_width_column(
     array: &Float64Array,
     column: &DirectColumnPlan,
@@ -552,6 +600,26 @@ pub(crate) fn measure_primitive_column_cell_lengths(
 
 fn validate_primitive_column_values(array: &dyn Array, column: &DirectColumnPlan) -> Result<()> {
     if matches!(
+        column.encoding(),
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal)
+    ) {
+        let array = downcast_direct_array::<Float32Array>(array, column)?;
+        for row_index in 0..array.len() {
+            if array.is_null(row_index) {
+                continue;
+            }
+
+            let value = array.value(row_index);
+            if !value.is_finite() {
+                return Err(value_conversion_error(row_column_diagnostic(
+                    column,
+                    row_index,
+                    DiagnosticCode::NonFiniteFloat,
+                    format!("non-finite floating point value {value} is not supported"),
+                )));
+            }
+        }
+    } else if matches!(
         column.encoding(),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat)
     ) {
@@ -833,6 +901,47 @@ pub(crate) fn fill_uint32_column(
     )
 }
 
+/// Fills one Float32-to-real column into an already allocated rows payload.
+pub(crate) fn fill_float32_column(
+    array: &Float32Array,
+    column: &DirectColumnPlan,
+    column_index: usize,
+    column_count: usize,
+    layout: &RowLayout,
+    bytes: &mut [u8],
+) -> Result<()> {
+    for row_index in 0..array.len() {
+        let cell = cell_position(layout, row_index, column_index, column_count)?;
+
+        if array.is_null(row_index) {
+            if !column.nullable() {
+                return Err(value_conversion_error(row_column_diagnostic(
+                    column,
+                    row_index,
+                    DiagnosticCode::NullInNonNullableColumn,
+                    "null value in non-nullable direct primitive column",
+                )));
+            }
+
+            write_null_cell(bytes, cell)?;
+        } else {
+            let value = array.value(row_index);
+            if !value.is_finite() {
+                return Err(value_conversion_error(row_column_diagnostic(
+                    column,
+                    row_index,
+                    DiagnosticCode::NonFiniteFloat,
+                    format!("non-finite floating point value {value} is not supported"),
+                )));
+            }
+
+            write_primitive_cell(bytes, cell, column, &value.to_le_bytes())?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Fills one Float64-to-float column into an already allocated rows payload.
 pub(crate) fn fill_float64_column(
     array: &Float64Array,
@@ -1060,6 +1169,31 @@ pub(crate) fn append_uint32_cell(
     )
 }
 
+/// Appends one Float32-to-real cell to a raw bulk append buffer.
+pub(crate) fn append_float32_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    array: &Float32Array,
+    column: &DirectColumnPlan,
+    row_index: usize,
+    measured_len: usize,
+) -> Result<()> {
+    if array.is_null(row_index) {
+        return append_null_cell(buf, column, row_index, measured_len);
+    }
+
+    let value = array.value(row_index);
+    if !value.is_finite() {
+        return Err(value_conversion_error(row_column_diagnostic(
+            column,
+            row_index,
+            DiagnosticCode::NonFiniteFloat,
+            format!("non-finite floating point value {value} is not supported"),
+        )));
+    }
+
+    append_primitive_cell(buf, column, measured_len, &value.to_le_bytes())
+}
+
 /// Appends one Float64-to-float cell to a raw bulk append buffer.
 pub(crate) fn append_float64_cell(
     buf: &mut tiberius::RawRowsAppendBuffer<'_>,
@@ -1284,6 +1418,7 @@ fn primitive_value_len(encoding: DirectColumnEncoding) -> Result<usize> {
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt16ToInt) => Ok(4),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int64ToBigInt) => Ok(8),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt32ToBigInt) => Ok(8),
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal) => Ok(4),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => Ok(8),
         DirectColumnEncoding::Primitive(other) => Err(unsupported_batch(format!(
             "direct primitive layout is not implemented yet for {other:?}"
@@ -1337,8 +1472,8 @@ fn unsupported_batch(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use arrow_array::{
-        BooleanArray, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, UInt8Array,
-        UInt16Array, UInt32Array,
+        BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        UInt8Array, UInt16Array, UInt32Array,
     };
     use arrow_schema::DataType;
 
@@ -1348,9 +1483,9 @@ mod tests {
 
     use super::{
         allocate_rows_payload_with_tokens, build_fixed_width_row_layout, fill_boolean_column,
-        fill_float64_column, fill_int8_column, fill_int16_column, fill_int32_column,
-        fill_int64_column, fill_uint8_column, fill_uint16_column, fill_uint32_column,
-        measure_primitive_column_cell_lengths,
+        fill_float32_column, fill_float64_column, fill_int8_column, fill_int16_column,
+        fill_int32_column, fill_int64_column, fill_uint8_column, fill_uint16_column,
+        fill_uint32_column, measure_primitive_column_cell_lengths,
     };
     use crate::write::direct::payload::TDS_ROW_TOKEN;
     use crate::write::direct::plan::{CurrentDirectMappings, DirectEncoderPlan};
@@ -2063,6 +2198,109 @@ mod tests {
     }
 
     #[test]
+    fn fills_float32_column_as_little_endian_real_values() {
+        let mappings = vec![mapping(
+            0,
+            "real_value",
+            DataType::Float32,
+            MssqlType::Real,
+            false,
+        )];
+        let plan = plan(&mappings);
+        let array = Float32Array::from(vec![0.0, -0.0, 1.25, -2.5]);
+        let row_count = array.len();
+        let column_count = 1;
+        let mut cell_lengths = vec![0; row_count * column_count];
+        measure_primitive_column_cell_lengths(
+            &array,
+            &plan.columns()[0],
+            0,
+            column_count,
+            &mut cell_lengths,
+        )
+        .unwrap();
+        let layout = build_fixed_width_row_layout(row_count, column_count, &cell_lengths).unwrap();
+        let mut bytes = allocate_rows_payload_with_tokens(&layout);
+
+        fill_float32_column(
+            &array,
+            &plan.columns()[0],
+            0,
+            column_count,
+            &layout,
+            &mut bytes,
+        )
+        .unwrap();
+
+        assert_eq!(
+            bytes,
+            [
+                TDS_ROW_TOKEN,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                TDS_ROW_TOKEN,
+                0x00,
+                0x00,
+                0x00,
+                0x80,
+                TDS_ROW_TOKEN,
+                0x00,
+                0x00,
+                0xA0,
+                0x3F,
+                TDS_ROW_TOKEN,
+                0x00,
+                0x00,
+                0x20,
+                0xC0,
+            ]
+        );
+    }
+
+    #[test]
+    fn fills_nullable_float32_column_with_zero_length_null_cell() {
+        let mappings = vec![mapping(
+            0,
+            "real_value",
+            DataType::Float32,
+            MssqlType::Real,
+            true,
+        )];
+        let plan = plan(&mappings);
+        let array = Float32Array::from(vec![Some(7.0), None]);
+        let row_count = array.len();
+        let column_count = 1;
+        let mut cell_lengths = vec![0; row_count * column_count];
+        measure_primitive_column_cell_lengths(
+            &array,
+            &plan.columns()[0],
+            0,
+            column_count,
+            &mut cell_lengths,
+        )
+        .unwrap();
+        let layout = build_fixed_width_row_layout(row_count, column_count, &cell_lengths).unwrap();
+        let mut bytes = allocate_rows_payload_with_tokens(&layout);
+
+        fill_float32_column(
+            &array,
+            &plan.columns()[0],
+            0,
+            column_count,
+            &layout,
+            &mut bytes,
+        )
+        .unwrap();
+
+        assert_eq!(
+            bytes,
+            [TDS_ROW_TOKEN, 4, 0, 0, 0xE0, 0x40, TDS_ROW_TOKEN, 0]
+        );
+    }
+
+    #[test]
     fn fills_float64_column_as_little_endian_float_values() {
         let mappings = vec![mapping(
             0,
@@ -2192,6 +2430,42 @@ mod tests {
                 0,
             ]
         );
+    }
+
+    #[test]
+    fn rejects_non_finite_float32_values_before_finishing_payload() {
+        let mappings = vec![mapping(
+            0,
+            "real_value",
+            DataType::Float32,
+            MssqlType::Real,
+            false,
+        )];
+        let plan = plan(&mappings);
+        let cases = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+
+        for value in cases {
+            let array = Float32Array::from(vec![1.0, value]);
+            let row_count = array.len();
+            let column_count = 1;
+            let mut cell_lengths = vec![0; row_count * column_count];
+
+            let err = measure_primitive_column_cell_lengths(
+                &array,
+                &plan.columns()[0],
+                0,
+                column_count,
+                &mut cell_lengths,
+            )
+            .expect_err("non-finite float must fail before layout is accepted");
+
+            assert_value_conversion_diagnostic(
+                err,
+                DiagnosticCode::NonFiniteFloat,
+                Some(1),
+                Some((0, "real_value")),
+            );
+        }
     }
 
     #[test]

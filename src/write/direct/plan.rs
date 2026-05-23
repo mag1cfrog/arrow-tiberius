@@ -71,6 +71,7 @@ impl DirectEncoderSupport for CurrentDirectMappings {
                 | PrimitiveArrowToMssql::UInt16ToInt
                 | PrimitiveArrowToMssql::Int64ToBigInt
                 | PrimitiveArrowToMssql::UInt32ToBigInt
+                | PrimitiveArrowToMssql::Float32ToReal
                 | PrimitiveArrowToMssql::Float64ToFloat),
             ) => DirectMappingSupport::Supported {
                 encoding: DirectColumnEncoding::Primitive(classification),
@@ -326,8 +327,9 @@ mod tests {
             mapping(5, "unsigned_medium", DataType::UInt16, MssqlType::Int),
             mapping(6, "total", DataType::Int64, MssqlType::BigInt),
             mapping(7, "unsigned_total", DataType::UInt32, MssqlType::BigInt),
+            mapping(8, "real_value", DataType::Float32, MssqlType::Real),
             mapping(
-                8,
+                9,
                 "ratio",
                 DataType::Float64,
                 MssqlType::Float { precision: 53 },
@@ -337,7 +339,7 @@ mod tests {
         let plan = DirectEncoderPlan::new(&mappings, &CurrentDirectMappings)
             .expect("implemented primitive mappings should be supported");
 
-        assert_eq!(plan.column_count(), 9);
+        assert_eq!(plan.column_count(), 10);
         assert_eq!(plan.columns()[0].target_type(), &MssqlType::Bit);
         assert_eq!(plan.columns()[1].target_type(), &MssqlType::TinyInt);
         assert_eq!(plan.columns()[2].target_type(), &MssqlType::SmallInt);
@@ -346,8 +348,9 @@ mod tests {
         assert_eq!(plan.columns()[5].target_type(), &MssqlType::Int);
         assert_eq!(plan.columns()[6].target_type(), &MssqlType::BigInt);
         assert_eq!(plan.columns()[7].target_type(), &MssqlType::BigInt);
+        assert_eq!(plan.columns()[8].target_type(), &MssqlType::Real);
         assert_eq!(
-            plan.columns()[8].target_type(),
+            plan.columns()[9].target_type(),
             &MssqlType::Float { precision: 53 }
         );
         assert_eq!(
@@ -384,16 +387,22 @@ mod tests {
         );
         assert_eq!(
             plan.columns()[8].encoding(),
+            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal)
+        );
+        assert_eq!(
+            plan.columns()[9].encoding(),
             DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat)
         );
     }
 
     #[test]
     fn current_direct_support_rejects_remaining_unimplemented_scalar_primitives() {
-        let mappings = vec![
-            mapping(0, "unsigned_huge", DataType::UInt64, MssqlType::BigInt),
-            mapping(1, "real_value", DataType::Float32, MssqlType::Real),
-        ];
+        let mappings = vec![mapping(
+            0,
+            "unsigned_huge",
+            DataType::UInt64,
+            MssqlType::BigInt,
+        )];
 
         let err = DirectEncoderPlan::new(&mappings, &CurrentDirectMappings)
             .expect_err("unimplemented primitives are still unsupported");
@@ -402,7 +411,7 @@ mod tests {
             panic!("expected direct encoding error");
         };
 
-        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics.len(), 1);
         for (index, diagnostic) in diagnostics.all().iter().enumerate() {
             assert_eq!(
                 diagnostic.code(),
