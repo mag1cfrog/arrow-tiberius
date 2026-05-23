@@ -1700,9 +1700,30 @@ async fn round_trip_date64_datetime2_values(
 
 #[tokio::test]
 async fn baseline_writer_round_trips_timezone_free_timestamp_datetime2_values() -> TestResult<()> {
+    round_trip_timezone_free_timestamp_datetime2_values(
+        WriteBackend::BaselineTokenRow,
+        "SQL Server timezone-free timestamp round-trip integration test",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn direct_raw_writer_round_trips_timezone_free_timestamp_datetime2_values() -> TestResult<()>
+{
+    round_trip_timezone_free_timestamp_datetime2_values(
+        WriteBackend::DirectRawBulk,
+        "SQL Server direct raw timezone-free timestamp round-trip integration test",
+    )
+    .await
+}
+
+async fn round_trip_timezone_free_timestamp_datetime2_values(
+    backend: WriteBackend,
+    test_name: &str,
+) -> TestResult<()> {
     let Some((connection_string, database)) = integration_config() else {
         eprintln!(
-            "skipping SQL Server timezone-free timestamp round-trip integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+            "skipping {test_name}: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
         );
         return Ok(());
     };
@@ -1777,7 +1798,7 @@ async fn baseline_writer_round_trips_timezone_free_timestamp_datetime2_values() 
             table.clone(),
             mappings,
             WriteOptions {
-                backend: WriteBackend::BaselineTokenRow,
+                backend,
                 plan_options,
                 ..WriteOptions::default()
             },
@@ -1875,9 +1896,30 @@ async fn baseline_writer_round_trips_timezone_free_timestamp_datetime2_values() 
 #[tokio::test]
 async fn baseline_writer_round_trips_timezone_aware_timestamp_normalized_datetime2_values()
 -> TestResult<()> {
+    round_trip_timezone_aware_timestamp_normalized_datetime2_values(
+        WriteBackend::BaselineTokenRow,
+        "SQL Server timezone-aware normalized datetime2 integration test",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn direct_raw_writer_round_trips_timezone_aware_timestamp_normalized_datetime2_values()
+-> TestResult<()> {
+    round_trip_timezone_aware_timestamp_normalized_datetime2_values(
+        WriteBackend::DirectRawBulk,
+        "SQL Server direct raw timezone-aware normalized datetime2 integration test",
+    )
+    .await
+}
+
+async fn round_trip_timezone_aware_timestamp_normalized_datetime2_values(
+    backend: WriteBackend,
+    test_name: &str,
+) -> TestResult<()> {
     let Some((connection_string, database)) = integration_config() else {
         eprintln!(
-            "skipping SQL Server timezone-aware normalized datetime2 integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+            "skipping {test_name}: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
         );
         return Ok(());
     };
@@ -1925,7 +1967,7 @@ async fn baseline_writer_round_trips_timezone_aware_timestamp_normalized_datetim
             table.clone(),
             mappings,
             WriteOptions {
-                backend: WriteBackend::BaselineTokenRow,
+                backend,
                 plan_options,
                 ..WriteOptions::default()
             },
