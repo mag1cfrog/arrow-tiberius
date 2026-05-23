@@ -5,13 +5,13 @@ use arrow_array::{Array, UInt64Array};
 use crate::{Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, Result, write::profile};
 
 use super::{
+    decimal::{
+        NULL_DECIMAL_CELL_LEN, append_decimal_cell, append_null_decimal_cell, decimal_cell_len,
+        write_decimal_cell, write_null_decimal_cell as write_null_decimal_payload_cell,
+    },
     layout::{CellPosition, RowLayout},
     plan::DirectColumnPlan,
 };
-
-const DECIMAL_CELL_LEN_PREFIX_LEN: usize = 1;
-const DECIMAL_SIGN_LEN: usize = 1;
-const DECIMAL_POSITIVE_SIGN: u8 = 1;
 
 /// Measures one UInt64-to-decimal(20,0) column into a row-major cell length matrix.
 pub(crate) fn measure_uint64_decimal20_cell_lengths(
@@ -25,7 +25,7 @@ pub(crate) fn measure_uint64_decimal20_cell_lengths(
         let cell_len = if array.is_null(row_index) {
             null_decimal20_cell_len(column, row_index)?
         } else {
-            uint64_decimal20_cell_len(array.value(row_index))
+            decimal_cell_len(i128::from(array.value(row_index)))
         };
 
         cell_lengths[row_index * column_count + column_index] = cell_len;
@@ -75,12 +75,12 @@ pub(crate) fn append_uint64_decimal20_cell(
             )));
         }
 
-        buf.put_u8(0);
+        append_null_decimal_cell(buf);
         return Ok(());
     }
 
     let value = array.value(row_index);
-    let expected_len = uint64_decimal20_cell_len(value);
+    let expected_len = decimal_cell_len(i128::from(value));
     if measured_len != expected_len {
         return Err(invalid_payload(format!(
             "measured UInt64 decimal20_0 cell at row {row_index} column {} has length {}, expected {expected_len}",
@@ -89,7 +89,7 @@ pub(crate) fn append_uint64_decimal20_cell(
         )));
     }
 
-    append_uint64_decimal20_value(buf, value)
+    append_decimal_cell(buf, i128::from(value))
 }
 
 fn write_null_decimal20_cell(
@@ -109,12 +109,11 @@ fn write_null_decimal20_cell(
     }
 
     let cell_bytes = cell_bytes_mut(bytes, cell)?;
-    cell_bytes[0] = 0;
-    Ok(())
+    write_null_decimal_payload_cell(cell_bytes)
 }
 
 fn write_uint64_decimal20_cell(bytes: &mut [u8], cell: &CellPosition, value: u64) -> Result<()> {
-    let expected_len = uint64_decimal20_cell_len(value);
+    let expected_len = decimal_cell_len(i128::from(value));
     if cell.len() != expected_len {
         return Err(invalid_payload(format!(
             "UInt64 decimal20_0 cell at row {} column {} has length {}, expected {expected_len}",
@@ -125,80 +124,7 @@ fn write_uint64_decimal20_cell(bytes: &mut [u8], cell: &CellPosition, value: u64
     }
 
     let cell_bytes = cell_bytes_mut(bytes, cell)?;
-    write_uint64_decimal20_value(cell_bytes, value)
-}
-
-fn append_uint64_decimal20_value(
-    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
-    value: u64,
-) -> Result<()> {
-    let value_len = uint64_decimal20_value_len(value);
-    buf.put_u8(value_len);
-    buf.put_u8(DECIMAL_POSITIVE_SIGN);
-
-    match decimal_magnitude_len(value) {
-        4 => buf.put_u32_le(value as u32),
-        8 => buf.put_u64_le(value),
-        12 => {
-            buf.put_u64_le(value);
-            buf.put_u32_le(0);
-        }
-        other => {
-            return Err(invalid_payload(format!(
-                "unsupported UInt64 decimal20_0 magnitude length {other}"
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-fn write_uint64_decimal20_value(dst: &mut [u8], value: u64) -> Result<()> {
-    let value_len = uint64_decimal20_value_len(value);
-    dst[0] = value_len;
-    dst[1] = DECIMAL_POSITIVE_SIGN;
-
-    match decimal_magnitude_len(value) {
-        4 => dst[2..6].copy_from_slice(&(value as u32).to_le_bytes()),
-        8 => dst[2..10].copy_from_slice(&value.to_le_bytes()),
-        12 => {
-            dst[2..10].copy_from_slice(&value.to_le_bytes());
-            dst[10..14].copy_from_slice(&0u32.to_le_bytes());
-        }
-        other => {
-            return Err(invalid_payload(format!(
-                "unsupported UInt64 decimal20_0 magnitude length {other}"
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-fn uint64_decimal20_cell_len(value: u64) -> usize {
-    DECIMAL_CELL_LEN_PREFIX_LEN + usize::from(uint64_decimal20_value_len(value))
-}
-
-fn uint64_decimal20_value_len(value: u64) -> u8 {
-    (DECIMAL_SIGN_LEN + decimal_magnitude_len(value)) as u8
-}
-
-fn decimal_magnitude_len(value: u64) -> usize {
-    match decimal_precision(value) {
-        1..=9 => 4,
-        10..=19 => 8,
-        20 => 12,
-        _ => unreachable!("u64 decimal precision cannot exceed 20"),
-    }
-}
-
-fn decimal_precision(mut value: u64) -> u8 {
-    let mut digits = 1;
-    while value >= 10 {
-        value /= 10;
-        digits += 1;
-    }
-    digits
+    write_decimal_cell(cell_bytes, i128::from(value))
 }
 
 fn null_decimal20_cell_len(column: &DirectColumnPlan, row_index: usize) -> Result<usize> {
@@ -211,7 +137,7 @@ fn null_decimal20_cell_len(column: &DirectColumnPlan, row_index: usize) -> Resul
         )));
     }
 
-    Ok(DECIMAL_CELL_LEN_PREFIX_LEN)
+    Ok(NULL_DECIMAL_CELL_LEN)
 }
 
 fn cell_bytes_mut<'a>(bytes: &'a mut [u8], cell: &CellPosition) -> Result<&'a mut [u8]> {

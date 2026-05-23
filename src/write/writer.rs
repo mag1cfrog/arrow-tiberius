@@ -461,7 +461,9 @@ fn expected_direct_bulk_column_type(column: &DirectColumnPlan) -> Option<tiberiu
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => {
             Some(tiberius::ColumnType::Float8)
         }
-        DirectColumnEncoding::UInt64Decimal20_0 => Some(tiberius::ColumnType::Decimaln),
+        DirectColumnEncoding::UInt64Decimal20_0 | DirectColumnEncoding::Decimal(_) => {
+            Some(tiberius::ColumnType::Decimaln)
+        }
         DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::Utf8ToNVarChar {
             ..
         }) => Some(tiberius::ColumnType::NVarchar),
@@ -475,6 +477,10 @@ fn expected_direct_bulk_column_type(column: &DirectColumnPlan) -> Option<tiberiu
 fn expected_direct_decimal_precision_scale(column: &DirectColumnPlan) -> Option<(u8, u8)> {
     match column.encoding() {
         DirectColumnEncoding::UInt64Decimal20_0 => Some((20, 0)),
+        DirectColumnEncoding::Decimal(classification) => Some((
+            classification.target_precision(),
+            classification.target_scale(),
+        )),
         _ => None,
     }
 }

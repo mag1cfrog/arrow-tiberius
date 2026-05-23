@@ -3,8 +3,10 @@
 use arrow_schema::DataType;
 
 use crate::{
-    DiagnosticCode, MssqlType, Result, SchemaMapping, arrow::cell::ArrowCell,
-    conversion::arrow_to_mssql::uint64::UInt64ArrowToMssql, mssql::cell::MssqlDecimal,
+    DiagnosticCode, MssqlType, Result, SchemaMapping,
+    arrow::cell::ArrowCell,
+    conversion::arrow_to_mssql::{decimal::DecimalArrowToMssql, uint64::UInt64ArrowToMssql},
+    mssql::cell::MssqlDecimal,
 };
 
 use super::{row_mapping_diagnostic, value_conversion_error};
@@ -14,42 +16,52 @@ pub(super) fn mssql_decimal_value(
     row_index: usize,
     cell: ArrowCell<'_>,
 ) -> Result<MssqlDecimal> {
-    let scale = decimal_scale(mapping, row_index)?;
-    validate_decimal_scale_compatibility(mapping, row_index, scale)?;
+    if let DataType::UInt64 = mapping.arrow().data_type() {
+        let scale = decimal_scale(mapping, row_index)?;
+        validate_uint64_decimal_scale_compatibility(mapping, row_index, scale)?;
+        let ArrowCell::UInt64(value) = cell else {
+            return Err(value_conversion_error(row_mapping_diagnostic(
+                mapping,
+                row_index,
+                DiagnosticCode::ValueTypeMismatch,
+                format!("expected Arrow decimal-compatible payload, got {cell:?}"),
+            )));
+        };
 
-    match (cell, mapping.arrow().data_type()) {
-        (ArrowCell::UInt64(value), DataType::UInt64) => {
-            classify_uint64_decimal20_0(mapping, row_index)?;
-            mssql_decimal(mapping, row_index, i128::from(value), scale)
+        classify_uint64_decimal20_0(mapping, row_index)?;
+        return mssql_decimal(mapping, row_index, i128::from(value), scale);
+    }
+
+    let classification = DecimalArrowToMssql::classify(mapping, row_index)?;
+    match (cell, classification) {
+        (ArrowCell::Decimal32(value), DecimalArrowToMssql::Decimal32 { .. }) => {
+            let value = normalize_unscaled_decimal(
+                mapping,
+                row_index,
+                i128::from(value),
+                classification.arrow_scale(),
+            )?;
+            mssql_decimal_for_classification(mapping, row_index, value, classification)
         }
-        (ArrowCell::Decimal32(value), DataType::Decimal32(_, arrow_scale)) if *arrow_scale >= 0 => {
-            mssql_decimal(mapping, row_index, i128::from(value), scale)
+        (ArrowCell::Decimal64(value), DecimalArrowToMssql::Decimal64 { .. }) => {
+            let value = normalize_unscaled_decimal(
+                mapping,
+                row_index,
+                i128::from(value),
+                classification.arrow_scale(),
+            )?;
+            mssql_decimal_for_classification(mapping, row_index, value, classification)
         }
-        (ArrowCell::Decimal32(value), DataType::Decimal32(_, arrow_scale)) => {
-            let value =
-                normalize_negative_scale(mapping, row_index, i128::from(value), *arrow_scale)?;
-            mssql_decimal(mapping, row_index, value, scale)
+        (ArrowCell::Decimal128(value), DecimalArrowToMssql::Decimal128 { .. }) => {
+            let value = normalize_unscaled_decimal(
+                mapping,
+                row_index,
+                value,
+                classification.arrow_scale(),
+            )?;
+            mssql_decimal_for_classification(mapping, row_index, value, classification)
         }
-        (ArrowCell::Decimal64(value), DataType::Decimal64(_, arrow_scale)) if *arrow_scale >= 0 => {
-            mssql_decimal(mapping, row_index, i128::from(value), scale)
-        }
-        (ArrowCell::Decimal64(value), DataType::Decimal64(_, arrow_scale)) => {
-            let value =
-                normalize_negative_scale(mapping, row_index, i128::from(value), *arrow_scale)?;
-            mssql_decimal(mapping, row_index, value, scale)
-        }
-        (ArrowCell::Decimal128(value), DataType::Decimal128(_, arrow_scale))
-            if *arrow_scale >= 0 =>
-        {
-            mssql_decimal(mapping, row_index, value, scale)
-        }
-        (ArrowCell::Decimal128(value), DataType::Decimal128(_, arrow_scale)) => {
-            let value = normalize_negative_scale(mapping, row_index, value, *arrow_scale)?;
-            mssql_decimal(mapping, row_index, value, scale)
-        }
-        (ArrowCell::Decimal256(value), DataType::Decimal256(_, arrow_scale))
-            if *arrow_scale >= 0 =>
-        {
+        (ArrowCell::Decimal256(value), DecimalArrowToMssql::Decimal256CheckedDowncast { .. }) => {
             let value = value.to_i128().ok_or_else(|| {
                 value_conversion_error(row_mapping_diagnostic(
                     mapping,
@@ -58,19 +70,13 @@ pub(super) fn mssql_decimal_value(
                     "Arrow Decimal256 value does not fit runtime i128 decimal representation",
                 ))
             })?;
-            mssql_decimal(mapping, row_index, value, scale)
-        }
-        (ArrowCell::Decimal256(value), DataType::Decimal256(_, arrow_scale)) => {
-            let value = value.to_i128().ok_or_else(|| {
-                value_conversion_error(row_mapping_diagnostic(
-                    mapping,
-                    row_index,
-                    DiagnosticCode::DecimalOutOfRange,
-                    "Arrow Decimal256 value does not fit runtime i128 decimal representation",
-                ))
-            })?;
-            let value = normalize_negative_scale(mapping, row_index, value, *arrow_scale)?;
-            mssql_decimal(mapping, row_index, value, scale)
+            let value = normalize_unscaled_decimal(
+                mapping,
+                row_index,
+                value,
+                classification.arrow_scale(),
+            )?;
+            mssql_decimal_for_classification(mapping, row_index, value, classification)
         }
         other => Err(value_conversion_error(row_mapping_diagnostic(
             mapping,
@@ -146,37 +152,13 @@ fn decimal_scale(mapping: &SchemaMapping, row_index: usize) -> Result<u8> {
     Ok(scale)
 }
 
-fn validate_decimal_scale_compatibility(
+fn validate_uint64_decimal_scale_compatibility(
     mapping: &SchemaMapping,
     row_index: usize,
     planned_scale: u8,
 ) -> Result<()> {
-    let expected_scale = match mapping.arrow().data_type() {
-        DataType::UInt64 => {
-            classify_uint64_decimal20_0(mapping, row_index)?;
-            0
-        }
-        DataType::Decimal32(_, arrow_scale)
-        | DataType::Decimal64(_, arrow_scale)
-        | DataType::Decimal128(_, arrow_scale)
-        | DataType::Decimal256(_, arrow_scale)
-            if *arrow_scale < 0 =>
-        {
-            0
-        }
-        DataType::Decimal32(_, arrow_scale)
-        | DataType::Decimal64(_, arrow_scale)
-        | DataType::Decimal128(_, arrow_scale)
-        | DataType::Decimal256(_, arrow_scale) => u8::try_from(*arrow_scale).map_err(|_| {
-            value_conversion_error(row_mapping_diagnostic(
-                mapping,
-                row_index,
-                DiagnosticCode::DecimalOutOfRange,
-                format!("Arrow decimal scale {arrow_scale} cannot be represented at runtime"),
-            ))
-        })?,
-        _ => return Ok(()),
-    };
+    classify_uint64_decimal20_0(mapping, row_index)?;
+    let expected_scale = 0;
 
     if planned_scale == expected_scale {
         return Ok(());
@@ -190,6 +172,21 @@ fn validate_decimal_scale_compatibility(
             "planned SQL Server decimal scale {planned_scale} is incompatible with Arrow decimal scale {expected_scale}"
         ),
     )))
+}
+
+fn mssql_decimal_for_classification(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    unscaled: i128,
+    classification: DecimalArrowToMssql,
+) -> Result<MssqlDecimal> {
+    mssql_decimal_with_shape(
+        mapping,
+        row_index,
+        unscaled,
+        classification.target_precision(),
+        classification.target_scale(),
+    )
 }
 
 fn mssql_decimal(
@@ -207,7 +204,17 @@ fn mssql_decimal(
         )));
     };
 
-    if decimal_unscaled_fits_precision(unscaled, *precision) {
+    mssql_decimal_with_shape(mapping, row_index, unscaled, *precision, scale)
+}
+
+fn mssql_decimal_with_shape(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    unscaled: i128,
+    precision: u8,
+    scale: u8,
+) -> Result<MssqlDecimal> {
+    if decimal_unscaled_fits_precision(unscaled, precision) {
         return Ok(MssqlDecimal::new(unscaled, scale));
     }
 
@@ -217,6 +224,19 @@ fn mssql_decimal(
         DiagnosticCode::DecimalOutOfRange,
         format!("decimal value {unscaled} does not fit planned precision {precision}"),
     )))
+}
+
+fn normalize_unscaled_decimal(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    unscaled: i128,
+    arrow_scale: i8,
+) -> Result<i128> {
+    if arrow_scale >= 0 {
+        Ok(unscaled)
+    } else {
+        normalize_negative_scale(mapping, row_index, unscaled, arrow_scale)
+    }
 }
 
 fn normalize_negative_scale(

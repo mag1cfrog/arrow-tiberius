@@ -2,18 +2,21 @@
 #![allow(dead_code)]
 
 use arrow_array::{
-    BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-    Int64Array, RecordBatch, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    BinaryArray, BooleanArray, Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch,
+    StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, Error, Result, SchemaMapping,
     conversion::arrow_to_mssql::{
-        primitive::PrimitiveArrowToMssql, variable_width::VariableWidthArrowToMssql,
+        decimal::DecimalArrowToMssql, primitive::PrimitiveArrowToMssql,
+        variable_width::VariableWidthArrowToMssql,
     },
     write::record_batch::validate_runtime_columns,
 };
 
+pub(crate) mod decimal;
 pub(crate) mod layout;
 pub(crate) mod payload;
 pub(crate) mod plan;
@@ -21,6 +24,10 @@ pub(crate) mod primitive;
 pub(crate) mod uint64;
 pub(crate) mod variable_width;
 
+use decimal::{
+    append_decimal32_cell, append_decimal64_cell, append_decimal128_cell, append_decimal256_cell,
+    fill_decimal_column, measure_decimal_column_cell_lengths,
+};
 use payload::EncodedRowsPayload;
 use plan::{CurrentDirectMappings, DirectColumnEncoding, DirectEncoderPlan};
 use primitive::{
@@ -288,6 +295,16 @@ impl DirectEncoder {
                         &mut cell_lengths,
                     )?;
                 }
+                DirectColumnEncoding::Decimal(classification) => {
+                    measure_decimal_column_cell_lengths(
+                        array,
+                        column,
+                        classification,
+                        column_index,
+                        column_count,
+                        &mut cell_lengths,
+                    )?;
+                }
                 DirectColumnEncoding::VariableWidth(_) => {
                     measure_variable_width_column_cell_lengths(
                         array,
@@ -382,6 +399,17 @@ impl DirectEncoder {
                     fill_uint64_decimal20_column(
                         array,
                         column,
+                        column_index,
+                        column_count,
+                        layout,
+                        bytes,
+                    )?;
+                }
+                DirectColumnEncoding::Decimal(classification) => {
+                    fill_decimal_column(
+                        array,
+                        column,
+                        classification,
                         column_index,
                         column_count,
                         layout,
@@ -514,6 +542,34 @@ impl DirectEncoder {
                     column,
                     array: downcast_direct_array::<UInt64Array>(array, column)?,
                 },
+                DirectColumnEncoding::Decimal(
+                    classification @ DecimalArrowToMssql::Decimal32 { .. },
+                ) => RuntimeDirectColumn::Decimal32 {
+                    column,
+                    classification,
+                    array: downcast_direct_array::<Decimal32Array>(array, column)?,
+                },
+                DirectColumnEncoding::Decimal(
+                    classification @ DecimalArrowToMssql::Decimal64 { .. },
+                ) => RuntimeDirectColumn::Decimal64 {
+                    column,
+                    classification,
+                    array: downcast_direct_array::<Decimal64Array>(array, column)?,
+                },
+                DirectColumnEncoding::Decimal(
+                    classification @ DecimalArrowToMssql::Decimal128 { .. },
+                ) => RuntimeDirectColumn::Decimal128 {
+                    column,
+                    classification,
+                    array: downcast_direct_array::<Decimal128Array>(array, column)?,
+                },
+                DirectColumnEncoding::Decimal(
+                    classification @ DecimalArrowToMssql::Decimal256CheckedDowncast { .. },
+                ) => RuntimeDirectColumn::Decimal256 {
+                    column,
+                    classification,
+                    array: downcast_direct_array::<Decimal256Array>(array, column)?,
+                },
                 DirectColumnEncoding::VariableWidth(
                     VariableWidthArrowToMssql::Utf8ToNVarChar { .. },
                 ) => RuntimeDirectColumn::Utf8 {
@@ -581,6 +637,26 @@ enum RuntimeDirectColumn<'a> {
         column: &'a plan::DirectColumnPlan,
         array: &'a UInt64Array,
     },
+    Decimal32 {
+        column: &'a plan::DirectColumnPlan,
+        classification: DecimalArrowToMssql,
+        array: &'a Decimal32Array,
+    },
+    Decimal64 {
+        column: &'a plan::DirectColumnPlan,
+        classification: DecimalArrowToMssql,
+        array: &'a Decimal64Array,
+    },
+    Decimal128 {
+        column: &'a plan::DirectColumnPlan,
+        classification: DecimalArrowToMssql,
+        array: &'a Decimal128Array,
+    },
+    Decimal256 {
+        column: &'a plan::DirectColumnPlan,
+        classification: DecimalArrowToMssql,
+        array: &'a Decimal256Array,
+    },
     Float32 {
         column: &'a plan::DirectColumnPlan,
         array: &'a Float32Array,
@@ -636,6 +712,34 @@ impl RuntimeDirectColumn<'_> {
             }
             Self::UInt64Decimal20_0 { column, array } => {
                 append_uint64_decimal20_cell(buf, array, column, row_index, measured_len)
+            }
+            Self::Decimal32 {
+                column,
+                classification,
+                array,
+            } => {
+                append_decimal32_cell(buf, array, column, *classification, row_index, measured_len)
+            }
+            Self::Decimal64 {
+                column,
+                classification,
+                array,
+            } => {
+                append_decimal64_cell(buf, array, column, *classification, row_index, measured_len)
+            }
+            Self::Decimal128 {
+                column,
+                classification,
+                array,
+            } => {
+                append_decimal128_cell(buf, array, column, *classification, row_index, measured_len)
+            }
+            Self::Decimal256 {
+                column,
+                classification,
+                array,
+            } => {
+                append_decimal256_cell(buf, array, column, *classification, row_index, measured_len)
             }
             Self::Float32 { column, array } => {
                 append_float32_cell(buf, array, column, row_index, measured_len)
@@ -912,10 +1016,11 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
-        RecordBatch, StringArray, UInt64Array,
+        ArrayRef, BinaryArray, BooleanArray, Decimal32Array, Decimal64Array, Decimal128Array,
+        Decimal256Array, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+        StringArray, UInt64Array,
     };
-    use arrow_buffer::{NullBuffer, ScalarBuffer};
+    use arrow_buffer::{NullBuffer, ScalarBuffer, i256};
     use arrow_schema::{DataType, Field, Schema};
 
     use crate::{
@@ -1657,6 +1762,280 @@ mod tests {
             DiagnosticCode::NullInNonNullableColumn,
             Some(1),
             Some((0, "unsigned_huge")),
+        );
+    }
+
+    #[test]
+    fn direct_encoder_encodes_decimal128_sign_zero_and_null() {
+        let mappings = vec![mapping(
+            0,
+            "amount",
+            DataType::Decimal128(5, 2),
+            MssqlType::Decimal {
+                precision: 5,
+                scale: 2,
+            },
+            true,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let array = Decimal128Array::from(vec![Some(99_999_i128), Some(-99_999), Some(0), None])
+            .with_precision_and_scale(5, 2)
+            .unwrap();
+        let batch = record_batch(
+            vec![Field::new("amount", DataType::Decimal128(5, 2), true)],
+            vec![Arc::new(array)],
+        );
+
+        let payload = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(payload.row_token_offsets(), [0, 7, 14, 21]);
+        assert_eq!(
+            payload.bytes(),
+            [
+                payload::TDS_ROW_TOKEN,
+                5,
+                1,
+                0x9F,
+                0x86,
+                0x01,
+                0,
+                payload::TDS_ROW_TOKEN,
+                5,
+                0,
+                0x9F,
+                0x86,
+                0x01,
+                0,
+                payload::TDS_ROW_TOKEN,
+                5,
+                1,
+                0,
+                0,
+                0,
+                0,
+                payload::TDS_ROW_TOKEN,
+                0,
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_encoder_encodes_decimal256_checked_downcast_value() {
+        let mappings = vec![mapping(
+            0,
+            "amount",
+            DataType::Decimal256(38, 0),
+            MssqlType::Decimal {
+                precision: 38,
+                scale: 0,
+            },
+            false,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let value = i256::from_i128(123_456_789_012_345_678_901_234_567_890_i128);
+        let array = Decimal256Array::from(vec![value])
+            .with_precision_and_scale(38, 0)
+            .unwrap();
+        let batch = record_batch(
+            vec![Field::new("amount", DataType::Decimal256(38, 0), false)],
+            vec![Arc::new(array)],
+        );
+
+        let payload = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(payload.row_count(), 1);
+        assert_eq!(
+            payload.bytes(),
+            [
+                payload::TDS_ROW_TOKEN,
+                17,
+                1,
+                0xD2,
+                0x0A,
+                0x3F,
+                0x4E,
+                0xEE,
+                0xE0,
+                0x73,
+                0xC3,
+                0xF6,
+                0x0F,
+                0xE9,
+                0x8E,
+                0x01,
+                0,
+                0,
+                0,
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_encoder_encodes_mixed_nullable_and_non_nullable_decimal_columns() {
+        let mappings = vec![
+            mapping(
+                0,
+                "amount32",
+                DataType::Decimal32(5, 2),
+                MssqlType::Decimal {
+                    precision: 5,
+                    scale: 2,
+                },
+                false,
+            ),
+            mapping(
+                1,
+                "amount64",
+                DataType::Decimal64(18, 4),
+                MssqlType::Decimal {
+                    precision: 18,
+                    scale: 4,
+                },
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let decimal32 = Decimal32Array::from(vec![12_345_i32, -12_345])
+            .with_precision_and_scale(5, 2)
+            .unwrap();
+        let decimal64 = Decimal64Array::from(vec![None, Some(0_i64)])
+            .with_precision_and_scale(18, 4)
+            .unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("amount32", DataType::Decimal32(5, 2), false),
+                Field::new("amount64", DataType::Decimal64(18, 4), true),
+            ],
+            vec![Arc::new(decimal32), Arc::new(decimal64)],
+        );
+
+        let payload = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(payload.row_token_offsets(), [0, 8]);
+        assert_eq!(
+            payload.bytes(),
+            [
+                payload::TDS_ROW_TOKEN,
+                5,
+                1,
+                0x39,
+                0x30,
+                0,
+                0,
+                0,
+                payload::TDS_ROW_TOKEN,
+                5,
+                0,
+                0x39,
+                0x30,
+                0,
+                0,
+                5,
+                1,
+                0,
+                0,
+                0,
+                0,
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_encoder_rejects_decimal_null_in_non_nullable_column() {
+        let mappings = vec![mapping(
+            0,
+            "amount",
+            DataType::Decimal128(5, 2),
+            MssqlType::Decimal {
+                precision: 5,
+                scale: 2,
+            },
+            false,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let array = Decimal128Array::from(vec![Some(0_i128), None])
+            .with_precision_and_scale(5, 2)
+            .unwrap();
+        let batch = record_batch(
+            vec![Field::new("amount", DataType::Decimal128(5, 2), true)],
+            vec![Arc::new(array)],
+        );
+
+        let err = encoder
+            .encode_batch(&batch)
+            .expect_err("decimal null must fail for non-nullable target");
+
+        assert_value_conversion_diagnostic(
+            err,
+            DiagnosticCode::NullInNonNullableColumn,
+            Some(1),
+            Some((0, "amount")),
+        );
+    }
+
+    #[test]
+    fn direct_encoder_rejects_decimal_value_outside_planned_precision() {
+        let mappings = vec![mapping(
+            0,
+            "amount",
+            DataType::Decimal128(6, 2),
+            MssqlType::Decimal {
+                precision: 5,
+                scale: 2,
+            },
+            false,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let array = Decimal128Array::from(vec![100_000_i128])
+            .with_precision_and_scale(6, 2)
+            .unwrap();
+        let batch = record_batch(
+            vec![Field::new("amount", DataType::Decimal128(6, 2), false)],
+            vec![Arc::new(array)],
+        );
+
+        let err = encoder
+            .encode_batch(&batch)
+            .expect_err("decimal value outside planned precision must fail");
+
+        assert_value_conversion_diagnostic(
+            err,
+            DiagnosticCode::DecimalOutOfRange,
+            Some(0),
+            Some((0, "amount")),
+        );
+    }
+
+    #[test]
+    fn direct_encoder_rejects_decimal256_value_that_cannot_downcast() {
+        let mappings = vec![mapping(
+            0,
+            "amount",
+            DataType::Decimal256(39, 0),
+            MssqlType::Decimal {
+                precision: 38,
+                scale: 0,
+            },
+            false,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let array = Decimal256Array::from(vec![i256::from_i128(i128::MAX) + i256::ONE])
+            .with_precision_and_scale(39, 0)
+            .unwrap();
+        let batch = record_batch(
+            vec![Field::new("amount", DataType::Decimal256(39, 0), false)],
+            vec![Arc::new(array)],
+        );
+
+        let err = encoder
+            .encode_batch(&batch)
+            .expect_err("Decimal256 value outside i128 must fail");
+
+        assert_value_conversion_diagnostic(
+            err,
+            DiagnosticCode::DecimalOutOfRange,
+            Some(0),
+            Some((0, "amount")),
         );
     }
 
