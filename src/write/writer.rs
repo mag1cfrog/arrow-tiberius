@@ -654,7 +654,7 @@ mod tests {
         task::{Context, Poll, Wake, Waker},
     };
 
-    use arrow_array::{BinaryArray, Float64Array, Int32Array, RecordBatch};
+    use arrow_array::{BinaryArray, Float64Array, Int32Array, RecordBatch, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use futures_util::io::{AsyncRead, AsyncWrite};
 
@@ -1467,6 +1467,43 @@ mod tests {
     }
 
     #[test]
+    fn write_direct_batch_to_sink_rejects_uint64_bigint_overflow_before_any_range_send() {
+        let mappings = vec![schema_mapping_at(
+            0,
+            "u64_value",
+            DataType::UInt64,
+            MssqlType::BigInt,
+            false,
+        )];
+        let mut state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingRawSink::default();
+        let row_count = DIRECT_RAW_MAX_PAYLOAD_BYTES / 9 + 2;
+        let mut values = vec![1_u64; row_count];
+        values[row_count - 1] = i64::MAX as u64 + 1;
+        let batch = uint64_batch("u64_value", &values);
+
+        let err =
+            poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch)).unwrap_err();
+
+        let Error::ValueConversion { diagnostics } = err else {
+            panic!("expected value conversion error");
+        };
+        assert_eq!(
+            diagnostics.all()[0].code(),
+            DiagnosticCode::IntegerOutOfRange
+        );
+        assert_eq!(diagnostics.all()[0].row(), Some(row_count - 1));
+        assert!(sink.payloads.is_empty());
+        assert_eq!(state.stats(), WriteStats::default());
+    }
+
+    #[test]
     fn write_direct_batch_to_sink_rejects_runtime_type_mismatch_before_send() {
         let mappings = vec![mapping("id")];
         let mut state = WriterState::new(
@@ -1578,6 +1615,13 @@ mod tests {
     fn int32_batch(name: &str, values: &[i32]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, false)]));
         let array = Arc::new(Int32Array::from(values.to_vec()));
+
+        RecordBatch::try_new(schema, vec![array]).unwrap()
+    }
+
+    fn uint64_batch(name: &str, values: &[u64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::UInt64, false)]));
+        let array = Arc::new(UInt64Array::from(values.to_vec()));
 
         RecordBatch::try_new(schema, vec![array]).unwrap()
     }

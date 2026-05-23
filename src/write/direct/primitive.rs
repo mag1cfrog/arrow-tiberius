@@ -678,6 +678,18 @@ fn validate_primitive_column_values(array: &dyn Array, column: &DirectColumnPlan
                 )));
             }
         }
+    } else if matches!(
+        column.encoding(),
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt64ToCheckedBigInt)
+    ) {
+        let array = downcast_direct_array::<UInt64Array>(array, column)?;
+        for row_index in 0..array.len() {
+            if array.is_null(row_index) {
+                continue;
+            }
+
+            uint64_checked_bigint_bytes(array.value(row_index), column, row_index)?;
+        }
     }
 
     Ok(())
