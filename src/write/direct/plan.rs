@@ -30,6 +30,8 @@ pub(crate) enum DirectMappingSupport {
 pub(crate) enum DirectColumnEncoding {
     /// Fixed-width primitive encoding.
     Primitive(PrimitiveArrowToMssql),
+    /// Arrow UInt64 to SQL Server `decimal(20,0)`.
+    UInt64Decimal20_0,
     /// Variable-width encoding.
     VariableWidth(VariableWidthArrowToMssql),
 }
@@ -73,10 +75,11 @@ impl DirectEncoderSupport for CurrentDirectMappings {
 
 fn uint64_support(mapping: &SchemaMapping) -> DirectMappingSupport {
     match UInt64ArrowToMssql::classify(mapping, 0) {
-        Ok(classification) => DirectMappingSupport::Unsupported {
-            reason: format!(
-                "direct encoding support for UInt64 mapping {classification:?} is not implemented yet"
-            ),
+        Ok(UInt64ArrowToMssql::Decimal20_0) => DirectMappingSupport::Supported {
+            encoding: DirectColumnEncoding::UInt64Decimal20_0,
+        },
+        Ok(UInt64ArrowToMssql::CheckedBigInt) => DirectMappingSupport::Supported {
+            encoding: DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt64ToCheckedBigInt),
         },
         Err(_) => variable_width_support(mapping),
     }
@@ -398,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn current_direct_support_rejects_uint64_decimal20_until_dedicated_encoder() {
+    fn current_direct_support_accepts_uint64_decimal20_mapping() {
         let mappings = vec![mapping(
             0,
             "unsigned_huge",
@@ -409,26 +412,14 @@ mod tests {
             },
         )];
 
-        let err = DirectEncoderPlan::new(&mappings, &CurrentDirectMappings)
-            .expect_err("UInt64 decimal direct encoding is implemented in a later slice");
+        let plan = DirectEncoderPlan::new(&mappings, &CurrentDirectMappings)
+            .expect("UInt64 decimal20 direct encoding should be supported");
 
-        let Error::DirectEncoding { diagnostics } = err else {
-            panic!("expected direct encoding error");
-        };
-
-        assert_eq!(diagnostics.len(), 1);
-        for (index, diagnostic) in diagnostics.all().iter().enumerate() {
-            assert_eq!(
-                diagnostic.code(),
-                DiagnosticCode::DirectEncodingUnsupportedMapping
-            );
-            assert_eq!(diagnostic.field().unwrap().index(), index);
-            assert!(
-                diagnostic
-                    .message()
-                    .contains("direct encoding support for UInt64 mapping Decimal20_0")
-            );
-        }
+        assert_eq!(plan.column_count(), 1);
+        assert_eq!(
+            plan.columns()[0].encoding(),
+            DirectColumnEncoding::UInt64Decimal20_0
+        );
     }
 
     #[test]

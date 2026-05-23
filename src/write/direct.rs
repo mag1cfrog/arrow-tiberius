@@ -18,6 +18,7 @@ pub(crate) mod layout;
 pub(crate) mod payload;
 pub(crate) mod plan;
 pub(crate) mod primitive;
+pub(crate) mod uint64;
 pub(crate) mod variable_width;
 
 use payload::EncodedRowsPayload;
@@ -31,6 +32,10 @@ use primitive::{
     fill_int32_column, fill_int64_column, fill_uint8_column, fill_uint16_column,
     fill_uint32_column, fill_uint64_checked_bigint_column, measure_primitive_column_cell_lengths,
     try_encode_fixed_width_primitive_rows,
+};
+use uint64::{
+    append_uint64_decimal20_cell, fill_uint64_decimal20_column,
+    measure_uint64_decimal20_cell_lengths,
 };
 use variable_width::{
     append_nvarchar_cell, append_varbinary_cell, fill_nvarchar_column, fill_varbinary_column,
@@ -273,6 +278,16 @@ impl DirectEncoder {
                         &mut cell_lengths,
                     )?;
                 }
+                DirectColumnEncoding::UInt64Decimal20_0 => {
+                    let array = downcast_direct_array::<UInt64Array>(array, column)?;
+                    measure_uint64_decimal20_cell_lengths(
+                        array,
+                        column,
+                        column_index,
+                        column_count,
+                        &mut cell_lengths,
+                    )?;
+                }
                 DirectColumnEncoding::VariableWidth(_) => {
                     measure_variable_width_column_cell_lengths(
                         array,
@@ -361,6 +376,17 @@ impl DirectEncoder {
                 DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => {
                     let array = downcast_direct_array::<Float64Array>(array, column)?;
                     fill_float64_column(array, column, column_index, column_count, layout, bytes)?;
+                }
+                DirectColumnEncoding::UInt64Decimal20_0 => {
+                    let array = downcast_direct_array::<UInt64Array>(array, column)?;
+                    fill_uint64_decimal20_column(
+                        array,
+                        column,
+                        column_index,
+                        column_count,
+                        layout,
+                        bytes,
+                    )?;
                 }
                 DirectColumnEncoding::VariableWidth(other) => match other {
                     VariableWidthArrowToMssql::Utf8ToNVarChar { .. } => {
@@ -484,6 +510,10 @@ impl DirectEncoder {
                         array: downcast_direct_array::<Float64Array>(array, column)?,
                     }
                 }
+                DirectColumnEncoding::UInt64Decimal20_0 => RuntimeDirectColumn::UInt64Decimal20_0 {
+                    column,
+                    array: downcast_direct_array::<UInt64Array>(array, column)?,
+                },
                 DirectColumnEncoding::VariableWidth(
                     VariableWidthArrowToMssql::Utf8ToNVarChar { .. },
                 ) => RuntimeDirectColumn::Utf8 {
@@ -547,6 +577,10 @@ enum RuntimeDirectColumn<'a> {
         column: &'a plan::DirectColumnPlan,
         array: &'a UInt64Array,
     },
+    UInt64Decimal20_0 {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a UInt64Array,
+    },
     Float32 {
         column: &'a plan::DirectColumnPlan,
         array: &'a Float32Array,
@@ -599,6 +633,9 @@ impl RuntimeDirectColumn<'_> {
             }
             Self::UInt64 { column, array } => {
                 append_uint64_checked_bigint_cell(buf, array, column, row_index, measured_len)
+            }
+            Self::UInt64Decimal20_0 { column, array } => {
+                append_uint64_decimal20_cell(buf, array, column, row_index, measured_len)
             }
             Self::Float32 { column, array } => {
                 append_float32_cell(buf, array, column, row_index, measured_len)
@@ -1522,6 +1559,104 @@ mod tests {
                 payload::TDS_ROW_TOKEN,
                 0,
             ]
+        );
+    }
+
+    #[test]
+    fn direct_encoder_encodes_uint64_decimal20_boundaries() {
+        let mappings = vec![mapping(
+            0,
+            "unsigned_huge",
+            DataType::UInt64,
+            MssqlType::Decimal {
+                precision: 20,
+                scale: 0,
+            },
+            true,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![Field::new("unsigned_huge", DataType::UInt64, true)],
+            vec![Arc::new(UInt64Array::from(vec![
+                Some(0),
+                Some((i64::MAX as u64) + 1),
+                Some(u64::MAX),
+                None,
+            ]))],
+        );
+
+        let payload = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(payload.row_token_offsets(), [0, 7, 18, 33]);
+        assert_eq!(
+            payload.bytes(),
+            [
+                payload::TDS_ROW_TOKEN,
+                5,
+                1,
+                0,
+                0,
+                0,
+                0,
+                payload::TDS_ROW_TOKEN,
+                9,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0x80,
+                payload::TDS_ROW_TOKEN,
+                13,
+                1,
+                0xFF,
+                0xFF,
+                0xFF,
+                0xFF,
+                0xFF,
+                0xFF,
+                0xFF,
+                0xFF,
+                0,
+                0,
+                0,
+                0,
+                payload::TDS_ROW_TOKEN,
+                0,
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_encoder_rejects_uint64_decimal20_null_in_non_nullable_column() {
+        let mappings = vec![mapping(
+            0,
+            "unsigned_huge",
+            DataType::UInt64,
+            MssqlType::Decimal {
+                precision: 20,
+                scale: 0,
+            },
+            false,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![Field::new("unsigned_huge", DataType::UInt64, true)],
+            vec![Arc::new(UInt64Array::from(vec![Some(1), None]))],
+        );
+
+        let err = encoder
+            .encode_batch(&batch)
+            .expect_err("UInt64 decimal20 null must fail for non-nullable target");
+
+        assert_value_conversion_diagnostic(
+            err,
+            DiagnosticCode::NullInNonNullableColumn,
+            Some(1),
+            Some((0, "unsigned_huge")),
         );
     }
 

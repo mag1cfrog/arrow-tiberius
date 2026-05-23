@@ -430,6 +430,7 @@ fn expected_direct_bulk_column_type(column: &DirectColumnPlan) -> Option<tiberiu
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => {
             Some(tiberius::ColumnType::Float8)
         }
+        DirectColumnEncoding::UInt64Decimal20_0 => Some(tiberius::ColumnType::Decimaln),
         DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::Utf8ToNVarChar {
             ..
         }) => Some(tiberius::ColumnType::NVarchar),

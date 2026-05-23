@@ -138,6 +138,9 @@ pub(crate) fn try_encode_fixed_width_primitive_rows(
                     &mut bytes,
                 )?;
             }
+            DirectColumnEncoding::UInt64Decimal20_0 => {
+                return Ok(None);
+            }
             DirectColumnEncoding::VariableWidth(_) => {
                 return Ok(None);
             }
@@ -265,6 +268,7 @@ fn fixed_width_value_len(encoding: DirectColumnEncoding) -> Option<usize> {
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt64ToCheckedBigInt) => Some(8),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal) => Some(4),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => Some(8),
+        DirectColumnEncoding::UInt64Decimal20_0 => None,
         DirectColumnEncoding::VariableWidth(_) => None,
     }
 }
@@ -1519,6 +1523,9 @@ fn primitive_value_len(encoding: DirectColumnEncoding) -> Result<usize> {
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt64ToCheckedBigInt) => Ok(8),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal) => Ok(4),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => Ok(8),
+        DirectColumnEncoding::UInt64Decimal20_0 => Err(unsupported_batch(
+            "direct primitive layout is not implemented for UInt64 decimal20_0",
+        )),
         DirectColumnEncoding::VariableWidth(other) => Err(unsupported_batch(format!(
             "direct primitive layout is not implemented for variable-width mapping {other:?}"
         ))),
