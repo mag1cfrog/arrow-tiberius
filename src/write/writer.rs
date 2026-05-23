@@ -392,6 +392,37 @@ fn validate_direct_bulk_target_column_type(
             )),
         );
     }
+
+    if let Some((expected_precision, expected_scale)) =
+        expected_direct_decimal_precision_scale(plan_column)
+    {
+        match column.decimal_precision_scale() {
+            Some((actual_precision, actual_scale))
+                if actual_precision == expected_precision && actual_scale == expected_scale => {}
+            Some((actual_precision, actual_scale)) => diagnostics.push(
+                Diagnostic::error(
+                    DiagnosticCode::SchemaMismatch,
+                    format!(
+                        "bulk target decimal precision/scale ({actual_precision},{actual_scale}) does not match direct encoder precision/scale ({expected_precision},{expected_scale})"
+                    ),
+                )
+                .with_field(FieldRef::new(
+                    plan_column.source_index(),
+                    plan_column.source_name(),
+                )),
+            ),
+            None => diagnostics.push(
+                Diagnostic::error(
+                    DiagnosticCode::SchemaMismatch,
+                    "bulk target decimal precision/scale metadata is not available",
+                )
+                .with_field(FieldRef::new(
+                    plan_column.source_index(),
+                    plan_column.source_name(),
+                )),
+            ),
+        }
+    }
 }
 
 fn expected_direct_bulk_column_type(column: &DirectColumnPlan) -> Option<tiberius::ColumnType> {
@@ -441,6 +472,13 @@ fn expected_direct_bulk_column_type(column: &DirectColumnPlan) -> Option<tiberiu
     }
 }
 
+fn expected_direct_decimal_precision_scale(column: &DirectColumnPlan) -> Option<(u8, u8)> {
+    match column.encoding() {
+        DirectColumnEncoding::UInt64Decimal20_0 => Some((20, 0)),
+        _ => None,
+    }
+}
+
 fn bulk_target_column_diagnostic(
     mapping: &SchemaMapping,
     message: impl Into<String>,
@@ -459,6 +497,10 @@ trait BulkTargetColumnMetadata {
     fn is_nullable(&self) -> bool;
 
     fn column_type(&self) -> tiberius::ColumnType;
+
+    fn decimal_precision_scale(&self) -> Option<(u8, u8)> {
+        None
+    }
 }
 
 impl BulkTargetColumnMetadata for tiberius::BulkLoadColumn<'_> {
@@ -476,6 +518,18 @@ impl BulkTargetColumnMetadata for tiberius::BulkLoadColumn<'_> {
 
     fn column_type(&self) -> tiberius::ColumnType {
         self.column_type()
+    }
+
+    fn decimal_precision_scale(&self) -> Option<(u8, u8)> {
+        match self.type_info() {
+            tiberius::TypeInfo::VarLenSizedPrecision {
+                ty: tiberius::VarLenType::Decimaln | tiberius::VarLenType::Numericn,
+                precision,
+                scale,
+                ..
+            } => Some((*precision, *scale)),
+            _ => None,
+        }
     }
 }
 
@@ -1126,7 +1180,7 @@ mod tests {
         .unwrap();
         let columns = vec![
             bulk_target_column_with_type(0, "checked", false, tiberius::ColumnType::Int8),
-            bulk_target_column_with_type(1, "decimal", false, tiberius::ColumnType::Decimaln),
+            bulk_target_decimal_column(1, "decimal", false, 20, 0),
         ];
 
         validate_direct_bulk_target_column_types(
@@ -1134,6 +1188,48 @@ mod tests {
             state.direct_encoder().unwrap().plan(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn direct_bulk_target_type_validation_rejects_uint64_decimal_precision_drift() {
+        let mappings = vec![schema_mapping_at(
+            0,
+            "decimal",
+            DataType::UInt64,
+            MssqlType::Decimal {
+                precision: 20,
+                scale: 0,
+            },
+            false,
+        )];
+        let state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let columns = vec![bulk_target_decimal_column(0, "decimal", false, 19, 0)];
+
+        let err = validate_direct_bulk_target_column_types(
+            columns.into_iter(),
+            state.direct_encoder().unwrap().plan(),
+        )
+        .unwrap_err();
+
+        let Error::ValueConversion { diagnostics } = err else {
+            panic!("expected value conversion error");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics.all()[0];
+        assert_eq!(diagnostic.code(), DiagnosticCode::SchemaMismatch);
+        assert!(diagnostic.message().contains("precision/scale (19,0)"));
+        assert_eq!(
+            diagnostic
+                .field()
+                .map(|field| (field.index(), field.name())),
+            Some((0, "decimal"))
+        );
     }
 
     #[test]
@@ -1648,6 +1744,23 @@ mod tests {
             name: name.to_owned(),
             nullable,
             column_type,
+            decimal_precision_scale: None,
+        }
+    }
+
+    fn bulk_target_decimal_column(
+        ordinal: usize,
+        name: &str,
+        nullable: bool,
+        precision: u8,
+        scale: u8,
+    ) -> FakeBulkTargetColumn {
+        FakeBulkTargetColumn {
+            ordinal,
+            name: name.to_owned(),
+            nullable,
+            column_type: tiberius::ColumnType::Decimaln,
+            decimal_precision_scale: Some((precision, scale)),
         }
     }
 
@@ -1740,6 +1853,7 @@ mod tests {
         name: String,
         nullable: bool,
         column_type: tiberius::ColumnType,
+        decimal_precision_scale: Option<(u8, u8)>,
     }
 
     impl BulkTargetColumnMetadata for FakeBulkTargetColumn {
@@ -1757,6 +1871,10 @@ mod tests {
 
         fn column_type(&self) -> tiberius::ColumnType {
             self.column_type
+        }
+
+        fn decimal_precision_scale(&self) -> Option<(u8, u8)> {
+            self.decimal_precision_scale
         }
     }
 
