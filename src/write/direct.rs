@@ -2668,6 +2668,71 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "bench-profile")]
+    #[test]
+    fn direct_encoder_timestamp_datetime2_fast_path_matches_general_path() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "created_at",
+                DataType::Timestamp(TimeUnit::Second, Some("America/New_York".into())),
+                MssqlType::DateTime2 { precision: 7 },
+                true,
+            ),
+            mapping(
+                2,
+                "precise_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                MssqlType::DateTime2 { precision: 7 },
+                true,
+            ),
+        ];
+        let options = PlanOptions {
+            nanosecond_policy: NanosecondPolicy::RoundTo100ns,
+            ..PlanOptions::default()
+        };
+        let encoder = DirectEncoder::new_with_options(&mappings, options).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new(
+                    "created_at",
+                    DataType::Timestamp(TimeUnit::Second, Some("America/New_York".into())),
+                    true,
+                ),
+                Field::new(
+                    "precise_at",
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    true,
+                ),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(
+                    TimestampSecondArray::from(vec![Some(0), Some(1_750_593_600), None])
+                        .with_timezone("America/New_York"),
+                ),
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    Some(150),
+                    Some(-50),
+                    None,
+                ])),
+            ],
+        );
+
+        let fast_path = encoder.encode_batch(&batch).unwrap();
+        let _disable_fast_path =
+            crate::write::profile::disable_direct_fixed_width_fast_path_for_scope();
+        let general_path = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(
+            fast_path.row_token_offsets(),
+            general_path.row_token_offsets()
+        );
+        assert_eq!(fast_path.bytes(), general_path.bytes());
+    }
+
     #[test]
     fn direct_encoder_encodes_uint64_checked_bigint_boundaries() {
         let mappings = vec![mapping(
