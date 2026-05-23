@@ -26,81 +26,32 @@ pub(in crate::mssql::cell::from_arrow) fn mssql_datetimeoffset_value(
             ArrowCell::TimestampSecond(value),
             TemporalArrowToMssql::TimestampSecondTzToDateTimeOffset,
             Some(timezone),
-        ) => {
-            let resolution = timezone_resolution_from_metadata(mapping, row_index, timezone)?;
-            let offset_minutes = resolution.offset_for_instant(mapping, row_index, value, 0)?;
-            let utc_ticks = i128::from(value) * TICKS_100NS_PER_SECOND;
-            mssql_datetimeoffset_from_utc_100ns_ticks(
-                mapping,
-                row_index,
-                utc_ticks,
-                offset_minutes,
-                "second",
-                value,
-            )
-        }
+        ) => mssql_datetimeoffset_from_arrow_timestamp_second(mapping, row_index, value, timezone),
         (
             ArrowCell::TimestampMillisecond(value),
             TemporalArrowToMssql::TimestampMillisecondTzToDateTimeOffset,
             Some(timezone),
-        ) => {
-            let (seconds, nanoseconds) = epoch_parts_from_milliseconds(mapping, row_index, value)?;
-            let resolution = timezone_resolution_from_metadata(mapping, row_index, timezone)?;
-            let offset_minutes =
-                resolution.offset_for_instant(mapping, row_index, seconds, nanoseconds)?;
-            let utc_ticks = i128::from(value) * TICKS_100NS_PER_MILLISECOND;
-            mssql_datetimeoffset_from_utc_100ns_ticks(
-                mapping,
-                row_index,
-                utc_ticks,
-                offset_minutes,
-                "millisecond",
-                value,
-            )
-        }
+        ) => mssql_datetimeoffset_from_arrow_timestamp_millisecond(
+            mapping, row_index, value, timezone,
+        ),
         (
             ArrowCell::TimestampMicrosecond(value),
             TemporalArrowToMssql::TimestampMicrosecondTzToDateTimeOffset,
             Some(timezone),
-        ) => {
-            let (seconds, nanoseconds) = epoch_parts_from_microseconds(mapping, row_index, value)?;
-            let resolution = timezone_resolution_from_metadata(mapping, row_index, timezone)?;
-            let offset_minutes =
-                resolution.offset_for_instant(mapping, row_index, seconds, nanoseconds)?;
-            let utc_ticks = i128::from(value) * TICKS_100NS_PER_MICROSECOND;
-            mssql_datetimeoffset_from_utc_100ns_ticks(
-                mapping,
-                row_index,
-                utc_ticks,
-                offset_minutes,
-                "microsecond",
-                value,
-            )
-        }
+        ) => mssql_datetimeoffset_from_arrow_timestamp_microsecond(
+            mapping, row_index, value, timezone,
+        ),
         (
             ArrowCell::TimestampNanosecond(value),
             TemporalArrowToMssql::TimestampNanosecondTzToDateTimeOffset,
             Some(timezone),
-        ) => {
-            let (seconds, nanoseconds) = epoch_parts_from_nanoseconds(mapping, row_index, value)?;
-            let resolution = timezone_resolution_from_metadata(mapping, row_index, timezone)?;
-            let offset_minutes =
-                resolution.offset_for_instant(mapping, row_index, seconds, nanoseconds)?;
-            let utc_ticks = nanoseconds_to_100ns_ticks(
-                mapping,
-                row_index,
-                value,
-                runtime_mapping.nanosecond_policy(),
-            )?;
-            mssql_datetimeoffset_from_utc_100ns_ticks(
-                mapping,
-                row_index,
-                utc_ticks,
-                offset_minutes,
-                "nanosecond",
-                value,
-            )
-        }
+        ) => mssql_datetimeoffset_from_arrow_timestamp_nanosecond(
+            mapping,
+            row_index,
+            value,
+            timezone,
+            runtime_mapping.nanosecond_policy(),
+        ),
         other => Err(value_conversion_error(row_mapping_diagnostic(
             mapping,
             row_index,
@@ -110,6 +61,91 @@ pub(in crate::mssql::cell::from_arrow) fn mssql_datetimeoffset_value(
             ),
         ))),
     }
+}
+
+pub(crate) fn mssql_datetimeoffset_from_arrow_timestamp_second(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    seconds_from_unix_epoch: i64,
+    timezone: &str,
+) -> Result<MssqlDateTimeOffset> {
+    let resolution = timezone_resolution_from_metadata(mapping, row_index, timezone)?;
+    let offset_minutes =
+        resolution.offset_for_instant(mapping, row_index, seconds_from_unix_epoch, 0)?;
+    let utc_ticks = i128::from(seconds_from_unix_epoch) * TICKS_100NS_PER_SECOND;
+    mssql_datetimeoffset_from_utc_100ns_ticks(
+        mapping,
+        row_index,
+        utc_ticks,
+        offset_minutes,
+        "second",
+        seconds_from_unix_epoch,
+    )
+}
+
+pub(crate) fn mssql_datetimeoffset_from_arrow_timestamp_millisecond(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    milliseconds_from_unix_epoch: i64,
+    timezone: &str,
+) -> Result<MssqlDateTimeOffset> {
+    let (seconds, nanoseconds) =
+        epoch_parts_from_milliseconds(mapping, row_index, milliseconds_from_unix_epoch)?;
+    let resolution = timezone_resolution_from_metadata(mapping, row_index, timezone)?;
+    let offset_minutes = resolution.offset_for_instant(mapping, row_index, seconds, nanoseconds)?;
+    let utc_ticks = i128::from(milliseconds_from_unix_epoch) * TICKS_100NS_PER_MILLISECOND;
+    mssql_datetimeoffset_from_utc_100ns_ticks(
+        mapping,
+        row_index,
+        utc_ticks,
+        offset_minutes,
+        "millisecond",
+        milliseconds_from_unix_epoch,
+    )
+}
+
+pub(crate) fn mssql_datetimeoffset_from_arrow_timestamp_microsecond(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    microseconds_from_unix_epoch: i64,
+    timezone: &str,
+) -> Result<MssqlDateTimeOffset> {
+    let (seconds, nanoseconds) =
+        epoch_parts_from_microseconds(mapping, row_index, microseconds_from_unix_epoch)?;
+    let resolution = timezone_resolution_from_metadata(mapping, row_index, timezone)?;
+    let offset_minutes = resolution.offset_for_instant(mapping, row_index, seconds, nanoseconds)?;
+    let utc_ticks = i128::from(microseconds_from_unix_epoch) * TICKS_100NS_PER_MICROSECOND;
+    mssql_datetimeoffset_from_utc_100ns_ticks(
+        mapping,
+        row_index,
+        utc_ticks,
+        offset_minutes,
+        "microsecond",
+        microseconds_from_unix_epoch,
+    )
+}
+
+pub(crate) fn mssql_datetimeoffset_from_arrow_timestamp_nanosecond(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    nanoseconds_from_unix_epoch: i64,
+    timezone: &str,
+    policy: crate::NanosecondPolicy,
+) -> Result<MssqlDateTimeOffset> {
+    let (seconds, nanoseconds) =
+        epoch_parts_from_nanoseconds(mapping, row_index, nanoseconds_from_unix_epoch)?;
+    let resolution = timezone_resolution_from_metadata(mapping, row_index, timezone)?;
+    let offset_minutes = resolution.offset_for_instant(mapping, row_index, seconds, nanoseconds)?;
+    let utc_ticks =
+        nanoseconds_to_100ns_ticks(mapping, row_index, nanoseconds_from_unix_epoch, policy)?;
+    mssql_datetimeoffset_from_utc_100ns_ticks(
+        mapping,
+        row_index,
+        utc_ticks,
+        offset_minutes,
+        "nanosecond",
+        nanoseconds_from_unix_epoch,
+    )
 }
 
 fn timestamp_timezone(mapping: &SchemaMapping) -> Option<&str> {

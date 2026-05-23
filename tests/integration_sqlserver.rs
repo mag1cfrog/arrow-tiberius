@@ -2036,9 +2036,30 @@ async fn round_trip_timezone_aware_timestamp_normalized_datetime2_values(
 #[tokio::test]
 async fn baseline_writer_round_trips_timezone_aware_timestamp_datetimeoffset_values()
 -> TestResult<()> {
+    round_trip_timezone_aware_timestamp_datetimeoffset_values(
+        WriteBackend::BaselineTokenRow,
+        "SQL Server timezone-aware datetimeoffset integration test",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn direct_raw_writer_round_trips_timezone_aware_timestamp_datetimeoffset_values()
+-> TestResult<()> {
+    round_trip_timezone_aware_timestamp_datetimeoffset_values(
+        WriteBackend::DirectRawBulk,
+        "SQL Server direct raw timezone-aware datetimeoffset integration test",
+    )
+    .await
+}
+
+async fn round_trip_timezone_aware_timestamp_datetimeoffset_values(
+    backend: WriteBackend,
+    test_name: &str,
+) -> TestResult<()> {
     let Some((connection_string, database)) = integration_config() else {
         eprintln!(
-            "skipping SQL Server timezone-aware datetimeoffset integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+            "skipping {test_name}: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
         );
         return Ok(());
     };
@@ -2092,7 +2113,7 @@ async fn baseline_writer_round_trips_timezone_aware_timestamp_datetimeoffset_val
             table.clone(),
             mappings,
             WriteOptions {
-                backend: WriteBackend::BaselineTokenRow,
+                backend,
                 plan_options,
                 ..WriteOptions::default()
             },
@@ -2171,9 +2192,26 @@ async fn baseline_writer_round_trips_timezone_aware_timestamp_datetimeoffset_val
 
 #[tokio::test]
 async fn baseline_writer_round_trips_time_only_values() -> TestResult<()> {
+    round_trip_time_only_values(
+        WriteBackend::BaselineTokenRow,
+        "SQL Server time-only round-trip integration test",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn direct_raw_writer_round_trips_time_only_values() -> TestResult<()> {
+    round_trip_time_only_values(
+        WriteBackend::DirectRawBulk,
+        "SQL Server direct raw time-only round-trip integration test",
+    )
+    .await
+}
+
+async fn round_trip_time_only_values(backend: WriteBackend, test_name: &str) -> TestResult<()> {
     let Some((connection_string, database)) = integration_config() else {
         eprintln!(
-            "skipping SQL Server time-only round-trip integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+            "skipping {test_name}: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
         );
         return Ok(());
     };
@@ -2225,7 +2263,7 @@ async fn baseline_writer_round_trips_time_only_values() -> TestResult<()> {
             table.clone(),
             mappings,
             WriteOptions {
-                backend: WriteBackend::BaselineTokenRow,
+                backend,
                 ..WriteOptions::default()
             },
         )

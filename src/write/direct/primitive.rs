@@ -2,7 +2,8 @@
 
 use arrow_array::{
     Array, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, RecordBatch, TimestampMicrosecondArray,
+    Int16Array, Int32Array, Int64Array, RecordBatch, Time32MillisecondArray, Time32SecondArray,
+    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
     UInt16Array, UInt32Array, UInt64Array,
 };
@@ -14,12 +15,22 @@ use crate::{
         primitive::PrimitiveArrowToMssql, temporal::TemporalArrowToMssql,
     },
     mssql::cell::{
-        MssqlDateTime2,
+        MssqlDateTime2, MssqlDateTimeOffset, MssqlTime,
         from_arrow::temporal::datetime2::{
             mssql_datetime2_from_arrow_timestamp_microsecond,
             mssql_datetime2_from_arrow_timestamp_millisecond,
             mssql_datetime2_from_arrow_timestamp_nanosecond,
             mssql_datetime2_from_arrow_timestamp_second,
+        },
+        from_arrow::temporal::datetimeoffset::{
+            mssql_datetimeoffset_from_arrow_timestamp_microsecond,
+            mssql_datetimeoffset_from_arrow_timestamp_millisecond,
+            mssql_datetimeoffset_from_arrow_timestamp_nanosecond,
+            mssql_datetimeoffset_from_arrow_timestamp_second,
+        },
+        from_arrow::temporal::time::{
+            mssql_time_from_arrow_time32_millisecond, mssql_time_from_arrow_time32_second,
+            mssql_time_from_arrow_time64_microsecond, mssql_time_from_arrow_time64_nanosecond,
         },
         from_arrow::temporal::{
             validate_mapping_timestamp_timezone_metadata, validate_null_timestamp_timezone_metadata,
@@ -33,8 +44,9 @@ use super::{
     payload::{EncodedRowsPayload, TDS_ROW_TOKEN},
     plan::{DirectColumnEncoding, DirectColumnPlan},
     temporal::{
-        date_cell_len, datetime2_cell_len, mssql_date_from_arrow_date32,
-        mssql_datetime2_from_arrow_date64, write_date_cell, write_datetime2_cell,
+        date_cell_len, datetime2_cell_len, datetimeoffset_cell_len, mssql_date_from_arrow_date32,
+        mssql_datetime2_from_arrow_date64, time_cell_len, write_date_cell, write_datetime2_cell,
+        write_datetimeoffset_cell, write_time_cell,
     },
 };
 
@@ -260,8 +272,167 @@ pub(crate) fn try_encode_fixed_width_primitive_rows(
                     plan_options.nanosecond_policy,
                 )?;
             }
-            DirectColumnEncoding::Temporal(_) => {
-                return Ok(None);
+            DirectColumnEncoding::Temporal(TemporalArrowToMssql::Time32SecondToTime) => {
+                let array = downcast_direct_array::<Time32SecondArray>(array, column.plan)?;
+                fill_time_fixed_width_column(
+                    array,
+                    column.mapping,
+                    column.plan,
+                    &mut current_offsets,
+                    &mut bytes,
+                    |array, mapping, row_index, _policy| {
+                        mssql_time_from_arrow_time32_second(
+                            mapping,
+                            row_index,
+                            array.value(row_index),
+                        )
+                    },
+                    plan_options.nanosecond_policy,
+                )?;
+            }
+            DirectColumnEncoding::Temporal(TemporalArrowToMssql::Time32MillisecondToTime) => {
+                let array = downcast_direct_array::<Time32MillisecondArray>(array, column.plan)?;
+                fill_time_fixed_width_column(
+                    array,
+                    column.mapping,
+                    column.plan,
+                    &mut current_offsets,
+                    &mut bytes,
+                    |array, mapping, row_index, _policy| {
+                        mssql_time_from_arrow_time32_millisecond(
+                            mapping,
+                            row_index,
+                            array.value(row_index),
+                        )
+                    },
+                    plan_options.nanosecond_policy,
+                )?;
+            }
+            DirectColumnEncoding::Temporal(TemporalArrowToMssql::Time64MicrosecondToTime) => {
+                let array = downcast_direct_array::<Time64MicrosecondArray>(array, column.plan)?;
+                fill_time_fixed_width_column(
+                    array,
+                    column.mapping,
+                    column.plan,
+                    &mut current_offsets,
+                    &mut bytes,
+                    |array, mapping, row_index, _policy| {
+                        mssql_time_from_arrow_time64_microsecond(
+                            mapping,
+                            row_index,
+                            array.value(row_index),
+                        )
+                    },
+                    plan_options.nanosecond_policy,
+                )?;
+            }
+            DirectColumnEncoding::Temporal(TemporalArrowToMssql::Time64NanosecondToTime) => {
+                let array = downcast_direct_array::<Time64NanosecondArray>(array, column.plan)?;
+                fill_time_fixed_width_column(
+                    array,
+                    column.mapping,
+                    column.plan,
+                    &mut current_offsets,
+                    &mut bytes,
+                    |array, mapping, row_index, policy| {
+                        mssql_time_from_arrow_time64_nanosecond(
+                            mapping,
+                            row_index,
+                            array.value(row_index),
+                            policy,
+                        )
+                    },
+                    plan_options.nanosecond_policy,
+                )?;
+            }
+            DirectColumnEncoding::Temporal(
+                TemporalArrowToMssql::TimestampSecondTzToDateTimeOffset,
+            ) => {
+                let array = downcast_direct_array::<TimestampSecondArray>(array, column.plan)?;
+                fill_datetimeoffset_fixed_width_column(
+                    array,
+                    column.mapping,
+                    column.plan,
+                    &mut current_offsets,
+                    &mut bytes,
+                    |array, mapping, row_index, _policy| {
+                        let timezone = timestamp_timezone_for_datetimeoffset(mapping, row_index)?;
+                        mssql_datetimeoffset_from_arrow_timestamp_second(
+                            mapping,
+                            row_index,
+                            array.value(row_index),
+                            timezone,
+                        )
+                    },
+                    plan_options.nanosecond_policy,
+                )?;
+            }
+            DirectColumnEncoding::Temporal(
+                TemporalArrowToMssql::TimestampMillisecondTzToDateTimeOffset,
+            ) => {
+                let array = downcast_direct_array::<TimestampMillisecondArray>(array, column.plan)?;
+                fill_datetimeoffset_fixed_width_column(
+                    array,
+                    column.mapping,
+                    column.plan,
+                    &mut current_offsets,
+                    &mut bytes,
+                    |array, mapping, row_index, _policy| {
+                        let timezone = timestamp_timezone_for_datetimeoffset(mapping, row_index)?;
+                        mssql_datetimeoffset_from_arrow_timestamp_millisecond(
+                            mapping,
+                            row_index,
+                            array.value(row_index),
+                            timezone,
+                        )
+                    },
+                    plan_options.nanosecond_policy,
+                )?;
+            }
+            DirectColumnEncoding::Temporal(
+                TemporalArrowToMssql::TimestampMicrosecondTzToDateTimeOffset,
+            ) => {
+                let array = downcast_direct_array::<TimestampMicrosecondArray>(array, column.plan)?;
+                fill_datetimeoffset_fixed_width_column(
+                    array,
+                    column.mapping,
+                    column.plan,
+                    &mut current_offsets,
+                    &mut bytes,
+                    |array, mapping, row_index, _policy| {
+                        let timezone = timestamp_timezone_for_datetimeoffset(mapping, row_index)?;
+                        mssql_datetimeoffset_from_arrow_timestamp_microsecond(
+                            mapping,
+                            row_index,
+                            array.value(row_index),
+                            timezone,
+                        )
+                    },
+                    plan_options.nanosecond_policy,
+                )?;
+            }
+            DirectColumnEncoding::Temporal(
+                TemporalArrowToMssql::TimestampNanosecondTzToDateTimeOffset,
+            ) => {
+                let array = downcast_direct_array::<TimestampNanosecondArray>(array, column.plan)?;
+                fill_datetimeoffset_fixed_width_column(
+                    array,
+                    column.mapping,
+                    column.plan,
+                    &mut current_offsets,
+                    &mut bytes,
+                    |array, mapping, row_index, policy| {
+                        let timezone = timestamp_timezone_for_datetimeoffset(mapping, row_index)?;
+                        mssql_datetimeoffset_from_arrow_timestamp_nanosecond(
+                            mapping,
+                            row_index,
+                            array.value(row_index),
+                            timezone,
+                            policy,
+                        )
+                    },
+                    plan_options.nanosecond_policy,
+                )?;
             }
         }
     }
@@ -412,6 +583,10 @@ fn validate_fixed_width_timestamp_timezone_metadata(
                 | TemporalArrowToMssql::TimestampMillisecondTzToDateTime2
                 | TemporalArrowToMssql::TimestampMicrosecondTzToDateTime2
                 | TemporalArrowToMssql::TimestampNanosecondTzToDateTime2
+                | TemporalArrowToMssql::TimestampSecondTzToDateTimeOffset
+                | TemporalArrowToMssql::TimestampMillisecondTzToDateTimeOffset
+                | TemporalArrowToMssql::TimestampMicrosecondTzToDateTimeOffset
+                | TemporalArrowToMssql::TimestampNanosecondTzToDateTimeOffset
         )
     ) {
         return Ok(());
@@ -447,7 +622,24 @@ fn fixed_width_non_null_cell_len(column: &DirectColumnPlan) -> Option<usize> {
             | TemporalArrowToMssql::TimestampMicrosecondTzToDateTime2
             | TemporalArrowToMssql::TimestampNanosecondTzToDateTime2,
         ) => Some(datetime2_cell_len(7).ok()?),
-        DirectColumnEncoding::Temporal(_) => None,
+        DirectColumnEncoding::Temporal(TemporalArrowToMssql::Time32SecondToTime) => {
+            Some(time_cell_len(0).ok()?)
+        }
+        DirectColumnEncoding::Temporal(TemporalArrowToMssql::Time32MillisecondToTime) => {
+            Some(time_cell_len(3).ok()?)
+        }
+        DirectColumnEncoding::Temporal(TemporalArrowToMssql::Time64MicrosecondToTime) => {
+            Some(time_cell_len(6).ok()?)
+        }
+        DirectColumnEncoding::Temporal(TemporalArrowToMssql::Time64NanosecondToTime) => {
+            Some(time_cell_len(7).ok()?)
+        }
+        DirectColumnEncoding::Temporal(
+            TemporalArrowToMssql::TimestampSecondTzToDateTimeOffset
+            | TemporalArrowToMssql::TimestampMillisecondTzToDateTimeOffset
+            | TemporalArrowToMssql::TimestampMicrosecondTzToDateTimeOffset
+            | TemporalArrowToMssql::TimestampNanosecondTzToDateTimeOffset,
+        ) => Some(datetimeoffset_cell_len(7).ok()?),
         encoding => {
             let value_len = fixed_width_value_len(encoding)?;
             if column.nullable() {
@@ -849,6 +1041,101 @@ fn timestamp_value(array: &dyn Array, row_index: usize) -> i64 {
     } else {
         unreachable!("timestamp fixed-width fill only receives timestamp arrays")
     }
+}
+
+fn fill_time_fixed_width_column<A, F>(
+    array: &A,
+    mapping: &SchemaMapping,
+    column: &DirectColumnPlan,
+    current_offsets: &mut [usize],
+    bytes: &mut [u8],
+    value: F,
+    nanosecond_policy: NanosecondPolicy,
+) -> Result<()>
+where
+    A: Array,
+    F: Fn(&A, &SchemaMapping, usize, NanosecondPolicy) -> Result<MssqlTime>,
+{
+    for (row_index, current_offset) in current_offsets.iter_mut().enumerate().take(array.len()) {
+        let offset = *current_offset;
+        if array.is_null(row_index) {
+            debug_assert!(column.nullable());
+            bytes[offset] = 0;
+            *current_offset += CELL_LEN_PREFIX_LEN;
+            continue;
+        }
+
+        let value = value(array, mapping, row_index, nanosecond_policy)?;
+        let cell_len = time_cell_len(value.scale())?;
+        let cell_bytes = bytes.get_mut(offset..offset + cell_len).ok_or_else(|| {
+            invalid_payload("fixed-width time temporal cell range is outside payload")
+        })?;
+        write_time_cell(cell_bytes, value)?;
+        *current_offset += cell_len;
+    }
+
+    Ok(())
+}
+
+fn fill_datetimeoffset_fixed_width_column<A, F>(
+    array: &A,
+    mapping: &SchemaMapping,
+    column: &DirectColumnPlan,
+    current_offsets: &mut [usize],
+    bytes: &mut [u8],
+    value: F,
+    nanosecond_policy: NanosecondPolicy,
+) -> Result<()>
+where
+    A: Array,
+    F: Fn(&A, &SchemaMapping, usize, NanosecondPolicy) -> Result<MssqlDateTimeOffset>,
+{
+    for (row_index, current_offset) in current_offsets.iter_mut().enumerate().take(array.len()) {
+        let offset = *current_offset;
+        if array.is_null(row_index) {
+            debug_assert!(column.nullable());
+            validate_null_timestamp_timezone_metadata(mapping, row_index)?;
+            bytes[offset] = 0;
+            *current_offset += CELL_LEN_PREFIX_LEN;
+            continue;
+        }
+
+        validate_mapping_timestamp_timezone_metadata(mapping, row_index)?;
+        let value = value(array, mapping, row_index, nanosecond_policy)?;
+        let cell_len = datetimeoffset_cell_len(value.datetime2().time().scale())?;
+        let cell_bytes = bytes.get_mut(offset..offset + cell_len).ok_or_else(|| {
+            invalid_payload("fixed-width datetimeoffset temporal cell range is outside payload")
+        })?;
+        write_datetimeoffset_cell(cell_bytes, value)?;
+        *current_offset += cell_len;
+    }
+
+    Ok(())
+}
+
+fn timestamp_timezone_for_datetimeoffset(
+    mapping: &SchemaMapping,
+    row_index: usize,
+) -> Result<&str> {
+    let arrow_schema::DataType::Timestamp(_, Some(timezone)) = mapping.arrow().data_type() else {
+        return Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            "planned datetimeoffset mapping does not have Arrow timestamp timezone metadata",
+        )));
+    };
+
+    if timezone.is_empty() {
+        return Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            "planned datetimeoffset mapping has empty Arrow timestamp timezone metadata",
+        )));
+    }
+
+    Ok(timezone)
 }
 
 fn write_fixed_width_value<Array, ValueBytes>(
@@ -1879,6 +2166,20 @@ fn row_column_diagnostic(
 ) -> Diagnostic {
     Diagnostic::error(code, message)
         .with_field(FieldRef::new(column.source_index(), column.source_name()))
+        .with_row(row_index)
+}
+
+fn row_mapping_diagnostic(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    code: DiagnosticCode,
+    message: impl Into<String>,
+) -> Diagnostic {
+    Diagnostic::error(code, message)
+        .with_field(FieldRef::new(
+            mapping.arrow().index(),
+            mapping.arrow().name(),
+        ))
         .with_row(row_index)
 }
 

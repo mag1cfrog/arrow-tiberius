@@ -93,6 +93,60 @@ pub(in crate::mssql::cell::from_arrow) fn null_time_cell<'a>(
     }
 }
 
+pub(crate) fn mssql_time_from_arrow_time32_second(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    seconds_since_midnight: i32,
+) -> Result<MssqlTime> {
+    mssql_time_from_i64(
+        mapping,
+        row_index,
+        i64::from(seconds_since_midnight),
+        SECONDS_PER_DAY,
+        0,
+        "Time32 second",
+    )
+}
+
+pub(crate) fn mssql_time_from_arrow_time32_millisecond(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    milliseconds_since_midnight: i32,
+) -> Result<MssqlTime> {
+    mssql_time_from_i64(
+        mapping,
+        row_index,
+        i64::from(milliseconds_since_midnight),
+        MILLISECONDS_PER_DAY,
+        3,
+        "Time32 millisecond",
+    )
+}
+
+pub(crate) fn mssql_time_from_arrow_time64_microsecond(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    microseconds_since_midnight: i64,
+) -> Result<MssqlTime> {
+    mssql_time_from_i64(
+        mapping,
+        row_index,
+        microseconds_since_midnight,
+        MICROSECONDS_PER_DAY,
+        6,
+        "Time64 microsecond",
+    )
+}
+
+pub(crate) fn mssql_time_from_arrow_time64_nanosecond(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    nanoseconds_since_midnight: i64,
+    policy: NanosecondPolicy,
+) -> Result<MssqlTime> {
+    mssql_time_from_nanoseconds(mapping, row_index, nanoseconds_since_midnight, policy)
+}
+
 fn mssql_time_from_i64(
     mapping: &SchemaMapping,
     row_index: usize,

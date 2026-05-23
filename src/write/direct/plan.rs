@@ -117,6 +117,10 @@ fn temporal_support(mapping: &SchemaMapping) -> DirectMappingSupport {
         Ok(
             classification @ (TemporalArrowToMssql::Date32ToDate
             | TemporalArrowToMssql::Date64ToDateTime2
+            | TemporalArrowToMssql::Time32SecondToTime
+            | TemporalArrowToMssql::Time32MillisecondToTime
+            | TemporalArrowToMssql::Time64MicrosecondToTime
+            | TemporalArrowToMssql::Time64NanosecondToTime
             | TemporalArrowToMssql::TimestampSecondToDateTime2
             | TemporalArrowToMssql::TimestampMillisecondToDateTime2
             | TemporalArrowToMssql::TimestampMicrosecondToDateTime2
@@ -124,14 +128,13 @@ fn temporal_support(mapping: &SchemaMapping) -> DirectMappingSupport {
             | TemporalArrowToMssql::TimestampSecondTzToDateTime2
             | TemporalArrowToMssql::TimestampMillisecondTzToDateTime2
             | TemporalArrowToMssql::TimestampMicrosecondTzToDateTime2
-            | TemporalArrowToMssql::TimestampNanosecondTzToDateTime2),
+            | TemporalArrowToMssql::TimestampNanosecondTzToDateTime2
+            | TemporalArrowToMssql::TimestampSecondTzToDateTimeOffset
+            | TemporalArrowToMssql::TimestampMillisecondTzToDateTimeOffset
+            | TemporalArrowToMssql::TimestampMicrosecondTzToDateTimeOffset
+            | TemporalArrowToMssql::TimestampNanosecondTzToDateTimeOffset),
         ) => DirectMappingSupport::Supported {
             encoding: DirectColumnEncoding::Temporal(classification),
-        },
-        Ok(classification) => DirectMappingSupport::Unsupported {
-            reason: format!(
-                "direct encoding support for temporal mapping {classification:?} is not implemented yet"
-            ),
         },
         Err(_) => DirectMappingSupport::Unsupported {
             reason: generic_unsupported_reason(mapping),
@@ -811,7 +814,7 @@ mod tests {
     }
 
     #[test]
-    fn current_direct_support_rejects_timezone_aware_timestamps_planned_as_datetimeoffset() {
+    fn current_direct_support_accepts_timezone_aware_timestamps_planned_as_datetimeoffset() {
         let mappings = mappings_for_schema_with_options(
             Schema::new(vec![
                 Field::new(
@@ -841,73 +844,109 @@ mod tests {
             },
         );
 
-        let err = DirectEncoderPlan::new(&mappings, &CurrentDirectMappings)
-            .expect_err("datetimeoffset direct encoding is outside issue 92");
+        let plan = DirectEncoderPlan::new(&mappings, &CurrentDirectMappings)
+            .expect("datetimeoffset timestamp direct encoding should be supported");
 
-        let Error::DirectEncoding { diagnostics } = err else {
-            panic!("expected direct encoding error");
-        };
-
-        assert_eq!(diagnostics.len(), 4);
-        let messages = diagnostics
-            .all()
-            .iter()
-            .map(|diagnostic| diagnostic.message())
-            .collect::<Vec<_>>();
-        assert!(
-            messages[0].contains("TimestampSecondTzToDateTimeOffset"),
-            "{messages:?}"
-        );
-        assert!(
-            messages[1].contains("TimestampMillisecondTzToDateTimeOffset"),
-            "{messages:?}"
-        );
-        assert!(
-            messages[2].contains("TimestampMicrosecondTzToDateTimeOffset"),
-            "{messages:?}"
-        );
-        assert!(
-            messages[3].contains("TimestampNanosecondTzToDateTimeOffset"),
-            "{messages:?}"
+        assert_eq!(
+            plan.columns()
+                .iter()
+                .map(|column| column.encoding())
+                .collect::<Vec<_>>(),
+            [
+                DirectColumnEncoding::Temporal(
+                    TemporalArrowToMssql::TimestampSecondTzToDateTimeOffset
+                ),
+                DirectColumnEncoding::Temporal(
+                    TemporalArrowToMssql::TimestampMillisecondTzToDateTimeOffset
+                ),
+                DirectColumnEncoding::Temporal(
+                    TemporalArrowToMssql::TimestampMicrosecondTzToDateTimeOffset
+                ),
+                DirectColumnEncoding::Temporal(
+                    TemporalArrowToMssql::TimestampNanosecondTzToDateTimeOffset
+                ),
+            ]
         );
     }
 
     #[test]
-    fn current_direct_support_rejects_temporal_mappings_with_classifier_reason() {
+    fn current_direct_support_accepts_time_only_mappings() {
         let mappings = vec![
             mapping(
                 0,
-                "event_time",
-                DataType::Time64(TimeUnit::Nanosecond),
-                MssqlType::Time(MssqlTimePrecision::SEVEN),
+                "time_s",
+                DataType::Time32(TimeUnit::Second),
+                MssqlType::Time(MssqlTimePrecision::ZERO),
             ),
             mapping(
                 1,
-                "created_at",
-                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
-                MssqlType::DateTimeOffset { precision: 7 },
+                "time_ms",
+                DataType::Time32(TimeUnit::Millisecond),
+                MssqlType::Time(MssqlTimePrecision::THREE),
+            ),
+            mapping(
+                2,
+                "time_us",
+                DataType::Time64(TimeUnit::Microsecond),
+                MssqlType::Time(MssqlTimePrecision::SIX),
+            ),
+            mapping(
+                3,
+                "time_ns",
+                DataType::Time64(TimeUnit::Nanosecond),
+                MssqlType::Time(MssqlTimePrecision::SEVEN),
+            ),
+        ];
+
+        let plan = DirectEncoderPlan::new(&mappings, &CurrentDirectMappings)
+            .expect("time-only direct encoding should be supported");
+
+        assert_eq!(
+            plan.columns()
+                .iter()
+                .map(|column| column.encoding())
+                .collect::<Vec<_>>(),
+            [
+                DirectColumnEncoding::Temporal(TemporalArrowToMssql::Time32SecondToTime),
+                DirectColumnEncoding::Temporal(TemporalArrowToMssql::Time32MillisecondToTime),
+                DirectColumnEncoding::Temporal(TemporalArrowToMssql::Time64MicrosecondToTime),
+                DirectColumnEncoding::Temporal(TemporalArrowToMssql::Time64NanosecondToTime),
+            ]
+        );
+    }
+
+    #[test]
+    fn current_direct_support_rejects_temporal_mappings_that_do_not_classify() {
+        let mappings = vec![
+            mapping(
+                0,
+                "time_bad_precision",
+                DataType::Time64(TimeUnit::Nanosecond),
+                MssqlType::Time(MssqlTimePrecision::SIX),
+            ),
+            mapping(
+                1,
+                "time_unsupported_unit",
+                DataType::Time32(TimeUnit::Millisecond),
+                MssqlType::Time(MssqlTimePrecision::ZERO),
             ),
         ];
 
         let err = DirectEncoderPlan::new(&mappings, &CurrentDirectMappings)
-            .expect_err("temporal direct encoding is implemented in later slices");
+            .expect_err("mismatched temporal mappings should remain unsupported");
 
         let Error::DirectEncoding { diagnostics } = err else {
             panic!("expected direct encoding error");
         };
 
         assert_eq!(diagnostics.len(), 2);
-        assert_eq!(diagnostics.all()[0].field().unwrap().name(), "event_time");
-        assert!(
-            diagnostics.all()[0]
-                .message()
-                .contains("Time64NanosecondToTime")
+        assert_eq!(
+            diagnostics.all()[0].field().unwrap().name(),
+            "time_bad_precision"
         );
-        assert_eq!(diagnostics.all()[1].field().unwrap().name(), "created_at");
-        assert!(
-            diagnostics.all()[1]
-                .message()
-                .contains("TimestampMicrosecondTzToDateTimeOffset")
+        assert_eq!(
+            diagnostics.all()[1].field().unwrap().name(),
+            "time_unsupported_unit"
         );
     }
 

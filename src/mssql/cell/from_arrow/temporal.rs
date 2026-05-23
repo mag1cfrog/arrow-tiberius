@@ -3,8 +3,8 @@
 mod date;
 mod date64;
 pub(crate) mod datetime2;
-mod datetimeoffset;
-mod time;
+pub(crate) mod datetimeoffset;
+pub(crate) mod time;
 mod timezone;
 
 use crate::{
