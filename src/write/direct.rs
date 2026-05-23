@@ -14,6 +14,7 @@ use crate::{
     write::record_batch::validate_runtime_columns,
 };
 
+pub(crate) mod decimal;
 pub(crate) mod layout;
 pub(crate) mod payload;
 pub(crate) mod plan;
