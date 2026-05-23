@@ -392,6 +392,37 @@ fn validate_direct_bulk_target_column_type(
             )),
         );
     }
+
+    if let Some((expected_precision, expected_scale)) =
+        expected_direct_decimal_precision_scale(plan_column)
+    {
+        match column.decimal_precision_scale() {
+            Some((actual_precision, actual_scale))
+                if actual_precision == expected_precision && actual_scale == expected_scale => {}
+            Some((actual_precision, actual_scale)) => diagnostics.push(
+                Diagnostic::error(
+                    DiagnosticCode::SchemaMismatch,
+                    format!(
+                        "bulk target decimal precision/scale ({actual_precision},{actual_scale}) does not match direct encoder precision/scale ({expected_precision},{expected_scale})"
+                    ),
+                )
+                .with_field(FieldRef::new(
+                    plan_column.source_index(),
+                    plan_column.source_name(),
+                )),
+            ),
+            None => diagnostics.push(
+                Diagnostic::error(
+                    DiagnosticCode::SchemaMismatch,
+                    "bulk target decimal precision/scale metadata is not available",
+                )
+                .with_field(FieldRef::new(
+                    plan_column.source_index(),
+                    plan_column.source_name(),
+                )),
+            ),
+        }
+    }
 }
 
 fn expected_direct_bulk_column_type(column: &DirectColumnPlan) -> Option<tiberius::ColumnType> {
@@ -421,13 +452,16 @@ fn expected_direct_bulk_column_type(column: &DirectColumnPlan) -> Option<tiberiu
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt32ToBigInt) => {
             Some(tiberius::ColumnType::Int8)
         }
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt64ToCheckedBigInt) => {
+            Some(tiberius::ColumnType::Int8)
+        }
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal) => {
             Some(tiberius::ColumnType::Float4)
         }
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => {
             Some(tiberius::ColumnType::Float8)
         }
-        DirectColumnEncoding::Primitive(_) => None,
+        DirectColumnEncoding::UInt64Decimal20_0 => Some(tiberius::ColumnType::Decimaln),
         DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::Utf8ToNVarChar {
             ..
         }) => Some(tiberius::ColumnType::NVarchar),
@@ -435,6 +469,13 @@ fn expected_direct_bulk_column_type(column: &DirectColumnPlan) -> Option<tiberiu
             ..
         }) => Some(tiberius::ColumnType::BigVarBin),
         DirectColumnEncoding::VariableWidth(_) => None,
+    }
+}
+
+fn expected_direct_decimal_precision_scale(column: &DirectColumnPlan) -> Option<(u8, u8)> {
+    match column.encoding() {
+        DirectColumnEncoding::UInt64Decimal20_0 => Some((20, 0)),
+        _ => None,
     }
 }
 
@@ -456,6 +497,10 @@ trait BulkTargetColumnMetadata {
     fn is_nullable(&self) -> bool;
 
     fn column_type(&self) -> tiberius::ColumnType;
+
+    fn decimal_precision_scale(&self) -> Option<(u8, u8)> {
+        None
+    }
 }
 
 impl BulkTargetColumnMetadata for tiberius::BulkLoadColumn<'_> {
@@ -473,6 +518,18 @@ impl BulkTargetColumnMetadata for tiberius::BulkLoadColumn<'_> {
 
     fn column_type(&self) -> tiberius::ColumnType {
         self.column_type()
+    }
+
+    fn decimal_precision_scale(&self) -> Option<(u8, u8)> {
+        match self.type_info() {
+            tiberius::TypeInfo::VarLenSizedPrecision {
+                ty: tiberius::VarLenType::Decimaln | tiberius::VarLenType::Numericn,
+                precision,
+                scale,
+                ..
+            } => Some((*precision, *scale)),
+            _ => None,
+        }
     }
 }
 
@@ -651,7 +708,7 @@ mod tests {
         task::{Context, Poll, Wake, Waker},
     };
 
-    use arrow_array::{BinaryArray, Float64Array, Int32Array, RecordBatch};
+    use arrow_array::{BinaryArray, Float64Array, Int32Array, RecordBatch, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use futures_util::io::{AsyncRead, AsyncWrite};
 
@@ -1100,6 +1157,82 @@ mod tests {
     }
 
     #[test]
+    fn direct_bulk_target_type_validation_accepts_uint64_policy_metadata() {
+        let mappings = vec![
+            schema_mapping_at(0, "checked", DataType::UInt64, MssqlType::BigInt, false),
+            schema_mapping_at(
+                1,
+                "decimal",
+                DataType::UInt64,
+                MssqlType::Decimal {
+                    precision: 20,
+                    scale: 0,
+                },
+                false,
+            ),
+        ];
+        let state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let columns = vec![
+            bulk_target_column_with_type(0, "checked", false, tiberius::ColumnType::Int8),
+            bulk_target_decimal_column(1, "decimal", false, 20, 0),
+        ];
+
+        validate_direct_bulk_target_column_types(
+            columns.into_iter(),
+            state.direct_encoder().unwrap().plan(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn direct_bulk_target_type_validation_rejects_uint64_decimal_precision_drift() {
+        let mappings = vec![schema_mapping_at(
+            0,
+            "decimal",
+            DataType::UInt64,
+            MssqlType::Decimal {
+                precision: 20,
+                scale: 0,
+            },
+            false,
+        )];
+        let state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let columns = vec![bulk_target_decimal_column(0, "decimal", false, 19, 0)];
+
+        let err = validate_direct_bulk_target_column_types(
+            columns.into_iter(),
+            state.direct_encoder().unwrap().plan(),
+        )
+        .unwrap_err();
+
+        let Error::ValueConversion { diagnostics } = err else {
+            panic!("expected value conversion error");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics.all()[0];
+        assert_eq!(diagnostic.code(), DiagnosticCode::SchemaMismatch);
+        assert!(diagnostic.message().contains("precision/scale (19,0)"));
+        assert_eq!(
+            diagnostic
+                .field()
+                .map(|field| (field.index(), field.name())),
+            Some((0, "decimal"))
+        );
+    }
+
+    #[test]
     fn direct_bulk_target_type_validation_accepts_matching_variable_width_metadata() {
         let mappings = vec![utf8_mapping_at(0, "name"), binary_mapping_at(1, "payload")];
         let state = WriterState::new(
@@ -1430,6 +1563,43 @@ mod tests {
     }
 
     #[test]
+    fn write_direct_batch_to_sink_rejects_uint64_bigint_overflow_before_any_range_send() {
+        let mappings = vec![schema_mapping_at(
+            0,
+            "u64_value",
+            DataType::UInt64,
+            MssqlType::BigInt,
+            false,
+        )];
+        let mut state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingRawSink::default();
+        let row_count = DIRECT_RAW_MAX_PAYLOAD_BYTES / 9 + 2;
+        let mut values = vec![1_u64; row_count];
+        values[row_count - 1] = i64::MAX as u64 + 1;
+        let batch = uint64_batch("u64_value", &values);
+
+        let err =
+            poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch)).unwrap_err();
+
+        let Error::ValueConversion { diagnostics } = err else {
+            panic!("expected value conversion error");
+        };
+        assert_eq!(
+            diagnostics.all()[0].code(),
+            DiagnosticCode::IntegerOutOfRange
+        );
+        assert_eq!(diagnostics.all()[0].row(), Some(row_count - 1));
+        assert!(sink.payloads.is_empty());
+        assert_eq!(state.stats(), WriteStats::default());
+    }
+
+    #[test]
     fn write_direct_batch_to_sink_rejects_runtime_type_mismatch_before_send() {
         let mappings = vec![mapping("id")];
         let mut state = WriterState::new(
@@ -1545,6 +1715,13 @@ mod tests {
         RecordBatch::try_new(schema, vec![array]).unwrap()
     }
 
+    fn uint64_batch(name: &str, values: &[u64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::UInt64, false)]));
+        let array = Arc::new(UInt64Array::from(values.to_vec()));
+
+        RecordBatch::try_new(schema, vec![array]).unwrap()
+    }
+
     fn binary_batch(name: &str, values: &[&[u8]]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Binary, false)]));
         let array = Arc::new(BinaryArray::from_iter_values(values.iter().copied()));
@@ -1567,6 +1744,23 @@ mod tests {
             name: name.to_owned(),
             nullable,
             column_type,
+            decimal_precision_scale: None,
+        }
+    }
+
+    fn bulk_target_decimal_column(
+        ordinal: usize,
+        name: &str,
+        nullable: bool,
+        precision: u8,
+        scale: u8,
+    ) -> FakeBulkTargetColumn {
+        FakeBulkTargetColumn {
+            ordinal,
+            name: name.to_owned(),
+            nullable,
+            column_type: tiberius::ColumnType::Decimaln,
+            decimal_precision_scale: Some((precision, scale)),
         }
     }
 
@@ -1659,6 +1853,7 @@ mod tests {
         name: String,
         nullable: bool,
         column_type: tiberius::ColumnType,
+        decimal_precision_scale: Option<(u8, u8)>,
     }
 
     impl BulkTargetColumnMetadata for FakeBulkTargetColumn {
@@ -1676,6 +1871,10 @@ mod tests {
 
         fn column_type(&self) -> tiberius::ColumnType {
             self.column_type
+        }
+
+        fn decimal_precision_scale(&self) -> Option<(u8, u8)> {
+            self.decimal_precision_scale
         }
     }
 

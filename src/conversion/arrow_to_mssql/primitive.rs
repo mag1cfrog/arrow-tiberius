@@ -4,6 +4,7 @@ use arrow_schema::DataType;
 
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, MssqlType, Result, SchemaMapping,
+    conversion::arrow_to_mssql::uint64::UInt64ArrowToMssql,
 };
 
 /// Shared semantic conversion class for primitive Arrow-to-MSSQL values.
@@ -45,7 +46,10 @@ impl PrimitiveArrowToMssql {
             (DataType::UInt16, MssqlType::Int) => Self::UInt16ToInt,
             (DataType::Int64, MssqlType::BigInt) => Self::Int64ToBigInt,
             (DataType::UInt32, MssqlType::BigInt) => Self::UInt32ToBigInt,
-            (DataType::UInt64, MssqlType::BigInt) => Self::UInt64ToCheckedBigInt,
+            (DataType::UInt64, MssqlType::BigInt) => {
+                UInt64ArrowToMssql::classify(mapping, row_index)?;
+                Self::UInt64ToCheckedBigInt
+            }
             (DataType::Float32, MssqlType::Real) => Self::Float32ToReal,
             (DataType::Float64, MssqlType::Float { precision: 53 }) => Self::Float64ToFloat,
             _ => {

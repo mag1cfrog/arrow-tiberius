@@ -917,7 +917,7 @@ async fn direct_raw_writer_round_trips_variable_width_matrix() -> TestResult<()>
 }
 
 #[tokio::test]
-async fn baseline_writer_round_trips_uint64_policy_values() -> TestResult<()> {
+async fn writer_round_trips_uint64_policy_values_across_supported_backends() -> TestResult<()> {
     let Some((connection_string, database)) = integration_config() else {
         eprintln!(
             "skipping SQL Server UInt64 policy integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
@@ -926,11 +926,10 @@ async fn baseline_writer_round_trips_uint64_policy_values() -> TestResult<()> {
     };
 
     let mut client = connect(&connection_string, &database).await?;
-    let decimal_table = unique_table_name()?;
-    let bigint_table = unique_table_name()?;
     let decimal_schema = Arc::new(Schema::new(vec![
         Field::new("row_id", DataType::Int32, false),
         Field::new("u64_value", DataType::UInt64, true),
+        Field::new("label", DataType::Utf8, true),
     ]));
     let bigint_schema = Arc::new(Schema::new(vec![
         Field::new("row_id", DataType::Int32, false),
@@ -964,6 +963,12 @@ async fn baseline_writer_round_trips_uint64_policy_values() -> TestResult<()> {
                 Some(u64::MAX),
                 None,
             ])),
+            Arc::new(StringArray::from(vec![
+                Some("zero"),
+                Some("over_bigint"),
+                Some("max_u64"),
+                None,
+            ])),
         ],
     )?;
     let bigint_batch = RecordBatch::try_new(
@@ -978,146 +983,174 @@ async fn baseline_writer_round_trips_uint64_policy_values() -> TestResult<()> {
         ],
     )?;
 
-    execute_sql(
-        &mut client,
-        create_table_sql_from_mappings(&decimal_table, &decimal_mappings),
-    )
-    .await?;
-    execute_sql(
-        &mut client,
-        create_table_sql_from_mappings(&bigint_table, &bigint_mappings),
-    )
-    .await?;
+    for backend in [
+        WriteBackend::BaselineTokenRow,
+        WriteBackend::DirectFramedBulk,
+        WriteBackend::DirectRawBulk,
+    ] {
+        let decimal_table = unique_table_name()?;
+        let bigint_table = unique_table_name()?;
 
-    let result = async {
-        let mut decimal_writer = BulkWriter::new(
+        execute_sql(
             &mut client,
-            decimal_table.clone(),
-            decimal_mappings,
-            WriteOptions {
-                backend: WriteBackend::BaselineTokenRow,
-                ..WriteOptions::default()
-            },
+            create_table_sql_from_mappings(&decimal_table, &decimal_mappings),
         )
         .await?;
-        let decimal_stats = decimal_writer.write_batch(&decimal_batch).await?;
-        ensure_eq(decimal_stats.rows_written, 4, "decimal rows_written")?;
-        ensure_eq(
-            decimal_writer.finish().await?,
-            decimal_stats,
-            "decimal finish stats",
-        )?;
-
-        let mut bigint_writer = BulkWriter::new(
+        execute_sql(
             &mut client,
-            bigint_table.clone(),
-            bigint_mappings,
-            WriteOptions {
-                backend: WriteBackend::BaselineTokenRow,
-                ..WriteOptions::default()
-            },
+            create_table_sql_from_mappings(&bigint_table, &bigint_mappings),
         )
         .await?;
-        let bigint_stats = bigint_writer.write_batch(&bigint_batch).await?;
-        ensure_eq(bigint_stats.rows_written, 3, "bigint rows_written")?;
-        ensure_eq(
-            bigint_writer.finish().await?,
-            bigint_stats,
-            "bigint finish stats",
-        )?;
 
-        let decimal_rows = client
-            .simple_query(format!(
-                "SELECT [row_id], CONVERT(varchar(40), [u64_value]) FROM {} ORDER BY [row_id]",
-                decimal_table.quoted_sql()
-            ))
-            .await?
-            .into_first_result()
+        let result = async {
+            let mut decimal_writer = BulkWriter::new(
+                &mut client,
+                decimal_table.clone(),
+                decimal_mappings.clone(),
+                WriteOptions {
+                    backend,
+                    ..WriteOptions::default()
+                },
+            )
             .await?;
+            let decimal_stats = decimal_writer.write_batch(&decimal_batch).await?;
+            ensure_eq(decimal_stats.rows_written, 4, "decimal rows_written")?;
+            ensure_eq(
+                decimal_writer.finish().await?,
+                decimal_stats,
+                "decimal finish stats",
+            )?;
 
-        ensure_eq(decimal_rows.len(), 4, "decimal row count")?;
-        ensure_eq(
-            decimal_rows[0].get::<i32, _>(0),
-            Some(1),
-            "decimal row 0 id",
-        )?;
-        ensure_eq(
-            decimal_rows[0].get::<&str, _>(1),
-            Some("0"),
-            "decimal row 0 value",
-        )?;
-        ensure_eq(
-            decimal_rows[1].get::<i32, _>(0),
-            Some(2),
-            "decimal row 1 id",
-        )?;
-        ensure_eq(
-            decimal_rows[1].get::<&str, _>(1),
-            Some("9223372036854775808"),
-            "decimal row 1 value",
-        )?;
-        ensure_eq(
-            decimal_rows[2].get::<i32, _>(0),
-            Some(3),
-            "decimal row 2 id",
-        )?;
-        ensure_eq(
-            decimal_rows[2].get::<&str, _>(1),
-            Some("18446744073709551615"),
-            "decimal row 2 value",
-        )?;
-        ensure_eq(
-            decimal_rows[3].get::<i32, _>(0),
-            Some(4),
-            "decimal row 3 id",
-        )?;
-        ensure_eq(
-            decimal_rows[3].get::<&str, _>(1),
-            None,
-            "decimal row 3 value",
-        )?;
-
-        let bigint_rows = client
-            .simple_query(format!(
-                "SELECT [row_id], [u64_value] FROM {} ORDER BY [row_id]",
-                bigint_table.quoted_sql()
-            ))
-            .await?
-            .into_first_result()
+            let mut bigint_writer = BulkWriter::new(
+                &mut client,
+                bigint_table.clone(),
+                bigint_mappings.clone(),
+                WriteOptions {
+                    backend,
+                    ..WriteOptions::default()
+                },
+            )
             .await?;
+            let bigint_stats = bigint_writer.write_batch(&bigint_batch).await?;
+            ensure_eq(bigint_stats.rows_written, 3, "bigint rows_written")?;
+            ensure_eq(
+                bigint_writer.finish().await?,
+                bigint_stats,
+                "bigint finish stats",
+            )?;
 
-        ensure_eq(bigint_rows.len(), 3, "bigint row count")?;
-        ensure_eq(bigint_rows[0].get::<i32, _>(0), Some(1), "bigint row 0 id")?;
-        ensure_eq(
-            bigint_rows[0].get::<i64, _>(1),
-            Some(0),
-            "bigint row 0 value",
-        )?;
-        ensure_eq(bigint_rows[1].get::<i32, _>(0), Some(2), "bigint row 1 id")?;
-        ensure_eq(
-            bigint_rows[1].get::<i64, _>(1),
-            Some(i64::MAX),
-            "bigint row 1 value",
-        )?;
-        ensure_eq(bigint_rows[2].get::<i32, _>(0), Some(3), "bigint row 2 id")?;
-        ensure_eq(bigint_rows[2].get::<i64, _>(1), None, "bigint row 2 value")?;
+            let decimal_rows = client
+                .simple_query(format!(
+                    "SELECT [row_id], CONVERT(varchar(40), [u64_value]), [label] FROM {} ORDER BY [row_id]",
+                    decimal_table.quoted_sql()
+                ))
+                .await?
+                .into_first_result()
+                .await?;
 
-        Ok::<(), Box<dyn std::error::Error>>(())
+            ensure_eq(decimal_rows.len(), 4, "decimal row count")?;
+            ensure_eq(
+                decimal_rows[0].get::<i32, _>(0),
+                Some(1),
+                "decimal row 0 id",
+            )?;
+            ensure_eq(
+                decimal_rows[0].get::<&str, _>(1),
+                Some("0"),
+                "decimal row 0 value",
+            )?;
+            ensure_eq(
+                decimal_rows[0].get::<&str, _>(2),
+                Some("zero"),
+                "decimal row 0 label",
+            )?;
+            ensure_eq(
+                decimal_rows[1].get::<i32, _>(0),
+                Some(2),
+                "decimal row 1 id",
+            )?;
+            ensure_eq(
+                decimal_rows[1].get::<&str, _>(1),
+                Some("9223372036854775808"),
+                "decimal row 1 value",
+            )?;
+            ensure_eq(
+                decimal_rows[1].get::<&str, _>(2),
+                Some("over_bigint"),
+                "decimal row 1 label",
+            )?;
+            ensure_eq(
+                decimal_rows[2].get::<i32, _>(0),
+                Some(3),
+                "decimal row 2 id",
+            )?;
+            ensure_eq(
+                decimal_rows[2].get::<&str, _>(1),
+                Some("18446744073709551615"),
+                "decimal row 2 value",
+            )?;
+            ensure_eq(
+                decimal_rows[2].get::<&str, _>(2),
+                Some("max_u64"),
+                "decimal row 2 label",
+            )?;
+            ensure_eq(
+                decimal_rows[3].get::<i32, _>(0),
+                Some(4),
+                "decimal row 3 id",
+            )?;
+            ensure_eq(
+                decimal_rows[3].get::<&str, _>(1),
+                None,
+                "decimal row 3 value",
+            )?;
+            ensure_eq(
+                decimal_rows[3].get::<&str, _>(2),
+                None,
+                "decimal row 3 label",
+            )?;
+
+            let bigint_rows = client
+                .simple_query(format!(
+                    "SELECT [row_id], [u64_value] FROM {} ORDER BY [row_id]",
+                    bigint_table.quoted_sql()
+                ))
+                .await?
+                .into_first_result()
+                .await?;
+
+            ensure_eq(bigint_rows.len(), 3, "bigint row count")?;
+            ensure_eq(bigint_rows[0].get::<i32, _>(0), Some(1), "bigint row 0 id")?;
+            ensure_eq(
+                bigint_rows[0].get::<i64, _>(1),
+                Some(0),
+                "bigint row 0 value",
+            )?;
+            ensure_eq(bigint_rows[1].get::<i32, _>(0), Some(2), "bigint row 1 id")?;
+            ensure_eq(
+                bigint_rows[1].get::<i64, _>(1),
+                Some(i64::MAX),
+                "bigint row 1 value",
+            )?;
+            ensure_eq(bigint_rows[2].get::<i32, _>(0), Some(3), "bigint row 2 id")?;
+            ensure_eq(bigint_rows[2].get::<i64, _>(1), None, "bigint row 2 value")?;
+
+            Ok::<(), Box<dyn std::error::Error>>(())
+        }
+        .await;
+
+        let decimal_drop_result = drop_table(&mut client, &decimal_table).await;
+        let bigint_drop_result = drop_table(&mut client, &bigint_table).await;
+        result?;
+        decimal_drop_result?;
+        bigint_drop_result?;
     }
-    .await;
-
-    let decimal_drop_result = drop_table(&mut client, &decimal_table).await;
-    let bigint_drop_result = drop_table(&mut client, &bigint_table).await;
-    result?;
-    decimal_drop_result?;
-    bigint_drop_result?;
 
     Ok(())
 }
 
 #[tokio::test]
-async fn baseline_writer_rejects_uint64_checked_bigint_overflow_without_partial_insert()
--> TestResult<()> {
+async fn writer_rejects_uint64_checked_bigint_overflow_without_partial_insert() -> TestResult<()> {
     let Some((connection_string, database)) = integration_config() else {
         eprintln!(
             "skipping SQL Server UInt64 overflow integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
@@ -1126,7 +1159,6 @@ async fn baseline_writer_rejects_uint64_checked_bigint_overflow_without_partial_
     };
 
     let mut client = connect(&connection_string, &database).await?;
-    let table = unique_table_name()?;
     let schema = Arc::new(Schema::new(vec![
         Field::new("row_id", DataType::Int32, false),
         Field::new("u64_value", DataType::UInt64, false),
@@ -1148,67 +1180,75 @@ async fn baseline_writer_rejects_uint64_checked_bigint_overflow_without_partial_
         ],
     )?;
 
-    execute_sql(
-        &mut client,
-        create_table_sql_from_mappings(&table, &mappings),
-    )
-    .await?;
+    for backend in [
+        WriteBackend::BaselineTokenRow,
+        WriteBackend::DirectFramedBulk,
+        WriteBackend::DirectRawBulk,
+    ] {
+        let table = unique_table_name()?;
 
-    let result = async {
-        let mut writer = BulkWriter::new(
+        execute_sql(
             &mut client,
-            table.clone(),
-            mappings,
-            WriteOptions {
-                backend: WriteBackend::BaselineTokenRow,
-                ..WriteOptions::default()
-            },
+            create_table_sql_from_mappings(&table, &mappings),
         )
         .await?;
-        let err = match writer.write_batch(&batch).await {
-            Ok(_stats) => {
-                let _stats = writer.finish().await?;
-                return Err(test_error("UInt64 bigint overflow was accepted"));
-            }
-            Err(err) => err,
-        };
 
-        let diagnostics = match err {
-            Error::ValueConversion { diagnostics } => diagnostics,
-            other => {
-                return Err(test_error(format!(
-                    "expected value conversion error, got {other}"
-                )));
-            }
-        };
-        ensure(
-            diagnostics.all().iter().any(|diagnostic| {
-                diagnostic.code() == DiagnosticCode::IntegerOutOfRange
-                    && diagnostic.row() == Some(1)
-                    && diagnostic
-                        .field()
-                        .is_some_and(|field| field.name() == "u64_value")
-            }),
-            "UInt64 bigint overflow diagnostic should include row and field",
-        )?;
-        ensure_eq(
-            writer.finish().await?.rows_written,
-            0,
-            "finish rows_written",
-        )?;
-        ensure_eq(
-            select_count(&mut client, &table).await?,
-            0,
-            "row count after overflow rejection",
-        )?;
+        let result = async {
+            let mut writer = BulkWriter::new(
+                &mut client,
+                table.clone(),
+                mappings.clone(),
+                WriteOptions {
+                    backend,
+                    ..WriteOptions::default()
+                },
+            )
+            .await?;
+            let err = match writer.write_batch(&batch).await {
+                Ok(_stats) => {
+                    let _stats = writer.finish().await?;
+                    return Err(test_error("UInt64 bigint overflow was accepted"));
+                }
+                Err(err) => err,
+            };
 
-        Ok::<(), Box<dyn std::error::Error>>(())
+            let diagnostics = match err {
+                Error::ValueConversion { diagnostics } => diagnostics,
+                other => {
+                    return Err(test_error(format!(
+                        "expected value conversion error, got {other}"
+                    )));
+                }
+            };
+            ensure(
+                diagnostics.all().iter().any(|diagnostic| {
+                    diagnostic.code() == DiagnosticCode::IntegerOutOfRange
+                        && diagnostic.row() == Some(1)
+                        && diagnostic
+                            .field()
+                            .is_some_and(|field| field.name() == "u64_value")
+                }),
+                "UInt64 bigint overflow diagnostic should include row and field",
+            )?;
+            ensure_eq(
+                writer.finish().await?.rows_written,
+                0,
+                "finish rows_written",
+            )?;
+            ensure_eq(
+                select_count(&mut client, &table).await?,
+                0,
+                "row count after overflow rejection",
+            )?;
+
+            Ok::<(), Box<dyn std::error::Error>>(())
+        }
+        .await;
+
+        let drop_result = drop_table(&mut client, &table).await;
+        result?;
+        drop_result?;
     }
-    .await;
-
-    let drop_result = drop_table(&mut client, &table).await;
-    result?;
-    drop_result?;
 
     Ok(())
 }
