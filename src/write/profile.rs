@@ -4,7 +4,11 @@ use std::time::Duration;
 
 #[cfg(feature = "bench-profile")]
 mod enabled {
-    use std::{cell::RefCell, time::Duration};
+    use std::{
+        cell::RefCell,
+        sync::atomic::{AtomicBool, Ordering},
+        time::Duration,
+    };
 
     use tiberius::BulkLoadStats;
 
@@ -182,6 +186,54 @@ mod enabled {
 
     thread_local! {
         static DIRECT_PROFILE: RefCell<Option<DirectWriteProfile>> = const { RefCell::new(None) };
+    }
+    static DIRECT_DATE_FAST_PATH_DISABLED: AtomicBool = AtomicBool::new(false);
+    static DIRECT_FIXED_WIDTH_FAST_PATH_DISABLED: AtomicBool = AtomicBool::new(false);
+
+    /// Scoped benchmark override that disables the direct date fast path.
+    #[derive(Debug)]
+    pub struct DirectDateFastPathOverride {
+        previous: bool,
+    }
+
+    /// Scoped benchmark override that disables the whole fixed-width fast path.
+    #[derive(Debug)]
+    pub struct DirectFixedWidthFastPathOverride {
+        previous: bool,
+    }
+
+    impl Drop for DirectDateFastPathOverride {
+        fn drop(&mut self) {
+            DIRECT_DATE_FAST_PATH_DISABLED.store(self.previous, Ordering::Relaxed);
+        }
+    }
+
+    impl Drop for DirectFixedWidthFastPathOverride {
+        fn drop(&mut self) {
+            DIRECT_FIXED_WIDTH_FAST_PATH_DISABLED.store(self.previous, Ordering::Relaxed);
+        }
+    }
+
+    /// Disables direct date fixed-width fast-path encoding for the current scope.
+    pub fn disable_direct_date_fast_path_for_scope() -> DirectDateFastPathOverride {
+        DirectDateFastPathOverride {
+            previous: DIRECT_DATE_FAST_PATH_DISABLED.swap(true, Ordering::Relaxed),
+        }
+    }
+
+    /// Disables direct fixed-width fast-path encoding for the current scope.
+    pub fn disable_direct_fixed_width_fast_path_for_scope() -> DirectFixedWidthFastPathOverride {
+        DirectFixedWidthFastPathOverride {
+            previous: DIRECT_FIXED_WIDTH_FAST_PATH_DISABLED.swap(true, Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn direct_date_fast_path_disabled() -> bool {
+        DIRECT_DATE_FAST_PATH_DISABLED.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn direct_fixed_width_fast_path_disabled() -> bool {
+        DIRECT_FIXED_WIDTH_FAST_PATH_DISABLED.load(Ordering::Relaxed)
     }
 
     /// Starts direct writer profiling on the current thread.
@@ -471,18 +523,32 @@ mod disabled {
 
     pub(crate) fn record_null_cell() {}
 
+    #[allow(dead_code)]
     pub(crate) fn record_bulk_load_stats(_stats: tiberius::BulkLoadStats) {}
+
+    pub(crate) fn direct_date_fast_path_disabled() -> bool {
+        false
+    }
+
+    pub(crate) fn direct_fixed_width_fast_path_disabled() -> bool {
+        false
+    }
 }
 
 #[cfg(not(feature = "bench-profile"))]
 pub(crate) use disabled::*;
 #[cfg(feature = "bench-profile")]
-pub use enabled::{DirectWriteProfile, finish_direct_write_profile, start_direct_write_profile};
+pub use enabled::{
+    DirectDateFastPathOverride, DirectFixedWidthFastPathOverride, DirectWriteProfile,
+    disable_direct_date_fast_path_for_scope, disable_direct_fixed_width_fast_path_for_scope,
+    finish_direct_write_profile, start_direct_write_profile,
+};
 #[cfg(feature = "bench-profile")]
 pub(crate) use enabled::{
-    record_accepted_batch, record_append_encode, record_bulk_load_stats, record_measure_batch,
-    record_null_cell, record_nvarchar_utf16_bytes, record_row_range, record_row_range_split,
-    record_send_total, record_varbinary_bytes,
+    direct_date_fast_path_disabled, direct_fixed_width_fast_path_disabled, record_accepted_batch,
+    record_append_encode, record_bulk_load_stats, record_measure_batch, record_null_cell,
+    record_nvarchar_utf16_bytes, record_row_range, record_row_range_split, record_send_total,
+    record_varbinary_bytes,
 };
 
 pub(crate) fn record_elapsed<T>(start: std::time::Instant, record: fn(Duration), value: T) -> T {

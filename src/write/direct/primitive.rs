@@ -1,19 +1,27 @@
 //! Fixed-width primitive direct TDS row layout.
 
 use arrow_array::{
-    Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    RecordBatch, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, RecordBatch, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
 };
 
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, Result,
-    conversion::arrow_to_mssql::primitive::PrimitiveArrowToMssql, write::profile,
+    conversion::arrow_to_mssql::{
+        primitive::PrimitiveArrowToMssql, temporal::TemporalArrowToMssql,
+    },
+    write::profile,
 };
 
 use super::{
     layout::{CellPosition, RowLayout},
     payload::{EncodedRowsPayload, TDS_ROW_TOKEN},
     plan::{DirectColumnEncoding, DirectColumnPlan},
+    temporal::{
+        date_cell_len, datetime2_cell_len, mssql_date_from_arrow_date32,
+        mssql_datetime2_from_arrow_date64, write_date_cell, write_datetime2_cell,
+    },
 };
 
 const ROW_TOKEN_LEN: usize = 1;
@@ -22,10 +30,10 @@ const CELL_LEN_PREFIX_LEN: usize = 1;
 #[derive(Debug, Clone, Copy)]
 struct FixedWidthColumn<'a> {
     plan: &'a DirectColumnPlan,
-    value_len: usize,
+    non_null_cell_len: usize,
 }
 
-/// Encodes fixed-width primitive columns without building a full per-cell row
+/// Encodes fixed-size direct columns without building a full per-cell row
 /// layout.
 ///
 /// Returns `Ok(None)` when the columns require the general layout path.
@@ -147,6 +155,27 @@ pub(crate) fn try_encode_fixed_width_primitive_rows(
             DirectColumnEncoding::VariableWidth(_) => {
                 return Ok(None);
             }
+            DirectColumnEncoding::Temporal(TemporalArrowToMssql::Date32ToDate) => {
+                let array = downcast_direct_array::<Date32Array>(array, column.plan)?;
+                fill_date32_fixed_width_column(
+                    array,
+                    column.plan,
+                    &mut current_offsets,
+                    &mut bytes,
+                )?;
+            }
+            DirectColumnEncoding::Temporal(TemporalArrowToMssql::Date64ToDateTime2) => {
+                let array = downcast_direct_array::<Date64Array>(array, column.plan)?;
+                fill_date64_fixed_width_column(
+                    array,
+                    column.plan,
+                    &mut current_offsets,
+                    &mut bytes,
+                )?;
+            }
+            DirectColumnEncoding::Temporal(_) => {
+                return Ok(None);
+            }
         }
     }
 
@@ -163,16 +192,20 @@ struct FixedWidthRowsLayout {
 }
 
 fn fixed_width_columns(columns: &[DirectColumnPlan]) -> Result<Option<Vec<FixedWidthColumn<'_>>>> {
+    if profile::direct_fixed_width_fast_path_disabled() {
+        return Ok(None);
+    }
+
     let mut fixed_width_columns = Vec::with_capacity(columns.len());
 
     for column in columns {
-        let Some(value_len) = fixed_width_value_len(column.encoding()) else {
+        let Some(non_null_cell_len) = fixed_width_non_null_cell_len(column) else {
             return Ok(None);
         };
 
         fixed_width_columns.push(FixedWidthColumn {
             plan: column,
-            value_len,
+            non_null_cell_len,
         });
     }
 
@@ -201,13 +234,20 @@ fn measure_fixed_width_rows(
         };
 
         if column.plan.nullable() {
-            add_nullable_fixed_width_column_lengths(array, column.value_len, &mut row_lengths)?;
+            add_nullable_fixed_width_column_lengths(
+                array,
+                column.non_null_cell_len,
+                &mut row_lengths,
+            )?;
         } else {
             if array.null_count() != 0 {
                 return Err(first_null_error(array, column.plan));
             }
 
-            add_non_nullable_fixed_width_column_lengths(column.value_len, &mut row_lengths)?;
+            add_non_nullable_fixed_width_column_lengths(
+                column.non_null_cell_len,
+                &mut row_lengths,
+            )?;
         }
     }
 
@@ -229,11 +269,11 @@ fn measure_fixed_width_rows(
 }
 
 fn add_non_nullable_fixed_width_column_lengths(
-    value_len: usize,
+    non_null_cell_len: usize,
     row_lengths: &mut [usize],
 ) -> Result<()> {
     for row_length in row_lengths {
-        *row_length = checked_add(*row_length, value_len)?;
+        *row_length = checked_add(*row_length, non_null_cell_len)?;
     }
 
     Ok(())
@@ -241,20 +281,41 @@ fn add_non_nullable_fixed_width_column_lengths(
 
 fn add_nullable_fixed_width_column_lengths(
     array: &dyn Array,
-    value_len: usize,
+    non_null_cell_len: usize,
     row_lengths: &mut [usize],
 ) -> Result<()> {
     for (row_index, row_length) in row_lengths.iter_mut().enumerate() {
         let cell_len = if array.is_null(row_index) {
             CELL_LEN_PREFIX_LEN
         } else {
-            checked_add(CELL_LEN_PREFIX_LEN, value_len)?
+            non_null_cell_len
         };
 
         *row_length = checked_add(*row_length, cell_len)?;
     }
 
     Ok(())
+}
+
+fn fixed_width_non_null_cell_len(column: &DirectColumnPlan) -> Option<usize> {
+    match column.encoding() {
+        DirectColumnEncoding::Temporal(
+            TemporalArrowToMssql::Date32ToDate | TemporalArrowToMssql::Date64ToDateTime2,
+        ) if profile::direct_date_fast_path_disabled() => None,
+        DirectColumnEncoding::Temporal(TemporalArrowToMssql::Date32ToDate) => Some(date_cell_len()),
+        DirectColumnEncoding::Temporal(TemporalArrowToMssql::Date64ToDateTime2) => {
+            Some(datetime2_cell_len(3).ok()?)
+        }
+        DirectColumnEncoding::Temporal(_) => None,
+        encoding => {
+            let value_len = fixed_width_value_len(encoding)?;
+            if column.nullable() {
+                value_len.checked_add(CELL_LEN_PREFIX_LEN)
+            } else {
+                Some(value_len)
+            }
+        }
+    }
 }
 
 fn fixed_width_value_len(encoding: DirectColumnEncoding) -> Option<usize> {
@@ -274,6 +335,7 @@ fn fixed_width_value_len(encoding: DirectColumnEncoding) -> Option<usize> {
         DirectColumnEncoding::UInt64Decimal20_0 => None,
         DirectColumnEncoding::Decimal(_) => None,
         DirectColumnEncoding::VariableWidth(_) => None,
+        DirectColumnEncoding::Temporal(_) => None,
     }
 }
 
@@ -539,6 +601,60 @@ fn fill_float64_fixed_width_column(
     Ok(())
 }
 
+fn fill_date32_fixed_width_column(
+    array: &Date32Array,
+    column: &DirectColumnPlan,
+    current_offsets: &mut [usize],
+    bytes: &mut [u8],
+) -> Result<()> {
+    for (row_index, current_offset) in current_offsets.iter_mut().enumerate().take(array.len()) {
+        let offset = *current_offset;
+        if array.is_null(row_index) {
+            debug_assert!(column.nullable());
+            bytes[offset] = 0;
+            *current_offset += CELL_LEN_PREFIX_LEN;
+            continue;
+        }
+
+        let value = mssql_date_from_arrow_date32(column, row_index, array.value(row_index))?;
+        let cell_len = date_cell_len();
+        let cell_bytes = bytes.get_mut(offset..offset + cell_len).ok_or_else(|| {
+            invalid_payload("fixed-width Date32 temporal cell range is outside payload")
+        })?;
+        write_date_cell(cell_bytes, value)?;
+        *current_offset += cell_len;
+    }
+
+    Ok(())
+}
+
+fn fill_date64_fixed_width_column(
+    array: &Date64Array,
+    column: &DirectColumnPlan,
+    current_offsets: &mut [usize],
+    bytes: &mut [u8],
+) -> Result<()> {
+    for (row_index, current_offset) in current_offsets.iter_mut().enumerate().take(array.len()) {
+        let offset = *current_offset;
+        if array.is_null(row_index) {
+            debug_assert!(column.nullable());
+            bytes[offset] = 0;
+            *current_offset += CELL_LEN_PREFIX_LEN;
+            continue;
+        }
+
+        let value = mssql_datetime2_from_arrow_date64(column, row_index, array.value(row_index))?;
+        let cell_len = datetime2_cell_len(value.time().scale())?;
+        let cell_bytes = bytes.get_mut(offset..offset + cell_len).ok_or_else(|| {
+            invalid_payload("fixed-width Date64 temporal cell range is outside payload")
+        })?;
+        write_datetime2_cell(cell_bytes, value)?;
+        *current_offset += cell_len;
+    }
+
+    Ok(())
+}
+
 fn write_fixed_width_value<Array, ValueBytes>(
     array: &Array,
     column: &DirectColumnPlan,
@@ -580,7 +696,7 @@ fn first_null_error(array: &dyn Array, column: &DirectColumnPlan) -> Error {
         column,
         row_index,
         DiagnosticCode::NullInNonNullableColumn,
-        "null value in non-nullable direct primitive column",
+        "null value in non-nullable fixed-size direct column",
     ))
 }
 
@@ -1547,6 +1663,9 @@ fn primitive_value_len(encoding: DirectColumnEncoding) -> Result<usize> {
         ))),
         DirectColumnEncoding::VariableWidth(other) => Err(unsupported_batch(format!(
             "direct primitive layout is not implemented for variable-width mapping {other:?}"
+        ))),
+        DirectColumnEncoding::Temporal(other) => Err(unsupported_batch(format!(
+            "direct primitive layout is not implemented for temporal mapping {other:?}"
         ))),
     }
 }

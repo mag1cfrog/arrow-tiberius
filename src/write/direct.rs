@@ -2,16 +2,17 @@
 #![allow(dead_code)]
 
 use arrow_array::{
-    BinaryArray, BooleanArray, Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array,
-    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch,
-    StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
+    Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, RecordBatch, StringArray, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
 };
 
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, Error, Result, SchemaMapping,
     conversion::arrow_to_mssql::{
         decimal::DecimalArrowToMssql, primitive::PrimitiveArrowToMssql,
-        variable_width::VariableWidthArrowToMssql,
+        temporal::TemporalArrowToMssql, variable_width::VariableWidthArrowToMssql,
     },
     write::record_batch::validate_runtime_columns,
 };
@@ -40,6 +41,10 @@ use primitive::{
     fill_int32_column, fill_int64_column, fill_uint8_column, fill_uint16_column,
     fill_uint32_column, fill_uint64_checked_bigint_column, measure_primitive_column_cell_lengths,
     try_encode_fixed_width_primitive_rows,
+};
+use temporal::{
+    append_date32_cell, append_date64_cell, fill_temporal_column,
+    measure_temporal_column_cell_lengths,
 };
 use uint64::{
     append_uint64_decimal20_cell, fill_uint64_decimal20_column,
@@ -166,8 +171,12 @@ impl DirectEncoder {
             )));
         }
 
-        let layout = measured.range_layout(start_row, row_count)?;
         let batch = batch.slice(start_row, row_count);
+        if let Some(payload) = try_encode_fixed_width_primitive_rows(&batch, self.plan.columns())? {
+            return Ok(payload);
+        }
+
+        let layout = measured.range_layout(start_row, row_count)?;
         let mut bytes = allocate_rows_payload_with_tokens(&layout);
         self.fill_columns(&batch, &layout, &mut bytes)?;
 
@@ -315,6 +324,16 @@ impl DirectEncoder {
                         &mut cell_lengths,
                     )?;
                 }
+                DirectColumnEncoding::Temporal(classification) => {
+                    measure_temporal_column_cell_lengths(
+                        array,
+                        column,
+                        classification,
+                        column_index,
+                        column_count,
+                        &mut cell_lengths,
+                    )?;
+                }
             }
         }
 
@@ -446,6 +465,17 @@ impl DirectEncoder {
                         )));
                     }
                 },
+                DirectColumnEncoding::Temporal(classification) => {
+                    fill_temporal_column(
+                        array,
+                        column,
+                        classification,
+                        column_index,
+                        column_count,
+                        layout,
+                        bytes,
+                    )?;
+                }
             }
         }
 
@@ -588,6 +618,23 @@ impl DirectEncoder {
                         "direct variable-width append is not implemented yet for {other:?}"
                     )));
                 }
+                DirectColumnEncoding::Temporal(TemporalArrowToMssql::Date32ToDate) => {
+                    RuntimeDirectColumn::Date32 {
+                        column,
+                        array: downcast_direct_array::<Date32Array>(array, column)?,
+                    }
+                }
+                DirectColumnEncoding::Temporal(TemporalArrowToMssql::Date64ToDateTime2) => {
+                    RuntimeDirectColumn::Date64 {
+                        column,
+                        array: downcast_direct_array::<Date64Array>(array, column)?,
+                    }
+                }
+                DirectColumnEncoding::Temporal(other) => {
+                    return Err(unsupported_batch(format!(
+                        "direct temporal append is not implemented yet for {other:?}"
+                    )));
+                }
             };
 
             columns.push(runtime);
@@ -674,6 +721,14 @@ enum RuntimeDirectColumn<'a> {
         column: &'a plan::DirectColumnPlan,
         array: &'a BinaryArray,
     },
+    Date32 {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a Date32Array,
+    },
+    Date64 {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a Date64Array,
+    },
 }
 
 impl RuntimeDirectColumn<'_> {
@@ -753,6 +808,12 @@ impl RuntimeDirectColumn<'_> {
             }
             Self::Binary { column, array } => {
                 append_varbinary_cell(buf, array, column, row_index, measured_len)
+            }
+            Self::Date32 { column, array } => {
+                append_date32_cell(buf, array, column, row_index, measured_len)
+            }
+            Self::Date64 { column, array } => {
+                append_date64_cell(buf, array, column, row_index, measured_len)
             }
         }
     }
@@ -1017,9 +1078,9 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        ArrayRef, BinaryArray, BooleanArray, Decimal32Array, Decimal64Array, Decimal128Array,
-        Decimal256Array, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
-        StringArray, UInt64Array,
+        ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array,
+        Decimal64Array, Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int32Array,
+        Int64Array, RecordBatch, StringArray, UInt64Array,
     };
     use arrow_buffer::{NullBuffer, ScalarBuffer, i256};
     use arrow_schema::{DataType, Field, Schema};
@@ -1325,6 +1386,215 @@ mod tests {
     }
 
     #[test]
+    fn direct_encoder_encodes_date32_and_date64_rows() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(1, "created_on", DataType::Date32, MssqlType::Date, true),
+            mapping(
+                2,
+                "created_at",
+                DataType::Date64,
+                MssqlType::DateTime2 { precision: 3 },
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("created_on", DataType::Date32, true),
+                Field::new("created_at", DataType::Date64, true),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(Date32Array::from(vec![Some(0), None])),
+                Arc::new(Date64Array::from(vec![Some(86_400_123), Some(0)])),
+            ],
+        );
+
+        let payload = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(payload.row_token_offsets(), [0, 17]);
+        assert_eq!(
+            payload.bytes(),
+            [
+                payload::TDS_ROW_TOKEN,
+                1,
+                0,
+                0,
+                0,
+                3,
+                0x3A,
+                0xF9,
+                0x0A,
+                7,
+                0x7B,
+                0,
+                0,
+                0,
+                0x3B,
+                0xF9,
+                0x0A,
+                payload::TDS_ROW_TOKEN,
+                2,
+                0,
+                0,
+                0,
+                0,
+                7,
+                0,
+                0,
+                0,
+                0,
+                0x3A,
+                0xF9,
+                0x0A,
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_encoder_encodes_date_boundaries_and_preserves_date64_time_of_day() {
+        let mappings = vec![
+            mapping(0, "date_value", DataType::Date32, MssqlType::Date, false),
+            mapping(
+                1,
+                "datetime_value",
+                DataType::Date64,
+                MssqlType::DateTime2 { precision: 3 },
+                false,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("date_value", DataType::Date32, true),
+                Field::new("datetime_value", DataType::Date64, true),
+            ],
+            vec![
+                Arc::new(Date32Array::from(vec![-719_162, 2_932_896])) as ArrayRef,
+                Arc::new(Date64Array::from(vec![
+                    -62_135_596_800_000,
+                    253_402_300_799_999,
+                ])),
+            ],
+        );
+
+        let payload = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(payload.row_token_offsets(), [0, 13]);
+        assert_eq!(
+            payload.bytes(),
+            [
+                payload::TDS_ROW_TOKEN,
+                3,
+                0,
+                0,
+                0,
+                7,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                payload::TDS_ROW_TOKEN,
+                3,
+                0xDA,
+                0xB9,
+                0x37,
+                7,
+                0xFF,
+                0x5B,
+                0x26,
+                0x05,
+                0xDA,
+                0xB9,
+                0x37,
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_encoder_rejects_date_values_outside_sql_server_bounds() {
+        let date32_mappings = vec![mapping(
+            0,
+            "date_value",
+            DataType::Date32,
+            MssqlType::Date,
+            false,
+        )];
+        let date32_encoder = DirectEncoder::new(&date32_mappings).unwrap();
+        let date32_batch = record_batch(
+            vec![Field::new("date_value", DataType::Date32, false)],
+            vec![Arc::new(Date32Array::from(vec![-719_163]))],
+        );
+
+        let err = date32_encoder.encode_batch(&date32_batch).unwrap_err();
+        assert_value_conversion_diagnostic(
+            err,
+            DiagnosticCode::TimestampOutOfRange,
+            Some(0),
+            Some((0, "date_value")),
+        );
+
+        let date64_mappings = vec![mapping(
+            0,
+            "datetime_value",
+            DataType::Date64,
+            MssqlType::DateTime2 { precision: 3 },
+            false,
+        )];
+        let date64_encoder = DirectEncoder::new(&date64_mappings).unwrap();
+        let date64_batch = record_batch(
+            vec![Field::new("datetime_value", DataType::Date64, false)],
+            vec![Arc::new(Date64Array::from(vec![253_402_300_800_000]))],
+        );
+
+        let err = date64_encoder.encode_batch(&date64_batch).unwrap_err();
+        assert_value_conversion_diagnostic(
+            err,
+            DiagnosticCode::TimestampOutOfRange,
+            Some(0),
+            Some((0, "datetime_value")),
+        );
+    }
+
+    #[test]
+    fn direct_encoder_rejects_date_nulls_in_non_nullable_columns() {
+        let mappings = vec![
+            mapping(0, "date_value", DataType::Date32, MssqlType::Date, false),
+            mapping(
+                1,
+                "datetime_value",
+                DataType::Date64,
+                MssqlType::DateTime2 { precision: 3 },
+                false,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("date_value", DataType::Date32, true),
+                Field::new("datetime_value", DataType::Date64, true),
+            ],
+            vec![
+                Arc::new(Date32Array::from(vec![Some(0)])) as ArrayRef,
+                Arc::new(Date64Array::from(vec![None])),
+            ],
+        );
+
+        let err = encoder.encode_batch(&batch).unwrap_err();
+        assert_value_conversion_diagnostic(
+            err,
+            DiagnosticCode::NullInNonNullableColumn,
+            Some(0),
+            Some((1, "datetime_value")),
+        );
+    }
+
+    #[test]
     fn direct_encoder_row_ranges_concatenate_to_full_payload() {
         let mappings = vec![
             mapping(0, "id", DataType::Int32, MssqlType::Int, false),
@@ -1615,6 +1885,44 @@ mod tests {
 
         assert_eq!(payload.row_token_offsets(), [0, 15]);
         assert_eq!(payload.row_count(), 2);
+    }
+
+    #[test]
+    fn direct_encoder_fixed_width_fast_path_is_active_for_date_columns() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(1, "created_on", DataType::Date32, MssqlType::Date, true),
+            mapping(
+                2,
+                "created_at",
+                DataType::Date64,
+                MssqlType::DateTime2 { precision: 3 },
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("created_on", DataType::Date32, true),
+                Field::new("created_at", DataType::Date64, true),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(Date32Array::from(vec![Some(0), None])),
+                Arc::new(Date64Array::from(vec![Some(86_400_123), Some(0)])),
+            ],
+        );
+
+        let payload = try_encode_fixed_width_primitive_rows(&batch, encoder.plan().columns())
+            .unwrap()
+            .expect("fixed-width date-family fast path should be active");
+
+        assert_eq!(payload.row_token_offsets(), [0, 17]);
+        assert_eq!(
+            payload.bytes(),
+            encoder.encode_batch(&batch).unwrap().bytes()
+        );
     }
 
     #[test]

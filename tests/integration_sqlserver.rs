@@ -1462,9 +1462,26 @@ async fn round_trip_decimal_policy_values(
 
 #[tokio::test]
 async fn baseline_writer_round_trips_date32_values() -> TestResult<()> {
+    round_trip_date32_values(
+        WriteBackend::BaselineTokenRow,
+        "SQL Server Date32 round-trip integration test",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn direct_raw_writer_round_trips_date32_values() -> TestResult<()> {
+    round_trip_date32_values(
+        WriteBackend::DirectRawBulk,
+        "SQL Server direct raw Date32 round-trip integration test",
+    )
+    .await
+}
+
+async fn round_trip_date32_values(backend: WriteBackend, test_name: &str) -> TestResult<()> {
     let Some((connection_string, database)) = integration_config() else {
         eprintln!(
-            "skipping SQL Server Date32 round-trip integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+            "skipping {test_name}: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
         );
         return Ok(());
     };
@@ -1506,7 +1523,7 @@ async fn baseline_writer_round_trips_date32_values() -> TestResult<()> {
             table.clone(),
             mappings,
             WriteOptions {
-                backend: WriteBackend::BaselineTokenRow,
+                backend,
                 ..WriteOptions::default()
             },
         )
@@ -1561,9 +1578,29 @@ async fn baseline_writer_round_trips_date32_values() -> TestResult<()> {
 
 #[tokio::test]
 async fn baseline_writer_round_trips_date64_datetime2_values() -> TestResult<()> {
+    round_trip_date64_datetime2_values(
+        WriteBackend::BaselineTokenRow,
+        "SQL Server Date64 datetime2 round-trip integration test",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn direct_raw_writer_round_trips_date64_datetime2_values() -> TestResult<()> {
+    round_trip_date64_datetime2_values(
+        WriteBackend::DirectRawBulk,
+        "SQL Server direct raw Date64 datetime2 round-trip integration test",
+    )
+    .await
+}
+
+async fn round_trip_date64_datetime2_values(
+    backend: WriteBackend,
+    test_name: &str,
+) -> TestResult<()> {
     let Some((connection_string, database)) = integration_config() else {
         eprintln!(
-            "skipping SQL Server Date64 datetime2 round-trip integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+            "skipping {test_name}: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
         );
         return Ok(());
     };
@@ -1608,7 +1645,7 @@ async fn baseline_writer_round_trips_date64_datetime2_values() -> TestResult<()>
             table.clone(),
             mappings,
             WriteOptions {
-                backend: WriteBackend::BaselineTokenRow,
+                backend,
                 ..WriteOptions::default()
             },
         )

@@ -21,7 +21,8 @@ use super::{
     token_row::tiberius_row_owned,
 };
 use crate::conversion::arrow_to_mssql::{
-    primitive::PrimitiveArrowToMssql, variable_width::VariableWidthArrowToMssql,
+    primitive::PrimitiveArrowToMssql, temporal::TemporalArrowToMssql,
+    variable_width::VariableWidthArrowToMssql,
 };
 
 const DIRECT_RAW_MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
@@ -471,6 +472,13 @@ fn expected_direct_bulk_column_type(column: &DirectColumnPlan) -> Option<tiberiu
             ..
         }) => Some(tiberius::ColumnType::BigVarBin),
         DirectColumnEncoding::VariableWidth(_) => None,
+        DirectColumnEncoding::Temporal(TemporalArrowToMssql::Date32ToDate) => {
+            Some(tiberius::ColumnType::Daten)
+        }
+        DirectColumnEncoding::Temporal(TemporalArrowToMssql::Date64ToDateTime2) => {
+            Some(tiberius::ColumnType::Datetime2)
+        }
+        DirectColumnEncoding::Temporal(_) => None,
     }
 }
 
@@ -715,7 +723,7 @@ mod tests {
     };
 
     use arrow_array::{BinaryArray, Float64Array, Int32Array, RecordBatch, UInt64Array};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use futures_util::io::{AsyncRead, AsyncWrite};
 
     use super::{
@@ -850,10 +858,15 @@ mod tests {
     #[test]
     fn direct_writer_state_rejects_unsupported_mappings() {
         let mappings = vec![SchemaMapping::new(
-            ArrowFieldRef::new(0, "created_on".to_owned(), true, DataType::Date32),
+            ArrowFieldRef::new(
+                0,
+                "event_time".to_owned(),
+                true,
+                DataType::Time64(TimeUnit::Nanosecond),
+            ),
             MssqlColumn::new(
-                Identifier::new("created_on").unwrap(),
-                MssqlType::Date,
+                Identifier::new("event_time").unwrap(),
+                MssqlType::Time(crate::MssqlTimePrecision::SEVEN),
                 true,
             ),
         )];
@@ -1251,6 +1264,45 @@ mod tests {
         let columns = vec![
             bulk_target_column_with_type(0, "name", false, tiberius::ColumnType::NVarchar),
             bulk_target_column_with_type(1, "payload", false, tiberius::ColumnType::BigVarBin),
+        ];
+
+        validate_direct_bulk_target_column_types(
+            columns.into_iter(),
+            state.direct_encoder().unwrap().plan(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn direct_bulk_target_type_validation_accepts_date_metadata() {
+        let mappings = vec![
+            SchemaMapping::new(
+                ArrowFieldRef::new(0, "created_on".to_owned(), true, DataType::Date32),
+                MssqlColumn::new(
+                    Identifier::new("created_on").unwrap(),
+                    MssqlType::Date,
+                    true,
+                ),
+            ),
+            SchemaMapping::new(
+                ArrowFieldRef::new(1, "created_at".to_owned(), true, DataType::Date64),
+                MssqlColumn::new(
+                    Identifier::new("created_at").unwrap(),
+                    MssqlType::DateTime2 { precision: 3 },
+                    true,
+                ),
+            ),
+        ];
+        let state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let columns = vec![
+            bulk_target_column_with_type(0, "created_on", true, tiberius::ColumnType::Daten),
+            bulk_target_column_with_type(1, "created_at", true, tiberius::ColumnType::Datetime2),
         ];
 
         validate_direct_bulk_target_column_types(
