@@ -494,7 +494,12 @@ fn expected_direct_bulk_column_type(column: &DirectColumnPlan) -> Option<tiberiu
             | TemporalArrowToMssql::Time64MicrosecondToTime
             | TemporalArrowToMssql::Time64NanosecondToTime,
         ) => Some(tiberius::ColumnType::Timen),
-        DirectColumnEncoding::Temporal(_) => None,
+        DirectColumnEncoding::Temporal(
+            TemporalArrowToMssql::TimestampSecondTzToDateTimeOffset
+            | TemporalArrowToMssql::TimestampMillisecondTzToDateTimeOffset
+            | TemporalArrowToMssql::TimestampMicrosecondTzToDateTimeOffset
+            | TemporalArrowToMssql::TimestampNanosecondTzToDateTimeOffset,
+        ) => Some(tiberius::ColumnType::DatetimeOffsetn),
     }
 }
 
