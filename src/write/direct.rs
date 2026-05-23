@@ -1016,8 +1016,9 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        ArrayRef, BinaryArray, BooleanArray, Decimal128Array, Decimal256Array, Float32Array,
-        Float64Array, Int32Array, Int64Array, RecordBatch, StringArray, UInt64Array,
+        ArrayRef, BinaryArray, BooleanArray, Decimal32Array, Decimal64Array, Decimal128Array,
+        Decimal256Array, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+        StringArray, UInt64Array,
     };
     use arrow_buffer::{NullBuffer, ScalarBuffer, i256};
     use arrow_schema::{DataType, Field, Schema};
@@ -1866,6 +1867,109 @@ mod tests {
                 0,
                 0,
             ]
+        );
+    }
+
+    #[test]
+    fn direct_encoder_encodes_mixed_nullable_and_non_nullable_decimal_columns() {
+        let mappings = vec![
+            mapping(
+                0,
+                "amount32",
+                DataType::Decimal32(5, 2),
+                MssqlType::Decimal {
+                    precision: 5,
+                    scale: 2,
+                },
+                false,
+            ),
+            mapping(
+                1,
+                "amount64",
+                DataType::Decimal64(18, 4),
+                MssqlType::Decimal {
+                    precision: 18,
+                    scale: 4,
+                },
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let decimal32 = Decimal32Array::from(vec![12_345_i32, -12_345])
+            .with_precision_and_scale(5, 2)
+            .unwrap();
+        let decimal64 = Decimal64Array::from(vec![None, Some(0_i64)])
+            .with_precision_and_scale(18, 4)
+            .unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("amount32", DataType::Decimal32(5, 2), false),
+                Field::new("amount64", DataType::Decimal64(18, 4), true),
+            ],
+            vec![Arc::new(decimal32), Arc::new(decimal64)],
+        );
+
+        let payload = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(payload.row_token_offsets(), [0, 8]);
+        assert_eq!(
+            payload.bytes(),
+            [
+                payload::TDS_ROW_TOKEN,
+                5,
+                1,
+                0x39,
+                0x30,
+                0,
+                0,
+                0,
+                payload::TDS_ROW_TOKEN,
+                5,
+                0,
+                0x39,
+                0x30,
+                0,
+                0,
+                5,
+                1,
+                0,
+                0,
+                0,
+                0,
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_encoder_rejects_decimal_null_in_non_nullable_column() {
+        let mappings = vec![mapping(
+            0,
+            "amount",
+            DataType::Decimal128(5, 2),
+            MssqlType::Decimal {
+                precision: 5,
+                scale: 2,
+            },
+            false,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let array = Decimal128Array::from(vec![Some(0_i128), None])
+            .with_precision_and_scale(5, 2)
+            .unwrap();
+        let batch = record_batch(
+            vec![Field::new("amount", DataType::Decimal128(5, 2), true)],
+            vec![Arc::new(array)],
+        );
+
+        let err = encoder
+            .encode_batch(&batch)
+            .expect_err("decimal null must fail for non-nullable target");
+
+        assert_value_conversion_diagnostic(
+            err,
+            DiagnosticCode::NullInNonNullableColumn,
+            Some(1),
+            Some((0, "amount")),
         );
     }
 
