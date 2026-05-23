@@ -2069,6 +2069,65 @@ mod tests {
     }
 
     #[test]
+    fn direct_encoder_measured_timestamp_ranges_concatenate_to_full_payload() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "precise_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                MssqlType::DateTime2 { precision: 7 },
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new_with_options(
+            &mappings,
+            PlanOptions {
+                nanosecond_policy: NanosecondPolicy::RoundTo100ns,
+                ..PlanOptions::default()
+            },
+        )
+        .unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new(
+                    "precise_at",
+                    DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                    true,
+                ),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(
+                    TimestampNanosecondArray::from(vec![Some(150), None, Some(-50)])
+                        .with_timezone("UTC"),
+                ),
+            ],
+        );
+
+        let measured = encoder.measure_batch(&batch).unwrap();
+        let full = encoder.encode_batch(&batch).unwrap();
+        let first = encoder
+            .encode_measured_batch_range(&batch, &measured, 0, 2)
+            .unwrap();
+        let second = encoder
+            .encode_measured_batch_range(&batch, &measured, 2, 1)
+            .unwrap();
+        let mut concatenated = Vec::new();
+        concatenated.extend_from_slice(first.bytes());
+        concatenated.extend_from_slice(second.bytes());
+
+        assert_eq!(measured.row_count(), 3);
+        assert_eq!(measured.cell_len(0, 1).unwrap(), 9);
+        assert_eq!(measured.cell_len(1, 1).unwrap(), 1);
+        assert_eq!(measured.cell_len(2, 1).unwrap(), 9);
+        assert_eq!(concatenated, full.bytes());
+        assert_eq!(first.row_token_offsets()[0], 0);
+        assert_eq!(second.row_token_offsets()[0], 0);
+    }
+
+    #[test]
     fn direct_encoder_rejects_timestamp_out_of_range_and_non_nullable_nulls() {
         let mappings = vec![mapping(
             0,
