@@ -4,7 +4,8 @@
 use arrow_array::{
     BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
     Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    Int32Array, Int64Array, RecordBatch, StringArray, Time32MillisecondArray, Time32SecondArray,
+    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
     UInt16Array, UInt32Array, UInt64Array,
 };
@@ -44,7 +45,8 @@ use primitive::{
     try_encode_fixed_width_primitive_rows,
 };
 use temporal::{
-    TemporalColumnContext, append_date32_cell, append_date64_cell,
+    TemporalColumnContext, append_date32_cell, append_date64_cell, append_time32_millisecond_cell,
+    append_time32_second_cell, append_time64_microsecond_cell, append_time64_nanosecond_cell,
     append_timestamp_microsecond_cell, append_timestamp_millisecond_cell,
     append_timestamp_nanosecond_cell, append_timestamp_second_cell, fill_temporal_column,
     measure_temporal_column_cell_lengths,
@@ -711,6 +713,39 @@ impl DirectEncoder {
                     nanosecond_policy: self.plan_options.nanosecond_policy,
                     array: downcast_direct_array::<TimestampNanosecondArray>(array, column)?,
                 },
+                DirectColumnEncoding::Temporal(
+                    classification @ TemporalArrowToMssql::Time32SecondToTime,
+                ) => RuntimeDirectColumn::Time32Second {
+                    column,
+                    mapping: self.mapping_for_column_index(column_index)?,
+                    classification,
+                    array: downcast_direct_array::<Time32SecondArray>(array, column)?,
+                },
+                DirectColumnEncoding::Temporal(
+                    classification @ TemporalArrowToMssql::Time32MillisecondToTime,
+                ) => RuntimeDirectColumn::Time32Millisecond {
+                    column,
+                    mapping: self.mapping_for_column_index(column_index)?,
+                    classification,
+                    array: downcast_direct_array::<Time32MillisecondArray>(array, column)?,
+                },
+                DirectColumnEncoding::Temporal(
+                    classification @ TemporalArrowToMssql::Time64MicrosecondToTime,
+                ) => RuntimeDirectColumn::Time64Microsecond {
+                    column,
+                    mapping: self.mapping_for_column_index(column_index)?,
+                    classification,
+                    array: downcast_direct_array::<Time64MicrosecondArray>(array, column)?,
+                },
+                DirectColumnEncoding::Temporal(
+                    classification @ TemporalArrowToMssql::Time64NanosecondToTime,
+                ) => RuntimeDirectColumn::Time64Nanosecond {
+                    column,
+                    mapping: self.mapping_for_column_index(column_index)?,
+                    classification,
+                    nanosecond_policy: self.plan_options.nanosecond_policy,
+                    array: downcast_direct_array::<Time64NanosecondArray>(array, column)?,
+                },
                 DirectColumnEncoding::Temporal(other) => {
                     return Err(unsupported_batch(format!(
                         "direct temporal append is not implemented yet for {other:?}"
@@ -846,6 +881,31 @@ enum RuntimeDirectColumn<'a> {
         nanosecond_policy: crate::NanosecondPolicy,
         array: &'a TimestampNanosecondArray,
     },
+    Time32Second {
+        column: &'a plan::DirectColumnPlan,
+        mapping: &'a SchemaMapping,
+        classification: TemporalArrowToMssql,
+        array: &'a Time32SecondArray,
+    },
+    Time32Millisecond {
+        column: &'a plan::DirectColumnPlan,
+        mapping: &'a SchemaMapping,
+        classification: TemporalArrowToMssql,
+        array: &'a Time32MillisecondArray,
+    },
+    Time64Microsecond {
+        column: &'a plan::DirectColumnPlan,
+        mapping: &'a SchemaMapping,
+        classification: TemporalArrowToMssql,
+        array: &'a Time64MicrosecondArray,
+    },
+    Time64Nanosecond {
+        column: &'a plan::DirectColumnPlan,
+        mapping: &'a SchemaMapping,
+        classification: TemporalArrowToMssql,
+        nanosecond_policy: crate::NanosecondPolicy,
+        array: &'a Time64NanosecondArray,
+    },
 }
 
 impl RuntimeDirectColumn<'_> {
@@ -975,6 +1035,43 @@ impl RuntimeDirectColumn<'_> {
                 nanosecond_policy,
                 array,
             } => append_timestamp_nanosecond_cell(
+                buf,
+                array,
+                mapping,
+                column,
+                *nanosecond_policy,
+                row_index,
+                measured_len,
+            ),
+            Self::Time32Second {
+                column,
+                mapping,
+                classification: _,
+                array,
+            } => append_time32_second_cell(buf, array, mapping, column, row_index, measured_len),
+            Self::Time32Millisecond {
+                column,
+                mapping,
+                classification: _,
+                array,
+            } => {
+                append_time32_millisecond_cell(buf, array, mapping, column, row_index, measured_len)
+            }
+            Self::Time64Microsecond {
+                column,
+                mapping,
+                classification: _,
+                array,
+            } => {
+                append_time64_microsecond_cell(buf, array, mapping, column, row_index, measured_len)
+            }
+            Self::Time64Nanosecond {
+                column,
+                mapping,
+                classification: _,
+                nanosecond_policy,
+                array,
+            } => append_time64_nanosecond_cell(
                 buf,
                 array,
                 mapping,
@@ -1248,22 +1345,23 @@ mod tests {
     use arrow_array::{
         ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array,
         Decimal64Array, Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int32Array,
-        Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-        TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
+        Int64Array, RecordBatch, StringArray, Time32MillisecondArray, Time32SecondArray,
+        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
     };
     use arrow_buffer::{NullBuffer, ScalarBuffer, i256};
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
     use crate::{
-        ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, MssqlTypeLength,
-        NanosecondPolicy, PlanOptions, SchemaMapping,
+        ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlTimePrecision,
+        MssqlType, MssqlTypeLength, NanosecondPolicy, PlanOptions, SchemaMapping,
         conversion::arrow_to_mssql::primitive::PrimitiveArrowToMssql,
         mssql::cell::{MssqlDate, MssqlDateTime2, MssqlTime},
     };
 
     use super::plan::{DirectColumnEncoding, DirectEncoderSupport, DirectMappingSupport};
     use super::primitive::try_encode_fixed_width_primitive_rows;
-    use super::temporal::write_datetime2_cell;
+    use super::temporal::{write_datetime2_cell, write_time_cell};
     use super::{DirectEncoder, payload};
 
     #[test]
@@ -2135,6 +2233,233 @@ mod tests {
         assert_eq!(concatenated, full.bytes());
         assert_eq!(first.row_token_offsets()[0], 0);
         assert_eq!(second.row_token_offsets()[0], 0);
+    }
+
+    #[test]
+    fn direct_encoder_encodes_all_time_units() {
+        let mappings = vec![
+            mapping(
+                0,
+                "time_s",
+                DataType::Time32(TimeUnit::Second),
+                MssqlType::Time(MssqlTimePrecision::ZERO),
+                false,
+            ),
+            mapping(
+                1,
+                "time_ms",
+                DataType::Time32(TimeUnit::Millisecond),
+                MssqlType::Time(MssqlTimePrecision::THREE),
+                false,
+            ),
+            mapping(
+                2,
+                "time_us",
+                DataType::Time64(TimeUnit::Microsecond),
+                MssqlType::Time(MssqlTimePrecision::SIX),
+                false,
+            ),
+            mapping(
+                3,
+                "time_ns",
+                DataType::Time64(TimeUnit::Nanosecond),
+                MssqlType::Time(MssqlTimePrecision::SEVEN),
+                false,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("time_s", DataType::Time32(TimeUnit::Second), false),
+                Field::new("time_ms", DataType::Time32(TimeUnit::Millisecond), false),
+                Field::new("time_us", DataType::Time64(TimeUnit::Microsecond), false),
+                Field::new("time_ns", DataType::Time64(TimeUnit::Nanosecond), false),
+            ],
+            vec![
+                Arc::new(Time32SecondArray::from(vec![86_399])) as ArrayRef,
+                Arc::new(Time32MillisecondArray::from(vec![12_345])),
+                Arc::new(Time64MicrosecondArray::from(vec![12_345_678])),
+                Arc::new(Time64NanosecondArray::from(vec![12_345_678_900])),
+            ],
+        );
+
+        let payload = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(payload.row_token_offsets(), [0]);
+        assert_eq!(
+            payload.bytes(),
+            expected_rows([[
+                time_cell(0, 86_399),
+                time_cell(3, 12_345),
+                time_cell(6, 12_345_678),
+                time_cell(7, 123_456_789),
+            ]])
+        );
+    }
+
+    #[test]
+    fn direct_encoder_encodes_time_nulls_and_measured_ranges() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "time_ms",
+                DataType::Time32(TimeUnit::Millisecond),
+                MssqlType::Time(MssqlTimePrecision::THREE),
+                true,
+            ),
+            mapping(
+                2,
+                "time_ns",
+                DataType::Time64(TimeUnit::Nanosecond),
+                MssqlType::Time(MssqlTimePrecision::SEVEN),
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new_with_options(
+            &mappings,
+            PlanOptions {
+                nanosecond_policy: NanosecondPolicy::RoundTo100ns,
+                ..PlanOptions::default()
+            },
+        )
+        .unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("time_ms", DataType::Time32(TimeUnit::Millisecond), true),
+                Field::new("time_ns", DataType::Time64(TimeUnit::Nanosecond), true),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(Time32MillisecondArray::from(vec![
+                    Some(1),
+                    None,
+                    Some(86_399_999),
+                ])),
+                Arc::new(Time64NanosecondArray::from(vec![
+                    Some(149),
+                    Some(150),
+                    None,
+                ])),
+            ],
+        );
+
+        let measured = encoder.measure_batch(&batch).unwrap();
+        let full = encoder.encode_batch(&batch).unwrap();
+        let first = encoder
+            .encode_measured_batch_range(&batch, &measured, 0, 2)
+            .unwrap();
+        let second = encoder
+            .encode_measured_batch_range(&batch, &measured, 2, 1)
+            .unwrap();
+        let mut concatenated = Vec::new();
+        concatenated.extend_from_slice(first.bytes());
+        concatenated.extend_from_slice(second.bytes());
+
+        assert_eq!(measured.row_count(), 3);
+        assert_eq!(measured.cell_len(0, 1).unwrap(), 5);
+        assert_eq!(measured.cell_len(1, 1).unwrap(), 1);
+        assert_eq!(measured.cell_len(0, 2).unwrap(), 6);
+        assert_eq!(measured.cell_len(2, 2).unwrap(), 1);
+        assert_eq!(concatenated, full.bytes());
+        assert_eq!(
+            full.bytes(),
+            expected_rows([
+                [int32_cell(1), time_cell(3, 1), time_cell(7, 1)],
+                [int32_cell(2), null_cell(), time_cell(7, 2)],
+                [int32_cell(3), time_cell(3, 86_399_999), null_cell()],
+            ])
+        );
+    }
+
+    #[test]
+    fn direct_encoder_rejects_time_out_of_range_lossy_nanoseconds_and_non_nullable_nulls() {
+        let mappings = vec![
+            mapping(
+                0,
+                "time_s",
+                DataType::Time32(TimeUnit::Second),
+                MssqlType::Time(MssqlTimePrecision::ZERO),
+                false,
+            ),
+            mapping(
+                1,
+                "time_ns",
+                DataType::Time64(TimeUnit::Nanosecond),
+                MssqlType::Time(MssqlTimePrecision::SEVEN),
+                false,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+
+        let negative_batch = record_batch(
+            vec![
+                Field::new("time_s", DataType::Time32(TimeUnit::Second), false),
+                Field::new("time_ns", DataType::Time64(TimeUnit::Nanosecond), false),
+            ],
+            vec![
+                Arc::new(Time32SecondArray::from(vec![-1])) as ArrayRef,
+                Arc::new(Time64NanosecondArray::from(vec![0])),
+            ],
+        );
+        assert_value_conversion_diagnostic(
+            encoder.encode_batch(&negative_batch).unwrap_err(),
+            DiagnosticCode::TimestampOutOfRange,
+            Some(0),
+            Some((0, "time_s")),
+        );
+
+        let exact_day_batch = record_batch(
+            vec![
+                Field::new("time_s", DataType::Time32(TimeUnit::Second), false),
+                Field::new("time_ns", DataType::Time64(TimeUnit::Nanosecond), false),
+            ],
+            vec![
+                Arc::new(Time32SecondArray::from(vec![0])) as ArrayRef,
+                Arc::new(Time64NanosecondArray::from(vec![86_400_000_000_000])),
+            ],
+        );
+        assert_value_conversion_diagnostic(
+            encoder.encode_batch(&exact_day_batch).unwrap_err(),
+            DiagnosticCode::TimestampOutOfRange,
+            Some(0),
+            Some((1, "time_ns")),
+        );
+
+        let lossy_batch = record_batch(
+            vec![
+                Field::new("time_s", DataType::Time32(TimeUnit::Second), false),
+                Field::new("time_ns", DataType::Time64(TimeUnit::Nanosecond), false),
+            ],
+            vec![
+                Arc::new(Time32SecondArray::from(vec![0])) as ArrayRef,
+                Arc::new(Time64NanosecondArray::from(vec![101])),
+            ],
+        );
+        assert_value_conversion_diagnostic(
+            encoder.encode_batch(&lossy_batch).unwrap_err(),
+            DiagnosticCode::LossyConversionRequiresPolicy,
+            Some(0),
+            Some((1, "time_ns")),
+        );
+
+        let null_batch = record_batch(
+            vec![
+                Field::new("time_s", DataType::Time32(TimeUnit::Second), true),
+                Field::new("time_ns", DataType::Time64(TimeUnit::Nanosecond), false),
+            ],
+            vec![
+                Arc::new(Time32SecondArray::from(vec![None])) as ArrayRef,
+                Arc::new(Time64NanosecondArray::from(vec![0])),
+            ],
+        );
+        assert_value_conversion_diagnostic(
+            encoder.encode_batch(&null_batch).unwrap_err(),
+            DiagnosticCode::NullInNonNullableColumn,
+            Some(0),
+            Some((0, "time_s")),
+        );
     }
 
     #[test]
@@ -3562,6 +3887,18 @@ mod tests {
             ),
         )
         .unwrap();
+        bytes
+    }
+
+    fn time_cell(scale: u8, increments: u64) -> Vec<u8> {
+        let len = match scale {
+            0..=2 => 4,
+            3..=4 => 5,
+            5..=7 => 6,
+            _ => panic!("unsupported test time scale"),
+        };
+        let mut bytes = vec![0; len];
+        write_time_cell(&mut bytes, MssqlTime::new(increments, scale)).unwrap();
         bytes
     }
 
