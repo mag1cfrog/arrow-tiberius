@@ -64,8 +64,13 @@ impl DirectEncoderSupport for CurrentDirectMappings {
         match PrimitiveArrowToMssql::classify(mapping, 0) {
             Ok(
                 classification @ (PrimitiveArrowToMssql::BooleanToBit
+                | PrimitiveArrowToMssql::UInt8ToTinyInt
+                | PrimitiveArrowToMssql::Int8ToSmallInt
+                | PrimitiveArrowToMssql::Int16ToSmallInt
                 | PrimitiveArrowToMssql::Int32ToInt
+                | PrimitiveArrowToMssql::UInt16ToInt
                 | PrimitiveArrowToMssql::Int64ToBigInt
+                | PrimitiveArrowToMssql::UInt32ToBigInt
                 | PrimitiveArrowToMssql::Float64ToFloat),
             ) => DirectMappingSupport::Supported {
                 encoding: DirectColumnEncoding::Primitive(classification),
@@ -314,10 +319,15 @@ mod tests {
     fn current_direct_support_accepts_implemented_primitive_mappings() {
         let mappings = vec![
             mapping(0, "is_active", DataType::Boolean, MssqlType::Bit),
-            mapping(1, "quantity", DataType::Int32, MssqlType::Int),
-            mapping(2, "total", DataType::Int64, MssqlType::BigInt),
+            mapping(1, "tiny", DataType::UInt8, MssqlType::TinyInt),
+            mapping(2, "signed_tiny", DataType::Int8, MssqlType::SmallInt),
+            mapping(3, "small", DataType::Int16, MssqlType::SmallInt),
+            mapping(4, "quantity", DataType::Int32, MssqlType::Int),
+            mapping(5, "unsigned_medium", DataType::UInt16, MssqlType::Int),
+            mapping(6, "total", DataType::Int64, MssqlType::BigInt),
+            mapping(7, "unsigned_total", DataType::UInt32, MssqlType::BigInt),
             mapping(
-                3,
+                8,
                 "ratio",
                 DataType::Float64,
                 MssqlType::Float { precision: 53 },
@@ -327,12 +337,17 @@ mod tests {
         let plan = DirectEncoderPlan::new(&mappings, &CurrentDirectMappings)
             .expect("implemented primitive mappings should be supported");
 
-        assert_eq!(plan.column_count(), 4);
+        assert_eq!(plan.column_count(), 9);
         assert_eq!(plan.columns()[0].target_type(), &MssqlType::Bit);
-        assert_eq!(plan.columns()[1].target_type(), &MssqlType::Int);
-        assert_eq!(plan.columns()[2].target_type(), &MssqlType::BigInt);
+        assert_eq!(plan.columns()[1].target_type(), &MssqlType::TinyInt);
+        assert_eq!(plan.columns()[2].target_type(), &MssqlType::SmallInt);
+        assert_eq!(plan.columns()[3].target_type(), &MssqlType::SmallInt);
+        assert_eq!(plan.columns()[4].target_type(), &MssqlType::Int);
+        assert_eq!(plan.columns()[5].target_type(), &MssqlType::Int);
+        assert_eq!(plan.columns()[6].target_type(), &MssqlType::BigInt);
+        assert_eq!(plan.columns()[7].target_type(), &MssqlType::BigInt);
         assert_eq!(
-            plan.columns()[3].target_type(),
+            plan.columns()[8].target_type(),
             &MssqlType::Float { precision: 53 }
         );
         assert_eq!(
@@ -341,25 +356,43 @@ mod tests {
         );
         assert_eq!(
             plan.columns()[1].encoding(),
-            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int32ToInt)
+            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt8ToTinyInt)
         );
         assert_eq!(
             plan.columns()[2].encoding(),
-            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int64ToBigInt)
+            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int8ToSmallInt)
         );
         assert_eq!(
             plan.columns()[3].encoding(),
+            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int16ToSmallInt)
+        );
+        assert_eq!(
+            plan.columns()[4].encoding(),
+            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int32ToInt)
+        );
+        assert_eq!(
+            plan.columns()[5].encoding(),
+            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt16ToInt)
+        );
+        assert_eq!(
+            plan.columns()[6].encoding(),
+            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int64ToBigInt)
+        );
+        assert_eq!(
+            plan.columns()[7].encoding(),
+            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt32ToBigInt)
+        );
+        assert_eq!(
+            plan.columns()[8].encoding(),
             DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat)
         );
     }
 
     #[test]
-    fn current_direct_support_rejects_unimplemented_scalar_primitives() {
+    fn current_direct_support_rejects_remaining_unimplemented_scalar_primitives() {
         let mappings = vec![
-            mapping(0, "tiny", DataType::UInt8, MssqlType::TinyInt),
-            mapping(1, "small", DataType::Int16, MssqlType::SmallInt),
-            mapping(2, "unsigned", DataType::UInt32, MssqlType::BigInt),
-            mapping(3, "real_value", DataType::Float32, MssqlType::Real),
+            mapping(0, "unsigned_huge", DataType::UInt64, MssqlType::BigInt),
+            mapping(1, "real_value", DataType::Float32, MssqlType::Real),
         ];
 
         let err = DirectEncoderPlan::new(&mappings, &CurrentDirectMappings)
@@ -369,7 +402,7 @@ mod tests {
             panic!("expected direct encoding error");
         };
 
-        assert_eq!(diagnostics.len(), 4);
+        assert_eq!(diagnostics.len(), 2);
         for (index, diagnostic) in diagnostics.all().iter().enumerate() {
             assert_eq!(
                 diagnostic.code(),
