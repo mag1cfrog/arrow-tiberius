@@ -10,15 +10,15 @@ use std::time::{Duration, Instant};
 
 use crate::{odbc_runner, sqlserver};
 use arrow_array::{
-    ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
     TimestampMillisecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow_tiberius::{
-    BulkWriter, MssqlProfile, PlanOptions, SchemaMapping, TableName, UInt64Policy, WriteBackend,
-    WriteOptions, create_table_sql_from_mappings, plan_arrow_schema_to_mssql_mappings,
-    write::profile::DirectWriteProfile,
+    BulkWriter, Date64Policy, MssqlProfile, PlanOptions, SchemaMapping, TableName, UInt64Policy,
+    WriteBackend, WriteOptions, create_table_sql_from_mappings,
+    plan_arrow_schema_to_mssql_mappings, write::profile::DirectWriteProfile,
 };
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -268,7 +268,7 @@ fn print_arrow_odbc_help() {
 
 fn print_compare_help() {
     println!(
-        "Usage:\n  cargo xtask writer-bench compare [OPTIONS]\n\nData Options:\n  --rows <COUNT>                    Total rows to generate [default: 100000]\n  --batch-size <COUNT>              Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>                 Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>                  Number of benchmark repeats [default: 1]\n  --backends <LIST>                 Comma-separated backends: baseline,direct-framed,direct-raw,arrow-odbc,odbc-bcp [default: baseline,arrow-odbc]\n  --output <FORMAT>                 Output format: human [default: human]\n  --profile-direct                  Include direct backend phase timings and counters\n\nSQL Server Options:\n  --container-runtime <PATH>        Container runtime executable, such as docker or podman\n  --connection-string <URL>         Use an existing SQL Server instead of a local container\n  --image <IMAGE>                   SQL Server container image\n  --database <NAME>                 Benchmark database name\n  --tds-packet-size <BYTES>         Requested TDS packet size for Tiberius writers\n  --sqlserver-recovery-model <MODEL>\n                                    Set compare database recovery model: full, bulk-logged, or simple\n  --sqlserver-bulk-table-lock       Enable table lock on bulk load for compare benchmark tables\n  --profile-sqlserver               Profile the SQL Server writer session during compare writes\n  --sqlserver-profile-sample-ms <MILLIS>\n                                    SQL Server profile sample interval [default: 250]\n  --keep-container                  Keep managed containers after the task exits\n\nODBC Runner Options:\n  --arrow-odbc-autocommit           Use ODBC autocommit for arrow-odbc compares\n  --odbc-bcp-defer-batches          Defer odbc-bcp commits to bcp_done\n  --runner-image <IMAGE>            Managed ODBC runner image tag\n  --keep-runner-image               Keep the managed ODBC runner image after the task exits\n  -h, --help                        Print help\n\nCompare runs use one shared Arrow IPC dataset as the fairness boundary."
+        "Usage:\n  cargo xtask writer-bench compare [OPTIONS]\n\nData Options:\n  --rows <COUNT>                    Total rows to generate [default: 100000]\n  --batch-size <COUNT>              Maximum rows per generated RecordBatch [default: 8192]\n  --scenario <NAME>                 Benchmark scenario [default: narrow_numeric]\n  --repeat <COUNT>                  Number of benchmark repeats [default: 1]\n  --backends <LIST>                 Comma-separated backends: baseline,direct-framed,direct-raw,direct-raw-no-date-fast-path,direct-raw-no-fixed-fast-path,arrow-odbc,odbc-bcp [default: baseline,arrow-odbc]\n  --output <FORMAT>                 Output format: human [default: human]\n  --profile-direct                  Include direct backend phase timings and counters\n\nSQL Server Options:\n  --container-runtime <PATH>        Container runtime executable, such as docker or podman\n  --connection-string <URL>         Use an existing SQL Server instead of a local container\n  --image <IMAGE>                   SQL Server container image\n  --database <NAME>                 Benchmark database name\n  --tds-packet-size <BYTES>         Requested TDS packet size for Tiberius writers\n  --sqlserver-recovery-model <MODEL>\n                                    Set compare database recovery model: full, bulk-logged, or simple\n  --sqlserver-bulk-table-lock       Enable table lock on bulk load for compare benchmark tables\n  --profile-sqlserver               Profile the SQL Server writer session during compare writes\n  --sqlserver-profile-sample-ms <MILLIS>\n                                    SQL Server profile sample interval [default: 250]\n  --keep-container                  Keep managed containers after the task exits\n\nODBC Runner Options:\n  --arrow-odbc-autocommit           Use ODBC autocommit for arrow-odbc compares\n  --odbc-bcp-defer-batches          Defer odbc-bcp commits to bcp_done\n  --runner-image <IMAGE>            Managed ODBC runner image tag\n  --keep-runner-image               Keep the managed ODBC runner image after the task exits\n  -h, --help                        Print help\n\nCompare runs use one shared Arrow IPC dataset as the fairness boundary."
     );
 }
 
@@ -677,7 +677,9 @@ fn print_compare_summary(options: &CompareBenchOptions, report: &CompareBenchRep
         match backend {
             CompareBackendBenchReport::Baseline { report }
             | CompareBackendBenchReport::DirectFramed { report }
-            | CompareBackendBenchReport::DirectRaw { report } => {
+            | CompareBackendBenchReport::DirectRaw { report }
+            | CompareBackendBenchReport::DirectRawNoDateFastPath { report }
+            | CompareBackendBenchReport::DirectRawNoFixedFastPath { report } => {
                 print_tiberius_backend_summary(report);
             }
             CompareBackendBenchReport::ArrowOdbc { report } => {
@@ -1407,17 +1409,32 @@ enum BenchmarkBackend {
     Baseline,
     DirectFramed,
     DirectRaw,
+    DirectRawNoDateFastPath,
+    DirectRawNoFixedFastPath,
     ArrowOdbc,
     OdbcBcp,
 }
 
 impl BenchmarkBackend {
     fn is_tiberius(&self) -> bool {
-        matches!(self, Self::Baseline | Self::DirectFramed | Self::DirectRaw)
+        matches!(
+            self,
+            Self::Baseline
+                | Self::DirectFramed
+                | Self::DirectRaw
+                | Self::DirectRawNoDateFastPath
+                | Self::DirectRawNoFixedFastPath
+        )
     }
 
     fn is_direct(&self) -> bool {
-        matches!(self, Self::DirectFramed | Self::DirectRaw)
+        matches!(
+            self,
+            Self::DirectFramed
+                | Self::DirectRaw
+                | Self::DirectRawNoDateFastPath
+                | Self::DirectRawNoFixedFastPath
+        )
     }
 
     fn supports_sql_server_profile(&self) -> bool {
@@ -1431,6 +1448,8 @@ impl fmt::Display for BenchmarkBackend {
             Self::Baseline => f.write_str("baseline"),
             Self::DirectFramed => f.write_str("direct-framed"),
             Self::DirectRaw => f.write_str("direct-raw"),
+            Self::DirectRawNoDateFastPath => f.write_str("direct-raw-no-date-fast-path"),
+            Self::DirectRawNoFixedFastPath => f.write_str("direct-raw-no-fixed-fast-path"),
             Self::ArrowOdbc => f.write_str("arrow-odbc"),
             Self::OdbcBcp => f.write_str("odbc-bcp"),
         }
@@ -1445,10 +1464,12 @@ impl FromStr for BenchmarkBackend {
             "baseline" => Ok(Self::Baseline),
             "direct-framed" => Ok(Self::DirectFramed),
             "direct-raw" => Ok(Self::DirectRaw),
+            "direct-raw-no-date-fast-path" => Ok(Self::DirectRawNoDateFastPath),
+            "direct-raw-no-fixed-fast-path" => Ok(Self::DirectRawNoFixedFastPath),
             "arrow-odbc" => Ok(Self::ArrowOdbc),
             "odbc-bcp" => Ok(Self::OdbcBcp),
             other => Err(WriterBenchError::Validation(format!(
-                "unknown writer-bench compare backend `{other}`; expected baseline, direct-framed, direct-raw, arrow-odbc, or odbc-bcp"
+                "unknown writer-bench compare backend `{other}`; expected baseline, direct-framed, direct-raw, direct-raw-no-date-fast-path, direct-raw-no-fixed-fast-path, arrow-odbc, or odbc-bcp"
             ))),
         }
     }
@@ -1495,6 +1516,19 @@ fn ensure_direct_raw_supported_scenario(
         "writer-bench compare direct backends currently support only scenarios {}; scenario `{}` contains column types that are not implemented by the direct TDS encoder yet",
         DIRECT_RAW_SUPPORTED_SCENARIOS.join(", "),
         benchmark.scenario.name
+    )))
+}
+
+fn ensure_direct_date_fast_path_ab_scenario(
+    benchmark: &WriterBenchOptions,
+) -> Result<(), WriterBenchError> {
+    if benchmark.scenario.name == DATE_FAST_PATH_SCENARIO.name {
+        return Ok(());
+    }
+
+    Err(WriterBenchError::Validation(format!(
+        "writer-bench compare backend direct-raw-no-date-fast-path is an exact A/B for scenario `{}` only; scenario `{}` would not isolate the date fast path",
+        DATE_FAST_PATH_SCENARIO.name, benchmark.scenario.name
     )))
 }
 
@@ -2175,6 +2209,13 @@ const UINT64_POLICY_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDef
     columns: uint64_policy_columns,
 };
 
+const DATE_FAST_PATH_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
+    name: "date_fast_path",
+    description: "Date32 date and Date64 datetime2 fixed-width direct rows",
+    schema: date_fast_path_schema,
+    columns: date_fast_path_columns,
+};
+
 const MIXED_NULLABLE_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
     name: "mixed_nullable",
     description: "Nullable primitives and short strings",
@@ -2266,6 +2307,7 @@ const DIRECT_RAW_SUPPORTED_SCENARIOS: &[&str] = &[
     NARROW_NUMERIC_SCENARIO.name,
     EXTENDED_PRIMITIVE_SCENARIO.name,
     UINT64_POLICY_SCENARIO.name,
+    DATE_FAST_PATH_SCENARIO.name,
     MIXED_NULLABLE_SCENARIO.name,
     STRING_HEAVY_SCENARIO.name,
     STRING_HEAVY_TEXT_ONLY_SCENARIO.name,
@@ -2287,6 +2329,7 @@ const SCENARIOS: &[BenchmarkScenarioDefinition] = &[
     NARROW_NUMERIC_SCENARIO,
     EXTENDED_PRIMITIVE_SCENARIO,
     UINT64_POLICY_SCENARIO,
+    DATE_FAST_PATH_SCENARIO,
     MIXED_NULLABLE_SCENARIO,
     WIDE_MIXED_SCENARIO,
     DECIMAL_TEMPORAL_SCENARIO,
@@ -2410,6 +2453,8 @@ struct TiberiusRepeatConfig {
     scenario: &'static BenchmarkScenarioDefinition,
     backend: WriteBackend,
     profile_direct: bool,
+    disable_date_fast_path: bool,
+    disable_fixed_width_fast_path: bool,
     bulk_table_lock: bool,
 }
 
@@ -2417,6 +2462,8 @@ struct TiberiusRepeatConfig {
 struct TiberiusBenchmarkConfig {
     backend: WriteBackend,
     profile_direct: bool,
+    disable_date_fast_path: bool,
+    disable_fixed_width_fast_path: bool,
     tds_packet_size: Option<u32>,
     sql_server_profile: Option<SqlServerProfileOptions>,
     bulk_table_lock: bool,
@@ -2448,6 +2495,8 @@ enum CompareBackendBenchReport {
     Baseline { report: TiberiusBenchReport },
     DirectFramed { report: TiberiusBenchReport },
     DirectRaw { report: TiberiusBenchReport },
+    DirectRawNoDateFastPath { report: TiberiusBenchReport },
+    DirectRawNoFixedFastPath { report: TiberiusBenchReport },
     ArrowOdbc { report: OdbcRunnerBenchReport },
     OdbcBcp { report: OdbcRunnerBenchReport },
 }
@@ -2458,6 +2507,8 @@ impl CompareBackendBenchReport {
             Self::Baseline { .. } => BenchmarkBackend::Baseline,
             Self::DirectFramed { .. } => BenchmarkBackend::DirectFramed,
             Self::DirectRaw { .. } => BenchmarkBackend::DirectRaw,
+            Self::DirectRawNoDateFastPath { .. } => BenchmarkBackend::DirectRawNoDateFastPath,
+            Self::DirectRawNoFixedFastPath { .. } => BenchmarkBackend::DirectRawNoFixedFastPath,
             Self::ArrowOdbc { .. } => BenchmarkBackend::ArrowOdbc,
             Self::OdbcBcp { .. } => BenchmarkBackend::OdbcBcp,
         }
@@ -3024,6 +3075,8 @@ async fn run_baseline_async(
         TiberiusBenchmarkConfig {
             backend: WriteBackend::BaselineTokenRow,
             profile_direct: false,
+            disable_date_fast_path: false,
+            disable_fixed_width_fast_path: false,
             tds_packet_size: options.tds_packet_size,
             sql_server_profile: None,
             bulk_table_lock: false,
@@ -3075,6 +3128,12 @@ fn run_compare_benchmark(
 
     if options.backends.iter().any(BenchmarkBackend::is_direct) {
         ensure_direct_raw_supported_scenario(&options.benchmark)?;
+    }
+    if options
+        .backends
+        .contains(&BenchmarkBackend::DirectRawNoDateFastPath)
+    {
+        ensure_direct_date_fast_path_ab_scenario(&options.benchmark)?;
     }
     if options.backends.contains(&BenchmarkBackend::ArrowOdbc) {
         ensure_arrow_odbc_supported_scenario(&options.benchmark)?;
@@ -3133,112 +3192,164 @@ fn run_compare_benchmark(
     let run_result = (|| {
         let mut backends = Vec::new();
 
-        if options.backends.contains(&BenchmarkBackend::Baseline) {
-            let report = runtime.block_on(async {
-                let backend_start = Instant::now();
-                let mut report = run_tiberius_benchmark_from_ipc(
-                    &options.benchmark,
-                    &connection,
-                    &ipc_dataset.host_path,
-                    TiberiusBenchmarkConfig {
-                        backend: WriteBackend::BaselineTokenRow,
-                        profile_direct: false,
-                        tds_packet_size: options.tds_packet_size,
-                        sql_server_profile: options.sql_server_profile,
-                        bulk_table_lock: options.sql_server_bulk_table_lock,
-                    },
-                )
-                .await?;
-                report.timings.total = backend_start.elapsed();
-                Ok::<_, WriterBenchError>(report)
-            })?;
-            backends.push(CompareBackendBenchReport::Baseline { report });
-        }
-
-        if options.backends.contains(&BenchmarkBackend::DirectFramed) {
-            let report = runtime.block_on(async {
-                let backend_start = Instant::now();
-                let mut report = run_tiberius_benchmark_from_ipc(
-                    &options.benchmark,
-                    &connection,
-                    &ipc_dataset.host_path,
-                    TiberiusBenchmarkConfig {
-                        backend: WriteBackend::DirectFramedBulk,
-                        profile_direct: options.profile_direct,
-                        tds_packet_size: options.tds_packet_size,
-                        sql_server_profile: options.sql_server_profile,
-                        bulk_table_lock: options.sql_server_bulk_table_lock,
-                    },
-                )
-                .await?;
-                report.timings.total = backend_start.elapsed();
-                Ok::<_, WriterBenchError>(report)
-            })?;
-            backends.push(CompareBackendBenchReport::DirectFramed { report });
-        }
-
-        if options.backends.contains(&BenchmarkBackend::DirectRaw) {
-            let report = runtime.block_on(async {
-                let backend_start = Instant::now();
-                let mut report = run_tiberius_benchmark_from_ipc(
-                    &options.benchmark,
-                    &connection,
-                    &ipc_dataset.host_path,
-                    TiberiusBenchmarkConfig {
-                        backend: WriteBackend::DirectRawBulk,
-                        profile_direct: options.profile_direct,
-                        tds_packet_size: options.tds_packet_size,
-                        sql_server_profile: options.sql_server_profile,
-                        bulk_table_lock: options.sql_server_bulk_table_lock,
-                    },
-                )
-                .await?;
-                report.timings.total = backend_start.elapsed();
-                Ok::<_, WriterBenchError>(report)
-            })?;
-            backends.push(CompareBackendBenchReport::DirectRaw { report });
-        }
-
-        if options.backends.contains(&BenchmarkBackend::ArrowOdbc) {
-            let runner_image = runner_image.as_ref().ok_or_else(|| {
-                WriterBenchError::Validation(
-                    "ODBC runner image was not prepared for arrow-odbc compare".to_owned(),
-                )
-            })?;
-            let report = run_arrow_odbc_runner_for_benchmark_capture(
-                &options.benchmark,
-                runner_image,
-                network.as_ref(),
-                &connection,
-                &ipc_dataset,
-                ArrowOdbcRunnerBenchOptions {
-                    profile_sql_server: options.sql_server_profile.is_some(),
-                    autocommit: options.arrow_odbc_autocommit,
-                    bulk_table_lock: options.sql_server_bulk_table_lock,
-                },
-            )?;
-            backends.push(CompareBackendBenchReport::ArrowOdbc { report });
-        }
-
-        if options.backends.contains(&BenchmarkBackend::OdbcBcp) {
-            let runner_image = runner_image.as_ref().ok_or_else(|| {
-                WriterBenchError::Validation(
-                    "ODBC runner image was not prepared for odbc-bcp compare".to_owned(),
-                )
-            })?;
-            let report = run_odbc_bcp_runner_for_benchmark_capture(
-                &options.benchmark,
-                runner_image,
-                network.as_ref(),
-                &connection,
-                &ipc_dataset,
-                OdbcBcpRunnerBenchOptions {
-                    profile_sql_server: options.sql_server_profile.is_some(),
-                    defer_batches: options.odbc_bcp_defer_batches,
-                    bulk_table_lock: options.sql_server_bulk_table_lock,
-                },
-            )?;
-            backends.push(CompareBackendBenchReport::OdbcBcp { report });
+        for backend in &options.backends {
+            match backend {
+                BenchmarkBackend::Baseline => {
+                    let report = runtime.block_on(async {
+                        let backend_start = Instant::now();
+                        let mut report = run_tiberius_benchmark_from_ipc(
+                            &options.benchmark,
+                            &connection,
+                            &ipc_dataset.host_path,
+                            TiberiusBenchmarkConfig {
+                                backend: WriteBackend::BaselineTokenRow,
+                                profile_direct: false,
+                                disable_date_fast_path: false,
+                                disable_fixed_width_fast_path: false,
+                                tds_packet_size: options.tds_packet_size,
+                                sql_server_profile: options.sql_server_profile,
+                                bulk_table_lock: options.sql_server_bulk_table_lock,
+                            },
+                        )
+                        .await?;
+                        report.timings.total = backend_start.elapsed();
+                        Ok::<_, WriterBenchError>(report)
+                    })?;
+                    backends.push(CompareBackendBenchReport::Baseline { report });
+                }
+                BenchmarkBackend::DirectFramed => {
+                    let report = runtime.block_on(async {
+                        let backend_start = Instant::now();
+                        let mut report = run_tiberius_benchmark_from_ipc(
+                            &options.benchmark,
+                            &connection,
+                            &ipc_dataset.host_path,
+                            TiberiusBenchmarkConfig {
+                                backend: WriteBackend::DirectFramedBulk,
+                                profile_direct: options.profile_direct,
+                                disable_date_fast_path: false,
+                                disable_fixed_width_fast_path: false,
+                                tds_packet_size: options.tds_packet_size,
+                                sql_server_profile: options.sql_server_profile,
+                                bulk_table_lock: options.sql_server_bulk_table_lock,
+                            },
+                        )
+                        .await?;
+                        report.timings.total = backend_start.elapsed();
+                        Ok::<_, WriterBenchError>(report)
+                    })?;
+                    backends.push(CompareBackendBenchReport::DirectFramed { report });
+                }
+                BenchmarkBackend::DirectRaw => {
+                    let report = runtime.block_on(async {
+                        let backend_start = Instant::now();
+                        let mut report = run_tiberius_benchmark_from_ipc(
+                            &options.benchmark,
+                            &connection,
+                            &ipc_dataset.host_path,
+                            TiberiusBenchmarkConfig {
+                                backend: WriteBackend::DirectRawBulk,
+                                profile_direct: options.profile_direct,
+                                disable_date_fast_path: false,
+                                disable_fixed_width_fast_path: false,
+                                tds_packet_size: options.tds_packet_size,
+                                sql_server_profile: options.sql_server_profile,
+                                bulk_table_lock: options.sql_server_bulk_table_lock,
+                            },
+                        )
+                        .await?;
+                        report.timings.total = backend_start.elapsed();
+                        Ok::<_, WriterBenchError>(report)
+                    })?;
+                    backends.push(CompareBackendBenchReport::DirectRaw { report });
+                }
+                BenchmarkBackend::DirectRawNoDateFastPath => {
+                    let report = runtime.block_on(async {
+                        let backend_start = Instant::now();
+                        let mut report = run_tiberius_benchmark_from_ipc(
+                            &options.benchmark,
+                            &connection,
+                            &ipc_dataset.host_path,
+                            TiberiusBenchmarkConfig {
+                                backend: WriteBackend::DirectRawBulk,
+                                profile_direct: options.profile_direct,
+                                disable_date_fast_path: true,
+                                disable_fixed_width_fast_path: false,
+                                tds_packet_size: options.tds_packet_size,
+                                sql_server_profile: options.sql_server_profile,
+                                bulk_table_lock: options.sql_server_bulk_table_lock,
+                            },
+                        )
+                        .await?;
+                        report.timings.total = backend_start.elapsed();
+                        Ok::<_, WriterBenchError>(report)
+                    })?;
+                    backends.push(CompareBackendBenchReport::DirectRawNoDateFastPath { report });
+                }
+                BenchmarkBackend::DirectRawNoFixedFastPath => {
+                    let report = runtime.block_on(async {
+                        let backend_start = Instant::now();
+                        let mut report = run_tiberius_benchmark_from_ipc(
+                            &options.benchmark,
+                            &connection,
+                            &ipc_dataset.host_path,
+                            TiberiusBenchmarkConfig {
+                                backend: WriteBackend::DirectRawBulk,
+                                profile_direct: options.profile_direct,
+                                disable_date_fast_path: false,
+                                disable_fixed_width_fast_path: true,
+                                tds_packet_size: options.tds_packet_size,
+                                sql_server_profile: options.sql_server_profile,
+                                bulk_table_lock: options.sql_server_bulk_table_lock,
+                            },
+                        )
+                        .await?;
+                        report.timings.total = backend_start.elapsed();
+                        Ok::<_, WriterBenchError>(report)
+                    })?;
+                    backends.push(CompareBackendBenchReport::DirectRawNoFixedFastPath { report });
+                }
+                BenchmarkBackend::ArrowOdbc => {
+                    let runner_image = runner_image.as_ref().ok_or_else(|| {
+                        WriterBenchError::Validation(
+                            "ODBC runner image was not prepared for arrow-odbc compare".to_owned(),
+                        )
+                    })?;
+                    let report = run_arrow_odbc_runner_for_benchmark_capture(
+                        &options.benchmark,
+                        runner_image,
+                        network.as_ref(),
+                        &connection,
+                        &ipc_dataset,
+                        ArrowOdbcRunnerBenchOptions {
+                            profile_sql_server: options.sql_server_profile.is_some(),
+                            autocommit: options.arrow_odbc_autocommit,
+                            bulk_table_lock: options.sql_server_bulk_table_lock,
+                        },
+                    )?;
+                    backends.push(CompareBackendBenchReport::ArrowOdbc { report });
+                }
+                BenchmarkBackend::OdbcBcp => {
+                    let runner_image = runner_image.as_ref().ok_or_else(|| {
+                        WriterBenchError::Validation(
+                            "ODBC runner image was not prepared for odbc-bcp compare".to_owned(),
+                        )
+                    })?;
+                    let report = run_odbc_bcp_runner_for_benchmark_capture(
+                        &options.benchmark,
+                        runner_image,
+                        network.as_ref(),
+                        &connection,
+                        &ipc_dataset,
+                        OdbcBcpRunnerBenchOptions {
+                            profile_sql_server: options.sql_server_profile.is_some(),
+                            defer_batches: options.odbc_bcp_defer_batches,
+                            bulk_table_lock: options.sql_server_bulk_table_lock,
+                        },
+                    )?;
+                    backends.push(CompareBackendBenchReport::OdbcBcp { report });
+                }
+            }
         }
 
         Ok(CompareBenchReport {
@@ -3307,6 +3418,8 @@ async fn run_tiberius_benchmark_from_ipc(
                         scenario: benchmark.scenario,
                         backend: config.backend,
                         profile_direct: config.profile_direct,
+                        disable_date_fast_path: config.disable_date_fast_path,
+                        disable_fixed_width_fast_path: config.disable_fixed_width_fast_path,
                         bulk_table_lock: config.bulk_table_lock,
                     },
                     &mappings,
@@ -3450,6 +3563,12 @@ async fn run_tiberius_repeat_with_batches(
             config.backend,
             WriteBackend::DirectFramedBulk | WriteBackend::DirectRawBulk
         );
+    let _date_fast_path_override = config
+        .disable_date_fast_path
+        .then(arrow_tiberius::write::profile::disable_direct_date_fast_path_for_scope);
+    let _fixed_width_fast_path_override = config
+        .disable_fixed_width_fast_path
+        .then(arrow_tiberius::write::profile::disable_direct_fixed_width_fast_path_for_scope);
     if profiling_direct {
         arrow_tiberius::write::profile::start_direct_write_profile();
     }
@@ -3935,6 +4054,13 @@ fn benchmark_plan_options(scenario: &BenchmarkScenarioDefinition) -> PlanOptions
         };
     }
 
+    if scenario.name == DATE_FAST_PATH_SCENARIO.name {
+        return PlanOptions {
+            date64_policy: Date64Policy::TimestampDateTime2,
+            ..PlanOptions::default()
+        };
+    }
+
     PlanOptions::default()
 }
 
@@ -4131,6 +4257,72 @@ fn uint64_policy_columns(offset: usize, len: usize) -> Result<Vec<ArrayRef>, Wri
         Arc::new(u64_full),
         Arc::new(maybe_u64_full),
     ])
+}
+
+fn date_fast_path_schema() -> SchemaRef {
+    let mut fields = vec![Field::new("row_id", DataType::Int32, false)];
+
+    for group in 0..8 {
+        fields.push(Field::new(
+            format!("trade_date_{group}"),
+            DataType::Date32,
+            false,
+        ));
+        fields.push(Field::new(
+            format!("maybe_trade_date_{group}"),
+            DataType::Date32,
+            true,
+        ));
+        fields.push(Field::new(
+            format!("posted_at_{group}"),
+            DataType::Date64,
+            false,
+        ));
+        fields.push(Field::new(
+            format!("maybe_posted_at_{group}"),
+            DataType::Date64,
+            true,
+        ));
+    }
+
+    Arc::new(Schema::new(fields))
+}
+
+fn date_fast_path_columns(offset: usize, len: usize) -> Result<Vec<ArrayRef>, WriterBenchError> {
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(33);
+    columns.push(Arc::new(
+        (offset..offset + len)
+            .map(deterministic_i32)
+            .collect::<Int32Array>(),
+    ));
+
+    for group in 0..8 {
+        columns.push(Arc::new(Date32Array::from_iter_values(
+            (offset..offset + len).map(|row| 19_723_i32 + ((row + group * 17) % 365) as i32),
+        )));
+        columns.push(Arc::new(
+            (offset..offset + len)
+                .map(|row| {
+                    (row % (11 + group) != 0)
+                        .then_some(19_723_i32 + ((row + group * 19) % 365) as i32)
+                })
+                .collect::<Date32Array>(),
+        ));
+        columns.push(Arc::new(Date64Array::from_iter_values(
+            (offset..offset + len)
+                .map(|row| 1_735_689_600_000_i64 + ((row + group) as i64 * 3_701)),
+        )));
+        columns.push(Arc::new(
+            (offset..offset + len)
+                .map(|row| {
+                    (row % (13 + group) != 0)
+                        .then_some(1_735_689_600_000_i64 + ((row + group * 3) as i64 * 9_001))
+                })
+                .collect::<Date64Array>(),
+        ));
+    }
+
+    Ok(columns)
 }
 
 fn mixed_nullable_schema() -> SchemaRef {
@@ -5031,8 +5223,8 @@ mod tests {
         WriterBenchError, WriterBenchOptions, sqlserver_profile,
     };
     use arrow_array::{
-        Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-        Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
+        Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array,
+        Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
         TimestampMillisecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     };
     use arrow_schema::{DataType, TimeUnit};
@@ -5565,7 +5757,9 @@ mod tests {
             OsString::from("--scenario"),
             OsString::from("narrow_numeric"),
             OsString::from("--backends"),
-            OsString::from("baseline,direct-framed,direct-raw,arrow-odbc,odbc-bcp"),
+            OsString::from(
+                "baseline,direct-framed,direct-raw,direct-raw-no-date-fast-path,direct-raw-no-fixed-fast-path,arrow-odbc,odbc-bcp",
+            ),
             OsString::from("--odbc-bcp-defer-batches"),
         ];
 
@@ -5577,6 +5771,8 @@ mod tests {
                 super::BenchmarkBackend::Baseline,
                 super::BenchmarkBackend::DirectFramed,
                 super::BenchmarkBackend::DirectRaw,
+                super::BenchmarkBackend::DirectRawNoDateFastPath,
+                super::BenchmarkBackend::DirectRawNoFixedFastPath,
                 super::BenchmarkBackend::ArrowOdbc,
                 super::BenchmarkBackend::OdbcBcp
             ]
@@ -5904,10 +6100,74 @@ mod tests {
     }
 
     #[test]
+    fn compare_allows_date_fast_path_ab_backend_for_date_fast_path_scenario() {
+        let args = [
+            OsString::from("--scenario"),
+            OsString::from("date_fast_path"),
+            OsString::from("--backends"),
+            OsString::from("direct-raw-no-date-fast-path,direct-raw"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+
+        assert_eq!(
+            options.backends,
+            [
+                super::BenchmarkBackend::DirectRawNoDateFastPath,
+                super::BenchmarkBackend::DirectRaw
+            ]
+        );
+        super::ensure_direct_date_fast_path_ab_scenario(&options.benchmark).unwrap();
+    }
+
+    #[test]
+    fn compare_allows_fixed_width_fast_path_ab_backend_for_narrow_numeric() {
+        let args = [
+            OsString::from("--scenario"),
+            OsString::from("narrow_numeric"),
+            OsString::from("--backends"),
+            OsString::from("direct-raw-no-fixed-fast-path,direct-raw"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+
+        assert_eq!(
+            options.backends,
+            [
+                super::BenchmarkBackend::DirectRawNoFixedFastPath,
+                super::BenchmarkBackend::DirectRaw
+            ]
+        );
+        super::ensure_direct_raw_supported_scenario(&options.benchmark).unwrap();
+    }
+
+    #[test]
+    fn compare_rejects_date_fast_path_ab_backend_for_other_scenarios() {
+        let args = [
+            OsString::from("--scenario"),
+            OsString::from("narrow_numeric"),
+            OsString::from("--backends"),
+            OsString::from("direct-raw-no-date-fast-path"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+        let err = super::ensure_direct_date_fast_path_ab_scenario(&options.benchmark).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("direct-raw-no-date-fast-path")
+                    && message.contains("date_fast_path")
+                    && message.contains("narrow_numeric")
+        ));
+    }
+
+    #[test]
     fn compare_allows_direct_raw_for_additional_supported_scenarios() {
         for scenario in [
             "extended_primitive",
             "uint64_policy",
+            "date_fast_path",
             "mixed_nullable",
             "string_heavy",
             "string_heavy_text_only",
@@ -5958,6 +6218,7 @@ mod tests {
                         && message.contains("narrow_numeric")
                         && message.contains("extended_primitive")
                         && message.contains("uint64_policy")
+                        && message.contains("date_fast_path")
                         && message.contains("mixed_nullable")
                         && message.contains("string_heavy")
                         && message.contains("string_heavy_text_only")
@@ -6993,6 +7254,33 @@ odbc-bcp runner
     }
 
     #[test]
+    fn date_fast_path_schema_maps_date64_to_datetime2() {
+        let scenario = super::scenario_by_name("date_fast_path").unwrap();
+        let mappings = super::benchmark_mappings_for_scenario(scenario).unwrap();
+        let mssql_types = mappings
+            .iter()
+            .map(|mapping| mapping.mssql().ty())
+            .collect::<Vec<_>>();
+
+        assert_eq!(mssql_types[0], &MssqlType::Int);
+        assert_eq!(mssql_types.len(), 33);
+        assert_eq!(
+            mssql_types
+                .iter()
+                .filter(|ty| matches!(ty, &&MssqlType::Date))
+                .count(),
+            16
+        );
+        assert_eq!(
+            mssql_types
+                .iter()
+                .filter(|ty| matches!(ty, &&MssqlType::DateTime2 { precision: 3 }))
+                .count(),
+            16
+        );
+    }
+
+    #[test]
     fn extended_primitive_runtime_array_types_and_nulls_match_schema() {
         let options = WriterBenchOptions {
             rows: 64,
@@ -7257,6 +7545,45 @@ odbc-bcp runner
     }
 
     #[test]
+    fn date_fast_path_covers_nullable_and_non_nullable_date_columns() {
+        let options = WriterBenchOptions {
+            rows: 64,
+            batch_size: 64,
+            scenario: super::scenario_by_name("date_fast_path").unwrap(),
+            repeat: 1,
+            output: BenchmarkOutput::Human,
+        };
+
+        let batches = generated_batches(&options);
+        let batch = &batches[0];
+        let schema = batch.schema();
+
+        assert_eq!(schema.fields().len(), 33);
+        assert_eq!(schema.field(0).data_type(), &DataType::Int32);
+        assert_eq!(batch.column(0).null_count(), 0);
+
+        for group in 0..8 {
+            let base = 1 + group * 4;
+            assert_eq!(schema.field(base).data_type(), &DataType::Date32);
+            assert_eq!(schema.field(base + 1).data_type(), &DataType::Date32);
+            assert_eq!(schema.field(base + 2).data_type(), &DataType::Date64);
+            assert_eq!(schema.field(base + 3).data_type(), &DataType::Date64);
+            assert!(!schema.field(base).is_nullable());
+            assert!(schema.field(base + 1).is_nullable());
+            assert!(!schema.field(base + 2).is_nullable());
+            assert!(schema.field(base + 3).is_nullable());
+            assert!(batch.column(base).as_any().is::<Date32Array>());
+            assert!(batch.column(base + 1).as_any().is::<Date32Array>());
+            assert!(batch.column(base + 2).as_any().is::<Date64Array>());
+            assert!(batch.column(base + 3).as_any().is::<Date64Array>());
+            assert_eq!(batch.column(base).null_count(), 0);
+            assert!(batch.column(base + 1).null_count() > 0);
+            assert_eq!(batch.column(base + 2).null_count(), 0);
+            assert!(batch.column(base + 3).null_count() > 0);
+        }
+    }
+
+    #[test]
     fn string_heavy_has_kb_scale_variable_payloads() {
         let options = WriterBenchOptions {
             rows: 128,
@@ -7489,6 +7816,7 @@ odbc-bcp runner
     #[test]
     fn realistic_scenarios_stream_multiple_batches() {
         for scenario_name in [
+            "date_fast_path",
             "wide_mixed",
             "decimal_temporal",
             "string_heavy",
@@ -7603,6 +7931,7 @@ odbc-bcp runner
                 "narrow_numeric",
                 "extended_primitive",
                 "uint64_policy",
+                "date_fast_path",
                 "mixed_nullable",
                 "wide_mixed",
                 "decimal_temporal",

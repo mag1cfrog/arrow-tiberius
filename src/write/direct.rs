@@ -171,8 +171,12 @@ impl DirectEncoder {
             )));
         }
 
-        let layout = measured.range_layout(start_row, row_count)?;
         let batch = batch.slice(start_row, row_count);
+        if let Some(payload) = try_encode_fixed_width_primitive_rows(&batch, self.plan.columns())? {
+            return Ok(payload);
+        }
+
+        let layout = measured.range_layout(start_row, row_count)?;
         let mut bytes = allocate_rows_payload_with_tokens(&layout);
         self.fill_columns(&batch, &layout, &mut bytes)?;
 

@@ -192,6 +192,10 @@ struct FixedWidthRowsLayout {
 }
 
 fn fixed_width_columns(columns: &[DirectColumnPlan]) -> Result<Option<Vec<FixedWidthColumn<'_>>>> {
+    if profile::direct_fixed_width_fast_path_disabled() {
+        return Ok(None);
+    }
+
     let mut fixed_width_columns = Vec::with_capacity(columns.len());
 
     for column in columns {
@@ -295,6 +299,9 @@ fn add_nullable_fixed_width_column_lengths(
 
 fn fixed_width_non_null_cell_len(column: &DirectColumnPlan) -> Option<usize> {
     match column.encoding() {
+        DirectColumnEncoding::Temporal(
+            TemporalArrowToMssql::Date32ToDate | TemporalArrowToMssql::Date64ToDateTime2,
+        ) if profile::direct_date_fast_path_disabled() => None,
         DirectColumnEncoding::Temporal(TemporalArrowToMssql::Date32ToDate) => Some(date_cell_len()),
         DirectColumnEncoding::Temporal(TemporalArrowToMssql::Date64ToDateTime2) => {
             Some(datetime2_cell_len(3).ok()?)
