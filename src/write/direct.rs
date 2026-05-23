@@ -194,7 +194,12 @@ impl DirectEncoder {
         }
 
         let batch = batch.slice(start_row, row_count);
-        if let Some(payload) = try_encode_fixed_width_primitive_rows(&batch, self.plan.columns())? {
+        if let Some(payload) = try_encode_fixed_width_primitive_rows(
+            &batch,
+            &self.mappings,
+            self.plan_options,
+            self.plan.columns(),
+        )? {
             return Ok(payload);
         }
 
@@ -262,7 +267,12 @@ impl DirectEncoder {
             return EncodedRowsPayload::new(Vec::new(), Vec::new());
         }
 
-        if let Some(payload) = try_encode_fixed_width_primitive_rows(batch, self.plan.columns())? {
+        if let Some(payload) = try_encode_fixed_width_primitive_rows(
+            batch,
+            &self.mappings,
+            self.plan_options,
+            self.plan.columns(),
+        )? {
             return Ok(payload);
         }
 
@@ -2534,9 +2544,14 @@ mod tests {
             ],
         );
 
-        let payload = try_encode_fixed_width_primitive_rows(&batch, encoder.plan().columns())
-            .unwrap()
-            .expect("fixed-width primitive fast path should be active");
+        let payload = try_encode_fixed_width_primitive_rows(
+            &batch,
+            encoder.mappings(),
+            PlanOptions::default(),
+            encoder.plan().columns(),
+        )
+        .unwrap()
+        .expect("fixed-width primitive fast path should be active");
 
         assert_eq!(payload.row_token_offsets(), [0, 15]);
         assert_eq!(payload.row_count(), 2);
@@ -2569,14 +2584,87 @@ mod tests {
             ],
         );
 
-        let payload = try_encode_fixed_width_primitive_rows(&batch, encoder.plan().columns())
-            .unwrap()
-            .expect("fixed-width date-family fast path should be active");
+        let payload = try_encode_fixed_width_primitive_rows(
+            &batch,
+            encoder.mappings(),
+            PlanOptions::default(),
+            encoder.plan().columns(),
+        )
+        .unwrap()
+        .expect("fixed-width date-family fast path should be active");
 
         assert_eq!(payload.row_token_offsets(), [0, 17]);
         assert_eq!(
             payload.bytes(),
             encoder.encode_batch(&batch).unwrap().bytes()
+        );
+    }
+
+    #[test]
+    fn direct_encoder_fixed_width_fast_path_is_active_for_timestamp_datetime2_columns() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "created_at",
+                DataType::Timestamp(TimeUnit::Second, Some("UTC".into())),
+                MssqlType::DateTime2 { precision: 7 },
+                true,
+            ),
+            mapping(
+                2,
+                "precise_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                MssqlType::DateTime2 { precision: 7 },
+                false,
+            ),
+        ];
+        let options = PlanOptions {
+            nanosecond_policy: NanosecondPolicy::RoundTo100ns,
+            ..PlanOptions::default()
+        };
+        let encoder = DirectEncoder::new_with_options(&mappings, options).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new(
+                    "created_at",
+                    DataType::Timestamp(TimeUnit::Second, Some("UTC".into())),
+                    true,
+                ),
+                Field::new(
+                    "precise_at",
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    false,
+                ),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(TimestampSecondArray::from(vec![Some(0), None]).with_timezone("UTC")),
+                Arc::new(TimestampNanosecondArray::from(vec![150, -50])),
+            ],
+        );
+
+        let payload = try_encode_fixed_width_primitive_rows(
+            &batch,
+            encoder.mappings(),
+            options,
+            encoder.plan().columns(),
+        )
+        .unwrap()
+        .expect("fixed-width timestamp datetime2 fast path should be active");
+
+        assert_eq!(payload.row_token_offsets(), [0, 23]);
+        assert_eq!(
+            payload.bytes(),
+            expected_rows([
+                [
+                    int32_cell(1),
+                    datetime2_7_cell(719_162, 0),
+                    datetime2_7_cell(719_162, 2),
+                ],
+                [int32_cell(2), null_cell(), datetime2_7_cell(719_162, 0)],
+            ])
         );
     }
 
@@ -3299,6 +3387,10 @@ mod tests {
         )
         .unwrap();
         bytes
+    }
+
+    fn int32_cell(value: i32) -> Vec<u8> {
+        value.to_le_bytes().to_vec()
     }
 
     fn null_cell() -> Vec<u8> {

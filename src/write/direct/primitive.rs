@@ -2,14 +2,28 @@
 
 use arrow_array::{
     Array, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, RecordBatch, UInt8Array, UInt16Array, UInt32Array,
-    UInt64Array,
+    Int16Array, Int32Array, Int64Array, RecordBatch, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 
 use crate::{
-    Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, Result,
+    Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, NanosecondPolicy, PlanOptions,
+    Result, SchemaMapping,
     conversion::arrow_to_mssql::{
         primitive::PrimitiveArrowToMssql, temporal::TemporalArrowToMssql,
+    },
+    mssql::cell::{
+        MssqlDateTime2,
+        from_arrow::temporal::datetime2::{
+            mssql_datetime2_from_arrow_timestamp_microsecond,
+            mssql_datetime2_from_arrow_timestamp_millisecond,
+            mssql_datetime2_from_arrow_timestamp_nanosecond,
+            mssql_datetime2_from_arrow_timestamp_second,
+        },
+        from_arrow::temporal::{
+            validate_mapping_timestamp_timezone_metadata, validate_null_timestamp_timezone_metadata,
+        },
     },
     write::profile,
 };
@@ -30,6 +44,7 @@ const CELL_LEN_PREFIX_LEN: usize = 1;
 #[derive(Debug, Clone, Copy)]
 struct FixedWidthColumn<'a> {
     plan: &'a DirectColumnPlan,
+    mapping: &'a SchemaMapping,
     non_null_cell_len: usize,
 }
 
@@ -39,13 +54,15 @@ struct FixedWidthColumn<'a> {
 /// Returns `Ok(None)` when the columns require the general layout path.
 pub(crate) fn try_encode_fixed_width_primitive_rows(
     batch: &RecordBatch,
+    mappings: &[SchemaMapping],
+    plan_options: PlanOptions,
     columns: &[DirectColumnPlan],
 ) -> Result<Option<EncodedRowsPayload>> {
     if batch.num_rows() == 0 {
         return Ok(Some(EncodedRowsPayload::new(Vec::new(), Vec::new())?));
     }
 
-    let Some(columns) = fixed_width_columns(columns)? else {
+    let Some(columns) = fixed_width_columns(mappings, columns)? else {
         return Ok(None);
     };
 
@@ -173,6 +190,76 @@ pub(crate) fn try_encode_fixed_width_primitive_rows(
                     &mut bytes,
                 )?;
             }
+            DirectColumnEncoding::Temporal(
+                TemporalArrowToMssql::TimestampSecondToDateTime2
+                | TemporalArrowToMssql::TimestampSecondTzToDateTime2,
+            ) => {
+                let array = downcast_direct_array::<TimestampSecondArray>(array, column.plan)?;
+                fill_timestamp_fixed_width_column(
+                    array,
+                    column.mapping,
+                    column.plan,
+                    &mut current_offsets,
+                    &mut bytes,
+                    |mapping, row_index, value, _policy| {
+                        mssql_datetime2_from_arrow_timestamp_second(mapping, row_index, value)
+                    },
+                    plan_options.nanosecond_policy,
+                )?;
+            }
+            DirectColumnEncoding::Temporal(
+                TemporalArrowToMssql::TimestampMillisecondToDateTime2
+                | TemporalArrowToMssql::TimestampMillisecondTzToDateTime2,
+            ) => {
+                let array = downcast_direct_array::<TimestampMillisecondArray>(array, column.plan)?;
+                fill_timestamp_fixed_width_column(
+                    array,
+                    column.mapping,
+                    column.plan,
+                    &mut current_offsets,
+                    &mut bytes,
+                    |mapping, row_index, value, _policy| {
+                        mssql_datetime2_from_arrow_timestamp_millisecond(mapping, row_index, value)
+                    },
+                    plan_options.nanosecond_policy,
+                )?;
+            }
+            DirectColumnEncoding::Temporal(
+                TemporalArrowToMssql::TimestampMicrosecondToDateTime2
+                | TemporalArrowToMssql::TimestampMicrosecondTzToDateTime2,
+            ) => {
+                let array = downcast_direct_array::<TimestampMicrosecondArray>(array, column.plan)?;
+                fill_timestamp_fixed_width_column(
+                    array,
+                    column.mapping,
+                    column.plan,
+                    &mut current_offsets,
+                    &mut bytes,
+                    |mapping, row_index, value, _policy| {
+                        mssql_datetime2_from_arrow_timestamp_microsecond(mapping, row_index, value)
+                    },
+                    plan_options.nanosecond_policy,
+                )?;
+            }
+            DirectColumnEncoding::Temporal(
+                TemporalArrowToMssql::TimestampNanosecondToDateTime2
+                | TemporalArrowToMssql::TimestampNanosecondTzToDateTime2,
+            ) => {
+                let array = downcast_direct_array::<TimestampNanosecondArray>(array, column.plan)?;
+                fill_timestamp_fixed_width_column(
+                    array,
+                    column.mapping,
+                    column.plan,
+                    &mut current_offsets,
+                    &mut bytes,
+                    |mapping, row_index, value, policy| {
+                        mssql_datetime2_from_arrow_timestamp_nanosecond(
+                            mapping, row_index, value, policy,
+                        )
+                    },
+                    plan_options.nanosecond_policy,
+                )?;
+            }
             DirectColumnEncoding::Temporal(_) => {
                 return Ok(None);
             }
@@ -191,20 +278,30 @@ struct FixedWidthRowsLayout {
     payload_len: usize,
 }
 
-fn fixed_width_columns(columns: &[DirectColumnPlan]) -> Result<Option<Vec<FixedWidthColumn<'_>>>> {
+fn fixed_width_columns<'a>(
+    mappings: &'a [SchemaMapping],
+    columns: &'a [DirectColumnPlan],
+) -> Result<Option<Vec<FixedWidthColumn<'a>>>> {
     if profile::direct_fixed_width_fast_path_disabled() {
         return Ok(None);
     }
 
     let mut fixed_width_columns = Vec::with_capacity(columns.len());
 
-    for column in columns {
+    for (column_index, column) in columns.iter().enumerate() {
         let Some(non_null_cell_len) = fixed_width_non_null_cell_len(column) else {
             return Ok(None);
+        };
+        let Some(mapping) = mappings.get(column_index) else {
+            return Err(invalid_payload(format!(
+                "direct mapping index {column_index} is outside mapping count {}",
+                mappings.len()
+            )));
         };
 
         fixed_width_columns.push(FixedWidthColumn {
             plan: column,
+            mapping,
             non_null_cell_len,
         });
     }
@@ -232,6 +329,8 @@ fn measure_fixed_width_rows(
                 "planned direct column index is outside the runtime batch",
             )));
         };
+
+        validate_fixed_width_timestamp_timezone_metadata(array, column.mapping, column.plan)?;
 
         if column.plan.nullable() {
             add_nullable_fixed_width_column_lengths(
@@ -297,6 +396,38 @@ fn add_nullable_fixed_width_column_lengths(
     Ok(())
 }
 
+fn validate_fixed_width_timestamp_timezone_metadata(
+    array: &dyn Array,
+    mapping: &SchemaMapping,
+    column: &DirectColumnPlan,
+) -> Result<()> {
+    if !matches!(
+        column.encoding(),
+        DirectColumnEncoding::Temporal(
+            TemporalArrowToMssql::TimestampSecondToDateTime2
+                | TemporalArrowToMssql::TimestampMillisecondToDateTime2
+                | TemporalArrowToMssql::TimestampMicrosecondToDateTime2
+                | TemporalArrowToMssql::TimestampNanosecondToDateTime2
+                | TemporalArrowToMssql::TimestampSecondTzToDateTime2
+                | TemporalArrowToMssql::TimestampMillisecondTzToDateTime2
+                | TemporalArrowToMssql::TimestampMicrosecondTzToDateTime2
+                | TemporalArrowToMssql::TimestampNanosecondTzToDateTime2
+        )
+    ) {
+        return Ok(());
+    }
+
+    for row_index in 0..array.len() {
+        if array.is_null(row_index) {
+            validate_null_timestamp_timezone_metadata(mapping, row_index)?;
+        } else {
+            validate_mapping_timestamp_timezone_metadata(mapping, row_index)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn fixed_width_non_null_cell_len(column: &DirectColumnPlan) -> Option<usize> {
     match column.encoding() {
         DirectColumnEncoding::Temporal(
@@ -306,6 +437,16 @@ fn fixed_width_non_null_cell_len(column: &DirectColumnPlan) -> Option<usize> {
         DirectColumnEncoding::Temporal(TemporalArrowToMssql::Date64ToDateTime2) => {
             Some(datetime2_cell_len(3).ok()?)
         }
+        DirectColumnEncoding::Temporal(
+            TemporalArrowToMssql::TimestampSecondToDateTime2
+            | TemporalArrowToMssql::TimestampMillisecondToDateTime2
+            | TemporalArrowToMssql::TimestampMicrosecondToDateTime2
+            | TemporalArrowToMssql::TimestampNanosecondToDateTime2
+            | TemporalArrowToMssql::TimestampSecondTzToDateTime2
+            | TemporalArrowToMssql::TimestampMillisecondTzToDateTime2
+            | TemporalArrowToMssql::TimestampMicrosecondTzToDateTime2
+            | TemporalArrowToMssql::TimestampNanosecondTzToDateTime2,
+        ) => Some(datetime2_cell_len(7).ok()?),
         DirectColumnEncoding::Temporal(_) => None,
         encoding => {
             let value_len = fixed_width_value_len(encoding)?;
@@ -653,6 +794,61 @@ fn fill_date64_fixed_width_column(
     }
 
     Ok(())
+}
+
+fn fill_timestamp_fixed_width_column<A, F>(
+    array: &A,
+    mapping: &SchemaMapping,
+    column: &DirectColumnPlan,
+    current_offsets: &mut [usize],
+    bytes: &mut [u8],
+    value: F,
+    nanosecond_policy: NanosecondPolicy,
+) -> Result<()>
+where
+    A: Array,
+    F: Fn(&SchemaMapping, usize, i64, NanosecondPolicy) -> Result<MssqlDateTime2>,
+{
+    for (row_index, current_offset) in current_offsets.iter_mut().enumerate().take(array.len()) {
+        let offset = *current_offset;
+        if array.is_null(row_index) {
+            debug_assert!(column.nullable());
+            validate_null_timestamp_timezone_metadata(mapping, row_index)?;
+            bytes[offset] = 0;
+            *current_offset += CELL_LEN_PREFIX_LEN;
+            continue;
+        }
+
+        validate_mapping_timestamp_timezone_metadata(mapping, row_index)?;
+        let value = value(
+            mapping,
+            row_index,
+            timestamp_value(array, row_index),
+            nanosecond_policy,
+        )?;
+        let cell_len = datetime2_cell_len(value.time().scale())?;
+        let cell_bytes = bytes.get_mut(offset..offset + cell_len).ok_or_else(|| {
+            invalid_payload("fixed-width timestamp temporal cell range is outside payload")
+        })?;
+        write_datetime2_cell(cell_bytes, value)?;
+        *current_offset += cell_len;
+    }
+
+    Ok(())
+}
+
+fn timestamp_value(array: &dyn Array, row_index: usize) -> i64 {
+    if let Some(array) = array.as_any().downcast_ref::<TimestampSecondArray>() {
+        array.value(row_index)
+    } else if let Some(array) = array.as_any().downcast_ref::<TimestampMillisecondArray>() {
+        array.value(row_index)
+    } else if let Some(array) = array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+        array.value(row_index)
+    } else if let Some(array) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {
+        array.value(row_index)
+    } else {
+        unreachable!("timestamp fixed-width fill only receives timestamp arrays")
+    }
 }
 
 fn write_fixed_width_value<Array, ValueBytes>(
