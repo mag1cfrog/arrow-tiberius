@@ -403,11 +403,26 @@ fn expected_direct_bulk_column_type(column: &DirectColumnPlan) -> Option<tiberiu
                 Some(tiberius::ColumnType::Bit)
             }
         }
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt8ToTinyInt) => {
+            Some(tiberius::ColumnType::Int1)
+        }
+        DirectColumnEncoding::Primitive(
+            PrimitiveArrowToMssql::Int8ToSmallInt | PrimitiveArrowToMssql::Int16ToSmallInt,
+        ) => Some(tiberius::ColumnType::Int2),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int32ToInt) => {
+            Some(tiberius::ColumnType::Int4)
+        }
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt16ToInt) => {
             Some(tiberius::ColumnType::Int4)
         }
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int64ToBigInt) => {
             Some(tiberius::ColumnType::Int8)
+        }
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt32ToBigInt) => {
+            Some(tiberius::ColumnType::Int8)
+        }
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal) => {
+            Some(tiberius::ColumnType::Float4)
         }
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => {
             Some(tiberius::ColumnType::Float8)
@@ -1012,6 +1027,79 @@ mod tests {
     }
 
     #[test]
+    fn direct_bulk_target_type_validation_accepts_issue_75_integer_metadata() {
+        let mappings = vec![
+            schema_mapping_at(0, "tiny", DataType::UInt8, MssqlType::TinyInt, false),
+            schema_mapping_at(1, "signed_tiny", DataType::Int8, MssqlType::SmallInt, false),
+            schema_mapping_at(2, "small", DataType::Int16, MssqlType::SmallInt, false),
+            schema_mapping_at(
+                3,
+                "unsigned_medium",
+                DataType::UInt16,
+                MssqlType::Int,
+                false,
+            ),
+            schema_mapping_at(
+                4,
+                "unsigned_total",
+                DataType::UInt32,
+                MssqlType::BigInt,
+                false,
+            ),
+        ];
+        let state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let columns = vec![
+            bulk_target_column_with_type(0, "tiny", false, tiberius::ColumnType::Int1),
+            bulk_target_column_with_type(1, "signed_tiny", false, tiberius::ColumnType::Int2),
+            bulk_target_column_with_type(2, "small", false, tiberius::ColumnType::Int2),
+            bulk_target_column_with_type(3, "unsigned_medium", false, tiberius::ColumnType::Int4),
+            bulk_target_column_with_type(4, "unsigned_total", false, tiberius::ColumnType::Int8),
+        ];
+
+        validate_direct_bulk_target_column_types(
+            columns.into_iter(),
+            state.direct_encoder().unwrap().plan(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn direct_bulk_target_type_validation_accepts_issue_75_float32_metadata() {
+        let mappings = vec![schema_mapping_at(
+            0,
+            "real_value",
+            DataType::Float32,
+            MssqlType::Real,
+            false,
+        )];
+        let state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let columns = vec![bulk_target_column_with_type(
+            0,
+            "real_value",
+            false,
+            tiberius::ColumnType::Float4,
+        )];
+
+        validate_direct_bulk_target_column_types(
+            columns.into_iter(),
+            state.direct_encoder().unwrap().plan(),
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn direct_bulk_target_type_validation_accepts_matching_variable_width_metadata() {
         let mappings = vec![utf8_mapping_at(0, "name"), binary_mapping_at(1, "payload")];
         let state = WriterState::new(
@@ -1342,6 +1430,43 @@ mod tests {
     }
 
     #[test]
+    fn write_direct_batch_to_sink_rejects_runtime_type_mismatch_before_send() {
+        let mappings = vec![mapping("id")];
+        let mut state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingRawSink::default();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "id",
+                DataType::Float64,
+                false,
+            )])),
+            vec![Arc::new(Float64Array::from(vec![1.0]))],
+        )
+        .unwrap();
+
+        let err =
+            poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch)).unwrap_err();
+
+        let Error::ValueConversion { diagnostics } = err else {
+            panic!("expected value conversion error");
+        };
+        assert_eq!(diagnostics.all()[0].code(), DiagnosticCode::SchemaMismatch);
+        assert!(
+            diagnostics.all()[0]
+                .message()
+                .contains("runtime Arrow type Float64")
+        );
+        assert!(sink.payloads.is_empty());
+        assert_eq!(state.stats(), WriteStats::default());
+    }
+
+    #[test]
     fn writer_types_are_exported_from_crate_root() {
         assert_eq!(crate::WriteBackend::default(), WriteBackend::Auto);
         assert_eq!(crate::WriteOptions::default(), WriteOptions::default());
@@ -1360,6 +1485,19 @@ mod tests {
         SchemaMapping::new(
             ArrowFieldRef::new(0, name.to_owned(), false, DataType::Int32),
             MssqlColumn::new(Identifier::new(name).unwrap(), MssqlType::Int, false),
+        )
+    }
+
+    fn schema_mapping_at(
+        index: usize,
+        name: &str,
+        arrow_type: DataType,
+        mssql_type: MssqlType,
+        nullable: bool,
+    ) -> SchemaMapping {
+        SchemaMapping::new(
+            ArrowFieldRef::new(index, name.to_owned(), nullable, arrow_type),
+            MssqlColumn::new(Identifier::new(name).unwrap(), mssql_type, nullable),
         )
     }
 

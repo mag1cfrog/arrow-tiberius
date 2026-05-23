@@ -8,8 +8,9 @@ use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
 
 use arrow_array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int32Array,
-    Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
+    Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
+    TimestampMillisecondArray, UInt16Array, UInt32Array, UInt8Array,
 };
 use arrow_ipc::reader::FileReader;
 use arrow_schema::DataType;
@@ -45,8 +46,11 @@ const DB_IN: i32 = 1;
 const SQL_NULL_DATA: DbInt = -1;
 const SQLVARBINARY: i32 = 0x25;
 const SQLVARCHAR: i32 = 0x27;
+const SQLINT1: i32 = 0x30;
 const SQLBIT: i32 = 0x32;
+const SQLINT2: i32 = 0x34;
 const SQLINT4: i32 = 0x38;
+const SQLFLT4: i32 = 0x3b;
 const SQLFLT8: i32 = 0x3e;
 const SQLINT8: i32 = 0x7f;
 const SQLNVARCHAR: i32 = 0xe7;
@@ -708,8 +712,11 @@ impl BcpColumnBinding {
 
 #[derive(Debug)]
 enum BcpColumnBuffer {
+    U8(u8),
+    I16(i16),
     I32(i32),
     I64(i64),
+    F32(f32),
     F64(f64),
     Bit(u8),
     Text(Vec<u8>),
@@ -720,8 +727,11 @@ enum BcpColumnBuffer {
 impl BcpColumnBuffer {
     fn new(data_type: &DataType) -> Result<Self, Box<dyn Error>> {
         match data_type {
-            DataType::Int32 => Ok(Self::I32(0)),
-            DataType::Int64 => Ok(Self::I64(0)),
+            DataType::UInt8 => Ok(Self::U8(0)),
+            DataType::Int8 | DataType::Int16 => Ok(Self::I16(0)),
+            DataType::Int32 | DataType::UInt16 => Ok(Self::I32(0)),
+            DataType::Int64 | DataType::UInt32 => Ok(Self::I64(0)),
+            DataType::Float32 => Ok(Self::F32(0.0)),
             DataType::Float64 => Ok(Self::F64(0.0)),
             DataType::Boolean => Ok(Self::Bit(0)),
             DataType::Utf8 => Ok(Self::WideText(vec![0])),
@@ -735,8 +745,11 @@ impl BcpColumnBuffer {
 
     fn server_type(&self) -> i32 {
         match self {
+            Self::U8(_) => SQLINT1,
+            Self::I16(_) => SQLINT2,
             Self::I32(_) => SQLINT4,
             Self::I64(_) => SQLINT8,
+            Self::F32(_) => SQLFLT4,
             Self::F64(_) => SQLFLT8,
             Self::Bit(_) => SQLBIT,
             Self::Text(_) => SQLVARCHAR,
@@ -747,8 +760,11 @@ impl BcpColumnBuffer {
 
     fn bind_len(&self) -> Result<DbInt, Box<dyn Error>> {
         match self {
+            Self::U8(_) => Ok(DbInt::try_from(std::mem::size_of::<u8>())?),
+            Self::I16(_) => Ok(DbInt::try_from(std::mem::size_of::<i16>())?),
             Self::I32(_) => Ok(DbInt::try_from(std::mem::size_of::<i32>())?),
             Self::I64(_) => Ok(DbInt::try_from(std::mem::size_of::<i64>())?),
+            Self::F32(_) => Ok(DbInt::try_from(std::mem::size_of::<f32>())?),
             Self::F64(_) => Ok(DbInt::try_from(std::mem::size_of::<f64>())?),
             Self::Bit(_) => Ok(DbInt::try_from(std::mem::size_of::<u8>())?),
             Self::Text(bytes) | Self::WideText(bytes) | Self::Binary(bytes) => {
@@ -759,8 +775,11 @@ impl BcpColumnBuffer {
 
     fn current_len(&self) -> Result<DbInt, Box<dyn Error>> {
         match self {
+            Self::U8(_) => Ok(DbInt::try_from(std::mem::size_of::<u8>())?),
+            Self::I16(_) => Ok(DbInt::try_from(std::mem::size_of::<i16>())?),
             Self::I32(_) => Ok(DbInt::try_from(std::mem::size_of::<i32>())?),
             Self::I64(_) => Ok(DbInt::try_from(std::mem::size_of::<i64>())?),
+            Self::F32(_) => Ok(DbInt::try_from(std::mem::size_of::<f32>())?),
             Self::F64(_) => Ok(DbInt::try_from(std::mem::size_of::<f64>())?),
             Self::Bit(_) => Ok(DbInt::try_from(std::mem::size_of::<u8>())?),
             Self::Text(bytes) | Self::WideText(bytes) | Self::Binary(bytes) => {
@@ -775,8 +794,11 @@ impl BcpColumnBuffer {
 
     fn ptr(&self) -> *const u8 {
         match self {
+            Self::U8(value) => std::ptr::from_ref(value).cast::<u8>(),
+            Self::I16(value) => std::ptr::from_ref(value).cast::<u8>(),
             Self::I32(value) => std::ptr::from_ref(value).cast::<u8>(),
             Self::I64(value) => std::ptr::from_ref(value).cast::<u8>(),
+            Self::F32(value) => std::ptr::from_ref(value).cast::<u8>(),
             Self::F64(value) => std::ptr::from_ref(value).cast::<u8>(),
             Self::Bit(value) => std::ptr::from_ref(value).cast::<u8>(),
             Self::Text(bytes) | Self::WideText(bytes) | Self::Binary(bytes) => bytes.as_ptr(),
@@ -791,22 +813,70 @@ impl BcpColumnBuffer {
         name: &str,
     ) -> Result<(), Box<dyn Error>> {
         match self {
-            Self::I32(value) => {
-                let array = required_column::<Int32Array>(batch, index, name)?;
-                *value = array.value(row_index);
-            }
+            Self::U8(value) => match batch.schema().field(index).data_type() {
+                DataType::UInt8 => {
+                    let array = required_column::<UInt8Array>(batch, index, name)?;
+                    *value = array.value(row_index);
+                }
+                other => {
+                    return Err(format!(
+                        "odbc-bcp column `{name}` expected UInt8 array, got {other:?}"
+                    )
+                    .into());
+                }
+            },
+            Self::I16(value) => match batch.schema().field(index).data_type() {
+                DataType::Int8 => {
+                    let array = required_column::<Int8Array>(batch, index, name)?;
+                    *value = i16::from(array.value(row_index));
+                }
+                DataType::Int16 => {
+                    let array = required_column::<Int16Array>(batch, index, name)?;
+                    *value = array.value(row_index);
+                }
+                other => {
+                    return Err(format!(
+                        "odbc-bcp column `{name}` expected Int8 or Int16 array, got {other:?}"
+                    )
+                    .into());
+                }
+            },
+            Self::I32(value) => match batch.schema().field(index).data_type() {
+                DataType::Int32 => {
+                    let array = required_column::<Int32Array>(batch, index, name)?;
+                    *value = array.value(row_index);
+                }
+                DataType::UInt16 => {
+                    let array = required_column::<UInt16Array>(batch, index, name)?;
+                    *value = i32::from(array.value(row_index));
+                }
+                other => {
+                    return Err(format!(
+                        "odbc-bcp column `{name}` expected Int32 or UInt16 array, got {other:?}"
+                    )
+                    .into());
+                }
+            },
             Self::I64(value) => match batch.schema().field(index).data_type() {
                 DataType::Int64 => {
                     let array = required_column::<Int64Array>(batch, index, name)?;
                     *value = array.value(row_index);
                 }
+                DataType::UInt32 => {
+                    let array = required_column::<UInt32Array>(batch, index, name)?;
+                    *value = i64::from(array.value(row_index));
+                }
                 other => {
                     return Err(format!(
-                        "odbc-bcp column `{name}` expected Int64 array, got {other:?}"
+                        "odbc-bcp column `{name}` expected Int64 or UInt32 array, got {other:?}"
                     )
                     .into());
                 }
             },
+            Self::F32(value) => {
+                let array = required_column::<Float32Array>(batch, index, name)?;
+                *value = array.value(row_index);
+            }
             Self::F64(value) => {
                 let array = required_column::<Float64Array>(batch, index, name)?;
                 *value = array.value(row_index);
@@ -1987,14 +2057,16 @@ mod tests {
     use super::{
         BcpColumnBindings, BcpColumnBuffer, BenchOptions, ConnectionSnapshot, DatabaseFileIoDelta,
         DatabaseFileIoSnapshot, SessionWaitDelta, SessionWaitSnapshot, TABLE_PLACEHOLDER,
-        c_string, connection_delta, database_file_io_deltas, format_date32, format_decimal,
-        format_timestamp_millis, push_utf16le, rows_per_second, session_wait_deltas,
+        SQLFLT4, SQLINT1, SQLINT2, SQLINT4, SQLINT8, c_string, connection_delta,
+        database_file_io_deltas, format_date32, format_decimal, format_timestamp_millis,
+        push_utf16le, rows_per_second, session_wait_deltas,
         string_heavy_unicode_tenant_sentinel_count_sql, validate_ipc_schema_and_count,
     };
     use arrow_array::{
         ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-        Float64Array, Int32Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
-        TimestampNanosecondArray,
+        Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, UInt8Array, UInt16Array, UInt32Array,
+        UInt64Array,
     };
     use arrow_ipc::writer::FileWriter;
     use arrow_schema::{DataType, Field, Schema};
@@ -2318,20 +2390,38 @@ mod tests {
     fn rejects_unsupported_arrow_type() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id32", DataType::Int32, false),
-            Field::new("unsupported", DataType::Float32, false),
+            Field::new("unsupported", DataType::UInt64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(Int32Array::from(vec![1])) as ArrayRef,
-                Arc::new(Float32Array::from(vec![2.5])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![2])) as ArrayRef,
             ],
         )
         .expect("batch should build");
 
         let err = BcpColumnBindings::new(&batch).expect_err("unsupported type should be rejected");
 
-        assert!(err.to_string().contains("Float32"));
+        assert!(err.to_string().contains("UInt64"));
+    }
+
+    #[test]
+    fn binds_extended_primitive_arrow_types_to_bcp_server_types() {
+        for (data_type, server_type, bind_len) in [
+            (DataType::UInt8, SQLINT1, std::mem::size_of::<u8>()),
+            (DataType::Int8, SQLINT2, std::mem::size_of::<i16>()),
+            (DataType::Int16, SQLINT2, std::mem::size_of::<i16>()),
+            (DataType::UInt16, SQLINT4, std::mem::size_of::<i32>()),
+            (DataType::UInt32, SQLINT8, std::mem::size_of::<i64>()),
+            (DataType::Float32, SQLFLT4, std::mem::size_of::<f32>()),
+        ] {
+            let buffer =
+                BcpColumnBuffer::new(&data_type).expect("extended primitive should bind");
+
+            assert_eq!(buffer.server_type(), server_type);
+            assert_eq!(buffer.bind_len().unwrap(), bind_len as i32);
+        }
     }
 
     #[test]
@@ -2440,6 +2530,12 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id32", DataType::Int32, false),
             Field::new("id64", DataType::Int64, false),
+            Field::new("tiny_value", DataType::UInt8, true),
+            Field::new("signed_tiny_value", DataType::Int8, true),
+            Field::new("small_value", DataType::Int16, true),
+            Field::new("unsigned_medium_value", DataType::UInt16, true),
+            Field::new("unsigned_total_value", DataType::UInt32, true),
+            Field::new("real_value", DataType::Float32, true),
             Field::new("score", DataType::Float64, false),
             Field::new("flag", DataType::Boolean, true),
             Field::new("label", DataType::Utf8, true),
@@ -2458,6 +2554,24 @@ mod tests {
                 Arc::new(Int32Array::from_iter_values(0..rows as i32)) as ArrayRef,
                 Arc::new(Int64Array::from_iter_values(
                     (0..rows).map(|row| row as i64 * 10),
+                )) as ArrayRef,
+                Arc::new(UInt8Array::from_iter(
+                    (0..rows).map(|row| (row % 7 != 0).then_some((row % 256) as u8)),
+                )) as ArrayRef,
+                Arc::new(Int8Array::from_iter(
+                    (0..rows).map(|row| (row % 11 != 0).then_some((row % 127) as i8)),
+                )) as ArrayRef,
+                Arc::new(Int16Array::from_iter(
+                    (0..rows).map(|row| (row % 13 != 0).then_some(row as i16)),
+                )) as ArrayRef,
+                Arc::new(UInt16Array::from_iter(
+                    (0..rows).map(|row| (row % 17 != 0).then_some(row as u16)),
+                )) as ArrayRef,
+                Arc::new(UInt32Array::from_iter(
+                    (0..rows).map(|row| (row % 19 != 0).then_some(row as u32)),
+                )) as ArrayRef,
+                Arc::new(Float32Array::from_iter(
+                    (0..rows).map(|row| (row % 23 != 0).then_some(row as f32 + 0.25)),
                 )) as ArrayRef,
                 Arc::new(Float64Array::from_iter_values(
                     (0..rows).map(|row| row as f64 + 0.5),

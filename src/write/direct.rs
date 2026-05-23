@@ -2,7 +2,8 @@
 #![allow(dead_code)]
 
 use arrow_array::{
-    BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, RecordBatch, StringArray, UInt8Array, UInt16Array, UInt32Array,
 };
 
 use crate::{
@@ -22,9 +23,12 @@ pub(crate) mod variable_width;
 use payload::EncodedRowsPayload;
 use plan::{CurrentDirectMappings, DirectColumnEncoding, DirectEncoderPlan};
 use primitive::{
-    allocate_rows_payload_with_tokens, append_boolean_cell, append_float64_cell, append_int32_cell,
-    append_int64_cell, build_fixed_width_row_layout, build_fixed_width_row_range_layout,
-    fill_boolean_column, fill_float64_column, fill_int32_column, fill_int64_column,
+    allocate_rows_payload_with_tokens, append_boolean_cell, append_float32_cell,
+    append_float64_cell, append_int8_cell, append_int16_cell, append_int32_cell, append_int64_cell,
+    append_uint8_cell, append_uint16_cell, append_uint32_cell, build_fixed_width_row_layout,
+    build_fixed_width_row_range_layout, fill_boolean_column, fill_float32_column,
+    fill_float64_column, fill_int8_column, fill_int16_column, fill_int32_column, fill_int64_column,
+    fill_uint8_column, fill_uint16_column, fill_uint32_column,
     measure_primitive_column_cell_lengths, try_encode_fixed_width_primitive_rows,
 };
 use variable_width::{
@@ -310,13 +314,37 @@ impl DirectEncoder {
                     let array = downcast_direct_array::<BooleanArray>(array, column)?;
                     fill_boolean_column(array, column, column_index, column_count, layout, bytes)?;
                 }
+                DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt8ToTinyInt) => {
+                    let array = downcast_direct_array::<UInt8Array>(array, column)?;
+                    fill_uint8_column(array, column, column_index, column_count, layout, bytes)?;
+                }
+                DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int8ToSmallInt) => {
+                    let array = downcast_direct_array::<Int8Array>(array, column)?;
+                    fill_int8_column(array, column, column_index, column_count, layout, bytes)?;
+                }
+                DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int16ToSmallInt) => {
+                    let array = downcast_direct_array::<Int16Array>(array, column)?;
+                    fill_int16_column(array, column, column_index, column_count, layout, bytes)?;
+                }
                 DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int32ToInt) => {
                     let array = downcast_direct_array::<Int32Array>(array, column)?;
                     fill_int32_column(array, column, column_index, column_count, layout, bytes)?;
                 }
+                DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt16ToInt) => {
+                    let array = downcast_direct_array::<UInt16Array>(array, column)?;
+                    fill_uint16_column(array, column, column_index, column_count, layout, bytes)?;
+                }
                 DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int64ToBigInt) => {
                     let array = downcast_direct_array::<Int64Array>(array, column)?;
                     fill_int64_column(array, column, column_index, column_count, layout, bytes)?;
+                }
+                DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt32ToBigInt) => {
+                    let array = downcast_direct_array::<UInt32Array>(array, column)?;
+                    fill_uint32_column(array, column, column_index, column_count, layout, bytes)?;
+                }
+                DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal) => {
+                    let array = downcast_direct_array::<Float32Array>(array, column)?;
+                    fill_float32_column(array, column, column_index, column_count, layout, bytes)?;
                 }
                 DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => {
                     let array = downcast_direct_array::<Float64Array>(array, column)?;
@@ -389,16 +417,52 @@ impl DirectEncoder {
                         array: downcast_direct_array::<BooleanArray>(array, column)?,
                     }
                 }
+                DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt8ToTinyInt) => {
+                    RuntimeDirectColumn::UInt8 {
+                        column,
+                        array: downcast_direct_array::<UInt8Array>(array, column)?,
+                    }
+                }
+                DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int8ToSmallInt) => {
+                    RuntimeDirectColumn::Int8 {
+                        column,
+                        array: downcast_direct_array::<Int8Array>(array, column)?,
+                    }
+                }
+                DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int16ToSmallInt) => {
+                    RuntimeDirectColumn::Int16 {
+                        column,
+                        array: downcast_direct_array::<Int16Array>(array, column)?,
+                    }
+                }
                 DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int32ToInt) => {
                     RuntimeDirectColumn::Int32 {
                         column,
                         array: downcast_direct_array::<Int32Array>(array, column)?,
                     }
                 }
+                DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt16ToInt) => {
+                    RuntimeDirectColumn::UInt16 {
+                        column,
+                        array: downcast_direct_array::<UInt16Array>(array, column)?,
+                    }
+                }
                 DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int64ToBigInt) => {
                     RuntimeDirectColumn::Int64 {
                         column,
                         array: downcast_direct_array::<Int64Array>(array, column)?,
+                    }
+                }
+                DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt32ToBigInt) => {
+                    RuntimeDirectColumn::UInt32 {
+                        column,
+                        array: downcast_direct_array::<UInt32Array>(array, column)?,
+                    }
+                }
+                DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal) => {
+                    RuntimeDirectColumn::Float32 {
+                        column,
+                        array: downcast_direct_array::<Float32Array>(array, column)?,
                     }
                 }
                 DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => {
@@ -443,13 +507,37 @@ enum RuntimeDirectColumn<'a> {
         column: &'a plan::DirectColumnPlan,
         array: &'a BooleanArray,
     },
+    UInt8 {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a UInt8Array,
+    },
+    Int8 {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a Int8Array,
+    },
+    Int16 {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a Int16Array,
+    },
     Int32 {
         column: &'a plan::DirectColumnPlan,
         array: &'a Int32Array,
     },
+    UInt16 {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a UInt16Array,
+    },
     Int64 {
         column: &'a plan::DirectColumnPlan,
         array: &'a Int64Array,
+    },
+    UInt32 {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a UInt32Array,
+    },
+    Float32 {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a Float32Array,
     },
     Float64 {
         column: &'a plan::DirectColumnPlan,
@@ -476,11 +564,29 @@ impl RuntimeDirectColumn<'_> {
             Self::Boolean { column, array } => {
                 append_boolean_cell(buf, array, column, row_index, measured_len)
             }
+            Self::UInt8 { column, array } => {
+                append_uint8_cell(buf, array, column, row_index, measured_len)
+            }
+            Self::Int8 { column, array } => {
+                append_int8_cell(buf, array, column, row_index, measured_len)
+            }
+            Self::Int16 { column, array } => {
+                append_int16_cell(buf, array, column, row_index, measured_len)
+            }
             Self::Int32 { column, array } => {
                 append_int32_cell(buf, array, column, row_index, measured_len)
             }
+            Self::UInt16 { column, array } => {
+                append_uint16_cell(buf, array, column, row_index, measured_len)
+            }
             Self::Int64 { column, array } => {
                 append_int64_cell(buf, array, column, row_index, measured_len)
+            }
+            Self::UInt32 { column, array } => {
+                append_uint32_cell(buf, array, column, row_index, measured_len)
+            }
+            Self::Float32 { column, array } => {
+                append_float32_cell(buf, array, column, row_index, measured_len)
             }
             Self::Float64 { column, array } => {
                 append_float64_cell(buf, array, column, row_index, measured_len)
@@ -754,8 +860,8 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        ArrayRef, BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch,
-        StringArray,
+        ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
+        RecordBatch, StringArray,
     };
     use arrow_buffer::{NullBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Schema};
@@ -879,8 +985,9 @@ mod tests {
             mapping(0, "is_active", DataType::Boolean, MssqlType::Bit, false),
             mapping(1, "quantity", DataType::Int32, MssqlType::Int, false),
             mapping(2, "total", DataType::Int64, MssqlType::BigInt, false),
+            mapping(3, "real_value", DataType::Float32, MssqlType::Real, false),
             mapping(
-                3,
+                4,
                 "ratio",
                 DataType::Float64,
                 MssqlType::Float { precision: 53 },
@@ -893,19 +1000,21 @@ mod tests {
                 Field::new("is_active", DataType::Boolean, false),
                 Field::new("quantity", DataType::Int32, false),
                 Field::new("total", DataType::Int64, false),
+                Field::new("real_value", DataType::Float32, false),
                 Field::new("ratio", DataType::Float64, false),
             ],
             vec![
                 Arc::new(BooleanArray::from(vec![true, false])) as ArrayRef,
                 Arc::new(Int32Array::from(vec![1, -2])),
                 Arc::new(Int64Array::from(vec![10, -20])),
+                Arc::new(Float32Array::from(vec![1.5, -3.25])),
                 Arc::new(Float64Array::from(vec![1.25, -2.5])),
             ],
         );
 
         let payload = encoder.encode_batch(&batch).unwrap();
 
-        assert_eq!(payload.row_token_offsets(), [0, 22]);
+        assert_eq!(payload.row_token_offsets(), [0, 26]);
         assert_eq!(
             payload.bytes(),
             [
@@ -923,6 +1032,10 @@ mod tests {
                 0,
                 0,
                 0,
+                0x00,
+                0x00,
+                0xC0,
+                0x3F,
                 0x00,
                 0x00,
                 0x00,
@@ -945,6 +1058,10 @@ mod tests {
                 0xFF,
                 0xFF,
                 0xFF,
+                0x00,
+                0x00,
+                0x50,
+                0xC0,
                 0x00,
                 0x00,
                 0x00,
@@ -1378,6 +1495,43 @@ mod tests {
                 0x00,
                 0x00,
                 0xF8,
+                0x3F
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_encoder_fast_path_does_not_read_non_finite_float32_from_null_slot() {
+        let mappings = vec![mapping(
+            0,
+            "real_value",
+            DataType::Float32,
+            MssqlType::Real,
+            true,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let array = Float32Array::new(
+            ScalarBuffer::from(vec![f32::NAN, 1.5]),
+            Some(NullBuffer::from(vec![false, true])),
+        );
+        let batch = record_batch(
+            vec![Field::new("real_value", DataType::Float32, true)],
+            vec![Arc::new(array)],
+        );
+
+        let payload = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(payload.row_token_offsets(), [0, 2]);
+        assert_eq!(
+            payload.bytes(),
+            [
+                payload::TDS_ROW_TOKEN,
+                0,
+                payload::TDS_ROW_TOKEN,
+                4,
+                0x00,
+                0x00,
+                0xC0,
                 0x3F
             ]
         );
