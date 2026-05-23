@@ -67,6 +67,9 @@ pub(crate) fn measure_variable_width_column_cell_lengths(
         DirectColumnEncoding::UInt64Decimal20_0 => Err(unsupported_batch(
             "direct variable-width layout cannot measure UInt64 decimal20_0",
         )),
+        DirectColumnEncoding::Decimal(classification) => Err(unsupported_batch(format!(
+            "direct variable-width layout cannot measure decimal mapping {classification:?}"
+        ))),
     }
 }
 

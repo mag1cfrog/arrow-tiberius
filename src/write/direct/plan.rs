@@ -5,7 +5,7 @@ use arrow_schema::DataType;
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, MssqlType, Result, SchemaMapping,
     conversion::arrow_to_mssql::{
-        primitive::PrimitiveArrowToMssql, uint64::UInt64ArrowToMssql,
+        decimal::DecimalArrowToMssql, primitive::PrimitiveArrowToMssql, uint64::UInt64ArrowToMssql,
         variable_width::VariableWidthArrowToMssql,
     },
 };
@@ -32,6 +32,8 @@ pub(crate) enum DirectColumnEncoding {
     Primitive(PrimitiveArrowToMssql),
     /// Arrow UInt64 to SQL Server `decimal(20,0)`.
     UInt64Decimal20_0,
+    /// Arrow decimal to SQL Server `decimal(p,s)`.
+    Decimal(DecimalArrowToMssql),
     /// Variable-width encoding.
     VariableWidth(VariableWidthArrowToMssql),
 }
@@ -68,8 +70,17 @@ impl DirectEncoderSupport for CurrentDirectMappings {
             Ok(classification) => DirectMappingSupport::Supported {
                 encoding: DirectColumnEncoding::Primitive(classification),
             },
-            Err(_) => uint64_support(mapping),
+            Err(_) => decimal_support(mapping),
         }
+    }
+}
+
+fn decimal_support(mapping: &SchemaMapping) -> DirectMappingSupport {
+    match DecimalArrowToMssql::classify(mapping, 0) {
+        Ok(classification) => DirectMappingSupport::Supported {
+            encoding: DirectColumnEncoding::Decimal(classification),
+        },
+        Err(_) => uint64_support(mapping),
     }
 }
 
@@ -229,7 +240,8 @@ mod tests {
         DirectMappingSupport, NoDirectMappings,
     };
     use crate::conversion::arrow_to_mssql::{
-        primitive::PrimitiveArrowToMssql, variable_width::VariableWidthArrowToMssql,
+        decimal::DecimalArrowToMssql, primitive::PrimitiveArrowToMssql,
+        variable_width::VariableWidthArrowToMssql,
     };
 
     #[test]
@@ -423,6 +435,110 @@ mod tests {
     }
 
     #[test]
+    fn current_direct_support_accepts_decimal_mappings() {
+        let mappings = vec![
+            mapping(0, "amount32", DataType::Decimal32(9, 2), decimal_type(9, 2)),
+            mapping(
+                1,
+                "amount64",
+                DataType::Decimal64(18, 4),
+                decimal_type(18, 4),
+            ),
+            mapping(
+                2,
+                "amount128",
+                DataType::Decimal128(38, 9),
+                decimal_type(38, 9),
+            ),
+            mapping(
+                3,
+                "amount256",
+                DataType::Decimal256(38, 0),
+                decimal_type(38, 0),
+            ),
+            mapping(
+                4,
+                "normalized",
+                DataType::Decimal128(3, -2),
+                decimal_type(5, 0),
+            ),
+        ];
+
+        let plan = DirectEncoderPlan::new(&mappings, &CurrentDirectMappings)
+            .expect("decimal mappings should be supported by the direct plan");
+
+        assert_eq!(plan.column_count(), 5);
+        assert_eq!(
+            plan.columns()[0].encoding(),
+            DirectColumnEncoding::Decimal(DecimalArrowToMssql::Decimal32 {
+                target_precision: 9,
+                target_scale: 2,
+                arrow_scale: 2,
+            })
+        );
+        assert_eq!(
+            plan.columns()[1].encoding(),
+            DirectColumnEncoding::Decimal(DecimalArrowToMssql::Decimal64 {
+                target_precision: 18,
+                target_scale: 4,
+                arrow_scale: 4,
+            })
+        );
+        assert_eq!(
+            plan.columns()[2].encoding(),
+            DirectColumnEncoding::Decimal(DecimalArrowToMssql::Decimal128 {
+                target_precision: 38,
+                target_scale: 9,
+                arrow_scale: 9,
+            })
+        );
+        assert_eq!(
+            plan.columns()[3].encoding(),
+            DirectColumnEncoding::Decimal(DecimalArrowToMssql::Decimal256CheckedDowncast {
+                target_precision: 38,
+                target_scale: 0,
+                arrow_scale: 0,
+            })
+        );
+        assert_eq!(
+            plan.columns()[4].encoding(),
+            DirectColumnEncoding::Decimal(DecimalArrowToMssql::Decimal128 {
+                target_precision: 5,
+                target_scale: 0,
+                arrow_scale: -2,
+            })
+        );
+    }
+
+    #[test]
+    fn current_direct_support_rejects_decimal_scale_mismatch() {
+        let mappings = vec![mapping(
+            0,
+            "amount",
+            DataType::Decimal128(5, 2),
+            decimal_type(5, 0),
+        )];
+
+        let err = DirectEncoderPlan::new(&mappings, &CurrentDirectMappings)
+            .expect_err("decimal scale drift should not be supported by the direct plan");
+
+        let Error::DirectEncoding { diagnostics } = err else {
+            panic!("expected direct encoding error");
+        };
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics.all()[0].code(),
+            DiagnosticCode::DirectEncodingUnsupportedMapping
+        );
+        assert_eq!(diagnostics.all()[0].field().unwrap().name(), "amount");
+        assert_eq!(
+            diagnostics.all()[0].message(),
+            "direct encoding is not implemented yet for Arrow Decimal128(5, 2) to SQL Server decimal(5,0)"
+        );
+    }
+
+    #[test]
     fn current_direct_support_rejects_forged_float64_non_53_precision_mapping() {
         let mappings = vec![mapping(
             0,
@@ -569,5 +685,9 @@ mod tests {
             ArrowFieldRef::new(index, name.to_owned(), false, arrow_type),
             MssqlColumn::new(Identifier::new(name).unwrap(), mssql_type, false),
         )
+    }
+
+    fn decimal_type(precision: u8, scale: i8) -> MssqlType {
+        MssqlType::Decimal { precision, scale }
     }
 }
