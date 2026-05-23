@@ -695,6 +695,12 @@ async fn direct_raw_writer_round_trips_variable_width_matrix() -> TestResult<()>
     let table = unique_table_name()?;
     let schema = Arc::new(Schema::new(vec![
         Field::new("row_id", DataType::Int32, false),
+        Field::new("tiny_value", DataType::UInt8, true),
+        Field::new("signed_tiny_value", DataType::Int8, true),
+        Field::new("small_value", DataType::Int16, true),
+        Field::new("unsigned_medium_value", DataType::UInt16, true),
+        Field::new("unsigned_total_value", DataType::UInt32, true),
+        Field::new("real_value", DataType::Float32, true),
         Field::new("text_value", DataType::Utf8, true),
         Field::new("bytes_value", DataType::Binary, true),
     ]));
@@ -710,6 +716,42 @@ async fn direct_raw_writer_round_trips_variable_width_matrix() -> TestResult<()>
         schema,
         vec![
             Arc::new(Int32Array::from(vec![1_i32, 2, 3, 4])) as ArrayRef,
+            Arc::new(UInt8Array::from(vec![
+                Some(u8::MIN),
+                None,
+                Some(42),
+                Some(u8::MAX),
+            ])),
+            Arc::new(Int8Array::from(vec![
+                Some(i8::MIN),
+                None,
+                Some(0),
+                Some(i8::MAX),
+            ])),
+            Arc::new(Int16Array::from(vec![
+                Some(i16::MIN),
+                None,
+                Some(0),
+                Some(i16::MAX),
+            ])),
+            Arc::new(UInt16Array::from(vec![
+                Some(u16::MIN),
+                None,
+                Some(42),
+                Some(u16::MAX),
+            ])),
+            Arc::new(UInt32Array::from(vec![
+                Some(u32::MIN),
+                None,
+                Some(42),
+                Some(u32::MAX),
+            ])),
+            Arc::new(Float32Array::from(vec![
+                Some(-123.5),
+                None,
+                Some(0.0),
+                Some(42.25),
+            ])),
             Arc::new(StringArray::from(vec![
                 Some(""),
                 Some("ascii"),
@@ -750,7 +792,7 @@ async fn direct_raw_writer_round_trips_variable_width_matrix() -> TestResult<()>
 
         let rows = client
             .simple_query(format!(
-                "SELECT [row_id], [text_value], [bytes_value] FROM {} ORDER BY [row_id]",
+                "SELECT [row_id], [tiny_value], [signed_tiny_value], [small_value], [unsigned_medium_value], [unsigned_total_value], [real_value], [text_value], [bytes_value] FROM {} ORDER BY [row_id]",
                 table.quoted_sql()
             ))
             .await?
@@ -760,37 +802,105 @@ async fn direct_raw_writer_round_trips_variable_width_matrix() -> TestResult<()>
         ensure_eq(rows.len(), 4, "row count")?;
 
         ensure_eq(rows[0].get::<i32, _>(0), Some(1), "row 0 row_id")?;
-        ensure_eq(rows[0].get::<&str, _>(1), Some(""), "row 0 text_value")?;
+        ensure_eq(rows[0].get::<u8, _>(1), Some(u8::MIN), "row 0 tiny")?;
         ensure_eq(
-            rows[0].get::<&[u8], _>(2),
+            rows[0].get::<i16, _>(2),
+            Some(i8::MIN as i16),
+            "row 0 signed_tiny",
+        )?;
+        ensure_eq(
+            rows[0].get::<i16, _>(3),
+            Some(i16::MIN),
+            "row 0 small",
+        )?;
+        ensure_eq(
+            rows[0].get::<i32, _>(4),
+            Some(u16::MIN as i32),
+            "row 0 unsigned_medium",
+        )?;
+        ensure_eq(
+            rows[0].get::<i64, _>(5),
+            Some(u32::MIN as i64),
+            "row 0 unsigned_total",
+        )?;
+        ensure_eq(rows[0].get::<f32, _>(6), Some(-123.5), "row 0 real")?;
+        ensure_eq(rows[0].get::<&str, _>(7), Some(""), "row 0 text_value")?;
+        ensure_eq(
+            rows[0].get::<&[u8], _>(8),
             Some(&b""[..]),
             "row 0 bytes_value",
         )?;
 
         ensure_eq(rows[1].get::<i32, _>(0), Some(2), "row 1 row_id")?;
-        ensure_eq(rows[1].get::<&str, _>(1), Some("ascii"), "row 1 text_value")?;
+        ensure_eq(rows[1].get::<u8, _>(1), None, "row 1 tiny")?;
+        ensure_eq(rows[1].get::<i16, _>(2), None, "row 1 signed_tiny")?;
+        ensure_eq(rows[1].get::<i16, _>(3), None, "row 1 small")?;
+        ensure_eq(rows[1].get::<i32, _>(4), None, "row 1 unsigned_medium")?;
+        ensure_eq(rows[1].get::<i64, _>(5), None, "row 1 unsigned_total")?;
+        ensure_eq(rows[1].get::<f32, _>(6), None, "row 1 real")?;
         ensure_eq(
-            rows[1].get::<&[u8], _>(2),
+            rows[1].get::<&str, _>(7),
+            Some("ascii"),
+            "row 1 text_value",
+        )?;
+        ensure_eq(
+            rows[1].get::<&[u8], _>(8),
             Some(&b"\x00\x01\xfe"[..]),
             "row 1 bytes_value",
         )?;
 
         ensure_eq(rows[2].get::<i32, _>(0), Some(3), "row 2 row_id")?;
+        ensure_eq(rows[2].get::<u8, _>(1), Some(42), "row 2 tiny")?;
+        ensure_eq(rows[2].get::<i16, _>(2), Some(0), "row 2 signed_tiny")?;
+        ensure_eq(rows[2].get::<i16, _>(3), Some(0), "row 2 small")?;
         ensure_eq(
-            rows[2].get::<&str, _>(1),
+            rows[2].get::<i32, _>(4),
+            Some(42),
+            "row 2 unsigned_medium",
+        )?;
+        ensure_eq(
+            rows[2].get::<i64, _>(5),
+            Some(42),
+            "row 2 unsigned_total",
+        )?;
+        ensure_eq(rows[2].get::<f32, _>(6), Some(0.0), "row 2 real")?;
+        ensure_eq(
+            rows[2].get::<&str, _>(7),
             Some("Tokyo 東京"),
             "row 2 text_value",
         )?;
-        ensure_eq(rows[2].get::<&[u8], _>(2), None, "row 2 bytes_value")?;
+        ensure_eq(rows[2].get::<&[u8], _>(8), None, "row 2 bytes_value")?;
 
         ensure_eq(rows[3].get::<i32, _>(0), Some(4), "row 3 row_id")?;
+        ensure_eq(rows[3].get::<u8, _>(1), Some(u8::MAX), "row 3 tiny")?;
         ensure_eq(
-            rows[3].get::<&str, _>(1),
+            rows[3].get::<i16, _>(2),
+            Some(i8::MAX as i16),
+            "row 3 signed_tiny",
+        )?;
+        ensure_eq(
+            rows[3].get::<i16, _>(3),
+            Some(i16::MAX),
+            "row 3 small",
+        )?;
+        ensure_eq(
+            rows[3].get::<i32, _>(4),
+            Some(u16::MAX as i32),
+            "row 3 unsigned_medium",
+        )?;
+        ensure_eq(
+            rows[3].get::<i64, _>(5),
+            Some(u32::MAX as i64),
+            "row 3 unsigned_total",
+        )?;
+        ensure_eq(rows[3].get::<f32, _>(6), Some(42.25), "row 3 real")?;
+        ensure_eq(
+            rows[3].get::<&str, _>(7),
             Some(large_text.as_str()),
             "row 3 text_value",
         )?;
         ensure_eq(
-            rows[3].get::<&[u8], _>(2),
+            rows[3].get::<&[u8], _>(8),
             Some(large_bytes.as_slice()),
             "row 3 bytes_value",
         )?;
