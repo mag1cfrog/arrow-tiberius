@@ -116,7 +116,15 @@ fn temporal_support(mapping: &SchemaMapping) -> DirectMappingSupport {
     match TemporalArrowToMssql::classify(mapping, 0) {
         Ok(
             classification @ (TemporalArrowToMssql::Date32ToDate
-            | TemporalArrowToMssql::Date64ToDateTime2),
+            | TemporalArrowToMssql::Date64ToDateTime2
+            | TemporalArrowToMssql::TimestampSecondToDateTime2
+            | TemporalArrowToMssql::TimestampMillisecondToDateTime2
+            | TemporalArrowToMssql::TimestampMicrosecondToDateTime2
+            | TemporalArrowToMssql::TimestampNanosecondToDateTime2
+            | TemporalArrowToMssql::TimestampSecondTzToDateTime2
+            | TemporalArrowToMssql::TimestampMillisecondTzToDateTime2
+            | TemporalArrowToMssql::TimestampMicrosecondTzToDateTime2
+            | TemporalArrowToMssql::TimestampNanosecondTzToDateTime2),
         ) => DirectMappingSupport::Supported {
             encoding: DirectColumnEncoding::Temporal(classification),
         },
@@ -683,6 +691,65 @@ mod tests {
         assert_eq!(
             plan.columns()[1].encoding(),
             DirectColumnEncoding::Temporal(TemporalArrowToMssql::Date64ToDateTime2)
+        );
+    }
+
+    #[test]
+    fn current_direct_support_accepts_timestamp_datetime2_mappings() {
+        let mappings = vec![
+            mapping(
+                0,
+                "ts_s",
+                DataType::Timestamp(TimeUnit::Second, None),
+                MssqlType::DateTime2 { precision: 7 },
+            ),
+            mapping(
+                1,
+                "ts_ms",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                MssqlType::DateTime2 { precision: 7 },
+            ),
+            mapping(
+                2,
+                "ts_us",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                MssqlType::DateTime2 { precision: 7 },
+            ),
+            mapping(
+                3,
+                "ts_ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                MssqlType::DateTime2 { precision: 7 },
+            ),
+            mapping(
+                4,
+                "ts_tz",
+                DataType::Timestamp(TimeUnit::Second, Some("America/New_York".into())),
+                MssqlType::DateTime2 { precision: 7 },
+            ),
+        ];
+
+        let plan = DirectEncoderPlan::new(&mappings, &CurrentDirectMappings)
+            .expect("timestamp datetime2 direct encoding should be supported");
+
+        assert_eq!(
+            plan.columns()
+                .iter()
+                .map(|column| column.encoding())
+                .collect::<Vec<_>>(),
+            [
+                DirectColumnEncoding::Temporal(TemporalArrowToMssql::TimestampSecondToDateTime2),
+                DirectColumnEncoding::Temporal(
+                    TemporalArrowToMssql::TimestampMillisecondToDateTime2
+                ),
+                DirectColumnEncoding::Temporal(
+                    TemporalArrowToMssql::TimestampMicrosecondToDateTime2
+                ),
+                DirectColumnEncoding::Temporal(
+                    TemporalArrowToMssql::TimestampNanosecondToDateTime2
+                ),
+                DirectColumnEncoding::Temporal(TemporalArrowToMssql::TimestampSecondTzToDateTime2),
+            ]
         );
     }
 

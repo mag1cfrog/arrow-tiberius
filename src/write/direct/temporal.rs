@@ -1,11 +1,26 @@
 //! Shared SQL Server temporal direct TDS row payload helpers.
 
-use arrow_array::{Array, Date32Array, Date64Array};
+use arrow_array::{
+    Array, Date32Array, Date64Array, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray,
+};
 
 use crate::{
-    Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, Result,
+    Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, NanosecondPolicy, PlanOptions,
+    Result, SchemaMapping,
     conversion::arrow_to_mssql::temporal::TemporalArrowToMssql,
-    mssql::cell::{MssqlDate, MssqlDateTime2, MssqlDateTimeOffset, MssqlTime},
+    mssql::cell::{
+        MssqlDate, MssqlDateTime2, MssqlDateTimeOffset, MssqlTime,
+        from_arrow::temporal::datetime2::{
+            mssql_datetime2_from_arrow_timestamp_microsecond,
+            mssql_datetime2_from_arrow_timestamp_millisecond,
+            mssql_datetime2_from_arrow_timestamp_nanosecond,
+            mssql_datetime2_from_arrow_timestamp_second,
+        },
+        from_arrow::temporal::{
+            validate_mapping_timestamp_timezone_metadata, validate_null_timestamp_timezone_metadata,
+        },
+    },
     write::profile,
 };
 
@@ -24,41 +39,135 @@ const SQL_SERVER_DATE_UNIX_EPOCH_DAYS: i64 = 719_162;
 const MILLISECONDS_PER_DAY: i64 = 86_400_000;
 const SQL_SERVER_DATETIME2_DATE64_SCALE: u8 = 3;
 
+#[derive(Clone, Copy)]
+pub(crate) struct TemporalColumnContext<'a> {
+    pub(crate) mapping: &'a SchemaMapping,
+    pub(crate) plan_options: PlanOptions,
+    pub(crate) column: &'a DirectColumnPlan,
+    pub(crate) classification: TemporalArrowToMssql,
+    pub(crate) column_index: usize,
+    pub(crate) column_count: usize,
+}
+
 /// Measures one Arrow date-family column into a row-major cell length matrix.
 pub(crate) fn measure_temporal_column_cell_lengths(
     array: &dyn Array,
-    column: &DirectColumnPlan,
-    classification: TemporalArrowToMssql,
-    column_index: usize,
-    column_count: usize,
+    context: TemporalColumnContext<'_>,
     cell_lengths: &mut [usize],
 ) -> Result<()> {
-    match classification {
+    match context.classification {
         TemporalArrowToMssql::Date32ToDate => {
-            let array = downcast_direct_array::<Date32Array>(array, column)?;
+            let array = downcast_direct_array::<Date32Array>(array, context.column)?;
             measure_temporal_values(
                 array,
-                column,
-                column_index,
-                column_count,
+                context.mapping,
+                context.column,
+                context.column_index,
+                context.column_count,
                 cell_lengths,
-                |array, row_index| {
-                    mssql_date_from_arrow_date32(column, row_index, array.value(row_index))
+                |array, _mapping, row_index| {
+                    mssql_date_from_arrow_date32(context.column, row_index, array.value(row_index))
                         .map(|_| date_cell_len())
                 },
             )
         }
         TemporalArrowToMssql::Date64ToDateTime2 => {
-            let array = downcast_direct_array::<Date64Array>(array, column)?;
+            let array = downcast_direct_array::<Date64Array>(array, context.column)?;
             measure_temporal_values(
                 array,
-                column,
-                column_index,
-                column_count,
+                context.mapping,
+                context.column,
+                context.column_index,
+                context.column_count,
                 cell_lengths,
-                |array, row_index| {
-                    mssql_datetime2_from_arrow_date64(column, row_index, array.value(row_index))
-                        .and_then(datetime2_cell_len_for_value)
+                |array, _mapping, row_index| {
+                    mssql_datetime2_from_arrow_date64(
+                        context.column,
+                        row_index,
+                        array.value(row_index),
+                    )
+                    .and_then(datetime2_cell_len_for_value)
+                },
+            )
+        }
+        TemporalArrowToMssql::TimestampSecondToDateTime2
+        | TemporalArrowToMssql::TimestampSecondTzToDateTime2 => {
+            let array = downcast_direct_array::<TimestampSecondArray>(array, context.column)?;
+            measure_temporal_values(
+                array,
+                context.mapping,
+                context.column,
+                context.column_index,
+                context.column_count,
+                cell_lengths,
+                |array, mapping, row_index| {
+                    mssql_datetime2_from_arrow_timestamp_second(
+                        mapping,
+                        row_index,
+                        array.value(row_index),
+                    )
+                    .and_then(datetime2_cell_len_for_value)
+                },
+            )
+        }
+        TemporalArrowToMssql::TimestampMillisecondToDateTime2
+        | TemporalArrowToMssql::TimestampMillisecondTzToDateTime2 => {
+            let array = downcast_direct_array::<TimestampMillisecondArray>(array, context.column)?;
+            measure_temporal_values(
+                array,
+                context.mapping,
+                context.column,
+                context.column_index,
+                context.column_count,
+                cell_lengths,
+                |array, mapping, row_index| {
+                    mssql_datetime2_from_arrow_timestamp_millisecond(
+                        mapping,
+                        row_index,
+                        array.value(row_index),
+                    )
+                    .and_then(datetime2_cell_len_for_value)
+                },
+            )
+        }
+        TemporalArrowToMssql::TimestampMicrosecondToDateTime2
+        | TemporalArrowToMssql::TimestampMicrosecondTzToDateTime2 => {
+            let array = downcast_direct_array::<TimestampMicrosecondArray>(array, context.column)?;
+            measure_temporal_values(
+                array,
+                context.mapping,
+                context.column,
+                context.column_index,
+                context.column_count,
+                cell_lengths,
+                |array, mapping, row_index| {
+                    mssql_datetime2_from_arrow_timestamp_microsecond(
+                        mapping,
+                        row_index,
+                        array.value(row_index),
+                    )
+                    .and_then(datetime2_cell_len_for_value)
+                },
+            )
+        }
+        TemporalArrowToMssql::TimestampNanosecondToDateTime2
+        | TemporalArrowToMssql::TimestampNanosecondTzToDateTime2 => {
+            let array = downcast_direct_array::<TimestampNanosecondArray>(array, context.column)?;
+            measure_temporal_values(
+                array,
+                context.mapping,
+                context.column,
+                context.column_index,
+                context.column_count,
+                cell_lengths,
+                |array, mapping, row_index| {
+                    mssql_datetime2_from_arrow_timestamp_nanosecond(
+                        mapping,
+                        row_index,
+                        array.value(row_index),
+                        context.plan_options.nanosecond_policy,
+                    )
+                    .and_then(datetime2_cell_len_for_value)
                 },
             )
         }
@@ -71,21 +180,101 @@ pub(crate) fn measure_temporal_column_cell_lengths(
 /// Fills one Arrow date-family column into an already allocated rows payload.
 pub(crate) fn fill_temporal_column(
     array: &dyn Array,
-    column: &DirectColumnPlan,
-    classification: TemporalArrowToMssql,
-    column_index: usize,
-    column_count: usize,
+    context: TemporalColumnContext<'_>,
     layout: &RowLayout,
     bytes: &mut [u8],
 ) -> Result<()> {
-    match classification {
+    match context.classification {
         TemporalArrowToMssql::Date32ToDate => {
-            let array = downcast_direct_array::<Date32Array>(array, column)?;
-            fill_date32_column(array, column, column_index, column_count, layout, bytes)
+            let array = downcast_direct_array::<Date32Array>(array, context.column)?;
+            fill_date32_column(
+                array,
+                context.column,
+                context.column_index,
+                context.column_count,
+                layout,
+                bytes,
+            )
         }
         TemporalArrowToMssql::Date64ToDateTime2 => {
-            let array = downcast_direct_array::<Date64Array>(array, column)?;
-            fill_date64_column(array, column, column_index, column_count, layout, bytes)
+            let array = downcast_direct_array::<Date64Array>(array, context.column)?;
+            fill_date64_column(
+                array,
+                context.column,
+                context.column_index,
+                context.column_count,
+                layout,
+                bytes,
+            )
+        }
+        TemporalArrowToMssql::TimestampSecondToDateTime2
+        | TemporalArrowToMssql::TimestampSecondTzToDateTime2 => {
+            let array = downcast_direct_array::<TimestampSecondArray>(array, context.column)?;
+            fill_timestamp_column(
+                array,
+                context,
+                layout,
+                bytes,
+                |array, mapping, row_index| {
+                    mssql_datetime2_from_arrow_timestamp_second(
+                        mapping,
+                        row_index,
+                        array.value(row_index),
+                    )
+                },
+            )
+        }
+        TemporalArrowToMssql::TimestampMillisecondToDateTime2
+        | TemporalArrowToMssql::TimestampMillisecondTzToDateTime2 => {
+            let array = downcast_direct_array::<TimestampMillisecondArray>(array, context.column)?;
+            fill_timestamp_column(
+                array,
+                context,
+                layout,
+                bytes,
+                |array, mapping, row_index| {
+                    mssql_datetime2_from_arrow_timestamp_millisecond(
+                        mapping,
+                        row_index,
+                        array.value(row_index),
+                    )
+                },
+            )
+        }
+        TemporalArrowToMssql::TimestampMicrosecondToDateTime2
+        | TemporalArrowToMssql::TimestampMicrosecondTzToDateTime2 => {
+            let array = downcast_direct_array::<TimestampMicrosecondArray>(array, context.column)?;
+            fill_timestamp_column(
+                array,
+                context,
+                layout,
+                bytes,
+                |array, mapping, row_index| {
+                    mssql_datetime2_from_arrow_timestamp_microsecond(
+                        mapping,
+                        row_index,
+                        array.value(row_index),
+                    )
+                },
+            )
+        }
+        TemporalArrowToMssql::TimestampNanosecondToDateTime2
+        | TemporalArrowToMssql::TimestampNanosecondTzToDateTime2 => {
+            let array = downcast_direct_array::<TimestampNanosecondArray>(array, context.column)?;
+            fill_timestamp_column(
+                array,
+                context,
+                layout,
+                bytes,
+                |array, mapping, row_index| {
+                    mssql_datetime2_from_arrow_timestamp_nanosecond(
+                        mapping,
+                        row_index,
+                        array.value(row_index),
+                        context.plan_options.nanosecond_policy,
+                    )
+                },
+            )
         }
         unsupported => Err(unsupported_temporal_batch(format!(
             "direct temporal fill is not implemented yet for {unsupported:?}"
@@ -97,6 +286,7 @@ pub(crate) fn fill_temporal_column(
 pub(crate) fn append_date32_cell(
     buf: &mut tiberius::RawRowsAppendBuffer<'_>,
     array: &Date32Array,
+    mapping: &SchemaMapping,
     column: &DirectColumnPlan,
     row_index: usize,
     measured_len: usize,
@@ -104,10 +294,11 @@ pub(crate) fn append_date32_cell(
     append_temporal_value(
         buf,
         array,
+        mapping,
         column,
         row_index,
         measured_len,
-        |array, row_index| {
+        |array, _mapping, row_index| {
             let value = mssql_date_from_arrow_date32(column, row_index, array.value(row_index))?;
             Ok((date_cell_len(), TemporalValue::Date(value)))
         },
@@ -118,6 +309,7 @@ pub(crate) fn append_date32_cell(
 pub(crate) fn append_date64_cell(
     buf: &mut tiberius::RawRowsAppendBuffer<'_>,
     array: &Date64Array,
+    _mapping: &SchemaMapping,
     column: &DirectColumnPlan,
     row_index: usize,
     measured_len: usize,
@@ -125,12 +317,131 @@ pub(crate) fn append_date64_cell(
     append_temporal_value(
         buf,
         array,
+        _mapping,
         column,
         row_index,
         measured_len,
-        |array, row_index| {
+        |array, _mapping, row_index| {
             let value =
                 mssql_datetime2_from_arrow_date64(column, row_index, array.value(row_index))?;
+            Ok((
+                datetime2_cell_len_for_value(value)?,
+                TemporalValue::DateTime2(value),
+            ))
+        },
+    )
+}
+
+pub(crate) fn append_timestamp_second_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    array: &TimestampSecondArray,
+    mapping: &SchemaMapping,
+    column: &DirectColumnPlan,
+    row_index: usize,
+    measured_len: usize,
+) -> Result<()> {
+    append_temporal_value(
+        buf,
+        array,
+        mapping,
+        column,
+        row_index,
+        measured_len,
+        |array, mapping, row_index| {
+            let value = mssql_datetime2_from_arrow_timestamp_second(
+                mapping,
+                row_index,
+                array.value(row_index),
+            )?;
+            Ok((
+                datetime2_cell_len_for_value(value)?,
+                TemporalValue::DateTime2(value),
+            ))
+        },
+    )
+}
+
+pub(crate) fn append_timestamp_millisecond_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    array: &TimestampMillisecondArray,
+    mapping: &SchemaMapping,
+    column: &DirectColumnPlan,
+    row_index: usize,
+    measured_len: usize,
+) -> Result<()> {
+    append_temporal_value(
+        buf,
+        array,
+        mapping,
+        column,
+        row_index,
+        measured_len,
+        |array, mapping, row_index| {
+            let value = mssql_datetime2_from_arrow_timestamp_millisecond(
+                mapping,
+                row_index,
+                array.value(row_index),
+            )?;
+            Ok((
+                datetime2_cell_len_for_value(value)?,
+                TemporalValue::DateTime2(value),
+            ))
+        },
+    )
+}
+
+pub(crate) fn append_timestamp_microsecond_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    array: &TimestampMicrosecondArray,
+    mapping: &SchemaMapping,
+    column: &DirectColumnPlan,
+    row_index: usize,
+    measured_len: usize,
+) -> Result<()> {
+    append_temporal_value(
+        buf,
+        array,
+        mapping,
+        column,
+        row_index,
+        measured_len,
+        |array, mapping, row_index| {
+            let value = mssql_datetime2_from_arrow_timestamp_microsecond(
+                mapping,
+                row_index,
+                array.value(row_index),
+            )?;
+            Ok((
+                datetime2_cell_len_for_value(value)?,
+                TemporalValue::DateTime2(value),
+            ))
+        },
+    )
+}
+
+pub(crate) fn append_timestamp_nanosecond_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    array: &TimestampNanosecondArray,
+    mapping: &SchemaMapping,
+    column: &DirectColumnPlan,
+    nanosecond_policy: NanosecondPolicy,
+    row_index: usize,
+    measured_len: usize,
+) -> Result<()> {
+    append_temporal_value(
+        buf,
+        array,
+        mapping,
+        column,
+        row_index,
+        measured_len,
+        |array, mapping, row_index| {
+            let value = mssql_datetime2_from_arrow_timestamp_nanosecond(
+                mapping,
+                row_index,
+                array.value(row_index),
+                nanosecond_policy,
+            )?;
             Ok((
                 datetime2_cell_len_for_value(value)?,
                 TemporalValue::DateTime2(value),
@@ -313,6 +624,7 @@ pub(crate) fn append_datetimeoffset_cell(
 
 fn measure_temporal_values<A, F>(
     array: &A,
+    mapping: &SchemaMapping,
     column: &DirectColumnPlan,
     column_index: usize,
     column_count: usize,
@@ -321,16 +633,50 @@ fn measure_temporal_values<A, F>(
 ) -> Result<()>
 where
     A: Array,
-    F: Fn(&A, usize) -> Result<usize>,
+    F: Fn(&A, &SchemaMapping, usize) -> Result<usize>,
 {
     for row_index in 0..array.len() {
         let cell_len = if array.is_null(row_index) {
+            validate_null_timestamp_timezone_metadata(mapping, row_index)?;
             null_temporal_cell_len_for_column(column, row_index)?
         } else {
-            value_len(array, row_index)?
+            validate_mapping_timestamp_timezone_metadata(mapping, row_index)?;
+            value_len(array, mapping, row_index)?
         };
 
         cell_lengths[row_index * column_count + column_index] = cell_len;
+    }
+
+    Ok(())
+}
+
+fn fill_timestamp_column<A, F>(
+    array: &A,
+    context: TemporalColumnContext<'_>,
+    layout: &RowLayout,
+    bytes: &mut [u8],
+    value: F,
+) -> Result<()>
+where
+    A: Array,
+    F: Fn(&A, &SchemaMapping, usize) -> Result<MssqlDateTime2>,
+{
+    for row_index in 0..array.len() {
+        let cell = cell_position(
+            layout,
+            row_index,
+            context.column_index,
+            context.column_count,
+        )?;
+
+        if array.is_null(row_index) {
+            validate_null_timestamp_timezone_metadata(context.mapping, row_index)?;
+            write_null_direct_temporal_cell(bytes, cell, context.column, row_index)?;
+        } else {
+            validate_mapping_timestamp_timezone_metadata(context.mapping, row_index)?;
+            let value = value(array, context.mapping, row_index)?;
+            write_direct_datetime2_cell(bytes, cell, context.column, value)?;
+        }
     }
 
     Ok(())
@@ -384,6 +730,7 @@ fn fill_date64_column(
 fn append_temporal_value<A, F>(
     buf: &mut tiberius::RawRowsAppendBuffer<'_>,
     array: &A,
+    mapping: &SchemaMapping,
     column: &DirectColumnPlan,
     row_index: usize,
     measured_len: usize,
@@ -391,10 +738,11 @@ fn append_temporal_value<A, F>(
 ) -> Result<()>
 where
     A: Array,
-    F: Fn(&A, usize) -> Result<(usize, TemporalValue)>,
+    F: Fn(&A, &SchemaMapping, usize) -> Result<(usize, TemporalValue)>,
 {
     if array.is_null(row_index) {
         profile::record_null_cell();
+        validate_null_timestamp_timezone_metadata(mapping, row_index)?;
         let expected_len = null_temporal_cell_len_for_column(column, row_index)?;
         if measured_len != expected_len {
             return Err(invalid_payload(format!(
@@ -408,7 +756,8 @@ where
         return Ok(());
     }
 
-    let (expected_len, value) = value(array, row_index)?;
+    validate_mapping_timestamp_timezone_metadata(mapping, row_index)?;
+    let (expected_len, value) = value(array, mapping, row_index)?;
     if measured_len != expected_len {
         return Err(invalid_payload(format!(
             "measured temporal cell at row {row_index} column {} has length {}, expected {expected_len}",

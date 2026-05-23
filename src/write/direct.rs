@@ -4,12 +4,13 @@
 use arrow_array::{
     BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
     Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, RecordBatch, StringArray, UInt8Array, UInt16Array, UInt32Array,
-    UInt64Array,
+    Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 
 use crate::{
-    Diagnostic, DiagnosticCode, DiagnosticSet, Error, Result, SchemaMapping,
+    Diagnostic, DiagnosticCode, DiagnosticSet, Error, PlanOptions, Result, SchemaMapping,
     conversion::arrow_to_mssql::{
         decimal::DecimalArrowToMssql, primitive::PrimitiveArrowToMssql,
         temporal::TemporalArrowToMssql, variable_width::VariableWidthArrowToMssql,
@@ -43,7 +44,9 @@ use primitive::{
     try_encode_fixed_width_primitive_rows,
 };
 use temporal::{
-    append_date32_cell, append_date64_cell, fill_temporal_column,
+    TemporalColumnContext, append_date32_cell, append_date64_cell,
+    append_timestamp_microsecond_cell, append_timestamp_millisecond_cell,
+    append_timestamp_nanosecond_cell, append_timestamp_second_cell, fill_temporal_column,
     measure_temporal_column_cell_lengths,
 };
 use uint64::{
@@ -59,13 +62,23 @@ use variable_width::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DirectEncoder {
     mappings: Vec<SchemaMapping>,
+    plan_options: PlanOptions,
     plan: DirectEncoderPlan,
 }
 
 impl DirectEncoder {
     /// Creates a direct encoder using the current supported direct mappings.
     pub(crate) fn new(mappings: &[SchemaMapping]) -> Result<Self> {
-        Self::new_with_support(mappings, &CurrentDirectMappings)
+        Self::new_with_options(mappings, PlanOptions::default())
+    }
+
+    /// Creates a direct encoder using the current supported direct mappings and
+    /// runtime conversion policies.
+    pub(crate) fn new_with_options(
+        mappings: &[SchemaMapping],
+        plan_options: PlanOptions,
+    ) -> Result<Self> {
+        Self::new_with_options_and_support(mappings, plan_options, &CurrentDirectMappings)
     }
 
     /// Creates a direct encoder using an explicit support checker.
@@ -73,8 +86,17 @@ impl DirectEncoder {
         mappings: &[SchemaMapping],
         support: &impl plan::DirectEncoderSupport,
     ) -> Result<Self> {
+        Self::new_with_options_and_support(mappings, PlanOptions::default(), support)
+    }
+
+    pub(crate) fn new_with_options_and_support(
+        mappings: &[SchemaMapping],
+        plan_options: PlanOptions,
+        support: &impl plan::DirectEncoderSupport,
+    ) -> Result<Self> {
         Ok(Self {
             mappings: mappings.to_vec(),
+            plan_options,
             plan: DirectEncoderPlan::new(mappings, support)?,
         })
     }
@@ -325,12 +347,17 @@ impl DirectEncoder {
                     )?;
                 }
                 DirectColumnEncoding::Temporal(classification) => {
+                    let mapping = self.mapping_for_column_index(column_index)?;
                     measure_temporal_column_cell_lengths(
                         array,
-                        column,
-                        classification,
-                        column_index,
-                        column_count,
+                        TemporalColumnContext {
+                            mapping,
+                            plan_options: self.plan_options,
+                            column,
+                            classification,
+                            column_index,
+                            column_count,
+                        },
                         &mut cell_lengths,
                     )?;
                 }
@@ -466,12 +493,17 @@ impl DirectEncoder {
                     }
                 },
                 DirectColumnEncoding::Temporal(classification) => {
+                    let mapping = self.mapping_for_column_index(column_index)?;
                     fill_temporal_column(
                         array,
-                        column,
-                        classification,
-                        column_index,
-                        column_count,
+                        TemporalColumnContext {
+                            mapping,
+                            plan_options: self.plan_options,
+                            column,
+                            classification,
+                            column_index,
+                            column_count,
+                        },
                         layout,
                         bytes,
                     )?;
@@ -488,7 +520,7 @@ impl DirectEncoder {
     ) -> Result<Vec<RuntimeDirectColumn<'a>>> {
         let mut columns = Vec::with_capacity(self.plan.column_count());
 
-        for column in self.plan.columns() {
+        for (column_index, column) in self.plan.columns().iter().enumerate() {
             let Some(array) = batch
                 .columns()
                 .get(column.source_index())
@@ -621,15 +653,54 @@ impl DirectEncoder {
                 DirectColumnEncoding::Temporal(TemporalArrowToMssql::Date32ToDate) => {
                     RuntimeDirectColumn::Date32 {
                         column,
+                        mapping: self.mapping_for_column_index(column_index)?,
                         array: downcast_direct_array::<Date32Array>(array, column)?,
                     }
                 }
                 DirectColumnEncoding::Temporal(TemporalArrowToMssql::Date64ToDateTime2) => {
                     RuntimeDirectColumn::Date64 {
                         column,
+                        mapping: self.mapping_for_column_index(column_index)?,
                         array: downcast_direct_array::<Date64Array>(array, column)?,
                     }
                 }
+                DirectColumnEncoding::Temporal(
+                    classification @ (TemporalArrowToMssql::TimestampSecondToDateTime2
+                    | TemporalArrowToMssql::TimestampSecondTzToDateTime2),
+                ) => RuntimeDirectColumn::TimestampSecond {
+                    column,
+                    mapping: self.mapping_for_column_index(column_index)?,
+                    classification,
+                    array: downcast_direct_array::<TimestampSecondArray>(array, column)?,
+                },
+                DirectColumnEncoding::Temporal(
+                    classification @ (TemporalArrowToMssql::TimestampMillisecondToDateTime2
+                    | TemporalArrowToMssql::TimestampMillisecondTzToDateTime2),
+                ) => RuntimeDirectColumn::TimestampMillisecond {
+                    column,
+                    mapping: self.mapping_for_column_index(column_index)?,
+                    classification,
+                    array: downcast_direct_array::<TimestampMillisecondArray>(array, column)?,
+                },
+                DirectColumnEncoding::Temporal(
+                    classification @ (TemporalArrowToMssql::TimestampMicrosecondToDateTime2
+                    | TemporalArrowToMssql::TimestampMicrosecondTzToDateTime2),
+                ) => RuntimeDirectColumn::TimestampMicrosecond {
+                    column,
+                    mapping: self.mapping_for_column_index(column_index)?,
+                    classification,
+                    array: downcast_direct_array::<TimestampMicrosecondArray>(array, column)?,
+                },
+                DirectColumnEncoding::Temporal(
+                    classification @ (TemporalArrowToMssql::TimestampNanosecondToDateTime2
+                    | TemporalArrowToMssql::TimestampNanosecondTzToDateTime2),
+                ) => RuntimeDirectColumn::TimestampNanosecond {
+                    column,
+                    mapping: self.mapping_for_column_index(column_index)?,
+                    classification,
+                    nanosecond_policy: self.plan_options.nanosecond_policy,
+                    array: downcast_direct_array::<TimestampNanosecondArray>(array, column)?,
+                },
                 DirectColumnEncoding::Temporal(other) => {
                     return Err(unsupported_batch(format!(
                         "direct temporal append is not implemented yet for {other:?}"
@@ -641,6 +712,15 @@ impl DirectEncoder {
         }
 
         Ok(columns)
+    }
+
+    fn mapping_for_column_index(&self, column_index: usize) -> Result<&SchemaMapping> {
+        self.mappings.get(column_index).ok_or_else(|| {
+            invalid_payload(format!(
+                "direct mapping index {column_index} is outside mapping count {}",
+                self.mappings.len()
+            ))
+        })
     }
 }
 
@@ -723,11 +803,38 @@ enum RuntimeDirectColumn<'a> {
     },
     Date32 {
         column: &'a plan::DirectColumnPlan,
+        mapping: &'a SchemaMapping,
         array: &'a Date32Array,
     },
     Date64 {
         column: &'a plan::DirectColumnPlan,
+        mapping: &'a SchemaMapping,
         array: &'a Date64Array,
+    },
+    TimestampSecond {
+        column: &'a plan::DirectColumnPlan,
+        mapping: &'a SchemaMapping,
+        classification: TemporalArrowToMssql,
+        array: &'a TimestampSecondArray,
+    },
+    TimestampMillisecond {
+        column: &'a plan::DirectColumnPlan,
+        mapping: &'a SchemaMapping,
+        classification: TemporalArrowToMssql,
+        array: &'a TimestampMillisecondArray,
+    },
+    TimestampMicrosecond {
+        column: &'a plan::DirectColumnPlan,
+        mapping: &'a SchemaMapping,
+        classification: TemporalArrowToMssql,
+        array: &'a TimestampMicrosecondArray,
+    },
+    TimestampNanosecond {
+        column: &'a plan::DirectColumnPlan,
+        mapping: &'a SchemaMapping,
+        classification: TemporalArrowToMssql,
+        nanosecond_policy: crate::NanosecondPolicy,
+        array: &'a TimestampNanosecondArray,
     },
 }
 
@@ -809,12 +916,63 @@ impl RuntimeDirectColumn<'_> {
             Self::Binary { column, array } => {
                 append_varbinary_cell(buf, array, column, row_index, measured_len)
             }
-            Self::Date32 { column, array } => {
-                append_date32_cell(buf, array, column, row_index, measured_len)
-            }
-            Self::Date64 { column, array } => {
-                append_date64_cell(buf, array, column, row_index, measured_len)
-            }
+            Self::Date32 {
+                column,
+                mapping,
+                array,
+            } => append_date32_cell(buf, array, mapping, column, row_index, measured_len),
+            Self::Date64 {
+                column,
+                mapping,
+                array,
+            } => append_date64_cell(buf, array, mapping, column, row_index, measured_len),
+            Self::TimestampSecond {
+                column,
+                mapping,
+                classification: _,
+                array,
+            } => append_timestamp_second_cell(buf, array, mapping, column, row_index, measured_len),
+            Self::TimestampMillisecond {
+                column,
+                mapping,
+                classification: _,
+                array,
+            } => append_timestamp_millisecond_cell(
+                buf,
+                array,
+                mapping,
+                column,
+                row_index,
+                measured_len,
+            ),
+            Self::TimestampMicrosecond {
+                column,
+                mapping,
+                classification: _,
+                array,
+            } => append_timestamp_microsecond_cell(
+                buf,
+                array,
+                mapping,
+                column,
+                row_index,
+                measured_len,
+            ),
+            Self::TimestampNanosecond {
+                column,
+                mapping,
+                classification: _,
+                nanosecond_policy,
+                array,
+            } => append_timestamp_nanosecond_cell(
+                buf,
+                array,
+                mapping,
+                column,
+                *nanosecond_policy,
+                row_index,
+                measured_len,
+            ),
         }
     }
 }
@@ -1080,14 +1238,16 @@ mod tests {
     use arrow_array::{
         ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array,
         Decimal64Array, Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int32Array,
-        Int64Array, RecordBatch, StringArray, UInt64Array,
+        Int64Array, RecordBatch, StringArray, TimestampNanosecondArray, TimestampSecondArray,
+        UInt64Array,
     };
     use arrow_buffer::{NullBuffer, ScalarBuffer, i256};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
     use crate::{
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, MssqlTypeLength,
-        SchemaMapping, conversion::arrow_to_mssql::primitive::PrimitiveArrowToMssql,
+        NanosecondPolicy, PlanOptions, SchemaMapping,
+        conversion::arrow_to_mssql::primitive::PrimitiveArrowToMssql,
     };
 
     use super::plan::{DirectColumnEncoding, DirectEncoderSupport, DirectMappingSupport};
@@ -1591,6 +1751,164 @@ mod tests {
             DiagnosticCode::NullInNonNullableColumn,
             Some(0),
             Some((1, "datetime_value")),
+        );
+    }
+
+    #[test]
+    fn direct_encoder_encodes_timestamp_datetime2_rows() {
+        let mappings = vec![
+            mapping(
+                0,
+                "created_at",
+                DataType::Timestamp(TimeUnit::Second, None),
+                MssqlType::DateTime2 { precision: 7 },
+                true,
+            ),
+            mapping(
+                1,
+                "precise_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                MssqlType::DateTime2 { precision: 7 },
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new(
+                    "created_at",
+                    DataType::Timestamp(TimeUnit::Second, None),
+                    true,
+                ),
+                Field::new(
+                    "precise_at",
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    true,
+                ),
+            ],
+            vec![
+                Arc::new(TimestampSecondArray::from(vec![Some(0), None])) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    Some(123_456_700),
+                    Some(0),
+                ])),
+            ],
+        );
+
+        let payload = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(payload.row_token_offsets(), [0, 19]);
+        assert_eq!(
+            payload.bytes(),
+            [
+                payload::TDS_ROW_TOKEN,
+                8,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0x3A,
+                0xF9,
+                0x0A,
+                8,
+                0x87,
+                0xD6,
+                0x12,
+                0,
+                0,
+                0x3A,
+                0xF9,
+                0x0A,
+                payload::TDS_ROW_TOKEN,
+                0,
+                8,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0x3A,
+                0xF9,
+                0x0A,
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_encoder_applies_timestamp_nanosecond_policy() {
+        let mappings = vec![mapping(
+            0,
+            "precise_at",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            MssqlType::DateTime2 { precision: 7 },
+            false,
+        )];
+        let batch = record_batch(
+            vec![Field::new(
+                "precise_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            )],
+            vec![Arc::new(TimestampNanosecondArray::from(vec![150]))],
+        );
+
+        let reject = DirectEncoder::new(&mappings)
+            .unwrap()
+            .encode_batch(&batch)
+            .unwrap_err();
+        assert_value_conversion_diagnostic(
+            reject,
+            DiagnosticCode::LossyConversionRequiresPolicy,
+            Some(0),
+            Some((0, "precise_at")),
+        );
+
+        let round = DirectEncoder::new_with_options(
+            &mappings,
+            PlanOptions {
+                nanosecond_policy: NanosecondPolicy::RoundTo100ns,
+                ..PlanOptions::default()
+            },
+        )
+        .unwrap()
+        .encode_batch(&batch)
+        .unwrap();
+
+        assert_eq!(
+            round.bytes(),
+            [payload::TDS_ROW_TOKEN, 8, 2, 0, 0, 0, 0, 0x3A, 0xF9, 0x0A,]
+        );
+    }
+
+    #[test]
+    fn direct_encoder_validates_timestamp_timezone_metadata_for_nulls() {
+        let mappings = vec![mapping(
+            0,
+            "created_at",
+            DataType::Timestamp(TimeUnit::Second, Some("Foobar".into())),
+            MssqlType::DateTime2 { precision: 7 },
+            true,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Second, Some("Foobar".into())),
+                true,
+            )],
+            vec![Arc::new(
+                TimestampSecondArray::from(vec![None]).with_timezone("Foobar"),
+            )],
+        );
+
+        let err = encoder.encode_batch(&batch).unwrap_err();
+
+        assert_value_conversion_diagnostic(
+            err,
+            DiagnosticCode::TimezoneUnsupported,
+            Some(0),
+            Some((0, "created_at")),
         );
     }
 

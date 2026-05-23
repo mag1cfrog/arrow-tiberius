@@ -10,7 +10,7 @@ use super::{
 };
 use crate::mssql::cell::{MssqlDate, MssqlDateTime2, MssqlTime};
 
-pub(in crate::mssql::cell::from_arrow) fn nanoseconds_to_100ns_ticks(
+pub(crate) fn nanoseconds_to_100ns_ticks(
     mapping: &SchemaMapping,
     row_index: usize,
     nanoseconds_from_unix_epoch: i64,
@@ -50,7 +50,7 @@ pub(in crate::mssql::cell::from_arrow) fn nanoseconds_to_100ns_ticks(
     }
 }
 
-pub(in crate::mssql::cell::from_arrow) fn mssql_datetime2_from_unix_epoch_100ns_ticks(
+pub(crate) fn mssql_datetime2_from_unix_epoch_100ns_ticks(
     mapping: &SchemaMapping,
     row_index: usize,
     ticks_from_unix_epoch: i128,
@@ -99,7 +99,7 @@ pub(in crate::mssql::cell::from_arrow) fn mssql_datetime2_from_unix_epoch_100ns_
     ))
 }
 
-pub(in crate::mssql::cell::from_arrow) fn mssql_datetime2_from_arrow_timestamp_second(
+pub(crate) fn mssql_datetime2_from_arrow_timestamp_second(
     mapping: &SchemaMapping,
     row_index: usize,
     seconds_from_unix_epoch: i64,
@@ -114,7 +114,7 @@ pub(in crate::mssql::cell::from_arrow) fn mssql_datetime2_from_arrow_timestamp_s
     )
 }
 
-pub(in crate::mssql::cell::from_arrow) fn mssql_datetime2_from_arrow_timestamp_millisecond(
+pub(crate) fn mssql_datetime2_from_arrow_timestamp_millisecond(
     mapping: &SchemaMapping,
     row_index: usize,
     milliseconds_from_unix_epoch: i64,
@@ -129,7 +129,7 @@ pub(in crate::mssql::cell::from_arrow) fn mssql_datetime2_from_arrow_timestamp_m
     )
 }
 
-pub(in crate::mssql::cell::from_arrow) fn mssql_datetime2_from_arrow_timestamp_microsecond(
+pub(crate) fn mssql_datetime2_from_arrow_timestamp_microsecond(
     mapping: &SchemaMapping,
     row_index: usize,
     microseconds_from_unix_epoch: i64,
@@ -144,7 +144,7 @@ pub(in crate::mssql::cell::from_arrow) fn mssql_datetime2_from_arrow_timestamp_m
     )
 }
 
-pub(in crate::mssql::cell::from_arrow) fn mssql_datetime2_from_arrow_timestamp_nanosecond(
+pub(crate) fn mssql_datetime2_from_arrow_timestamp_nanosecond(
     mapping: &SchemaMapping,
     row_index: usize,
     nanoseconds_from_unix_epoch: i64,

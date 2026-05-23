@@ -81,7 +81,7 @@ impl WriterState {
         let backend = resolve_backend(requested_backend)?;
         let direct_encoder = match backend {
             WriteBackend::DirectFramedBulk | WriteBackend::DirectRawBulk => {
-                Some(DirectEncoder::new(&mappings)?)
+                Some(DirectEncoder::new_with_options(&mappings, plan_options)?)
             }
             WriteBackend::Auto | WriteBackend::BaselineTokenRow => None,
         };
@@ -478,6 +478,16 @@ fn expected_direct_bulk_column_type(column: &DirectColumnPlan) -> Option<tiberiu
         DirectColumnEncoding::Temporal(TemporalArrowToMssql::Date64ToDateTime2) => {
             Some(tiberius::ColumnType::Datetime2)
         }
+        DirectColumnEncoding::Temporal(
+            TemporalArrowToMssql::TimestampSecondToDateTime2
+            | TemporalArrowToMssql::TimestampMillisecondToDateTime2
+            | TemporalArrowToMssql::TimestampMicrosecondToDateTime2
+            | TemporalArrowToMssql::TimestampNanosecondToDateTime2
+            | TemporalArrowToMssql::TimestampSecondTzToDateTime2
+            | TemporalArrowToMssql::TimestampMillisecondTzToDateTime2
+            | TemporalArrowToMssql::TimestampMicrosecondTzToDateTime2
+            | TemporalArrowToMssql::TimestampNanosecondTzToDateTime2,
+        ) => Some(tiberius::ColumnType::Datetime2),
         DirectColumnEncoding::Temporal(_) => None,
     }
 }

@@ -2,7 +2,7 @@
 
 mod decimal;
 mod primitive;
-mod temporal;
+pub(crate) mod temporal;
 mod variable_width;
 
 use crate::{
