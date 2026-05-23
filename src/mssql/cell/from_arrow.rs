@@ -14,8 +14,8 @@ use super::MssqlCell;
 use decimal::{mssql_decimal_value, supports_null_decimal_cell};
 use primitive::primitive_mssql_cell;
 use temporal::{
-    mssql_date_value, mssql_datetime2_value, mssql_datetimeoffset_value, null_datetime2_cell,
-    null_datetimeoffset_cell,
+    mssql_date_value, mssql_datetime2_value, mssql_datetimeoffset_value, mssql_time_value,
+    null_datetime2_cell, null_datetimeoffset_cell, null_time_cell,
 };
 use variable_width::{nvar_char_cell, var_binary_cell};
 
@@ -80,6 +80,11 @@ pub(crate) fn mssql_cell_from_arrow_cell<'a>(
         MssqlType::Date => Ok(MssqlCell::Date(Some(mssql_date_value(
             mapping, row_index, cell,
         )?))),
+        MssqlType::Time { .. } => Ok(MssqlCell::Time(Some(mssql_time_value(
+            runtime_mapping,
+            row_index,
+            cell,
+        )?))),
         MssqlType::DateTime2 { .. } => Ok(MssqlCell::DateTime2(Some(mssql_datetime2_value(
             runtime_mapping,
             row_index,
@@ -104,6 +109,7 @@ fn null_mssql_cell<'a>(mapping: &SchemaMapping, row_index: usize) -> Result<Mssq
             Ok(MssqlCell::Decimal(None))
         }
         MssqlType::Date => Ok(MssqlCell::Date(None)),
+        MssqlType::Time { .. } => null_time_cell(mapping, row_index),
         MssqlType::DateTime2 { .. } => null_datetime2_cell(mapping, row_index),
         MssqlType::DateTimeOffset { .. } => null_datetimeoffset_cell(mapping, row_index),
         MssqlType::Real => Ok(MssqlCell::Real(None)),

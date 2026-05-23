@@ -1,6 +1,6 @@
 //! Arrow schema type to MSSQL type planning.
 
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, TimeUnit};
 
 use crate::write::{
     BinaryPolicy, Date64Policy, Decimal256Policy, DecimalPolicy, PlanOptions, StringPolicy,
@@ -49,6 +49,10 @@ pub(crate) fn plan_arrow_data_type_as_mssql_type(
         ),
         DataType::Date32 => Ok(MssqlType::Date),
         DataType::Date64 => plan_arrow_date64_as_mssql_type(options.date64_policy, index, field),
+        DataType::Time32(TimeUnit::Second) => Ok(MssqlType::Time { precision: 0 }),
+        DataType::Time32(TimeUnit::Millisecond) => Ok(MssqlType::Time { precision: 3 }),
+        DataType::Time64(TimeUnit::Microsecond) => Ok(MssqlType::Time { precision: 6 }),
+        DataType::Time64(TimeUnit::Nanosecond) => Ok(MssqlType::Time { precision: 7 }),
         DataType::Timestamp(_, timezone) => plan_arrow_timestamp_as_mssql_type(
             timezone.as_deref(),
             options.timezone_policy,
@@ -505,6 +509,22 @@ mod tests {
                 DataType::Timestamp(TimeUnit::Second, Some("".into())),
                 MssqlType::DateTime2 { precision: 7 },
             ),
+            (
+                DataType::Time32(TimeUnit::Second),
+                MssqlType::Time { precision: 0 },
+            ),
+            (
+                DataType::Time32(TimeUnit::Millisecond),
+                MssqlType::Time { precision: 3 },
+            ),
+            (
+                DataType::Time64(TimeUnit::Microsecond),
+                MssqlType::Time { precision: 6 },
+            ),
+            (
+                DataType::Time64(TimeUnit::Nanosecond),
+                MssqlType::Time { precision: 7 },
+            ),
         ];
 
         for (data_type, expected) in cases {
@@ -660,7 +680,7 @@ mod tests {
         let cases = [
             (DataType::Null, "null"),
             (DataType::Float16, "16-bit floating-point"),
-            (DataType::Time32(TimeUnit::Second), "time-only"),
+            (DataType::Time32(TimeUnit::Microsecond), "time-only"),
             (DataType::Duration(TimeUnit::Microsecond), "duration"),
             (DataType::FixedSizeBinary(16), "fixed-size binary"),
             (DataType::BinaryView, "view"),

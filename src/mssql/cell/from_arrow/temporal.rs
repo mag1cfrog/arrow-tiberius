@@ -4,6 +4,7 @@ mod date;
 mod date64;
 mod datetime2;
 mod datetimeoffset;
+mod time;
 mod timezone;
 
 use crate::{DiagnosticCode, MssqlType, Result, SchemaMapping, arrow::cell::ArrowCell};
@@ -22,6 +23,7 @@ use datetime2::{
     mssql_datetime2_from_arrow_timestamp_nanosecond, mssql_datetime2_from_arrow_timestamp_second,
 };
 pub(super) use datetimeoffset::mssql_datetimeoffset_value;
+pub(super) use time::{mssql_time_value, null_time_cell};
 use timezone::timezone_resolution_from_metadata;
 
 const SQL_SERVER_DATE_UNIX_EPOCH_DAYS: i64 = 719_162;
