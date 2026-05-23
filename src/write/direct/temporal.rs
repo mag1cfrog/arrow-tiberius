@@ -487,7 +487,7 @@ fn validate_precision(precision: u8) -> Result<()> {
     time_payload_len(precision).map(|_| ())
 }
 
-fn mssql_date_from_arrow_date32(
+pub(crate) fn mssql_date_from_arrow_date32(
     column: &DirectColumnPlan,
     row_index: usize,
     days_from_unix_epoch: i32,
@@ -506,7 +506,7 @@ fn mssql_date_from_arrow_date32(
     )))
 }
 
-fn mssql_datetime2_from_arrow_date64(
+pub(crate) fn mssql_datetime2_from_arrow_date64(
     column: &DirectColumnPlan,
     row_index: usize,
     milliseconds_from_unix_epoch: i64,

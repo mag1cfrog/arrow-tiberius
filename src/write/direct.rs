@@ -1884,6 +1884,44 @@ mod tests {
     }
 
     #[test]
+    fn direct_encoder_fixed_width_fast_path_is_active_for_date_columns() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(1, "created_on", DataType::Date32, MssqlType::Date, true),
+            mapping(
+                2,
+                "created_at",
+                DataType::Date64,
+                MssqlType::DateTime2 { precision: 3 },
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("created_on", DataType::Date32, true),
+                Field::new("created_at", DataType::Date64, true),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(Date32Array::from(vec![Some(0), None])),
+                Arc::new(Date64Array::from(vec![Some(86_400_123), Some(0)])),
+            ],
+        );
+
+        let payload = try_encode_fixed_width_primitive_rows(&batch, encoder.plan().columns())
+            .unwrap()
+            .expect("fixed-width date-family fast path should be active");
+
+        assert_eq!(payload.row_token_offsets(), [0, 17]);
+        assert_eq!(
+            payload.bytes(),
+            encoder.encode_batch(&batch).unwrap().bytes()
+        );
+    }
+
+    #[test]
     fn direct_encoder_encodes_uint64_checked_bigint_boundaries() {
         let mappings = vec![mapping(
             0,
