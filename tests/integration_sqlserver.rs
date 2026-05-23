@@ -929,6 +929,7 @@ async fn writer_round_trips_uint64_policy_values_across_supported_backends() -> 
     let decimal_schema = Arc::new(Schema::new(vec![
         Field::new("row_id", DataType::Int32, false),
         Field::new("u64_value", DataType::UInt64, true),
+        Field::new("label", DataType::Utf8, true),
     ]));
     let bigint_schema = Arc::new(Schema::new(vec![
         Field::new("row_id", DataType::Int32, false),
@@ -960,6 +961,12 @@ async fn writer_round_trips_uint64_policy_values_across_supported_backends() -> 
                 Some(0_u64),
                 Some((i64::MAX as u64) + 1),
                 Some(u64::MAX),
+                None,
+            ])),
+            Arc::new(StringArray::from(vec![
+                Some("zero"),
+                Some("over_bigint"),
+                Some("max_u64"),
                 None,
             ])),
         ],
@@ -1034,7 +1041,7 @@ async fn writer_round_trips_uint64_policy_values_across_supported_backends() -> 
 
             let decimal_rows = client
                 .simple_query(format!(
-                    "SELECT [row_id], CONVERT(varchar(40), [u64_value]) FROM {} ORDER BY [row_id]",
+                    "SELECT [row_id], CONVERT(varchar(40), [u64_value]), [label] FROM {} ORDER BY [row_id]",
                     decimal_table.quoted_sql()
                 ))
                 .await?
@@ -1053,6 +1060,11 @@ async fn writer_round_trips_uint64_policy_values_across_supported_backends() -> 
                 "decimal row 0 value",
             )?;
             ensure_eq(
+                decimal_rows[0].get::<&str, _>(2),
+                Some("zero"),
+                "decimal row 0 label",
+            )?;
+            ensure_eq(
                 decimal_rows[1].get::<i32, _>(0),
                 Some(2),
                 "decimal row 1 id",
@@ -1061,6 +1073,11 @@ async fn writer_round_trips_uint64_policy_values_across_supported_backends() -> 
                 decimal_rows[1].get::<&str, _>(1),
                 Some("9223372036854775808"),
                 "decimal row 1 value",
+            )?;
+            ensure_eq(
+                decimal_rows[1].get::<&str, _>(2),
+                Some("over_bigint"),
+                "decimal row 1 label",
             )?;
             ensure_eq(
                 decimal_rows[2].get::<i32, _>(0),
@@ -1073,6 +1090,11 @@ async fn writer_round_trips_uint64_policy_values_across_supported_backends() -> 
                 "decimal row 2 value",
             )?;
             ensure_eq(
+                decimal_rows[2].get::<&str, _>(2),
+                Some("max_u64"),
+                "decimal row 2 label",
+            )?;
+            ensure_eq(
                 decimal_rows[3].get::<i32, _>(0),
                 Some(4),
                 "decimal row 3 id",
@@ -1081,6 +1103,11 @@ async fn writer_round_trips_uint64_policy_values_across_supported_backends() -> 
                 decimal_rows[3].get::<&str, _>(1),
                 None,
                 "decimal row 3 value",
+            )?;
+            ensure_eq(
+                decimal_rows[3].get::<&str, _>(2),
+                None,
+                "decimal row 3 label",
             )?;
 
             let bigint_rows = client
