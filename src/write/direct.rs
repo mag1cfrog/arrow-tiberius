@@ -2993,6 +2993,92 @@ mod tests {
         );
     }
 
+    #[test]
+    fn direct_encoder_fixed_width_fast_path_is_active_for_time_columns() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "time_s",
+                DataType::Time32(TimeUnit::Second),
+                MssqlType::Time(MssqlTimePrecision::ZERO),
+                true,
+            ),
+            mapping(
+                2,
+                "time_ms",
+                DataType::Time32(TimeUnit::Millisecond),
+                MssqlType::Time(MssqlTimePrecision::THREE),
+                true,
+            ),
+            mapping(
+                3,
+                "time_us",
+                DataType::Time64(TimeUnit::Microsecond),
+                MssqlType::Time(MssqlTimePrecision::SIX),
+                false,
+            ),
+            mapping(
+                4,
+                "time_ns",
+                DataType::Time64(TimeUnit::Nanosecond),
+                MssqlType::Time(MssqlTimePrecision::SEVEN),
+                false,
+            ),
+        ];
+        let options = PlanOptions {
+            nanosecond_policy: NanosecondPolicy::RoundTo100ns,
+            ..PlanOptions::default()
+        };
+        let encoder = DirectEncoder::new_with_options(&mappings, options).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("time_s", DataType::Time32(TimeUnit::Second), true),
+                Field::new("time_ms", DataType::Time32(TimeUnit::Millisecond), true),
+                Field::new("time_us", DataType::Time64(TimeUnit::Microsecond), false),
+                Field::new("time_ns", DataType::Time64(TimeUnit::Nanosecond), false),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(Time32SecondArray::from(vec![Some(86_399), None])),
+                Arc::new(Time32MillisecondArray::from(vec![Some(12_345), None])),
+                Arc::new(Time64MicrosecondArray::from(vec![12_345_678, 0])),
+                Arc::new(Time64NanosecondArray::from(vec![149, 150])),
+            ],
+        );
+
+        let payload = try_encode_fixed_width_primitive_rows(
+            &batch,
+            encoder.mappings(),
+            options,
+            encoder.plan().columns(),
+        )
+        .unwrap()
+        .expect("fixed-width time fast path should be active");
+
+        assert_eq!(payload.row_token_offsets(), [0, 26]);
+        assert_eq!(
+            payload.bytes(),
+            expected_rows([
+                [
+                    int32_cell(1),
+                    time_cell(0, 86_399),
+                    time_cell(3, 12_345),
+                    time_cell(6, 12_345_678),
+                    time_cell(7, 1),
+                ],
+                [
+                    int32_cell(2),
+                    null_cell(),
+                    null_cell(),
+                    time_cell(6, 0),
+                    time_cell(7, 2),
+                ],
+            ])
+        );
+    }
+
     #[cfg(feature = "bench-profile")]
     #[test]
     fn direct_encoder_timestamp_datetime2_fast_path_matches_general_path() {
@@ -3041,6 +3127,60 @@ mod tests {
                 Arc::new(TimestampNanosecondArray::from(vec![
                     Some(150),
                     Some(-50),
+                    None,
+                ])),
+            ],
+        );
+
+        let fast_path = encoder.encode_batch(&batch).unwrap();
+        let _disable_fast_path =
+            crate::write::profile::disable_direct_fixed_width_fast_path_for_scope();
+        let general_path = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(
+            fast_path.row_token_offsets(),
+            general_path.row_token_offsets()
+        );
+        assert_eq!(fast_path.bytes(), general_path.bytes());
+    }
+
+    #[cfg(feature = "bench-profile")]
+    #[test]
+    fn direct_encoder_time_fast_path_matches_general_path() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "time_s",
+                DataType::Time32(TimeUnit::Second),
+                MssqlType::Time(MssqlTimePrecision::ZERO),
+                true,
+            ),
+            mapping(
+                2,
+                "time_ns",
+                DataType::Time64(TimeUnit::Nanosecond),
+                MssqlType::Time(MssqlTimePrecision::SEVEN),
+                true,
+            ),
+        ];
+        let options = PlanOptions {
+            nanosecond_policy: NanosecondPolicy::RoundTo100ns,
+            ..PlanOptions::default()
+        };
+        let encoder = DirectEncoder::new_with_options(&mappings, options).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("time_s", DataType::Time32(TimeUnit::Second), true),
+                Field::new("time_ns", DataType::Time64(TimeUnit::Nanosecond), true),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(Time32SecondArray::from(vec![Some(0), Some(86_399), None])),
+                Arc::new(Time64NanosecondArray::from(vec![
+                    Some(149),
+                    Some(150),
                     None,
                 ])),
             ],
