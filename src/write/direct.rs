@@ -2734,6 +2734,117 @@ mod tests {
     }
 
     #[test]
+    fn direct_encoder_fast_path_rejects_invalid_timestamp_timezone_metadata_for_nulls() {
+        let mappings = vec![mapping(
+            0,
+            "created_at",
+            DataType::Timestamp(TimeUnit::Second, Some("Foobar".into())),
+            MssqlType::DateTime2 { precision: 7 },
+            true,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Second, Some("Foobar".into())),
+                true,
+            )],
+            vec![Arc::new(
+                TimestampSecondArray::from(vec![None]).with_timezone("Foobar"),
+            )],
+        );
+
+        let err = encoder.encode_batch(&batch).unwrap_err();
+
+        assert_value_conversion_diagnostic(
+            err,
+            DiagnosticCode::TimezoneUnsupported,
+            Some(0),
+            Some((0, "created_at")),
+        );
+    }
+
+    #[cfg(feature = "bench-profile")]
+    #[test]
+    fn direct_encoder_timestamp_datetime2_fast_path_errors_match_general_path() {
+        let mappings = vec![mapping(
+            0,
+            "precise_at",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            MssqlType::DateTime2 { precision: 7 },
+            false,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let lossy_batch = record_batch(
+            vec![Field::new(
+                "precise_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            )],
+            vec![Arc::new(TimestampNanosecondArray::from(vec![101]))],
+        );
+
+        let fast_path = encoder.encode_batch(&lossy_batch).unwrap_err();
+        let _disable_fast_path =
+            crate::write::profile::disable_direct_fixed_width_fast_path_for_scope();
+        let general_path = encoder.encode_batch(&lossy_batch).unwrap_err();
+
+        assert_value_conversion_diagnostic(
+            fast_path,
+            DiagnosticCode::LossyConversionRequiresPolicy,
+            Some(0),
+            Some((0, "precise_at")),
+        );
+        assert_value_conversion_diagnostic(
+            general_path,
+            DiagnosticCode::LossyConversionRequiresPolicy,
+            Some(0),
+            Some((0, "precise_at")),
+        );
+
+        drop(_disable_fast_path);
+
+        let out_of_range_mappings = vec![mapping(
+            0,
+            "created_at",
+            DataType::Timestamp(TimeUnit::Second, None),
+            MssqlType::DateTime2 { precision: 7 },
+            false,
+        )];
+        let out_of_range_encoder = DirectEncoder::new(&out_of_range_mappings).unwrap();
+        let out_of_range_batch = record_batch(
+            vec![Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Second, None),
+                false,
+            )],
+            vec![Arc::new(TimestampSecondArray::from(vec![i64::MAX]))],
+        );
+
+        let fast_path = out_of_range_encoder
+            .encode_batch(&out_of_range_batch)
+            .unwrap_err();
+        let _disable_fast_path =
+            crate::write::profile::disable_direct_fixed_width_fast_path_for_scope();
+        let general_path = out_of_range_encoder
+            .encode_batch(&out_of_range_batch)
+            .unwrap_err();
+
+        assert_value_conversion_diagnostic(
+            fast_path,
+            DiagnosticCode::TimestampOutOfRange,
+            Some(0),
+            Some((0, "created_at")),
+        );
+        assert_value_conversion_diagnostic(
+            general_path,
+            DiagnosticCode::TimestampOutOfRange,
+            Some(0),
+            Some((0, "created_at")),
+        );
+    }
+
+    #[test]
     fn direct_encoder_encodes_uint64_checked_bigint_boundaries() {
         let mappings = vec![mapping(
             0,
