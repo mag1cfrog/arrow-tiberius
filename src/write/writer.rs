@@ -1103,6 +1103,40 @@ mod tests {
     }
 
     #[test]
+    fn direct_bulk_target_type_validation_accepts_uint64_policy_metadata() {
+        let mappings = vec![
+            schema_mapping_at(0, "checked", DataType::UInt64, MssqlType::BigInt, false),
+            schema_mapping_at(
+                1,
+                "decimal",
+                DataType::UInt64,
+                MssqlType::Decimal {
+                    precision: 20,
+                    scale: 0,
+                },
+                false,
+            ),
+        ];
+        let state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let columns = vec![
+            bulk_target_column_with_type(0, "checked", false, tiberius::ColumnType::Int8),
+            bulk_target_column_with_type(1, "decimal", false, tiberius::ColumnType::Decimaln),
+        ];
+
+        validate_direct_bulk_target_column_types(
+            columns.into_iter(),
+            state.direct_encoder().unwrap().plan(),
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn direct_bulk_target_type_validation_accepts_matching_variable_width_metadata() {
         let mappings = vec![utf8_mapping_at(0, "name"), binary_mapping_at(1, "payload")];
         let state = WriterState::new(
