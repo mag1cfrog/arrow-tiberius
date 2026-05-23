@@ -1,10 +1,9 @@
 //! Time-only Arrow-to-MSSQL runtime cell conversion.
 
-use arrow_schema::{DataType, TimeUnit};
-
 use crate::{
-    DiagnosticCode, MssqlTimePrecision, MssqlType, NanosecondPolicy, Result, SchemaMapping,
+    DiagnosticCode, NanosecondPolicy, Result, SchemaMapping,
     arrow::cell::ArrowCell,
+    conversion::arrow_to_mssql::temporal::TemporalArrowToMssql,
     mssql::cell::{MssqlCell, MssqlTime},
 };
 
@@ -26,53 +25,47 @@ pub(in crate::mssql::cell::from_arrow) fn mssql_time_value(
 ) -> Result<MssqlTime> {
     let mapping = runtime_mapping.mapping();
 
-    match (cell, mapping.arrow().data_type(), mapping.mssql().ty()) {
-        (
-            ArrowCell::Time32Second(value),
-            DataType::Time32(TimeUnit::Second),
-            MssqlType::Time(MssqlTimePrecision::ZERO),
-        ) => mssql_time_from_i64(
-            mapping,
-            row_index,
-            i64::from(value),
-            SECONDS_PER_DAY,
-            0,
-            "Time32 second",
-        ),
-        (
-            ArrowCell::Time32Millisecond(value),
-            DataType::Time32(TimeUnit::Millisecond),
-            MssqlType::Time(MssqlTimePrecision::THREE),
-        ) => mssql_time_from_i64(
-            mapping,
-            row_index,
-            i64::from(value),
-            MILLISECONDS_PER_DAY,
-            3,
-            "Time32 millisecond",
-        ),
-        (
-            ArrowCell::Time64Microsecond(value),
-            DataType::Time64(TimeUnit::Microsecond),
-            MssqlType::Time(MssqlTimePrecision::SIX),
-        ) => mssql_time_from_i64(
-            mapping,
-            row_index,
-            value,
-            MICROSECONDS_PER_DAY,
-            6,
-            "Time64 microsecond",
-        ),
-        (
-            ArrowCell::Time64Nanosecond(value),
-            DataType::Time64(TimeUnit::Nanosecond),
-            MssqlType::Time(MssqlTimePrecision::SEVEN),
-        ) => mssql_time_from_nanoseconds(
-            mapping,
-            row_index,
-            value,
-            runtime_mapping.nanosecond_policy(),
-        ),
+    let classification = TemporalArrowToMssql::classify(mapping, row_index)?;
+
+    match (cell, classification) {
+        (ArrowCell::Time32Second(value), TemporalArrowToMssql::Time32SecondToTime) => {
+            mssql_time_from_i64(
+                mapping,
+                row_index,
+                i64::from(value),
+                SECONDS_PER_DAY,
+                0,
+                "Time32 second",
+            )
+        }
+        (ArrowCell::Time32Millisecond(value), TemporalArrowToMssql::Time32MillisecondToTime) => {
+            mssql_time_from_i64(
+                mapping,
+                row_index,
+                i64::from(value),
+                MILLISECONDS_PER_DAY,
+                3,
+                "Time32 millisecond",
+            )
+        }
+        (ArrowCell::Time64Microsecond(value), TemporalArrowToMssql::Time64MicrosecondToTime) => {
+            mssql_time_from_i64(
+                mapping,
+                row_index,
+                value,
+                MICROSECONDS_PER_DAY,
+                6,
+                "Time64 microsecond",
+            )
+        }
+        (ArrowCell::Time64Nanosecond(value), TemporalArrowToMssql::Time64NanosecondToTime) => {
+            mssql_time_from_nanoseconds(
+                mapping,
+                row_index,
+                value,
+                runtime_mapping.nanosecond_policy(),
+            )
+        }
         other => Err(value_conversion_error(row_mapping_diagnostic(
             mapping,
             row_index,
@@ -86,38 +79,18 @@ pub(in crate::mssql::cell::from_arrow) fn null_time_cell<'a>(
     mapping: &SchemaMapping,
     row_index: usize,
 ) -> Result<MssqlCell<'a>> {
-    if supports_null_time_cell(mapping) {
-        Ok(MssqlCell::Time(None))
-    } else {
-        Err(value_conversion_error(row_mapping_diagnostic(
+    match TemporalArrowToMssql::classify(mapping, row_index)? {
+        TemporalArrowToMssql::Time32SecondToTime
+        | TemporalArrowToMssql::Time32MillisecondToTime
+        | TemporalArrowToMssql::Time64MicrosecondToTime
+        | TemporalArrowToMssql::Time64NanosecondToTime => Ok(MssqlCell::Time(None)),
+        classification => Err(value_conversion_error(row_mapping_diagnostic(
             mapping,
             row_index,
             DiagnosticCode::ValueConversionUnsupported,
-            format!(
-                "planned SQL Server type {} is not supported yet",
-                mapping.mssql().ty().to_sql()
-            ),
-        )))
+            format!("planned temporal mapping {classification:?} is not a time conversion"),
+        ))),
     }
-}
-
-fn supports_null_time_cell(mapping: &SchemaMapping) -> bool {
-    matches!(
-        (mapping.arrow().data_type(), mapping.mssql().ty()),
-        (
-            DataType::Time32(TimeUnit::Second),
-            MssqlType::Time(MssqlTimePrecision::ZERO)
-        ) | (
-            DataType::Time32(TimeUnit::Millisecond),
-            MssqlType::Time(MssqlTimePrecision::THREE)
-        ) | (
-            DataType::Time64(TimeUnit::Microsecond),
-            MssqlType::Time(MssqlTimePrecision::SIX)
-        ) | (
-            DataType::Time64(TimeUnit::Nanosecond),
-            MssqlType::Time(MssqlTimePrecision::SEVEN)
-        )
-    )
 }
 
 fn mssql_time_from_i64(
@@ -437,7 +410,7 @@ mod tests {
 
         assert_single_diagnostic(
             err,
-            DiagnosticCode::ValueTypeMismatch,
+            DiagnosticCode::ValueConversionUnsupported,
             Some(0),
             Some((0, "time_value")),
         );
@@ -463,7 +436,7 @@ mod tests {
 
         assert_single_diagnostic(
             err,
-            DiagnosticCode::ValueTypeMismatch,
+            DiagnosticCode::ValueConversionUnsupported,
             Some(0),
             Some((0, "time_value")),
         );

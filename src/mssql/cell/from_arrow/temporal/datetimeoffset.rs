@@ -1,14 +1,15 @@
 //! Timezone-aware Arrow timestamp to MSSQL datetimeoffset conversion.
 
-use arrow_schema::{DataType, TimeUnit};
-
-use crate::{DiagnosticCode, MssqlType, Result, SchemaMapping, arrow::cell::ArrowCell};
+use crate::{
+    DiagnosticCode, Result, SchemaMapping, arrow::cell::ArrowCell,
+    conversion::arrow_to_mssql::temporal::TemporalArrowToMssql,
+};
 
 use super::{
-    ArrowToMssqlRuntimeMapping, SQL_SERVER_DATETIME2_TIMESTAMP_SCALE, TICKS_100NS_PER_MICROSECOND,
-    TICKS_100NS_PER_MILLISECOND, TICKS_100NS_PER_SECOND,
-    datetime2::mssql_datetime2_from_unix_epoch_100ns_ticks, datetime2::nanoseconds_to_100ns_ticks,
-    row_mapping_diagnostic, timezone::timezone_resolution_from_metadata, value_conversion_error,
+    ArrowToMssqlRuntimeMapping, TICKS_100NS_PER_MICROSECOND, TICKS_100NS_PER_MILLISECOND,
+    TICKS_100NS_PER_SECOND, datetime2::mssql_datetime2_from_unix_epoch_100ns_ticks,
+    datetime2::nanoseconds_to_100ns_ticks, row_mapping_diagnostic,
+    timezone::timezone_resolution_from_metadata, value_conversion_error,
 };
 use crate::mssql::cell::MssqlDateTimeOffset;
 
@@ -18,14 +19,13 @@ pub(in crate::mssql::cell::from_arrow) fn mssql_datetimeoffset_value(
     cell: ArrowCell<'_>,
 ) -> Result<MssqlDateTimeOffset> {
     let mapping = runtime_mapping.mapping();
+    let classification = TemporalArrowToMssql::classify(mapping, row_index)?;
 
-    match (cell, mapping.arrow().data_type(), mapping.mssql().ty()) {
+    match (cell, classification, timestamp_timezone(mapping)) {
         (
             ArrowCell::TimestampSecond(value),
-            DataType::Timestamp(TimeUnit::Second, Some(timezone)),
-            MssqlType::DateTimeOffset {
-                precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
-            },
+            TemporalArrowToMssql::TimestampSecondTzToDateTimeOffset,
+            Some(timezone),
         ) => {
             let resolution = timezone_resolution_from_metadata(mapping, row_index, timezone)?;
             let offset_minutes = resolution.offset_for_instant(mapping, row_index, value, 0)?;
@@ -41,10 +41,8 @@ pub(in crate::mssql::cell::from_arrow) fn mssql_datetimeoffset_value(
         }
         (
             ArrowCell::TimestampMillisecond(value),
-            DataType::Timestamp(TimeUnit::Millisecond, Some(timezone)),
-            MssqlType::DateTimeOffset {
-                precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
-            },
+            TemporalArrowToMssql::TimestampMillisecondTzToDateTimeOffset,
+            Some(timezone),
         ) => {
             let (seconds, nanoseconds) = epoch_parts_from_milliseconds(mapping, row_index, value)?;
             let resolution = timezone_resolution_from_metadata(mapping, row_index, timezone)?;
@@ -62,10 +60,8 @@ pub(in crate::mssql::cell::from_arrow) fn mssql_datetimeoffset_value(
         }
         (
             ArrowCell::TimestampMicrosecond(value),
-            DataType::Timestamp(TimeUnit::Microsecond, Some(timezone)),
-            MssqlType::DateTimeOffset {
-                precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
-            },
+            TemporalArrowToMssql::TimestampMicrosecondTzToDateTimeOffset,
+            Some(timezone),
         ) => {
             let (seconds, nanoseconds) = epoch_parts_from_microseconds(mapping, row_index, value)?;
             let resolution = timezone_resolution_from_metadata(mapping, row_index, timezone)?;
@@ -83,10 +79,8 @@ pub(in crate::mssql::cell::from_arrow) fn mssql_datetimeoffset_value(
         }
         (
             ArrowCell::TimestampNanosecond(value),
-            DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone)),
-            MssqlType::DateTimeOffset {
-                precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
-            },
+            TemporalArrowToMssql::TimestampNanosecondTzToDateTimeOffset,
+            Some(timezone),
         ) => {
             let (seconds, nanoseconds) = epoch_parts_from_nanoseconds(mapping, row_index, value)?;
             let resolution = timezone_resolution_from_metadata(mapping, row_index, timezone)?;
@@ -116,6 +110,14 @@ pub(in crate::mssql::cell::from_arrow) fn mssql_datetimeoffset_value(
             ),
         ))),
     }
+}
+
+fn timestamp_timezone(mapping: &SchemaMapping) -> Option<&str> {
+    let arrow_schema::DataType::Timestamp(_, Some(timezone)) = mapping.arrow().data_type() else {
+        return None;
+    };
+
+    Some(timezone)
 }
 
 fn validate_datetimeoffset_local_range(

@@ -177,7 +177,7 @@ mod tests {
 
         assert_single_diagnostic(
             err,
-            DiagnosticCode::ValueTypeMismatch,
+            DiagnosticCode::ValueConversionUnsupported,
             Some(0),
             Some((0, "date_value")),
         );
