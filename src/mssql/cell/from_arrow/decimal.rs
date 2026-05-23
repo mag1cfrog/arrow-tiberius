@@ -4,7 +4,7 @@ use arrow_schema::DataType;
 
 use crate::{
     DiagnosticCode, MssqlType, Result, SchemaMapping, arrow::cell::ArrowCell,
-    mssql::cell::MssqlDecimal,
+    conversion::arrow_to_mssql::uint64::UInt64ArrowToMssql, mssql::cell::MssqlDecimal,
 };
 
 use super::{row_mapping_diagnostic, value_conversion_error};
@@ -18,7 +18,8 @@ pub(super) fn mssql_decimal_value(
     validate_decimal_scale_compatibility(mapping, row_index, scale)?;
 
     match (cell, mapping.arrow().data_type()) {
-        (ArrowCell::UInt64(value), DataType::UInt64) if is_uint64_decimal20_0_mapping(mapping) => {
+        (ArrowCell::UInt64(value), DataType::UInt64) => {
+            classify_uint64_decimal20_0(mapping, row_index)?;
             mssql_decimal(mapping, row_index, i128::from(value), scale)
         }
         (ArrowCell::Decimal32(value), DataType::Decimal32(_, arrow_scale)) if *arrow_scale >= 0 => {
@@ -81,27 +82,33 @@ pub(super) fn mssql_decimal_value(
 }
 
 pub(super) fn supports_null_decimal_cell(mapping: &SchemaMapping) -> bool {
-    matches!(
-        mapping.arrow().data_type(),
-        DataType::UInt64
-            | DataType::Decimal32(_, _)
-            | DataType::Decimal64(_, _)
-            | DataType::Decimal128(_, _)
-            | DataType::Decimal256(_, _)
-    ) && matches!(mapping.mssql().ty(), MssqlType::Decimal { .. })
+    match mapping.arrow().data_type() {
+        DataType::UInt64 => is_uint64_decimal20_0_mapping(mapping),
+        DataType::Decimal32(_, _)
+        | DataType::Decimal64(_, _)
+        | DataType::Decimal128(_, _)
+        | DataType::Decimal256(_, _) => matches!(mapping.mssql().ty(), MssqlType::Decimal { .. }),
+        _ => false,
+    }
 }
 
 fn is_uint64_decimal20_0_mapping(mapping: &SchemaMapping) -> bool {
     matches!(
-        (mapping.arrow().data_type(), mapping.mssql().ty()),
-        (
-            DataType::UInt64,
-            MssqlType::Decimal {
-                precision: 20,
-                scale: 0
-            }
-        )
+        UInt64ArrowToMssql::classify(mapping, 0),
+        Ok(UInt64ArrowToMssql::Decimal20_0)
     )
+}
+
+fn classify_uint64_decimal20_0(mapping: &SchemaMapping, row_index: usize) -> Result<()> {
+    match UInt64ArrowToMssql::classify(mapping, row_index)? {
+        UInt64ArrowToMssql::Decimal20_0 => Ok(()),
+        UInt64ArrowToMssql::CheckedBigInt => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            "planned UInt64 conversion is not decimal(20,0)",
+        ))),
+    }
 }
 
 fn decimal_scale(mapping: &SchemaMapping, row_index: usize) -> Result<u8> {
@@ -145,7 +152,10 @@ fn validate_decimal_scale_compatibility(
     planned_scale: u8,
 ) -> Result<()> {
     let expected_scale = match mapping.arrow().data_type() {
-        DataType::UInt64 if is_uint64_decimal20_0_mapping(mapping) => 0,
+        DataType::UInt64 => {
+            classify_uint64_decimal20_0(mapping, row_index)?;
+            0
+        }
         DataType::Decimal32(_, arrow_scale)
         | DataType::Decimal64(_, arrow_scale)
         | DataType::Decimal128(_, arrow_scale)
