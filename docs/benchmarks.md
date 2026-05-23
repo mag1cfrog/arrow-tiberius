@@ -28,6 +28,7 @@ Run `cargo xtask writer-bench --help` to see the authoritative scenario list.
 Current scenarios are:
 
 - `narrow_numeric`: primitive numeric throughput.
+- `extended_primitive`: small integer and real primitive throughput.
 - `mixed_nullable`: nullable primitives and short strings.
 - `wide_mixed`: ingestion-style ids, event time, categories, text, and binary
   payloads.

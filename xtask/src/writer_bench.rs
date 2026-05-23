@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 
 use crate::{odbc_runner, sqlserver};
 use arrow_array::{
-    ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int32Array,
-    Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    TimestampMillisecondArray, UInt8Array, UInt16Array, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow_tiberius::{
@@ -100,6 +101,7 @@ fn run_arrow_odbc(args: &[OsString]) -> Result<(), WriterBenchError> {
     }
 
     let options = ArrowOdbcBenchOptions::parse(args)?;
+    ensure_arrow_odbc_supported_scenario(&options.benchmark)?;
     let network = create_arrow_odbc_network(&options)?;
     let connection = options
         .sql_server
@@ -1496,6 +1498,19 @@ fn ensure_direct_raw_supported_scenario(
     )))
 }
 
+fn ensure_arrow_odbc_supported_scenario(
+    benchmark: &WriterBenchOptions,
+) -> Result<(), WriterBenchError> {
+    if !ARROW_ODBC_UNSUPPORTED_SCENARIOS.contains(&benchmark.scenario.name) {
+        return Ok(());
+    }
+
+    Err(WriterBenchError::Validation(format!(
+        "writer-bench arrow-odbc does not support scenario `{}` because arrow-odbc rejects the UInt16/UInt32 columns used by that scenario; use baseline, direct-framed, direct-raw, or odbc-bcp",
+        benchmark.scenario.name
+    )))
+}
+
 fn parse_writer_sqlserver_options(
     args: &[OsString],
     print_command_help: fn(),
@@ -2134,6 +2149,13 @@ const NARROW_NUMERIC_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDe
     columns: narrow_numeric_columns,
 };
 
+const EXTENDED_PRIMITIVE_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
+    name: "extended_primitive",
+    description: "Small integer and real primitive throughput",
+    schema: extended_primitive_schema,
+    columns: extended_primitive_columns,
+};
+
 const MIXED_NULLABLE_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
     name: "mixed_nullable",
     description: "Nullable primitives and short strings",
@@ -2223,6 +2245,7 @@ const TPCH_LINEITEM_LIKE_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenar
 
 const DIRECT_RAW_SUPPORTED_SCENARIOS: &[&str] = &[
     NARROW_NUMERIC_SCENARIO.name,
+    EXTENDED_PRIMITIVE_SCENARIO.name,
     MIXED_NULLABLE_SCENARIO.name,
     STRING_HEAVY_SCENARIO.name,
     STRING_HEAVY_TEXT_ONLY_SCENARIO.name,
@@ -2234,8 +2257,11 @@ const DIRECT_RAW_SUPPORTED_SCENARIOS: &[&str] = &[
     WIDE_SPARSE_SCENARIO.name,
 ];
 
+const ARROW_ODBC_UNSUPPORTED_SCENARIOS: &[&str] = &[EXTENDED_PRIMITIVE_SCENARIO.name];
+
 const SCENARIOS: &[BenchmarkScenarioDefinition] = &[
     NARROW_NUMERIC_SCENARIO,
+    EXTENDED_PRIMITIVE_SCENARIO,
     MIXED_NULLABLE_SCENARIO,
     WIDE_MIXED_SCENARIO,
     DECIMAL_TEMPORAL_SCENARIO,
@@ -3024,6 +3050,9 @@ fn run_compare_benchmark(
 
     if options.backends.iter().any(BenchmarkBackend::is_direct) {
         ensure_direct_raw_supported_scenario(&options.benchmark)?;
+    }
+    if options.backends.contains(&BenchmarkBackend::ArrowOdbc) {
+        ensure_arrow_odbc_supported_scenario(&options.benchmark)?;
     }
 
     let network = create_compare_network(options)?;
@@ -3931,6 +3960,88 @@ fn narrow_numeric_columns(offset: usize, len: usize) -> Result<Vec<ArrayRef>, Wr
     Ok(vec![Arc::new(id32), Arc::new(id64), Arc::new(score)])
 }
 
+fn extended_primitive_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("u8_value", DataType::UInt8, false),
+        Field::new("maybe_u8", DataType::UInt8, true),
+        Field::new("i8_value", DataType::Int8, false),
+        Field::new("maybe_i8", DataType::Int8, true),
+        Field::new("i16_value", DataType::Int16, false),
+        Field::new("maybe_i16", DataType::Int16, true),
+        Field::new("u16_value", DataType::UInt16, false),
+        Field::new("maybe_u16", DataType::UInt16, true),
+        Field::new("u32_value", DataType::UInt32, false),
+        Field::new("maybe_u32", DataType::UInt32, true),
+        Field::new("f32_value", DataType::Float32, false),
+        Field::new("maybe_f32", DataType::Float32, true),
+    ]))
+}
+
+fn extended_primitive_columns(
+    offset: usize,
+    len: usize,
+) -> Result<Vec<ArrayRef>, WriterBenchError> {
+    let u8_value = (offset..offset + len)
+        .map(|row| (row % 256) as u8)
+        .collect::<UInt8Array>();
+    let maybe_u8 = (offset..offset + len)
+        .map(|row| (row % 7 != 0).then_some((row % 256) as u8))
+        .collect::<UInt8Array>();
+    let i8_value = (offset..offset + len)
+        .map(|row| ((row % 256) as i16 - 128) as i8)
+        .collect::<Int8Array>();
+    let maybe_i8 = (offset..offset + len)
+        .map(|row| (row % 11 != 0).then_some(((row % 256) as i16 - 128) as i8))
+        .collect::<Int8Array>();
+    let i16_value = (offset..offset + len)
+        .map(|row| ((row % 65_536) as i32 - 32_768) as i16)
+        .collect::<Int16Array>();
+    let maybe_i16 = (offset..offset + len)
+        .map(|row| (row % 13 != 0).then_some(((row % 65_536) as i32 - 32_768) as i16))
+        .collect::<Int16Array>();
+    let u16_value = (offset..offset + len)
+        .map(|row| (row % 65_536) as u16)
+        .collect::<UInt16Array>();
+    let maybe_u16 = (offset..offset + len)
+        .map(|row| (row % 17 != 0).then_some((row % 65_536) as u16))
+        .collect::<UInt16Array>();
+    let u32_value = (offset..offset + len)
+        .map(|row| {
+            let value = (row as u64).wrapping_mul(1_103_515_245) & u64::from(u32::MAX);
+            value as u32
+        })
+        .collect::<UInt32Array>();
+    let maybe_u32 = (offset..offset + len)
+        .map(|row| {
+            (row % 19 != 0).then_some({
+                let value = (row as u64).wrapping_mul(2_654_435_761) & u64::from(u32::MAX);
+                value as u32
+            })
+        })
+        .collect::<UInt32Array>();
+    let f32_value = (offset..offset + len)
+        .map(|row| ((row % 10_000) as f32 - 5_000.0) / 8.0)
+        .collect::<Float32Array>();
+    let maybe_f32 = (offset..offset + len)
+        .map(|row| (row % 23 != 0).then_some(((row % 10_000) as f32 - 5_000.0) / 16.0))
+        .collect::<Float32Array>();
+
+    Ok(vec![
+        Arc::new(u8_value),
+        Arc::new(maybe_u8),
+        Arc::new(i8_value),
+        Arc::new(maybe_i8),
+        Arc::new(i16_value),
+        Arc::new(maybe_i16),
+        Arc::new(u16_value),
+        Arc::new(maybe_u16),
+        Arc::new(u32_value),
+        Arc::new(maybe_u32),
+        Arc::new(f32_value),
+        Arc::new(maybe_f32),
+    ])
+}
+
 fn mixed_nullable_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("id32", DataType::Int32, false),
@@ -4829,8 +4940,9 @@ mod tests {
         WriterBenchError, WriterBenchOptions, sqlserver_profile,
     };
     use arrow_array::{
-        Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int32Array,
-        Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
+        Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+        Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
+        TimestampMillisecondArray, UInt8Array, UInt16Array, UInt32Array,
     };
     use arrow_schema::{DataType, TimeUnit};
     use std::path::PathBuf;
@@ -5700,8 +5812,9 @@ mod tests {
     }
 
     #[test]
-    fn compare_allows_direct_raw_for_variable_width_supported_scenarios() {
+    fn compare_allows_direct_raw_for_additional_supported_scenarios() {
         for scenario in [
+            "extended_primitive",
             "mixed_nullable",
             "string_heavy",
             "string_heavy_text_only",
@@ -5750,6 +5863,7 @@ mod tests {
                 WriterBenchError::Validation(message)
                     if message.contains("direct backends")
                         && message.contains("narrow_numeric")
+                        && message.contains("extended_primitive")
                         && message.contains("mixed_nullable")
                         && message.contains("string_heavy")
                         && message.contains("string_heavy_text_only")
@@ -5855,6 +5969,28 @@ mod tests {
             WriterBenchError::Validation(message)
                 if message.contains("--arrow-odbc-autocommit")
                     && message.contains("arrow-odbc")
+        ));
+    }
+
+    #[test]
+    fn compare_rejects_extended_primitive_for_arrow_odbc() {
+        let args = [
+            OsString::from("--scenario"),
+            OsString::from("extended_primitive"),
+            OsString::from("--backends"),
+            OsString::from("baseline,arrow-odbc"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+        let err = super::run_compare_benchmark(&options).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("arrow-odbc")
+                    && message.contains("extended_primitive")
+                    && message.contains("UInt16")
+                    && message.contains("UInt32")
         ));
     }
 
@@ -6532,6 +6668,26 @@ odbc-bcp runner
     }
 
     #[test]
+    fn arrow_odbc_command_rejects_extended_primitive() {
+        let args = [
+            OsString::from("--scenario"),
+            OsString::from("extended_primitive"),
+        ];
+
+        let options = super::ArrowOdbcBenchOptions::parse(&args).unwrap();
+        let err = super::ensure_arrow_odbc_supported_scenario(&options.benchmark).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("arrow-odbc")
+                    && message.contains("extended_primitive")
+                    && message.contains("UInt16")
+                    && message.contains("UInt32")
+        ));
+    }
+
+    #[test]
     fn arrow_odbc_command_rejects_standalone_runner_image_build_flag() {
         let args = [OsString::from("--build-runner-image")];
         let err = super::ArrowOdbcBenchOptions::parse(&args).unwrap_err();
@@ -6615,6 +6771,85 @@ odbc-bcp runner
         assert!(schema.field(2).is_nullable());
         assert_eq!(schema.field(3).data_type(), &DataType::Utf8);
         assert!(schema.field(3).is_nullable());
+    }
+
+    #[test]
+    fn extended_primitive_schema_matches_definition() {
+        let options = WriterBenchOptions {
+            rows: 1,
+            batch_size: 1,
+            scenario: super::scenario_by_name("extended_primitive").unwrap(),
+            repeat: 1,
+            output: BenchmarkOutput::Human,
+        };
+
+        let batches = generated_batches(&options);
+        let schema = batches[0].schema();
+
+        assert_eq!(schema.fields().len(), 12);
+        assert_eq!(schema.field(0).data_type(), &DataType::UInt8);
+        assert!(!schema.field(0).is_nullable());
+        assert_eq!(schema.field(1).data_type(), &DataType::UInt8);
+        assert!(schema.field(1).is_nullable());
+        assert_eq!(schema.field(2).data_type(), &DataType::Int8);
+        assert!(!schema.field(2).is_nullable());
+        assert_eq!(schema.field(3).data_type(), &DataType::Int8);
+        assert!(schema.field(3).is_nullable());
+        assert_eq!(schema.field(4).data_type(), &DataType::Int16);
+        assert!(!schema.field(4).is_nullable());
+        assert_eq!(schema.field(5).data_type(), &DataType::Int16);
+        assert!(schema.field(5).is_nullable());
+        assert_eq!(schema.field(6).data_type(), &DataType::UInt16);
+        assert!(!schema.field(6).is_nullable());
+        assert_eq!(schema.field(7).data_type(), &DataType::UInt16);
+        assert!(schema.field(7).is_nullable());
+        assert_eq!(schema.field(8).data_type(), &DataType::UInt32);
+        assert!(!schema.field(8).is_nullable());
+        assert_eq!(schema.field(9).data_type(), &DataType::UInt32);
+        assert!(schema.field(9).is_nullable());
+        assert_eq!(schema.field(10).data_type(), &DataType::Float32);
+        assert!(!schema.field(10).is_nullable());
+        assert_eq!(schema.field(11).data_type(), &DataType::Float32);
+        assert!(schema.field(11).is_nullable());
+    }
+
+    #[test]
+    fn extended_primitive_runtime_array_types_and_nulls_match_schema() {
+        let options = WriterBenchOptions {
+            rows: 64,
+            batch_size: 64,
+            scenario: super::scenario_by_name("extended_primitive").unwrap(),
+            repeat: 1,
+            output: BenchmarkOutput::Human,
+        };
+
+        let batches = generated_batches(&options);
+        let batch = &batches[0];
+
+        assert!(batch.column(0).as_any().is::<UInt8Array>());
+        assert_eq!(batch.column(0).null_count(), 0);
+        assert!(batch.column(1).as_any().is::<UInt8Array>());
+        assert!(batch.column(1).null_count() > 0);
+        assert!(batch.column(2).as_any().is::<Int8Array>());
+        assert_eq!(batch.column(2).null_count(), 0);
+        assert!(batch.column(3).as_any().is::<Int8Array>());
+        assert!(batch.column(3).null_count() > 0);
+        assert!(batch.column(4).as_any().is::<Int16Array>());
+        assert_eq!(batch.column(4).null_count(), 0);
+        assert!(batch.column(5).as_any().is::<Int16Array>());
+        assert!(batch.column(5).null_count() > 0);
+        assert!(batch.column(6).as_any().is::<UInt16Array>());
+        assert_eq!(batch.column(6).null_count(), 0);
+        assert!(batch.column(7).as_any().is::<UInt16Array>());
+        assert!(batch.column(7).null_count() > 0);
+        assert!(batch.column(8).as_any().is::<UInt32Array>());
+        assert_eq!(batch.column(8).null_count(), 0);
+        assert!(batch.column(9).as_any().is::<UInt32Array>());
+        assert!(batch.column(9).null_count() > 0);
+        assert!(batch.column(10).as_any().is::<Float32Array>());
+        assert_eq!(batch.column(10).null_count(), 0);
+        assert!(batch.column(11).as_any().is::<Float32Array>());
+        assert!(batch.column(11).null_count() > 0);
     }
 
     #[test]
@@ -7187,6 +7422,7 @@ odbc-bcp runner
             names,
             [
                 "narrow_numeric",
+                "extended_primitive",
                 "mixed_nullable",
                 "wide_mixed",
                 "decimal_temporal",
