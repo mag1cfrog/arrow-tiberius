@@ -2,7 +2,7 @@
 
 mod date;
 mod date64;
-mod datetime2;
+pub(crate) mod datetime2;
 mod datetimeoffset;
 mod time;
 mod timezone;
@@ -146,7 +146,7 @@ pub(super) fn null_datetimeoffset_cell<'a>(
     }
 }
 
-fn validate_null_timestamp_timezone_metadata(
+pub(crate) fn validate_null_timestamp_timezone_metadata(
     mapping: &SchemaMapping,
     row_index: usize,
 ) -> Result<()> {
@@ -157,7 +157,7 @@ fn validate_null_timestamp_timezone_metadata(
     Ok(())
 }
 
-fn validate_mapping_timestamp_timezone_metadata(
+pub(crate) fn validate_mapping_timestamp_timezone_metadata(
     mapping: &SchemaMapping,
     row_index: usize,
 ) -> Result<()> {

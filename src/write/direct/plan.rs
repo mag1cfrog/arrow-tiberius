@@ -116,7 +116,15 @@ fn temporal_support(mapping: &SchemaMapping) -> DirectMappingSupport {
     match TemporalArrowToMssql::classify(mapping, 0) {
         Ok(
             classification @ (TemporalArrowToMssql::Date32ToDate
-            | TemporalArrowToMssql::Date64ToDateTime2),
+            | TemporalArrowToMssql::Date64ToDateTime2
+            | TemporalArrowToMssql::TimestampSecondToDateTime2
+            | TemporalArrowToMssql::TimestampMillisecondToDateTime2
+            | TemporalArrowToMssql::TimestampMicrosecondToDateTime2
+            | TemporalArrowToMssql::TimestampNanosecondToDateTime2
+            | TemporalArrowToMssql::TimestampSecondTzToDateTime2
+            | TemporalArrowToMssql::TimestampMillisecondTzToDateTime2
+            | TemporalArrowToMssql::TimestampMicrosecondTzToDateTime2
+            | TemporalArrowToMssql::TimestampNanosecondTzToDateTime2),
         ) => DirectMappingSupport::Supported {
             encoding: DirectColumnEncoding::Temporal(classification),
         },
@@ -248,11 +256,14 @@ fn generic_unsupported_reason(mapping: &SchemaMapping) -> String {
 
 #[cfg(test)]
 mod tests {
-    use arrow_schema::{DataType, TimeUnit};
+    use std::sync::Arc;
+
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
     use crate::{
-        ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlTimePrecision,
-        MssqlType, MssqlTypeLength, SchemaMapping,
+        ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlProfile,
+        MssqlTimePrecision, MssqlType, MssqlTypeLength, PlanOptions, SchemaMapping, TimezonePolicy,
+        plan_arrow_schema_to_mssql_mappings,
     };
 
     use super::{
@@ -687,6 +698,181 @@ mod tests {
     }
 
     #[test]
+    fn current_direct_support_accepts_timestamp_datetime2_mappings() {
+        let mappings = vec![
+            mapping(
+                0,
+                "ts_s",
+                DataType::Timestamp(TimeUnit::Second, None),
+                MssqlType::DateTime2 { precision: 7 },
+            ),
+            mapping(
+                1,
+                "ts_ms",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                MssqlType::DateTime2 { precision: 7 },
+            ),
+            mapping(
+                2,
+                "ts_us",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                MssqlType::DateTime2 { precision: 7 },
+            ),
+            mapping(
+                3,
+                "ts_ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                MssqlType::DateTime2 { precision: 7 },
+            ),
+            mapping(
+                4,
+                "ts_tz",
+                DataType::Timestamp(TimeUnit::Second, Some("America/New_York".into())),
+                MssqlType::DateTime2 { precision: 7 },
+            ),
+        ];
+
+        let plan = DirectEncoderPlan::new(&mappings, &CurrentDirectMappings)
+            .expect("timestamp datetime2 direct encoding should be supported");
+
+        assert_eq!(
+            plan.columns()
+                .iter()
+                .map(|column| column.encoding())
+                .collect::<Vec<_>>(),
+            [
+                DirectColumnEncoding::Temporal(TemporalArrowToMssql::TimestampSecondToDateTime2),
+                DirectColumnEncoding::Temporal(
+                    TemporalArrowToMssql::TimestampMillisecondToDateTime2
+                ),
+                DirectColumnEncoding::Temporal(
+                    TemporalArrowToMssql::TimestampMicrosecondToDateTime2
+                ),
+                DirectColumnEncoding::Temporal(
+                    TemporalArrowToMssql::TimestampNanosecondToDateTime2
+                ),
+                DirectColumnEncoding::Temporal(TemporalArrowToMssql::TimestampSecondTzToDateTime2),
+            ]
+        );
+    }
+
+    #[test]
+    fn current_direct_support_accepts_timezone_aware_timestamps_planned_as_datetime2() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![
+                Field::new(
+                    "ts_s",
+                    DataType::Timestamp(TimeUnit::Second, Some("America/New_York".into())),
+                    false,
+                ),
+                Field::new(
+                    "ts_ms",
+                    DataType::Timestamp(TimeUnit::Millisecond, Some("+02:30".into())),
+                    false,
+                ),
+                Field::new(
+                    "ts_us",
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                    false,
+                ),
+                Field::new(
+                    "ts_ns",
+                    DataType::Timestamp(TimeUnit::Nanosecond, Some("-07".into())),
+                    false,
+                ),
+            ]),
+            PlanOptions {
+                timezone_policy: TimezonePolicy::NormalizeUtcDateTime2,
+                ..PlanOptions::default()
+            },
+        );
+
+        let plan = DirectEncoderPlan::new(&mappings, &CurrentDirectMappings)
+            .expect("normalized timezone-aware timestamp datetime2 mappings should be direct");
+
+        assert_eq!(
+            plan.columns()
+                .iter()
+                .map(|column| column.encoding())
+                .collect::<Vec<_>>(),
+            [
+                DirectColumnEncoding::Temporal(TemporalArrowToMssql::TimestampSecondTzToDateTime2),
+                DirectColumnEncoding::Temporal(
+                    TemporalArrowToMssql::TimestampMillisecondTzToDateTime2
+                ),
+                DirectColumnEncoding::Temporal(
+                    TemporalArrowToMssql::TimestampMicrosecondTzToDateTime2
+                ),
+                DirectColumnEncoding::Temporal(
+                    TemporalArrowToMssql::TimestampNanosecondTzToDateTime2
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn current_direct_support_rejects_timezone_aware_timestamps_planned_as_datetimeoffset() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![
+                Field::new(
+                    "ts_s",
+                    DataType::Timestamp(TimeUnit::Second, Some("+00:00".into())),
+                    false,
+                ),
+                Field::new(
+                    "ts_ms",
+                    DataType::Timestamp(TimeUnit::Millisecond, Some("+00:00".into())),
+                    false,
+                ),
+                Field::new(
+                    "ts_us",
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                    false,
+                ),
+                Field::new(
+                    "ts_ns",
+                    DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())),
+                    false,
+                ),
+            ]),
+            PlanOptions {
+                timezone_policy: TimezonePolicy::DateTimeOffset,
+                ..PlanOptions::default()
+            },
+        );
+
+        let err = DirectEncoderPlan::new(&mappings, &CurrentDirectMappings)
+            .expect_err("datetimeoffset direct encoding is outside issue 92");
+
+        let Error::DirectEncoding { diagnostics } = err else {
+            panic!("expected direct encoding error");
+        };
+
+        assert_eq!(diagnostics.len(), 4);
+        let messages = diagnostics
+            .all()
+            .iter()
+            .map(|diagnostic| diagnostic.message())
+            .collect::<Vec<_>>();
+        assert!(
+            messages[0].contains("TimestampSecondTzToDateTimeOffset"),
+            "{messages:?}"
+        );
+        assert!(
+            messages[1].contains("TimestampMillisecondTzToDateTimeOffset"),
+            "{messages:?}"
+        );
+        assert!(
+            messages[2].contains("TimestampMicrosecondTzToDateTimeOffset"),
+            "{messages:?}"
+        );
+        assert!(
+            messages[3].contains("TimestampNanosecondTzToDateTimeOffset"),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
     fn current_direct_support_rejects_temporal_mappings_with_classifier_reason() {
         let mappings = vec![
             mapping(
@@ -771,6 +957,20 @@ mod tests {
             ArrowFieldRef::new(index, name.to_owned(), false, arrow_type),
             MssqlColumn::new(Identifier::new(name).unwrap(), mssql_type, false),
         )
+    }
+
+    fn mappings_for_schema_with_options(
+        schema: Schema,
+        options: PlanOptions,
+    ) -> Vec<SchemaMapping> {
+        plan_arrow_schema_to_mssql_mappings(
+            Arc::new(schema),
+            MssqlProfile::sql_server_2016_compat_100(),
+            options,
+        )
+        .unwrap()
+        .into_parts()
+        .0
     }
 
     fn decimal_type(precision: u8, scale: i8) -> MssqlType {
