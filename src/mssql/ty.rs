@@ -9,6 +9,35 @@ pub enum MssqlTypeLength {
     Max,
 }
 
+/// SQL Server `time(p)` precision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MssqlTimePrecision(u8);
+
+impl MssqlTimePrecision {
+    /// SQL Server `time(0)` precision.
+    pub const ZERO: Self = Self(0);
+    /// SQL Server `time(3)` precision.
+    pub const THREE: Self = Self(3);
+    /// SQL Server `time(6)` precision.
+    pub const SIX: Self = Self(6);
+    /// SQL Server `time(7)` precision.
+    pub const SEVEN: Self = Self(7);
+
+    /// Creates a SQL Server `time(p)` precision when `p` is valid.
+    pub const fn new(precision: u8) -> Option<Self> {
+        if precision <= 7 {
+            Some(Self(precision))
+        } else {
+            None
+        }
+    }
+
+    /// Returns the raw SQL Server precision value.
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
 impl MssqlTypeLength {
     fn render(self) -> String {
         match self {
@@ -52,6 +81,8 @@ pub enum MssqlType {
     },
     /// SQL Server `date`.
     Date,
+    /// SQL Server `time(p)`.
+    Time(MssqlTimePrecision),
     /// SQL Server `datetime2(p)`.
     DateTime2 {
         /// Fractional seconds precision.
@@ -79,6 +110,7 @@ impl MssqlType {
             Self::VarBinary(length) => format!("varbinary({})", length.render()),
             Self::Decimal { precision, scale } => format!("decimal({precision},{scale})"),
             Self::Date => "date".to_owned(),
+            Self::Time(precision) => format!("time({})", precision.get()),
             Self::DateTime2 { precision } => format!("datetime2({precision})"),
             Self::DateTimeOffset { precision } => format!("datetimeoffset({precision})"),
         }
@@ -87,7 +119,7 @@ impl MssqlType {
 
 #[cfg(test)]
 mod tests {
-    use super::{MssqlType, MssqlTypeLength};
+    use super::{MssqlTimePrecision, MssqlType, MssqlTypeLength};
 
     #[test]
     fn renders_primitive_types() {
@@ -132,6 +164,35 @@ mod tests {
         );
         assert_eq!(MssqlType::Date.to_sql(), "date");
         assert_eq!(
+            MssqlType::Time(MssqlTimePrecision::ZERO).to_sql(),
+            "time(0)"
+        );
+        assert_eq!(
+            MssqlType::Time(MssqlTimePrecision::THREE).to_sql(),
+            "time(3)"
+        );
+        assert_eq!(MssqlType::Time(MssqlTimePrecision::SIX).to_sql(), "time(6)");
+        assert_eq!(
+            MssqlType::Time(MssqlTimePrecision::SEVEN).to_sql(),
+            "time(7)"
+        );
+        assert_eq!(
+            MssqlType::Time(MssqlTimePrecision::new(1).unwrap()).to_sql(),
+            "time(1)"
+        );
+        assert_eq!(
+            MssqlType::Time(MssqlTimePrecision::new(2).unwrap()).to_sql(),
+            "time(2)"
+        );
+        assert_eq!(
+            MssqlType::Time(MssqlTimePrecision::new(4).unwrap()).to_sql(),
+            "time(4)"
+        );
+        assert_eq!(
+            MssqlType::Time(MssqlTimePrecision::new(5).unwrap()).to_sql(),
+            "time(5)"
+        );
+        assert_eq!(
             MssqlType::DateTime2 { precision: 7 }.to_sql(),
             "datetime2(7)"
         );
@@ -139,5 +200,14 @@ mod tests {
             MssqlType::DateTimeOffset { precision: 7 }.to_sql(),
             "datetimeoffset(7)"
         );
+    }
+
+    #[test]
+    fn rejects_invalid_time_precision() {
+        for precision in 0..=7 {
+            assert_eq!(MssqlTimePrecision::new(precision).unwrap().get(), precision);
+        }
+        assert_eq!(MssqlTimePrecision::new(8), None);
+        assert_eq!(MssqlTimePrecision::new(u8::MAX), None);
     }
 }

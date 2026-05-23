@@ -37,6 +37,7 @@ pub(crate) fn mssql_cell_to_tiberius_borrowed(cell: MssqlCell<'_>) -> tiberius::
         MssqlCell::BigInt(value) => tiberius::ColumnData::I64(value),
         MssqlCell::Decimal(value) => tiberius::ColumnData::Numeric(value.map(tiberius_numeric)),
         MssqlCell::Date(value) => tiberius::ColumnData::Date(value.map(tiberius_date)),
+        MssqlCell::Time(value) => tiberius::ColumnData::Time(value.map(tiberius_time)),
         MssqlCell::DateTime2(value) => {
             tiberius::ColumnData::DateTime2(value.map(tiberius_datetime2))
         }
@@ -60,6 +61,7 @@ pub(crate) fn mssql_cell_to_tiberius_owned(cell: MssqlCell<'_>) -> tiberius::Col
         MssqlCell::BigInt(value) => tiberius::ColumnData::I64(value),
         MssqlCell::Decimal(value) => tiberius::ColumnData::Numeric(value.map(tiberius_numeric)),
         MssqlCell::Date(value) => tiberius::ColumnData::Date(value.map(tiberius_date)),
+        MssqlCell::Time(value) => tiberius::ColumnData::Time(value.map(tiberius_time)),
         MssqlCell::DateTime2(value) => {
             tiberius::ColumnData::DateTime2(value.map(tiberius_datetime2))
         }
@@ -219,6 +221,10 @@ mod tests {
             tiberius::ColumnData::Date(Some(tiberius::time::Date::new(719_163)))
         );
         assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::Time(Some(MssqlTime::new(12_345, 3)))),
+            tiberius::ColumnData::Time(Some(tiberius::time::Time::new(12_345, 3)))
+        );
+        assert_eq!(
             mssql_cell_to_tiberius_borrowed(MssqlCell::DateTime2(Some(MssqlDateTime2::new(
                 MssqlDate::new(719_163),
                 MssqlTime::new(12_345, 4),
@@ -272,6 +278,10 @@ mod tests {
             mssql_cell_to_tiberius_borrowed(MssqlCell::VarBinary(None)),
             tiberius::ColumnData::Binary(None)
         );
+        assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::Time(None)),
+            tiberius::ColumnData::Time(None)
+        );
     }
 
     #[test]
@@ -289,6 +299,10 @@ mod tests {
         assert_eq!(
             mssql_cell_to_tiberius_owned(MssqlCell::Date(Some(MssqlDate::new(719_163)))),
             tiberius::ColumnData::Date(Some(tiberius::time::Date::new(719_163)))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_owned(MssqlCell::Time(Some(MssqlTime::new(12_345, 3)))),
+            tiberius::ColumnData::Time(Some(tiberius::time::Time::new(12_345, 3)))
         );
         assert_eq!(
             mssql_cell_to_tiberius_owned(MssqlCell::Real(Some(1.25))),

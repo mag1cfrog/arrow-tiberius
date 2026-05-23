@@ -33,8 +33,8 @@ pub fn create_table_sql(
 #[cfg(test)]
 mod tests {
     use crate::{
-        CreateTableOptions, Identifier, MssqlColumn, MssqlType, MssqlTypeLength, TableName,
-        create_table_sql,
+        CreateTableOptions, Identifier, MssqlColumn, MssqlTimePrecision, MssqlType,
+        MssqlTypeLength, TableName, create_table_sql,
     };
 
     #[test]
@@ -101,6 +101,11 @@ mod tests {
                 true,
             ),
             MssqlColumn::new(
+                Identifier::new("event_time").unwrap(),
+                MssqlType::Time(MssqlTimePrecision::SEVEN),
+                true,
+            ),
+            MssqlColumn::new(
                 Identifier::new("created_at").unwrap(),
                 MssqlType::DateTime2 { precision: 7 },
                 false,
@@ -116,7 +121,7 @@ mod tests {
 
         assert_eq!(
             sql,
-            "CREATE TABLE [dbo].[events] (\n    [amount] decimal(38,9) NOT NULL,\n    [event_date] date NULL,\n    [created_at] datetime2(7) NOT NULL,\n    [source_offset] datetimeoffset(7) NULL\n);"
+            "CREATE TABLE [dbo].[events] (\n    [amount] decimal(38,9) NOT NULL,\n    [event_date] date NULL,\n    [event_time] time(7) NULL,\n    [created_at] datetime2(7) NOT NULL,\n    [source_offset] datetimeoffset(7) NULL\n);"
         );
     }
 }

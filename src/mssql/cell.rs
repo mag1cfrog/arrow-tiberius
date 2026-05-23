@@ -20,6 +20,8 @@ pub(crate) enum MssqlCell<'a> {
     Decimal(Option<MssqlDecimal>),
     /// SQL Server `date` cell.
     Date(Option<MssqlDate>),
+    /// SQL Server `time` cell.
+    Time(Option<MssqlTime>),
     /// SQL Server `datetime2` cell.
     DateTime2(Option<MssqlDateTime2>),
     /// SQL Server `datetimeoffset` cell.

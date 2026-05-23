@@ -4,6 +4,7 @@ use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
     Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array,
     Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
+    Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
     TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
     TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
@@ -47,6 +48,14 @@ pub(crate) enum ArrowCell<'a> {
     Date32(i32),
     /// Arrow Date64 millisecond timestamp from Unix epoch.
     Date64(i64),
+    /// Arrow Time32 second offset from midnight.
+    Time32Second(i32),
+    /// Arrow Time32 millisecond offset from midnight.
+    Time32Millisecond(i32),
+    /// Arrow Time64 microsecond offset from midnight.
+    Time64Microsecond(i64),
+    /// Arrow Time64 nanosecond offset from midnight.
+    Time64Nanosecond(i64),
     /// Arrow timestamp second offset from Unix epoch.
     TimestampSecond(i64),
     /// Arrow timestamp millisecond offset from Unix epoch.
@@ -135,6 +144,36 @@ pub(crate) fn extract_arrow_cell<'a>(
             let array = downcast_array::<Date64Array>(array, mapping, row_index)?;
             Ok(ArrowCell::Date64(array.value(row_index)))
         }
+        DataType::Time32(time_unit) => match time_unit {
+            TimeUnit::Second => {
+                let array = downcast_array::<Time32SecondArray>(array, mapping, row_index)?;
+                Ok(ArrowCell::Time32Second(array.value(row_index)))
+            }
+            TimeUnit::Millisecond => {
+                let array = downcast_array::<Time32MillisecondArray>(array, mapping, row_index)?;
+                Ok(ArrowCell::Time32Millisecond(array.value(row_index)))
+            }
+            other => Err(unsupported_value_conversion(
+                mapping,
+                row_index,
+                format!("Arrow Time32 unit {other:?} is not supported for value extraction"),
+            )),
+        },
+        DataType::Time64(time_unit) => match time_unit {
+            TimeUnit::Microsecond => {
+                let array = downcast_array::<Time64MicrosecondArray>(array, mapping, row_index)?;
+                Ok(ArrowCell::Time64Microsecond(array.value(row_index)))
+            }
+            TimeUnit::Nanosecond => {
+                let array = downcast_array::<Time64NanosecondArray>(array, mapping, row_index)?;
+                Ok(ArrowCell::Time64Nanosecond(array.value(row_index)))
+            }
+            other => Err(unsupported_value_conversion(
+                mapping,
+                row_index,
+                format!("Arrow Time64 unit {other:?} is not supported for value extraction"),
+            )),
+        },
         DataType::Timestamp(time_unit, _) => match time_unit {
             TimeUnit::Second => {
                 let array = downcast_array::<TimestampSecondArray>(array, mapping, row_index)?;
@@ -245,6 +284,7 @@ mod tests {
         ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array,
         Decimal64Array, Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array,
         Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
+        Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
         TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
         TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     };
@@ -594,6 +634,46 @@ mod tests {
         assert_eq!(
             extract_arrow_cell(&date64, &date64_mapping, 3).unwrap(),
             ArrowCell::Null
+        );
+    }
+
+    #[test]
+    fn extracts_time_arrow_cells() {
+        let time32_s = Time32SecondArray::from(vec![Some(0_i32), Some(42_i32), None]);
+        let time32_ms = Time32MillisecondArray::from(vec![Some(0_i32), Some(42_123_i32), None]);
+        let time64_us = Time64MicrosecondArray::from(vec![Some(0_i64), Some(42_123_456_i64), None]);
+        let time64_ns =
+            Time64NanosecondArray::from(vec![Some(0_i64), Some(42_123_456_789_i64), None]);
+
+        let time32_s_mapping = mapping("time32_s", DataType::Time32(TimeUnit::Second));
+        let time32_ms_mapping = mapping("time32_ms", DataType::Time32(TimeUnit::Millisecond));
+        let time64_us_mapping = mapping("time64_us", DataType::Time64(TimeUnit::Microsecond));
+        let time64_ns_mapping = mapping("time64_ns", DataType::Time64(TimeUnit::Nanosecond));
+
+        assert_eq!(
+            extract_arrow_cell(&time32_s, &time32_s_mapping, 0).unwrap(),
+            ArrowCell::Time32Second(0)
+        );
+        assert_eq!(
+            extract_arrow_cell(&time32_s, &time32_s_mapping, 1).unwrap(),
+            ArrowCell::Time32Second(42)
+        );
+        assert_eq!(
+            extract_arrow_cell(&time32_s, &time32_s_mapping, 2).unwrap(),
+            ArrowCell::Null
+        );
+
+        assert_eq!(
+            extract_arrow_cell(&time32_ms, &time32_ms_mapping, 1).unwrap(),
+            ArrowCell::Time32Millisecond(42_123)
+        );
+        assert_eq!(
+            extract_arrow_cell(&time64_us, &time64_us_mapping, 1).unwrap(),
+            ArrowCell::Time64Microsecond(42_123_456)
+        );
+        assert_eq!(
+            extract_arrow_cell(&time64_ns, &time64_ns_mapping, 1).unwrap(),
+            ArrowCell::Time64Nanosecond(42_123_456_789)
         );
     }
 
