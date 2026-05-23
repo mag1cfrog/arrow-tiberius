@@ -12,12 +12,12 @@ use crate::{odbc_runner, sqlserver};
 use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
     Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
-    TimestampMillisecondArray, UInt8Array, UInt16Array, UInt32Array,
+    TimestampMillisecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow_tiberius::{
-    BulkWriter, MssqlProfile, PlanOptions, SchemaMapping, TableName, WriteBackend, WriteOptions,
-    create_table_sql_from_mappings, plan_arrow_schema_to_mssql_mappings,
+    BulkWriter, MssqlProfile, PlanOptions, SchemaMapping, TableName, UInt64Policy, WriteBackend,
+    WriteOptions, create_table_sql_from_mappings, plan_arrow_schema_to_mssql_mappings,
     write::profile::DirectWriteProfile,
 };
 use tokio::net::TcpStream;
@@ -1506,7 +1506,20 @@ fn ensure_arrow_odbc_supported_scenario(
     }
 
     Err(WriterBenchError::Validation(format!(
-        "writer-bench arrow-odbc does not support scenario `{}` because arrow-odbc rejects the UInt16/UInt32 columns used by that scenario; use baseline, direct-framed, direct-raw, or odbc-bcp",
+        "writer-bench arrow-odbc does not support scenario `{}` because this benchmark path does not support the unsigned integer mappings used by that scenario; choose a backend that supports this scenario",
+        benchmark.scenario.name
+    )))
+}
+
+fn ensure_odbc_bcp_supported_scenario(
+    benchmark: &WriterBenchOptions,
+) -> Result<(), WriterBenchError> {
+    if !ODBC_BCP_UNSUPPORTED_SCENARIOS.contains(&benchmark.scenario.name) {
+        return Ok(());
+    }
+
+    Err(WriterBenchError::Validation(format!(
+        "writer-bench odbc-bcp does not support scenario `{}` because the ODBC BCP runner does not support UInt64 columns yet; use baseline, direct-framed, or direct-raw",
         benchmark.scenario.name
     )))
 }
@@ -1939,8 +1952,7 @@ fn arrow_odbc_create_table_sql_template(
 ) -> Result<String, WriterBenchError> {
     let placeholder_table =
         TableName::new("dbo", ODBC_TABLE_PLACEHOLDER).map_err(WriterBenchError::ArrowTiberius)?;
-    let schema = (benchmark.scenario.schema)();
-    let mappings = benchmark_mappings_for_schema(schema)?;
+    let mappings = benchmark_mappings_for_scenario(benchmark.scenario)?;
     let sql = benchmark_table_sql(&placeholder_table, &mappings);
     let quoted_placeholder = placeholder_table.quoted_sql();
     let sql = if bulk_table_lock {
@@ -2156,6 +2168,13 @@ const EXTENDED_PRIMITIVE_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenar
     columns: extended_primitive_columns,
 };
 
+const UINT64_POLICY_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
+    name: "uint64_policy",
+    description: "UInt64 decimal(20,0) policy throughput",
+    schema: uint64_policy_schema,
+    columns: uint64_policy_columns,
+};
+
 const MIXED_NULLABLE_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
     name: "mixed_nullable",
     description: "Nullable primitives and short strings",
@@ -2246,6 +2265,7 @@ const TPCH_LINEITEM_LIKE_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenar
 const DIRECT_RAW_SUPPORTED_SCENARIOS: &[&str] = &[
     NARROW_NUMERIC_SCENARIO.name,
     EXTENDED_PRIMITIVE_SCENARIO.name,
+    UINT64_POLICY_SCENARIO.name,
     MIXED_NULLABLE_SCENARIO.name,
     STRING_HEAVY_SCENARIO.name,
     STRING_HEAVY_TEXT_ONLY_SCENARIO.name,
@@ -2257,11 +2277,16 @@ const DIRECT_RAW_SUPPORTED_SCENARIOS: &[&str] = &[
     WIDE_SPARSE_SCENARIO.name,
 ];
 
-const ARROW_ODBC_UNSUPPORTED_SCENARIOS: &[&str] = &[EXTENDED_PRIMITIVE_SCENARIO.name];
+const ARROW_ODBC_UNSUPPORTED_SCENARIOS: &[&str] = &[
+    EXTENDED_PRIMITIVE_SCENARIO.name,
+    UINT64_POLICY_SCENARIO.name,
+];
+const ODBC_BCP_UNSUPPORTED_SCENARIOS: &[&str] = &[UINT64_POLICY_SCENARIO.name];
 
 const SCENARIOS: &[BenchmarkScenarioDefinition] = &[
     NARROW_NUMERIC_SCENARIO,
     EXTENDED_PRIMITIVE_SCENARIO,
+    UINT64_POLICY_SCENARIO,
     MIXED_NULLABLE_SCENARIO,
     WIDE_MIXED_SCENARIO,
     DECIMAL_TEMPORAL_SCENARIO,
@@ -3054,6 +3079,9 @@ fn run_compare_benchmark(
     if options.backends.contains(&BenchmarkBackend::ArrowOdbc) {
         ensure_arrow_odbc_supported_scenario(&options.benchmark)?;
     }
+    if options.backends.contains(&BenchmarkBackend::OdbcBcp) {
+        ensure_odbc_bcp_supported_scenario(&options.benchmark)?;
+    }
 
     let network = create_compare_network(options)?;
     let connection = options
@@ -3266,8 +3294,7 @@ async fn run_tiberius_benchmark_from_ipc(
     } else {
         None
     };
-    let schema = (benchmark.scenario.schema)();
-    let mappings = benchmark_mappings_for_schema(Arc::clone(&schema))?;
+    let mappings = benchmark_mappings_for_scenario(benchmark.scenario)?;
     report.timings.setup += setup_start.elapsed();
 
     for _repeat_index in 0..benchmark.repeat {
@@ -3884,13 +3911,41 @@ fn escape_sql_string_literal(value: &str) -> String {
     value.replace('\'', "''")
 }
 
+#[cfg(test)]
 fn benchmark_mappings_for_schema(
     schema: SchemaRef,
+) -> Result<Vec<SchemaMapping>, WriterBenchError> {
+    benchmark_mappings_for_schema_with_options(schema, PlanOptions::default())
+}
+
+fn benchmark_mappings_for_scenario(
+    scenario: &BenchmarkScenarioDefinition,
+) -> Result<Vec<SchemaMapping>, WriterBenchError> {
+    benchmark_mappings_for_schema_with_options(
+        (scenario.schema)(),
+        benchmark_plan_options(scenario),
+    )
+}
+
+fn benchmark_plan_options(scenario: &BenchmarkScenarioDefinition) -> PlanOptions {
+    if scenario.name == UINT64_POLICY_SCENARIO.name {
+        return PlanOptions {
+            uint64_policy: UInt64Policy::Decimal20_0,
+            ..PlanOptions::default()
+        };
+    }
+
+    PlanOptions::default()
+}
+
+fn benchmark_mappings_for_schema_with_options(
+    schema: SchemaRef,
+    plan_options: PlanOptions,
 ) -> Result<Vec<SchemaMapping>, WriterBenchError> {
     let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
         schema,
         MssqlProfile::sql_server_2016_compat_100(),
-        PlanOptions::default(),
+        plan_options,
     )
     .map_err(WriterBenchError::ArrowTiberius)?
     .into_parts();
@@ -4039,6 +4094,42 @@ fn extended_primitive_columns(
         Arc::new(maybe_u32),
         Arc::new(f32_value),
         Arc::new(maybe_f32),
+    ])
+}
+
+fn uint64_policy_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::Int32, false),
+        Field::new("u64_small", DataType::UInt64, false),
+        Field::new("u64_mid", DataType::UInt64, false),
+        Field::new("u64_full", DataType::UInt64, false),
+        Field::new("maybe_u64_full", DataType::UInt64, true),
+    ]))
+}
+
+fn uint64_policy_columns(offset: usize, len: usize) -> Result<Vec<ArrayRef>, WriterBenchError> {
+    let row_id = (offset..offset + len)
+        .map(deterministic_i32)
+        .collect::<Int32Array>();
+    let u64_small = (offset..offset + len)
+        .map(|row| (row % 1_000_000_000) as u64)
+        .collect::<UInt64Array>();
+    let u64_mid = (offset..offset + len)
+        .map(|row| i64::MAX as u64 - (row % 1_000_000) as u64)
+        .collect::<UInt64Array>();
+    let u64_full = (offset..offset + len)
+        .map(|row| u64::MAX - (row % 1_000_000) as u64)
+        .collect::<UInt64Array>();
+    let maybe_u64_full = (offset..offset + len)
+        .map(|row| (row % 13 != 0).then_some(u64::MAX - (row % 1_000_000) as u64))
+        .collect::<UInt64Array>();
+
+    Ok(vec![
+        Arc::new(row_id),
+        Arc::new(u64_small),
+        Arc::new(u64_mid),
+        Arc::new(u64_full),
+        Arc::new(maybe_u64_full),
     ])
 }
 
@@ -4942,9 +5033,10 @@ mod tests {
     use arrow_array::{
         Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
         Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
-        TimestampMillisecondArray, UInt8Array, UInt16Array, UInt32Array,
+        TimestampMillisecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     };
     use arrow_schema::{DataType, TimeUnit};
+    use arrow_tiberius::MssqlType;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::{ffi::OsString, time::Duration};
@@ -5815,6 +5907,7 @@ mod tests {
     fn compare_allows_direct_raw_for_additional_supported_scenarios() {
         for scenario in [
             "extended_primitive",
+            "uint64_policy",
             "mixed_nullable",
             "string_heavy",
             "string_heavy_text_only",
@@ -5864,6 +5957,7 @@ mod tests {
                     if message.contains("direct backends")
                         && message.contains("narrow_numeric")
                         && message.contains("extended_primitive")
+                        && message.contains("uint64_policy")
                         && message.contains("mixed_nullable")
                         && message.contains("string_heavy")
                         && message.contains("string_heavy_text_only")
@@ -5989,8 +6083,28 @@ mod tests {
             WriterBenchError::Validation(message)
                 if message.contains("arrow-odbc")
                     && message.contains("extended_primitive")
-                    && message.contains("UInt16")
-                    && message.contains("UInt32")
+                    && message.contains("unsigned integer mappings")
+        ));
+    }
+
+    #[test]
+    fn compare_rejects_uint64_policy_for_odbc_bcp() {
+        let args = [
+            OsString::from("--scenario"),
+            OsString::from("uint64_policy"),
+            OsString::from("--backends"),
+            OsString::from("baseline,odbc-bcp"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+        let err = super::run_compare_benchmark(&options).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("odbc-bcp")
+                    && message.contains("uint64_policy")
+                    && message.contains("UInt64")
         ));
     }
 
@@ -6168,6 +6282,19 @@ mod tests {
         assert_eq!(
             sql,
             "CREATE TABLE [dbo].[bench] (\n    [id32] int NOT NULL,\n    [maybe_id64] bigint NULL,\n    [maybe_score] float(53) NULL,\n    [category] nvarchar(max) NULL\n);"
+        );
+    }
+
+    #[test]
+    fn renders_uint64_policy_benchmark_table_ddl() {
+        let table = arrow_tiberius::TableName::new("dbo", "bench").unwrap();
+        let scenario = super::scenario_by_name("uint64_policy").unwrap();
+        let mappings = super::benchmark_mappings_for_scenario(scenario).unwrap();
+        let sql = super::benchmark_table_sql(&table, &mappings);
+
+        assert_eq!(
+            sql,
+            "CREATE TABLE [dbo].[bench] (\n    [row_id] int NOT NULL,\n    [u64_small] decimal(20,0) NOT NULL,\n    [u64_mid] decimal(20,0) NOT NULL,\n    [u64_full] decimal(20,0) NOT NULL,\n    [maybe_u64_full] decimal(20,0) NULL\n);"
         );
     }
 
@@ -6682,8 +6809,7 @@ odbc-bcp runner
             WriterBenchError::Validation(message)
                 if message.contains("arrow-odbc")
                     && message.contains("extended_primitive")
-                    && message.contains("UInt16")
-                    && message.contains("UInt32")
+                    && message.contains("unsigned integer mappings")
         ));
     }
 
@@ -6811,6 +6937,59 @@ odbc-bcp runner
         assert!(!schema.field(10).is_nullable());
         assert_eq!(schema.field(11).data_type(), &DataType::Float32);
         assert!(schema.field(11).is_nullable());
+    }
+
+    #[test]
+    fn uint64_policy_schema_maps_to_decimal20() {
+        let scenario = super::scenario_by_name("uint64_policy").unwrap();
+        let options = WriterBenchOptions {
+            rows: 64,
+            batch_size: 64,
+            scenario,
+            repeat: 1,
+            output: BenchmarkOutput::Human,
+        };
+
+        let batches = generated_batches(&options);
+        let batch = &batches[0];
+        let schema = batch.schema();
+        let mappings = super::benchmark_mappings_for_scenario(scenario).unwrap();
+
+        assert_eq!(schema.fields().len(), 5);
+        assert_eq!(schema.field(0).data_type(), &DataType::Int32);
+        assert_eq!(schema.field(1).data_type(), &DataType::UInt64);
+        assert_eq!(schema.field(2).data_type(), &DataType::UInt64);
+        assert_eq!(schema.field(3).data_type(), &DataType::UInt64);
+        assert_eq!(schema.field(4).data_type(), &DataType::UInt64);
+        assert!(schema.field(4).is_nullable());
+        assert!(batch.column(1).as_any().is::<UInt64Array>());
+        assert!(batch.column(4).as_any().is::<UInt64Array>());
+        assert!(batch.column(4).null_count() > 0);
+        assert_eq!(
+            mappings
+                .iter()
+                .map(|mapping| mapping.mssql().ty())
+                .collect::<Vec<_>>(),
+            [
+                &MssqlType::Int,
+                &MssqlType::Decimal {
+                    precision: 20,
+                    scale: 0
+                },
+                &MssqlType::Decimal {
+                    precision: 20,
+                    scale: 0
+                },
+                &MssqlType::Decimal {
+                    precision: 20,
+                    scale: 0
+                },
+                &MssqlType::Decimal {
+                    precision: 20,
+                    scale: 0
+                }
+            ]
+        );
     }
 
     #[test]
@@ -7423,6 +7602,7 @@ odbc-bcp runner
             [
                 "narrow_numeric",
                 "extended_primitive",
+                "uint64_policy",
                 "mixed_nullable",
                 "wide_mixed",
                 "decimal_temporal",
