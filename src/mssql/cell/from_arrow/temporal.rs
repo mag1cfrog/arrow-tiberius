@@ -7,8 +7,11 @@ mod datetimeoffset;
 mod time;
 mod timezone;
 
-use crate::{DiagnosticCode, MssqlType, Result, SchemaMapping, arrow::cell::ArrowCell};
-use arrow_schema::{DataType, TimeUnit};
+use crate::{
+    DiagnosticCode, Result, SchemaMapping, arrow::cell::ArrowCell,
+    conversion::arrow_to_mssql::temporal::TemporalArrowToMssql,
+};
+use arrow_schema::DataType;
 
 use super::{
     ArrowToMssqlRuntimeMapping, row_mapping_diagnostic, unsupported_value_conversion,
@@ -42,53 +45,42 @@ pub(super) fn mssql_datetime2_value(
     cell: ArrowCell<'_>,
 ) -> Result<MssqlDateTime2> {
     let mapping = runtime_mapping.mapping();
+    let classification = TemporalArrowToMssql::classify(mapping, row_index)?;
 
-    match (cell, mapping.arrow().data_type(), mapping.mssql().ty()) {
-        (
-            ArrowCell::Date64(value),
-            DataType::Date64,
-            MssqlType::DateTime2 {
-                precision: SQL_SERVER_DATETIME2_DATE64_SCALE,
-            },
-        ) => mssql_datetime2_from_arrow_date64(mapping, row_index, value),
+    match (cell, classification) {
+        (ArrowCell::Date64(value), TemporalArrowToMssql::Date64ToDateTime2) => {
+            mssql_datetime2_from_arrow_date64(mapping, row_index, value)
+        }
         (
             ArrowCell::TimestampSecond(value),
-            DataType::Timestamp(TimeUnit::Second, timezone),
-            MssqlType::DateTime2 {
-                precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
-            },
+            TemporalArrowToMssql::TimestampSecondToDateTime2
+            | TemporalArrowToMssql::TimestampSecondTzToDateTime2,
         ) => {
-            validate_timestamp_timezone_metadata(mapping, row_index, timezone.as_deref())?;
+            validate_mapping_timestamp_timezone_metadata(mapping, row_index)?;
             mssql_datetime2_from_arrow_timestamp_second(mapping, row_index, value)
         }
         (
             ArrowCell::TimestampMillisecond(value),
-            DataType::Timestamp(TimeUnit::Millisecond, timezone),
-            MssqlType::DateTime2 {
-                precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
-            },
+            TemporalArrowToMssql::TimestampMillisecondToDateTime2
+            | TemporalArrowToMssql::TimestampMillisecondTzToDateTime2,
         ) => {
-            validate_timestamp_timezone_metadata(mapping, row_index, timezone.as_deref())?;
+            validate_mapping_timestamp_timezone_metadata(mapping, row_index)?;
             mssql_datetime2_from_arrow_timestamp_millisecond(mapping, row_index, value)
         }
         (
             ArrowCell::TimestampMicrosecond(value),
-            DataType::Timestamp(TimeUnit::Microsecond, timezone),
-            MssqlType::DateTime2 {
-                precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
-            },
+            TemporalArrowToMssql::TimestampMicrosecondToDateTime2
+            | TemporalArrowToMssql::TimestampMicrosecondTzToDateTime2,
         ) => {
-            validate_timestamp_timezone_metadata(mapping, row_index, timezone.as_deref())?;
+            validate_mapping_timestamp_timezone_metadata(mapping, row_index)?;
             mssql_datetime2_from_arrow_timestamp_microsecond(mapping, row_index, value)
         }
         (
             ArrowCell::TimestampNanosecond(value),
-            DataType::Timestamp(TimeUnit::Nanosecond, timezone),
-            MssqlType::DateTime2 {
-                precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
-            },
+            TemporalArrowToMssql::TimestampNanosecondToDateTime2
+            | TemporalArrowToMssql::TimestampNanosecondTzToDateTime2,
         ) => {
-            validate_timestamp_timezone_metadata(mapping, row_index, timezone.as_deref())?;
+            validate_mapping_timestamp_timezone_metadata(mapping, row_index)?;
             mssql_datetime2_from_arrow_timestamp_nanosecond(
                 mapping,
                 row_index,
@@ -111,79 +103,47 @@ pub(super) fn null_datetime2_cell<'a>(
     mapping: &SchemaMapping,
     row_index: usize,
 ) -> Result<MssqlCell<'a>> {
-    if !supports_null_datetime2_cell(mapping) {
-        return Err(unsupported_value_conversion(
+    match TemporalArrowToMssql::classify(mapping, row_index)? {
+        TemporalArrowToMssql::Date64ToDateTime2
+        | TemporalArrowToMssql::TimestampSecondToDateTime2
+        | TemporalArrowToMssql::TimestampMillisecondToDateTime2
+        | TemporalArrowToMssql::TimestampMicrosecondToDateTime2
+        | TemporalArrowToMssql::TimestampNanosecondToDateTime2
+        | TemporalArrowToMssql::TimestampSecondTzToDateTime2
+        | TemporalArrowToMssql::TimestampMillisecondTzToDateTime2
+        | TemporalArrowToMssql::TimestampMicrosecondTzToDateTime2
+        | TemporalArrowToMssql::TimestampNanosecondTzToDateTime2 => {
+            validate_null_timestamp_timezone_metadata(mapping, row_index)?;
+            Ok(MssqlCell::DateTime2(None))
+        }
+        classification => Err(unsupported_value_conversion(
             mapping,
             row_index,
-            format!(
-                "planned SQL Server type {} is not supported yet",
-                mapping.mssql().ty().to_sql()
-            ),
-        ));
+            format!("planned temporal mapping {classification:?} is not a datetime2 conversion"),
+        )),
     }
-
-    validate_null_timestamp_timezone_metadata(mapping, row_index)?;
-    Ok(MssqlCell::DateTime2(None))
-}
-
-fn supports_null_datetime2_cell(mapping: &SchemaMapping) -> bool {
-    matches!(
-        (mapping.arrow().data_type(), mapping.mssql().ty()),
-        (
-            DataType::Date64,
-            MssqlType::DateTime2 {
-                precision: SQL_SERVER_DATETIME2_DATE64_SCALE,
-            },
-        ) | (
-            DataType::Timestamp(
-                TimeUnit::Second
-                    | TimeUnit::Millisecond
-                    | TimeUnit::Microsecond
-                    | TimeUnit::Nanosecond,
-                _,
-            ),
-            MssqlType::DateTime2 {
-                precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
-            },
-        )
-    )
 }
 
 pub(super) fn null_datetimeoffset_cell<'a>(
     mapping: &SchemaMapping,
     row_index: usize,
 ) -> Result<MssqlCell<'a>> {
-    if !supports_null_datetimeoffset_cell(mapping) {
-        return Err(unsupported_value_conversion(
+    match TemporalArrowToMssql::classify(mapping, row_index)? {
+        TemporalArrowToMssql::TimestampSecondTzToDateTimeOffset
+        | TemporalArrowToMssql::TimestampMillisecondTzToDateTimeOffset
+        | TemporalArrowToMssql::TimestampMicrosecondTzToDateTimeOffset
+        | TemporalArrowToMssql::TimestampNanosecondTzToDateTimeOffset => {
+            validate_null_timestamp_timezone_metadata(mapping, row_index)?;
+            Ok(MssqlCell::DateTimeOffset(None))
+        }
+        classification => Err(unsupported_value_conversion(
             mapping,
             row_index,
             format!(
-                "planned SQL Server type {} is not supported yet",
-                mapping.mssql().ty().to_sql()
+                "planned temporal mapping {classification:?} is not a datetimeoffset conversion"
             ),
-        ));
+        )),
     }
-
-    validate_null_timestamp_timezone_metadata(mapping, row_index)?;
-    Ok(MssqlCell::DateTimeOffset(None))
-}
-
-fn supports_null_datetimeoffset_cell(mapping: &SchemaMapping) -> bool {
-    matches!(
-        (mapping.arrow().data_type(), mapping.mssql().ty()),
-        (
-            DataType::Timestamp(
-                TimeUnit::Second
-                    | TimeUnit::Millisecond
-                    | TimeUnit::Microsecond
-                    | TimeUnit::Nanosecond,
-                Some(_)
-            ),
-            MssqlType::DateTimeOffset {
-                precision: SQL_SERVER_DATETIME2_TIMESTAMP_SCALE,
-            }
-        )
-    )
 }
 
 fn validate_null_timestamp_timezone_metadata(
@@ -195,6 +155,17 @@ fn validate_null_timestamp_timezone_metadata(
     }
 
     Ok(())
+}
+
+fn validate_mapping_timestamp_timezone_metadata(
+    mapping: &SchemaMapping,
+    row_index: usize,
+) -> Result<()> {
+    if let DataType::Timestamp(_, timezone) = mapping.arrow().data_type() {
+        validate_timestamp_timezone_metadata(mapping, row_index, timezone.as_deref())
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_timestamp_timezone_metadata(

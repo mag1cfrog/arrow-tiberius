@@ -1,8 +1,9 @@
 //! Date32 Arrow-to-MSSQL runtime cell conversion.
 
-use arrow_schema::DataType;
-
-use crate::{DiagnosticCode, Result, SchemaMapping, arrow::cell::ArrowCell};
+use crate::{
+    DiagnosticCode, Result, SchemaMapping, arrow::cell::ArrowCell,
+    conversion::arrow_to_mssql::temporal::TemporalArrowToMssql,
+};
 
 use super::{
     SQL_SERVER_DATE_MAX_DAYS, SQL_SERVER_DATE_UNIX_EPOCH_DAYS, row_mapping_diagnostic,
@@ -15,8 +16,10 @@ pub(in crate::mssql::cell::from_arrow) fn mssql_date_value(
     row_index: usize,
     cell: ArrowCell<'_>,
 ) -> Result<MssqlDate> {
-    match (cell, mapping.arrow().data_type()) {
-        (ArrowCell::Date32(value), DataType::Date32) => {
+    let classification = TemporalArrowToMssql::classify(mapping, row_index)?;
+
+    match (cell, classification) {
+        (ArrowCell::Date32(value), TemporalArrowToMssql::Date32ToDate) => {
             mssql_date_from_arrow_date32(mapping, row_index, value)
         }
         other => Err(value_conversion_error(row_mapping_diagnostic(
