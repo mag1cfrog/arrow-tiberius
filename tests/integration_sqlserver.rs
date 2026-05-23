@@ -8,9 +8,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
-    Decimal128Array, Decimal256Array, Float64Array, Int32Array, Int64Array, RecordBatch,
-    StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt64Array,
+    Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_buffer::i256;
 use arrow_data::ArrayData;
@@ -358,10 +359,22 @@ async fn direct_raw_writer_round_trips_fast_path_primitive_matrix() -> TestResul
         Field::new("row_id", DataType::Int32, false),
         Field::new("flag_nn", DataType::Boolean, false),
         Field::new("flag_null", DataType::Boolean, true),
+        Field::new("u8_nn", DataType::UInt8, false),
+        Field::new("u8_null", DataType::UInt8, true),
+        Field::new("i8_nn", DataType::Int8, false),
+        Field::new("i8_null", DataType::Int8, true),
+        Field::new("i16_nn", DataType::Int16, false),
+        Field::new("i16_null", DataType::Int16, true),
         Field::new("i32_nn", DataType::Int32, false),
         Field::new("i32_null", DataType::Int32, true),
+        Field::new("u16_nn", DataType::UInt16, false),
+        Field::new("u16_null", DataType::UInt16, true),
         Field::new("i64_nn", DataType::Int64, false),
         Field::new("i64_null", DataType::Int64, true),
+        Field::new("u32_nn", DataType::UInt32, false),
+        Field::new("u32_null", DataType::UInt32, true),
+        Field::new("f32_nn", DataType::Float32, false),
+        Field::new("f32_null", DataType::Float32, true),
         Field::new("f64_nn", DataType::Float64, false),
         Field::new("f64_null", DataType::Float64, true),
     ]));
@@ -382,11 +395,39 @@ async fn direct_raw_writer_round_trips_fast_path_primitive_matrix() -> TestResul
                 Some(false),
                 None,
             ])),
+            Arc::new(UInt8Array::from(vec![u8::MIN, 1, 42, u8::MAX])),
+            Arc::new(UInt8Array::from(vec![
+                Some(u8::MIN),
+                None,
+                Some(u8::MAX),
+                Some(0),
+            ])),
+            Arc::new(Int8Array::from(vec![i8::MIN, -1, 0, i8::MAX])),
+            Arc::new(Int8Array::from(vec![
+                Some(i8::MIN),
+                None,
+                Some(i8::MAX),
+                Some(0),
+            ])),
+            Arc::new(Int16Array::from(vec![i16::MIN, -1, 0, i16::MAX])),
+            Arc::new(Int16Array::from(vec![
+                Some(i16::MIN),
+                None,
+                Some(i16::MAX),
+                Some(0),
+            ])),
             Arc::new(Int32Array::from(vec![i32::MIN, -1, 0, i32::MAX])),
             Arc::new(Int32Array::from(vec![
                 Some(i32::MIN),
                 None,
                 Some(i32::MAX),
+                Some(0),
+            ])),
+            Arc::new(UInt16Array::from(vec![u16::MIN, 1, 42, u16::MAX])),
+            Arc::new(UInt16Array::from(vec![
+                Some(u16::MIN),
+                None,
+                Some(u16::MAX),
                 Some(0),
             ])),
             Arc::new(Int64Array::from(vec![i64::MIN, -1, 0, i64::MAX])),
@@ -395,6 +436,20 @@ async fn direct_raw_writer_round_trips_fast_path_primitive_matrix() -> TestResul
                 None,
                 Some(i64::MAX),
                 Some(0),
+            ])),
+            Arc::new(UInt32Array::from(vec![u32::MIN, 1, 42, u32::MAX])),
+            Arc::new(UInt32Array::from(vec![
+                Some(u32::MIN),
+                None,
+                Some(u32::MAX),
+                Some(0),
+            ])),
+            Arc::new(Float32Array::from(vec![-123.5, -0.0, 0.0, 42.25])),
+            Arc::new(Float32Array::from(vec![
+                Some(-123.5),
+                None,
+                Some(42.25),
+                Some(0.0),
             ])),
             Arc::new(Float64Array::from(vec![-123.5, -0.0, 0.0, 42.25])),
             Arc::new(Float64Array::from(vec![
@@ -431,7 +486,7 @@ async fn direct_raw_writer_round_trips_fast_path_primitive_matrix() -> TestResul
 
         let rows = client
             .simple_query(format!(
-                "SELECT [row_id], [flag_nn], [flag_null], [i32_nn], [i32_null], [i64_nn], [i64_null], [f64_nn], [f64_null] FROM {} ORDER BY [row_id]",
+                "SELECT [row_id], [flag_nn], [flag_null], [u8_nn], [u8_null], [i8_nn], [i8_null], [i16_nn], [i16_null], [i32_nn], [i32_null], [u16_nn], [u16_null], [i64_nn], [i64_null], [u32_nn], [u32_null], [f32_nn], [f32_null], [f64_nn], [f64_null] FROM {} ORDER BY [row_id]",
                 table.quoted_sql()
             ))
             .await?
@@ -443,21 +498,65 @@ async fn direct_raw_writer_round_trips_fast_path_primitive_matrix() -> TestResul
         ensure_eq(rows[0].get::<i32, _>(0), Some(1), "row 0 row_id")?;
         ensure_eq(rows[0].get::<bool, _>(1), Some(true), "row 0 flag_nn")?;
         ensure_eq(rows[0].get::<bool, _>(2), Some(true), "row 0 flag_null")?;
-        ensure_eq(rows[0].get::<i32, _>(3), Some(i32::MIN), "row 0 i32_nn")?;
+        ensure_eq(rows[0].get::<u8, _>(3), Some(u8::MIN), "row 0 u8_nn")?;
         ensure_eq(
-            rows[0].get::<i32, _>(4),
+            rows[0].get::<u8, _>(4),
+            Some(u8::MIN),
+            "row 0 u8_null",
+        )?;
+        ensure_eq(rows[0].get::<i16, _>(5), Some(i8::MIN as i16), "row 0 i8_nn")?;
+        ensure_eq(
+            rows[0].get::<i16, _>(6),
+            Some(i8::MIN as i16),
+            "row 0 i8_null",
+        )?;
+        ensure_eq(rows[0].get::<i16, _>(7), Some(i16::MIN), "row 0 i16_nn")?;
+        ensure_eq(
+            rows[0].get::<i16, _>(8),
+            Some(i16::MIN),
+            "row 0 i16_null",
+        )?;
+        ensure_eq(rows[0].get::<i32, _>(9), Some(i32::MIN), "row 0 i32_nn")?;
+        ensure_eq(
+            rows[0].get::<i32, _>(10),
             Some(i32::MIN),
             "row 0 i32_null",
         )?;
-        ensure_eq(rows[0].get::<i64, _>(5), Some(i64::MIN), "row 0 i64_nn")?;
         ensure_eq(
-            rows[0].get::<i64, _>(6),
+            rows[0].get::<i32, _>(11),
+            Some(u16::MIN as i32),
+            "row 0 u16_nn",
+        )?;
+        ensure_eq(
+            rows[0].get::<i32, _>(12),
+            Some(u16::MIN as i32),
+            "row 0 u16_null",
+        )?;
+        ensure_eq(rows[0].get::<i64, _>(13), Some(i64::MIN), "row 0 i64_nn")?;
+        ensure_eq(
+            rows[0].get::<i64, _>(14),
             Some(i64::MIN),
             "row 0 i64_null",
         )?;
-        ensure_eq(rows[0].get::<f64, _>(7), Some(-123.5), "row 0 f64_nn")?;
         ensure_eq(
-            rows[0].get::<f64, _>(8),
+            rows[0].get::<i64, _>(15),
+            Some(u32::MIN as i64),
+            "row 0 u32_nn",
+        )?;
+        ensure_eq(
+            rows[0].get::<i64, _>(16),
+            Some(u32::MIN as i64),
+            "row 0 u32_null",
+        )?;
+        ensure_eq(rows[0].get::<f32, _>(17), Some(-123.5), "row 0 f32_nn")?;
+        ensure_eq(
+            rows[0].get::<f32, _>(18),
+            Some(-123.5),
+            "row 0 f32_null",
+        )?;
+        ensure_eq(rows[0].get::<f64, _>(19), Some(-123.5), "row 0 f64_nn")?;
+        ensure_eq(
+            rows[0].get::<f64, _>(20),
             Some(-123.5),
             "row 0 f64_null",
         )?;
@@ -465,40 +564,112 @@ async fn direct_raw_writer_round_trips_fast_path_primitive_matrix() -> TestResul
         ensure_eq(rows[1].get::<i32, _>(0), Some(2), "row 1 row_id")?;
         ensure_eq(rows[1].get::<bool, _>(1), Some(false), "row 1 flag_nn")?;
         ensure_eq(rows[1].get::<bool, _>(2), None, "row 1 flag_null")?;
-        ensure_eq(rows[1].get::<i32, _>(3), Some(-1), "row 1 i32_nn")?;
-        ensure_eq(rows[1].get::<i32, _>(4), None, "row 1 i32_null")?;
-        ensure_eq(rows[1].get::<i64, _>(5), Some(-1), "row 1 i64_nn")?;
-        ensure_eq(rows[1].get::<i64, _>(6), None, "row 1 i64_null")?;
-        ensure_eq(rows[1].get::<f64, _>(7), Some(-0.0), "row 1 f64_nn")?;
-        ensure_eq(rows[1].get::<f64, _>(8), None, "row 1 f64_null")?;
+        ensure_eq(rows[1].get::<u8, _>(3), Some(1), "row 1 u8_nn")?;
+        ensure_eq(rows[1].get::<u8, _>(4), None, "row 1 u8_null")?;
+        ensure_eq(rows[1].get::<i16, _>(5), Some(-1), "row 1 i8_nn")?;
+        ensure_eq(rows[1].get::<i16, _>(6), None, "row 1 i8_null")?;
+        ensure_eq(rows[1].get::<i16, _>(7), Some(-1), "row 1 i16_nn")?;
+        ensure_eq(rows[1].get::<i16, _>(8), None, "row 1 i16_null")?;
+        ensure_eq(rows[1].get::<i32, _>(9), Some(-1), "row 1 i32_nn")?;
+        ensure_eq(rows[1].get::<i32, _>(10), None, "row 1 i32_null")?;
+        ensure_eq(rows[1].get::<i32, _>(11), Some(1), "row 1 u16_nn")?;
+        ensure_eq(rows[1].get::<i32, _>(12), None, "row 1 u16_null")?;
+        ensure_eq(rows[1].get::<i64, _>(13), Some(-1), "row 1 i64_nn")?;
+        ensure_eq(rows[1].get::<i64, _>(14), None, "row 1 i64_null")?;
+        ensure_eq(rows[1].get::<i64, _>(15), Some(1), "row 1 u32_nn")?;
+        ensure_eq(rows[1].get::<i64, _>(16), None, "row 1 u32_null")?;
+        ensure_eq(rows[1].get::<f32, _>(17), Some(-0.0), "row 1 f32_nn")?;
+        ensure_eq(rows[1].get::<f32, _>(18), None, "row 1 f32_null")?;
+        ensure_eq(rows[1].get::<f64, _>(19), Some(-0.0), "row 1 f64_nn")?;
+        ensure_eq(rows[1].get::<f64, _>(20), None, "row 1 f64_null")?;
 
         ensure_eq(rows[2].get::<i32, _>(0), Some(3), "row 2 row_id")?;
         ensure_eq(rows[2].get::<bool, _>(1), Some(true), "row 2 flag_nn")?;
         ensure_eq(rows[2].get::<bool, _>(2), Some(false), "row 2 flag_null")?;
-        ensure_eq(rows[2].get::<i32, _>(3), Some(0), "row 2 i32_nn")?;
+        ensure_eq(rows[2].get::<u8, _>(3), Some(42), "row 2 u8_nn")?;
+        ensure_eq(rows[2].get::<u8, _>(4), Some(u8::MAX), "row 2 u8_null")?;
+        ensure_eq(rows[2].get::<i16, _>(5), Some(0), "row 2 i8_nn")?;
         ensure_eq(
-            rows[2].get::<i32, _>(4),
+            rows[2].get::<i16, _>(6),
+            Some(i8::MAX as i16),
+            "row 2 i8_null",
+        )?;
+        ensure_eq(rows[2].get::<i16, _>(7), Some(0), "row 2 i16_nn")?;
+        ensure_eq(
+            rows[2].get::<i16, _>(8),
+            Some(i16::MAX),
+            "row 2 i16_null",
+        )?;
+        ensure_eq(rows[2].get::<i32, _>(9), Some(0), "row 2 i32_nn")?;
+        ensure_eq(
+            rows[2].get::<i32, _>(10),
             Some(i32::MAX),
             "row 2 i32_null",
         )?;
-        ensure_eq(rows[2].get::<i64, _>(5), Some(0), "row 2 i64_nn")?;
         ensure_eq(
-            rows[2].get::<i64, _>(6),
+            rows[2].get::<i32, _>(11),
+            Some(42),
+            "row 2 u16_nn",
+        )?;
+        ensure_eq(
+            rows[2].get::<i32, _>(12),
+            Some(u16::MAX as i32),
+            "row 2 u16_null",
+        )?;
+        ensure_eq(rows[2].get::<i64, _>(13), Some(0), "row 2 i64_nn")?;
+        ensure_eq(
+            rows[2].get::<i64, _>(14),
             Some(i64::MAX),
             "row 2 i64_null",
         )?;
-        ensure_eq(rows[2].get::<f64, _>(7), Some(0.0), "row 2 f64_nn")?;
-        ensure_eq(rows[2].get::<f64, _>(8), Some(42.25), "row 2 f64_null")?;
+        ensure_eq(rows[2].get::<i64, _>(15), Some(42), "row 2 u32_nn")?;
+        ensure_eq(
+            rows[2].get::<i64, _>(16),
+            Some(u32::MAX as i64),
+            "row 2 u32_null",
+        )?;
+        ensure_eq(rows[2].get::<f32, _>(17), Some(0.0), "row 2 f32_nn")?;
+        ensure_eq(rows[2].get::<f32, _>(18), Some(42.25), "row 2 f32_null")?;
+        ensure_eq(rows[2].get::<f64, _>(19), Some(0.0), "row 2 f64_nn")?;
+        ensure_eq(rows[2].get::<f64, _>(20), Some(42.25), "row 2 f64_null")?;
 
         ensure_eq(rows[3].get::<i32, _>(0), Some(4), "row 3 row_id")?;
         ensure_eq(rows[3].get::<bool, _>(1), Some(false), "row 3 flag_nn")?;
         ensure_eq(rows[3].get::<bool, _>(2), None, "row 3 flag_null")?;
-        ensure_eq(rows[3].get::<i32, _>(3), Some(i32::MAX), "row 3 i32_nn")?;
-        ensure_eq(rows[3].get::<i32, _>(4), Some(0), "row 3 i32_null")?;
-        ensure_eq(rows[3].get::<i64, _>(5), Some(i64::MAX), "row 3 i64_nn")?;
-        ensure_eq(rows[3].get::<i64, _>(6), Some(0), "row 3 i64_null")?;
-        ensure_eq(rows[3].get::<f64, _>(7), Some(42.25), "row 3 f64_nn")?;
-        ensure_eq(rows[3].get::<f64, _>(8), Some(0.0), "row 3 f64_null")?;
+        ensure_eq(rows[3].get::<u8, _>(3), Some(u8::MAX), "row 3 u8_nn")?;
+        ensure_eq(rows[3].get::<u8, _>(4), Some(0), "row 3 u8_null")?;
+        ensure_eq(
+            rows[3].get::<i16, _>(5),
+            Some(i8::MAX as i16),
+            "row 3 i8_nn",
+        )?;
+        ensure_eq(rows[3].get::<i16, _>(6), Some(0), "row 3 i8_null")?;
+        ensure_eq(
+            rows[3].get::<i16, _>(7),
+            Some(i16::MAX),
+            "row 3 i16_nn",
+        )?;
+        ensure_eq(rows[3].get::<i16, _>(8), Some(0), "row 3 i16_null")?;
+        ensure_eq(rows[3].get::<i32, _>(9), Some(i32::MAX), "row 3 i32_nn")?;
+        ensure_eq(rows[3].get::<i32, _>(10), Some(0), "row 3 i32_null")?;
+        ensure_eq(
+            rows[3].get::<i32, _>(11),
+            Some(u16::MAX as i32),
+            "row 3 u16_nn",
+        )?;
+        ensure_eq(rows[3].get::<i32, _>(12), Some(0), "row 3 u16_null")?;
+        ensure_eq(rows[3].get::<i64, _>(13), Some(i64::MAX), "row 3 i64_nn")?;
+        ensure_eq(rows[3].get::<i64, _>(14), Some(0), "row 3 i64_null")?;
+        ensure_eq(
+            rows[3].get::<i64, _>(15),
+            Some(u32::MAX as i64),
+            "row 3 u32_nn",
+        )?;
+        ensure_eq(rows[3].get::<i64, _>(16), Some(0), "row 3 u32_null")?;
+        ensure_eq(rows[3].get::<f32, _>(17), Some(42.25), "row 3 f32_nn")?;
+        ensure_eq(rows[3].get::<f32, _>(18), Some(0.0), "row 3 f32_null")?;
+        ensure_eq(rows[3].get::<f64, _>(19), Some(42.25), "row 3 f64_nn")?;
+        ensure_eq(rows[3].get::<f64, _>(20), Some(0.0), "row 3 f64_null")?;
 
         Ok::<(), Box<dyn std::error::Error>>(())
     }
