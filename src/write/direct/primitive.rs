@@ -147,6 +147,9 @@ pub(crate) fn try_encode_fixed_width_primitive_rows(
             DirectColumnEncoding::VariableWidth(_) => {
                 return Ok(None);
             }
+            DirectColumnEncoding::Temporal(_) => {
+                return Ok(None);
+            }
         }
     }
 
@@ -274,6 +277,7 @@ fn fixed_width_value_len(encoding: DirectColumnEncoding) -> Option<usize> {
         DirectColumnEncoding::UInt64Decimal20_0 => None,
         DirectColumnEncoding::Decimal(_) => None,
         DirectColumnEncoding::VariableWidth(_) => None,
+        DirectColumnEncoding::Temporal(_) => None,
     }
 }
 
@@ -1547,6 +1551,9 @@ fn primitive_value_len(encoding: DirectColumnEncoding) -> Result<usize> {
         ))),
         DirectColumnEncoding::VariableWidth(other) => Err(unsupported_batch(format!(
             "direct primitive layout is not implemented for variable-width mapping {other:?}"
+        ))),
+        DirectColumnEncoding::Temporal(other) => Err(unsupported_batch(format!(
+            "direct primitive layout is not implemented for temporal mapping {other:?}"
         ))),
     }
 }

@@ -70,6 +70,9 @@ pub(crate) fn measure_variable_width_column_cell_lengths(
         DirectColumnEncoding::Decimal(classification) => Err(unsupported_batch(format!(
             "direct variable-width layout cannot measure decimal mapping {classification:?}"
         ))),
+        DirectColumnEncoding::Temporal(other) => Err(unsupported_batch(format!(
+            "direct variable-width layout cannot measure temporal mapping {other:?}"
+        ))),
     }
 }
 

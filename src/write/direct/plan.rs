@@ -37,6 +37,8 @@ pub(crate) enum DirectColumnEncoding {
     Decimal(DecimalArrowToMssql),
     /// Variable-width encoding.
     VariableWidth(VariableWidthArrowToMssql),
+    /// Temporal encoding.
+    Temporal(TemporalArrowToMssql),
 }
 
 /// Direct encoder support policy.
@@ -112,6 +114,12 @@ fn variable_width_support(mapping: &SchemaMapping) -> DirectMappingSupport {
 
 fn temporal_support(mapping: &SchemaMapping) -> DirectMappingSupport {
     match TemporalArrowToMssql::classify(mapping, 0) {
+        Ok(
+            classification @ (TemporalArrowToMssql::Date32ToDate
+            | TemporalArrowToMssql::Date64ToDateTime2),
+        ) => DirectMappingSupport::Supported {
+            encoding: DirectColumnEncoding::Temporal(classification),
+        },
         Ok(classification) => DirectMappingSupport::Unsupported {
             reason: format!(
                 "direct encoding support for temporal mapping {classification:?} is not implemented yet"
@@ -253,7 +261,7 @@ mod tests {
     };
     use crate::conversion::arrow_to_mssql::{
         decimal::DecimalArrowToMssql, primitive::PrimitiveArrowToMssql,
-        variable_width::VariableWidthArrowToMssql,
+        temporal::TemporalArrowToMssql, variable_width::VariableWidthArrowToMssql,
     };
 
     #[test]
@@ -653,39 +661,42 @@ mod tests {
     }
 
     #[test]
-    fn current_direct_support_rejects_non_direct_mapping_with_type_reason() {
-        let mappings = vec![mapping(0, "created_on", DataType::Date32, MssqlType::Date)];
+    fn current_direct_support_accepts_date_mappings() {
+        let mappings = vec![
+            mapping(0, "created_on", DataType::Date32, MssqlType::Date),
+            mapping(
+                1,
+                "created_at",
+                DataType::Date64,
+                MssqlType::DateTime2 { precision: 3 },
+            ),
+        ];
 
-        let err = DirectEncoderPlan::new(&mappings, &CurrentDirectMappings)
-            .expect_err("date direct encoding is implemented in a later slice");
+        let plan = DirectEncoderPlan::new(&mappings, &CurrentDirectMappings)
+            .expect("date-family temporal direct encoding should be supported");
 
-        let Error::DirectEncoding { diagnostics } = err else {
-            panic!("expected direct encoding error");
-        };
-
-        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(plan.column_count(), 2);
         assert_eq!(
-            diagnostics.all()[0].code(),
-            DiagnosticCode::DirectEncodingUnsupportedMapping
+            plan.columns()[0].encoding(),
+            DirectColumnEncoding::Temporal(TemporalArrowToMssql::Date32ToDate)
         );
         assert_eq!(
-            diagnostics.all()[0].message(),
-            "direct encoding support for temporal mapping Date32ToDate is not implemented yet"
+            plan.columns()[1].encoding(),
+            DirectColumnEncoding::Temporal(TemporalArrowToMssql::Date64ToDateTime2)
         );
     }
 
     #[test]
     fn current_direct_support_rejects_temporal_mappings_with_classifier_reason() {
         let mappings = vec![
-            mapping(0, "created_on", DataType::Date32, MssqlType::Date),
             mapping(
-                1,
+                0,
                 "event_time",
                 DataType::Time64(TimeUnit::Nanosecond),
                 MssqlType::Time(MssqlTimePrecision::SEVEN),
             ),
             mapping(
-                2,
+                1,
                 "created_at",
                 DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
                 MssqlType::DateTimeOffset { precision: 7 },
@@ -699,23 +710,41 @@ mod tests {
             panic!("expected direct encoding error");
         };
 
-        assert_eq!(diagnostics.len(), 3);
-        assert_eq!(diagnostics.all()[0].field().unwrap().name(), "created_on");
-        assert_eq!(
-            diagnostics.all()[0].message(),
-            "direct encoding support for temporal mapping Date32ToDate is not implemented yet"
-        );
-        assert_eq!(diagnostics.all()[1].field().unwrap().name(), "event_time");
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics.all()[0].field().unwrap().name(), "event_time");
         assert!(
-            diagnostics.all()[1]
+            diagnostics.all()[0]
                 .message()
                 .contains("Time64NanosecondToTime")
         );
-        assert_eq!(diagnostics.all()[2].field().unwrap().name(), "created_at");
+        assert_eq!(diagnostics.all()[1].field().unwrap().name(), "created_at");
         assert!(
-            diagnostics.all()[2]
+            diagnostics.all()[1]
                 .message()
                 .contains("TimestampMicrosecondTzToDateTimeOffset")
+        );
+    }
+
+    #[test]
+    fn current_direct_support_rejects_unplanned_date64_to_date_mapping() {
+        let mappings = vec![mapping(0, "date_value", DataType::Date64, MssqlType::Date)];
+
+        let err = DirectEncoderPlan::new(&mappings, &CurrentDirectMappings)
+            .expect_err("Date64 to date is not a planned direct mapping");
+
+        let Error::DirectEncoding { diagnostics } = err else {
+            panic!("expected direct encoding error");
+        };
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics.all()[0].code(),
+            DiagnosticCode::DirectEncodingUnsupportedMapping
+        );
+        assert_eq!(diagnostics.all()[0].field().unwrap().name(), "date_value");
+        assert_eq!(
+            diagnostics.all()[0].message(),
+            "direct encoding is not implemented yet for Arrow Date64 to SQL Server date"
         );
     }
 
