@@ -907,11 +907,10 @@ mod tests {
     use crate::{
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, MssqlTypeLength,
         SchemaMapping,
-        write::direct::layout::CellPosition,
-        write::direct::plan::{CurrentDirectMappings, DirectEncoderPlan},
-        write::direct::types::primitive::{
-            allocate_rows_payload_with_tokens, build_fixed_width_row_layout,
+        write::direct::layout::{
+            CellPosition, allocate_rows_payload_with_tokens, build_fixed_width_row_layout,
         },
+        write::direct::plan::{CurrentDirectMappings, DirectEncoderPlan},
     };
 
     use super::{

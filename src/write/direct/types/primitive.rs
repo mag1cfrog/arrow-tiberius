@@ -13,11 +13,9 @@ use crate::{
 use super::super::{
     downcast_direct_array,
     layout::{CellPosition, RowLayout},
-    payload::TDS_ROW_TOKEN,
     plan::{DirectColumnEncoding, DirectColumnPlan},
 };
 
-const ROW_TOKEN_LEN: usize = 1;
 const CELL_LEN_PREFIX_LEN: usize = 1;
 
 /// Measures one primitive Arrow column into a row-major cell length matrix.
@@ -116,70 +114,6 @@ fn validate_primitive_column_values(array: &dyn Array, column: &DirectColumnPlan
     }
 
     Ok(())
-}
-
-pub(crate) fn build_fixed_width_row_layout(
-    row_count: usize,
-    column_count: usize,
-    cell_lengths: &[usize],
-) -> Result<RowLayout> {
-    build_fixed_width_row_range_layout(0, row_count, column_count, cell_lengths)
-}
-
-pub(crate) fn build_fixed_width_row_range_layout(
-    start_row: usize,
-    row_count: usize,
-    column_count: usize,
-    cell_lengths: &[usize],
-) -> Result<RowLayout> {
-    let end_row = start_row
-        .checked_add(row_count)
-        .ok_or_else(|| invalid_payload("direct row range end overflowed usize"))?;
-    let mut row_token_offsets = Vec::with_capacity(row_count);
-    let mut row_lengths = Vec::with_capacity(row_count);
-    let mut cell_positions = Vec::with_capacity(row_count * column_count);
-    let mut offset = 0usize;
-
-    for row_index in start_row..end_row {
-        let row_offset = offset;
-        row_token_offsets.push(row_offset);
-        offset = checked_add(offset, ROW_TOKEN_LEN)?;
-
-        for column_index in 0..column_count {
-            let cell_len = cell_lengths[row_index * column_count + column_index];
-            cell_positions.push(CellPosition::new(
-                row_index - start_row,
-                column_index,
-                offset,
-                cell_len,
-            ));
-            offset = checked_add(offset, cell_len)?;
-        }
-
-        // Row length is the byte span from this row's ROW token through the
-        // last encoded cell. RowLayout uses it to prove rows are contiguous.
-        row_lengths.push(offset - row_offset);
-    }
-
-    RowLayout::new(row_token_offsets, row_lengths, cell_positions, offset)
-}
-
-/// Allocates a complete payload buffer and writes every row token.
-///
-/// The measured layout already knows where each row starts inside the payload.
-/// This function creates a zero-filled buffer of the final payload size and
-/// writes `0xD1` at every absolute row start offset. Later fill steps write
-/// encoded cell bytes into the remaining positions.
-pub(crate) fn allocate_rows_payload_with_tokens(layout: &RowLayout) -> Vec<u8> {
-    let mut bytes = vec![0; layout.payload_len()];
-
-    // One payload can contain many rows. Each row must start with the TDS ROW
-    // token byte, and row_token_offsets gives those absolute byte positions.
-    for &row_offset in layout.row_token_offsets() {
-        bytes[row_offset] = TDS_ROW_TOKEN;
-    }
-
-    bytes
 }
 
 /// Fills one Boolean-to-bit column into an already allocated rows payload.
@@ -973,11 +907,6 @@ fn primitive_value_len(encoding: DirectColumnEncoding) -> Result<usize> {
     }
 }
 
-fn checked_add(lhs: usize, rhs: usize) -> Result<usize> {
-    lhs.checked_add(rhs)
-        .ok_or_else(|| invalid_payload("direct primitive row layout length overflowed usize"))
-}
-
 fn row_column_diagnostic(
     column: &DirectColumnPlan,
     row_index: usize,
@@ -1040,10 +969,12 @@ mod tests {
     };
 
     use super::{
-        allocate_rows_payload_with_tokens, build_fixed_width_row_layout, fill_boolean_column,
-        fill_float32_column, fill_float64_column, fill_int8_column, fill_int16_column,
-        fill_int32_column, fill_int64_column, fill_uint8_column, fill_uint16_column,
-        fill_uint32_column, measure_primitive_column_cell_lengths,
+        fill_boolean_column, fill_float32_column, fill_float64_column, fill_int8_column,
+        fill_int16_column, fill_int32_column, fill_int64_column, fill_uint8_column,
+        fill_uint16_column, fill_uint32_column, measure_primitive_column_cell_lengths,
+    };
+    use crate::write::direct::layout::{
+        allocate_rows_payload_with_tokens, build_fixed_width_row_layout,
     };
     use crate::write::direct::payload::TDS_ROW_TOKEN;
     use crate::write::direct::plan::{CurrentDirectMappings, DirectEncoderPlan};

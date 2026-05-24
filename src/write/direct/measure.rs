@@ -6,14 +6,12 @@ use crate::{DiagnosticCode, Result};
 
 use super::{
     DirectEncoder, downcast_direct_array, invalid_payload, layout,
+    layout::{build_fixed_width_row_layout, build_fixed_width_row_range_layout},
     plan::DirectColumnEncoding,
     row_column_diagnostic,
     types::{
         decimal::measure_decimal_column_cell_lengths,
-        primitive::{
-            build_fixed_width_row_layout, build_fixed_width_row_range_layout,
-            measure_primitive_column_cell_lengths,
-        },
+        primitive::measure_primitive_column_cell_lengths,
         temporal::{TemporalColumnContext, measure_temporal_column_cell_lengths},
         uint64::measure_uint64_decimal20_cell_lengths,
         variable_width::measure_variable_width_column_cell_lengths,

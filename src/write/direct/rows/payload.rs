@@ -15,6 +15,7 @@ use crate::{
 
 use super::super::{
     DirectEncoder, MeasuredDirectBatch, downcast_direct_array, invalid_payload, layout,
+    layout::allocate_rows_payload_with_tokens,
     measure::measure_layout,
     payload::EncodedRowsPayload,
     plan::DirectColumnEncoding,
@@ -23,10 +24,9 @@ use super::super::{
     types::{
         decimal::fill_decimal_column,
         primitive::{
-            allocate_rows_payload_with_tokens, fill_boolean_column, fill_float32_column,
-            fill_float64_column, fill_int8_column, fill_int16_column, fill_int32_column,
-            fill_int64_column, fill_uint8_column, fill_uint16_column, fill_uint32_column,
-            fill_uint64_checked_bigint_column,
+            fill_boolean_column, fill_float32_column, fill_float64_column, fill_int8_column,
+            fill_int16_column, fill_int32_column, fill_int64_column, fill_uint8_column,
+            fill_uint16_column, fill_uint32_column, fill_uint64_checked_bigint_column,
         },
         temporal::{TemporalColumnContext, fill_temporal_column},
         uint64::fill_uint64_decimal20_column,
