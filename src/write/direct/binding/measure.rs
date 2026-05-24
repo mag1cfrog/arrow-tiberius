@@ -188,7 +188,21 @@ impl BoundDirectColumn<'_> {
                 column_count,
                 cell_lengths,
             ),
+            Self::LargeUtf8 { column, array } => measure_nvarchar_column_cell_lengths(
+                array,
+                column,
+                column_index,
+                column_count,
+                cell_lengths,
+            ),
             Self::Binary { column, array } => measure_varbinary_column_cell_lengths(
+                array,
+                column,
+                column_index,
+                column_count,
+                cell_lengths,
+            ),
+            Self::LargeBinary { column, array } => measure_varbinary_column_cell_lengths(
                 array,
                 column,
                 column_index,

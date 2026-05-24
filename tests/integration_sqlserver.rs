@@ -7,14 +7,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow_array::{
-    ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
-    Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, RecordBatch, StringArray, Time32MillisecondArray, Time32SecondArray,
-    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array,
+    Decimal64Array, Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch,
+    StringArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
+    Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
 };
-use arrow_buffer::i256;
+use arrow_buffer::{MutableBuffer, NullBuffer, OffsetBuffer, ScalarBuffer, i256};
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use arrow_tiberius::{
@@ -904,6 +905,264 @@ async fn direct_raw_writer_round_trips_variable_width_matrix() -> TestResult<()>
             rows[3].get::<&[u8], _>(8),
             Some(large_bytes.as_slice()),
             "row 3 bytes_value",
+        )?;
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    let drop_result = drop_table(&mut client, &table).await;
+    result?;
+    drop_result?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn direct_raw_writer_round_trips_large_variable_width_values() -> TestResult<()> {
+    let Some((connection_string, database)) = integration_config() else {
+        eprintln!(
+            "skipping SQL Server direct raw large variable-width integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+        );
+        return Ok(());
+    };
+
+    let mut client = connect(&connection_string, &database).await?;
+    let table = unique_table_name()?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::Int32, false),
+        Field::new("large_text", DataType::LargeUtf8, true),
+        Field::new("large_bytes", DataType::LargeBinary, true),
+    ]));
+    let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
+        Arc::clone(&schema),
+        MssqlProfile::sql_server_2016_compat_100(),
+        PlanOptions::default(),
+    )?
+    .into_parts();
+    let long_text = "x".repeat(5000);
+    let long_bytes = vec![0xab; 9000];
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1_i32, 2, 3, 4])) as ArrayRef,
+            Arc::new(LargeStringArray::from(vec![
+                Some(""),
+                Some("ascii"),
+                Some("Tokyo 東京 🙂"),
+                Some(long_text.as_str()),
+            ])),
+            Arc::new(LargeBinaryArray::from_iter(vec![
+                Some(&b""[..]),
+                Some(&b"\x00\x01\xfe\xff"[..]),
+                None,
+                Some(long_bytes.as_slice()),
+            ])),
+        ],
+    )?;
+
+    execute_sql(
+        &mut client,
+        create_table_sql_from_mappings(&table, &mappings),
+    )
+    .await?;
+
+    let result = async {
+        let mut writer = BulkWriter::new(
+            &mut client,
+            table.clone(),
+            mappings,
+            WriteOptions {
+                backend: WriteBackend::DirectRawBulk,
+                ..WriteOptions::default()
+            },
+        )
+        .await?;
+        let stats = writer.write_batch(&batch).await?;
+
+        ensure_eq(stats.rows_written, 4, "rows_written")?;
+        ensure_eq(stats.batches_written, 1, "batches_written")?;
+        ensure_eq(writer.finish().await?, stats, "finish stats")?;
+
+        let rows = client
+            .simple_query(format!(
+                "SELECT [row_id], [large_text], [large_bytes] FROM {} ORDER BY [row_id]",
+                table.quoted_sql()
+            ))
+            .await?
+            .into_first_result()
+            .await?;
+
+        ensure_eq(rows.len(), 4, "row count")?;
+
+        ensure_eq(rows[0].get::<i32, _>(0), Some(1), "row 0 row_id")?;
+        ensure_eq(rows[0].get::<&str, _>(1), Some(""), "row 0 large_text")?;
+        ensure_eq(
+            rows[0].get::<&[u8], _>(2),
+            Some(&b""[..]),
+            "row 0 large_bytes",
+        )?;
+
+        ensure_eq(rows[1].get::<i32, _>(0), Some(2), "row 1 row_id")?;
+        ensure_eq(rows[1].get::<&str, _>(1), Some("ascii"), "row 1 large_text")?;
+        ensure_eq(
+            rows[1].get::<&[u8], _>(2),
+            Some(&b"\x00\x01\xfe\xff"[..]),
+            "row 1 large_bytes",
+        )?;
+
+        ensure_eq(rows[2].get::<i32, _>(0), Some(3), "row 2 row_id")?;
+        ensure_eq(
+            rows[2].get::<&str, _>(1),
+            Some("Tokyo 東京 🙂"),
+            "row 2 large_text",
+        )?;
+        ensure_eq(rows[2].get::<&[u8], _>(2), None, "row 2 large_bytes")?;
+
+        ensure_eq(rows[3].get::<i32, _>(0), Some(4), "row 3 row_id")?;
+        ensure_eq(
+            rows[3].get::<&str, _>(1),
+            Some(long_text.as_str()),
+            "row 3 large_text",
+        )?;
+        ensure_eq(
+            rows[3].get::<&[u8], _>(2),
+            Some(long_bytes.as_slice()),
+            "row 3 large_bytes",
+        )?;
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    let drop_result = drop_table(&mut client, &table).await;
+    result?;
+    drop_result?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "manual multi-GB allocation stress test for LargeBinary offsets above i32::MAX"]
+async fn direct_raw_writer_round_trips_large_binary_offsets_above_i32_boundary() -> TestResult<()> {
+    let Some((connection_string, database)) = integration_config() else {
+        eprintln!(
+            "skipping SQL Server direct raw LargeBinary offset stress test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+        );
+        return Ok(());
+    };
+
+    let mut client = connect(&connection_string, &database).await?;
+    let table = unique_table_name()?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::Int32, false),
+        Field::new("large_bytes", DataType::LargeBinary, true),
+    ]));
+    let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
+        Arc::clone(&schema),
+        MssqlProfile::sql_server_2016_compat_100(),
+        PlanOptions::default(),
+    )?
+    .into_parts();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1_i32, 2, 3])) as ArrayRef,
+            large_binary_array_crossing_i32_offset_boundary()?,
+        ],
+    )?;
+    let large_bytes = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<LargeBinaryArray>()
+        .ok_or_else(|| std::io::Error::other("large_bytes should be LargeBinaryArray"))?;
+    ensure_eq(large_bytes.is_null(0), true, "row 0 local null")?;
+    ensure_eq(
+        &large_bytes.value(1)[..4],
+        &[1, 2, 3, 4],
+        "row 1 local prefix",
+    )?;
+    ensure_eq(
+        &large_bytes.value(1)[12..16],
+        &[5, 6, 7, 8],
+        "row 1 local suffix",
+    )?;
+    ensure_eq(
+        &large_bytes.value(2)[..4],
+        &[9, 10, 11, 12],
+        "row 2 local prefix",
+    )?;
+    ensure_eq(
+        &large_bytes.value(2)[4..8],
+        &[13, 14, 15, 16],
+        "row 2 local suffix",
+    )?;
+
+    execute_sql(
+        &mut client,
+        create_table_sql_from_mappings(&table, &mappings),
+    )
+    .await?;
+
+    let result = async {
+        let mut writer = BulkWriter::new(
+            &mut client,
+            table.clone(),
+            mappings,
+            WriteOptions {
+                backend: WriteBackend::DirectRawBulk,
+                ..WriteOptions::default()
+            },
+        )
+        .await?;
+        let stats = writer.write_batch(&batch).await?;
+
+        ensure_eq(stats.rows_written, 3, "rows_written")?;
+        ensure_eq(stats.batches_written, 1, "batches_written")?;
+        ensure_eq(writer.finish().await?, stats, "finish stats")?;
+
+        let rows = client
+            .simple_query(format!(
+                "SELECT [row_id], CONVERT(bigint, DATALENGTH([large_bytes])), \
+                 SUBSTRING([large_bytes], 1, 4), \
+                 SUBSTRING([large_bytes], DATALENGTH([large_bytes]) - 3, 4) \
+                 FROM {} ORDER BY [row_id]",
+                table.quoted_sql()
+            ))
+            .await?
+            .into_first_result()
+            .await?;
+
+        ensure_eq(rows.len(), 3, "row count")?;
+        ensure_eq(rows[0].get::<i32, _>(0), Some(1), "row 0 row_id")?;
+        ensure_eq(rows[0].get::<i64, _>(1), None, "row 0 byte length")?;
+        ensure_eq(rows[0].get::<&[u8], _>(2), None, "row 0 prefix")?;
+        ensure_eq(rows[0].get::<&[u8], _>(3), None, "row 0 suffix")?;
+
+        ensure_eq(rows[1].get::<i32, _>(0), Some(2), "row 1 row_id")?;
+        ensure_eq(rows[1].get::<i64, _>(1), Some(16), "row 1 byte length")?;
+        ensure_eq(
+            rows[1].get::<&[u8], _>(2),
+            Some(&[1, 2, 3, 4][..]),
+            "row 1 prefix",
+        )?;
+        ensure_eq(
+            rows[1].get::<&[u8], _>(3),
+            Some(&[5, 6, 7, 8][..]),
+            "row 1 suffix",
+        )?;
+
+        ensure_eq(rows[2].get::<i32, _>(0), Some(3), "row 2 row_id")?;
+        ensure_eq(rows[2].get::<i64, _>(1), Some(8), "row 2 byte length")?;
+        ensure_eq(
+            rows[2].get::<&[u8], _>(2),
+            Some(&[9, 10, 11, 12][..]),
+            "row 2 prefix",
+        )?;
+        ensure_eq(
+            rows[2].get::<&[u8], _>(3),
+            Some(&[13, 14, 15, 16][..]),
+            "row 2 suffix",
         )?;
 
         Ok::<(), Box<dyn std::error::Error>>(())
@@ -2629,6 +2888,52 @@ fn malicious_decimal128_array(data_type: DataType, values: &[i128]) -> TestResul
         .build()?;
 
     Ok(Arc::new(Decimal128Array::from(data)))
+}
+
+fn large_binary_array_crossing_i32_offset_boundary() -> TestResult<ArrayRef> {
+    let boundary = i64::from(i32::MAX);
+    let offsets = vec![0_i64, boundary - 8, boundary + 8, boundary + 16];
+    let mut values = MutableBuffer::from_len_zeroed(usize::try_from(boundary + 16)?);
+    values.as_slice_mut().fill(0xab);
+
+    values.as_slice_mut()[usize::try_from(boundary - 8)?..usize::try_from(boundary - 4)?]
+        .copy_from_slice(&[1, 2, 3, 4]);
+    values.as_slice_mut()[usize::try_from(boundary + 4)?..usize::try_from(boundary + 8)?]
+        .copy_from_slice(&[5, 6, 7, 8]);
+    values.as_slice_mut()[usize::try_from(boundary + 8)?..usize::try_from(boundary + 12)?]
+        .copy_from_slice(&[9, 10, 11, 12]);
+    values.as_slice_mut()[usize::try_from(boundary + 12)?..usize::try_from(boundary + 16)?]
+        .copy_from_slice(&[13, 14, 15, 16]);
+    ensure_eq(
+        &values.as_slice()[usize::try_from(boundary - 8)?..usize::try_from(boundary - 4)?],
+        &[1, 2, 3, 4],
+        "raw values row 1 prefix",
+    )?;
+    ensure_eq(
+        &values.as_slice()[usize::try_from(boundary + 4)?..usize::try_from(boundary + 8)?],
+        &[5, 6, 7, 8],
+        "raw values row 1 suffix",
+    )?;
+    ensure_eq(
+        &values.as_slice()[usize::try_from(boundary + 8)?..usize::try_from(boundary + 12)?],
+        &[9, 10, 11, 12],
+        "raw values row 2 prefix",
+    )?;
+    ensure_eq(
+        &values.as_slice()[usize::try_from(boundary + 12)?..usize::try_from(boundary + 16)?],
+        &[13, 14, 15, 16],
+        "raw values row 2 suffix",
+    )?;
+
+    let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets));
+    let values = values.into();
+    let array = LargeBinaryArray::try_new(
+        offsets,
+        values,
+        Some(NullBuffer::from(vec![false, true, true])),
+    )?;
+
+    Ok(Arc::new(array))
 }
 
 fn unique_table_name() -> arrow_tiberius::Result<TableName> {
