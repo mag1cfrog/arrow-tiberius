@@ -15,26 +15,22 @@ use crate::{
 
 use super::super::{
     DirectEncoder, MeasuredDirectBatch, downcast_direct_array, invalid_payload, layout,
+    measure::measure_layout,
     payload::EncodedRowsPayload,
     plan::DirectColumnEncoding,
     row_column_diagnostic,
     rows::fixed_width::try_encode_fixed_width_rows,
     types::{
-        decimal::{fill_decimal_column, measure_decimal_column_cell_lengths},
+        decimal::fill_decimal_column,
         primitive::{
-            allocate_rows_payload_with_tokens, build_fixed_width_row_layout, fill_boolean_column,
-            fill_float32_column, fill_float64_column, fill_int8_column, fill_int16_column,
-            fill_int32_column, fill_int64_column, fill_uint8_column, fill_uint16_column,
-            fill_uint32_column, fill_uint64_checked_bigint_column,
-            measure_primitive_column_cell_lengths,
+            allocate_rows_payload_with_tokens, fill_boolean_column, fill_float32_column,
+            fill_float64_column, fill_int8_column, fill_int16_column, fill_int32_column,
+            fill_int64_column, fill_uint8_column, fill_uint16_column, fill_uint32_column,
+            fill_uint64_checked_bigint_column,
         },
-        temporal::{
-            TemporalColumnContext, fill_temporal_column, measure_temporal_column_cell_lengths,
-        },
-        uint64::{fill_uint64_decimal20_column, measure_uint64_decimal20_cell_lengths},
-        variable_width::{
-            fill_nvarchar_column, fill_varbinary_column, measure_variable_width_column_cell_lengths,
-        },
+        temporal::{TemporalColumnContext, fill_temporal_column},
+        uint64::fill_uint64_decimal20_column,
+        variable_width::{fill_nvarchar_column, fill_varbinary_column},
     },
     unsupported_batch, value_conversion_error,
 };
@@ -118,93 +114,6 @@ pub(crate) fn encode_measured_batch_range(
     EncodedRowsPayload::new(bytes, layout.row_token_offsets().to_vec())
 }
 
-pub(crate) fn measure_cell_lengths(
-    encoder: &DirectEncoder,
-    batch: &RecordBatch,
-) -> Result<Vec<usize>> {
-    let row_count = batch.num_rows();
-    let column_count = encoder.plan.column_count();
-
-    if row_count == 0 {
-        return Ok(Vec::new());
-    }
-
-    let mut cell_lengths = vec![0; row_count * column_count];
-
-    for (column_index, column) in encoder.plan.columns().iter().enumerate() {
-        let Some(array) = batch
-            .columns()
-            .get(column.source_index())
-            .map(AsRef::as_ref)
-        else {
-            return Err(value_conversion_error(row_column_diagnostic(
-                column,
-                0,
-                DiagnosticCode::ValueTypeMismatch,
-                "planned direct column index is outside the runtime batch",
-            )));
-        };
-
-        match column.encoding() {
-            DirectColumnEncoding::Primitive(_) => {
-                measure_primitive_column_cell_lengths(
-                    array,
-                    column,
-                    column_index,
-                    column_count,
-                    &mut cell_lengths,
-                )?;
-            }
-            DirectColumnEncoding::UInt64Decimal20_0 => {
-                let array = downcast_direct_array::<UInt64Array>(array, column)?;
-                measure_uint64_decimal20_cell_lengths(
-                    array,
-                    column,
-                    column_index,
-                    column_count,
-                    &mut cell_lengths,
-                )?;
-            }
-            DirectColumnEncoding::Decimal(classification) => {
-                measure_decimal_column_cell_lengths(
-                    array,
-                    column,
-                    classification,
-                    column_index,
-                    column_count,
-                    &mut cell_lengths,
-                )?;
-            }
-            DirectColumnEncoding::VariableWidth(_) => {
-                measure_variable_width_column_cell_lengths(
-                    array,
-                    column,
-                    column_index,
-                    column_count,
-                    &mut cell_lengths,
-                )?;
-            }
-            DirectColumnEncoding::Temporal(classification) => {
-                let mapping = encoder.mapping_for_column_index(column_index)?;
-                measure_temporal_column_cell_lengths(
-                    array,
-                    TemporalColumnContext {
-                        mapping,
-                        plan_options: encoder.plan_options,
-                        column,
-                        classification,
-                        column_index,
-                        column_count,
-                    },
-                    &mut cell_lengths,
-                )?;
-            }
-        }
-    }
-
-    Ok(cell_lengths)
-}
-
 fn encode_checked_batch(
     encoder: &DirectEncoder,
     batch: &RecordBatch,
@@ -229,16 +138,6 @@ fn encode_checked_batch(
     fill_columns(encoder, batch, &layout, &mut bytes)?;
 
     EncodedRowsPayload::new(bytes, layout.row_token_offsets().to_vec())
-}
-
-fn measure_layout(encoder: &DirectEncoder, batch: &RecordBatch) -> Result<layout::RowLayout> {
-    let row_count = batch.num_rows();
-    if row_count == 0 {
-        return layout::RowLayout::new(Vec::new(), Vec::new(), Vec::new(), 0);
-    }
-
-    let cell_lengths = measure_cell_lengths(encoder, batch)?;
-    build_fixed_width_row_layout(row_count, encoder.plan.column_count(), &cell_lengths)
 }
 
 fn fill_columns(

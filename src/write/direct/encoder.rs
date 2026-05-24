@@ -91,7 +91,7 @@ impl DirectEncoder {
             return Ok(MeasuredDirectBatch::empty(column_count));
         }
 
-        let cell_lengths = rows::payload::measure_cell_lengths(self, batch)?;
+        let cell_lengths = super::measure::measure_cell_lengths(self, batch)?;
         MeasuredDirectBatch::new(row_count, column_count, cell_lengths)
     }
 

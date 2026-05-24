@@ -1,8 +1,125 @@
 //! Direct row payload measurement.
 
-use crate::Result;
+use arrow_array::{RecordBatch, UInt64Array};
 
-use super::{invalid_payload, layout, types::primitive::build_fixed_width_row_range_layout};
+use crate::{DiagnosticCode, Result};
+
+use super::{
+    DirectEncoder, downcast_direct_array, invalid_payload, layout,
+    plan::DirectColumnEncoding,
+    row_column_diagnostic,
+    types::{
+        decimal::measure_decimal_column_cell_lengths,
+        primitive::{
+            build_fixed_width_row_layout, build_fixed_width_row_range_layout,
+            measure_primitive_column_cell_lengths,
+        },
+        temporal::{TemporalColumnContext, measure_temporal_column_cell_lengths},
+        uint64::measure_uint64_decimal20_cell_lengths,
+        variable_width::measure_variable_width_column_cell_lengths,
+    },
+    value_conversion_error,
+};
+
+pub(crate) fn measure_layout(
+    encoder: &DirectEncoder,
+    batch: &RecordBatch,
+) -> Result<layout::RowLayout> {
+    let row_count = batch.num_rows();
+    if row_count == 0 {
+        return layout::RowLayout::new(Vec::new(), Vec::new(), Vec::new(), 0);
+    }
+
+    let cell_lengths = measure_cell_lengths(encoder, batch)?;
+    build_fixed_width_row_layout(row_count, encoder.plan.column_count(), &cell_lengths)
+}
+
+pub(crate) fn measure_cell_lengths(
+    encoder: &DirectEncoder,
+    batch: &RecordBatch,
+) -> Result<Vec<usize>> {
+    let row_count = batch.num_rows();
+    let column_count = encoder.plan.column_count();
+
+    if row_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut cell_lengths = vec![0; row_count * column_count];
+
+    for (column_index, column) in encoder.plan.columns().iter().enumerate() {
+        let Some(array) = batch
+            .columns()
+            .get(column.source_index())
+            .map(AsRef::as_ref)
+        else {
+            return Err(value_conversion_error(row_column_diagnostic(
+                column,
+                0,
+                DiagnosticCode::ValueTypeMismatch,
+                "planned direct column index is outside the runtime batch",
+            )));
+        };
+
+        match column.encoding() {
+            DirectColumnEncoding::Primitive(_) => {
+                measure_primitive_column_cell_lengths(
+                    array,
+                    column,
+                    column_index,
+                    column_count,
+                    &mut cell_lengths,
+                )?;
+            }
+            DirectColumnEncoding::UInt64Decimal20_0 => {
+                let array = downcast_direct_array::<UInt64Array>(array, column)?;
+                measure_uint64_decimal20_cell_lengths(
+                    array,
+                    column,
+                    column_index,
+                    column_count,
+                    &mut cell_lengths,
+                )?;
+            }
+            DirectColumnEncoding::Decimal(classification) => {
+                measure_decimal_column_cell_lengths(
+                    array,
+                    column,
+                    classification,
+                    column_index,
+                    column_count,
+                    &mut cell_lengths,
+                )?;
+            }
+            DirectColumnEncoding::VariableWidth(_) => {
+                measure_variable_width_column_cell_lengths(
+                    array,
+                    column,
+                    column_index,
+                    column_count,
+                    &mut cell_lengths,
+                )?;
+            }
+            DirectColumnEncoding::Temporal(classification) => {
+                let mapping = encoder.mapping_for_column_index(column_index)?;
+                measure_temporal_column_cell_lengths(
+                    array,
+                    TemporalColumnContext {
+                        mapping,
+                        plan_options: encoder.plan_options,
+                        column,
+                        classification,
+                        column_index,
+                        column_count,
+                    },
+                    &mut cell_lengths,
+                )?;
+            }
+        }
+    }
+
+    Ok(cell_lengths)
+}
 
 /// Direct row payload measurement for one runtime batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
