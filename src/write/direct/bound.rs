@@ -45,7 +45,8 @@ use super::{
         },
         variable_width::{
             append_nvarchar_cell, append_varbinary_cell, fill_nvarchar_column,
-            fill_varbinary_column, measure_variable_width_column_cell_lengths,
+            fill_varbinary_column, measure_nvarchar_column_cell_lengths,
+            measure_varbinary_column_cell_lengths,
         },
     },
     unsupported_batch, value_conversion_error,
@@ -681,15 +682,15 @@ impl BoundDirectColumn<'_> {
                 column_count,
                 cell_lengths,
             ),
-            Self::Utf8 { column, array } => measure_variable_width_column_cell_lengths(
-                *array,
+            Self::Utf8 { column, array } => measure_nvarchar_column_cell_lengths(
+                array,
                 column,
                 column_index,
                 column_count,
                 cell_lengths,
             ),
-            Self::Binary { column, array } => measure_variable_width_column_cell_lengths(
-                *array,
+            Self::Binary { column, array } => measure_varbinary_column_cell_lengths(
+                array,
                 column,
                 column_index,
                 column_count,

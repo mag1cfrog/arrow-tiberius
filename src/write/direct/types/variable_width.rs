@@ -76,6 +76,64 @@ pub(crate) fn measure_variable_width_column_cell_lengths(
     }
 }
 
+/// Measures one Utf8-to-nvarchar column into a row-major cell length matrix.
+pub(crate) fn measure_nvarchar_column_cell_lengths(
+    array: &StringArray,
+    column: &DirectColumnPlan,
+    column_index: usize,
+    column_count: usize,
+    cell_lengths: &mut [usize],
+) -> Result<()> {
+    let length = match column.encoding() {
+        DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::Utf8ToNVarChar {
+            length,
+        }) => length,
+        other => {
+            return Err(unsupported_batch(format!(
+                "direct nvarchar layout cannot measure mapping {other:?}"
+            )));
+        }
+    };
+
+    measure_nvarchar_cell_lengths(
+        array,
+        column,
+        column_index,
+        column_count,
+        length,
+        cell_lengths,
+    )
+}
+
+/// Measures one Binary-to-varbinary column into a row-major cell length matrix.
+pub(crate) fn measure_varbinary_column_cell_lengths(
+    array: &BinaryArray,
+    column: &DirectColumnPlan,
+    column_index: usize,
+    column_count: usize,
+    cell_lengths: &mut [usize],
+) -> Result<()> {
+    let length = match column.encoding() {
+        DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::BinaryToVarBinary {
+            length,
+        }) => length,
+        other => {
+            return Err(unsupported_batch(format!(
+                "direct varbinary layout cannot measure mapping {other:?}"
+            )));
+        }
+    };
+
+    measure_varbinary_cell_lengths(
+        array,
+        column,
+        column_index,
+        column_count,
+        length,
+        cell_lengths,
+    )
+}
+
 /// Fills one Utf8-to-nvarchar column into an already allocated rows payload.
 pub(crate) fn fill_nvarchar_column(
     array: &StringArray,
