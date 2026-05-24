@@ -348,9 +348,29 @@ async fn baseline_writer_round_trips_supported_value_matrix() -> TestResult<()> 
 
 #[tokio::test]
 async fn baseline_writer_round_trips_fixed_size_binary_values() -> TestResult<()> {
+    round_trip_fixed_size_binary_values(
+        WriteBackend::BaselineTokenRow,
+        "SQL Server baseline fixed-size binary integration test",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn direct_raw_writer_round_trips_fixed_size_binary_values() -> TestResult<()> {
+    round_trip_fixed_size_binary_values(
+        WriteBackend::DirectRawBulk,
+        "SQL Server direct raw fixed-size binary integration test",
+    )
+    .await
+}
+
+async fn round_trip_fixed_size_binary_values(
+    backend: WriteBackend,
+    skip_context: &str,
+) -> TestResult<()> {
     let Some((connection_string, database)) = integration_config() else {
         eprintln!(
-            "skipping SQL Server baseline fixed-size binary integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+            "skipping {skip_context}: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
         );
         return Ok(());
     };
@@ -402,7 +422,7 @@ async fn baseline_writer_round_trips_fixed_size_binary_values() -> TestResult<()
             table.clone(),
             mappings,
             WriteOptions {
-                backend: WriteBackend::BaselineTokenRow,
+                backend,
                 ..WriteOptions::default()
             },
         )
