@@ -11,7 +11,7 @@ use arrow_array::{
 
 use super::{
     DirectEncoder, downcast_direct_array,
-    layout::RowLayout,
+    layout::{RowLayout, build_fixed_width_row_layout},
     plan,
     plan::DirectColumnEncoding,
     row_column_diagnostic,
@@ -92,6 +92,15 @@ impl<'a> BoundDirectBatch<'a> {
         }
 
         Ok(cell_lengths)
+    }
+
+    pub(crate) fn measure_layout(&self) -> Result<RowLayout> {
+        if self.row_count == 0 {
+            return RowLayout::new(Vec::new(), Vec::new(), Vec::new(), 0);
+        }
+
+        let cell_lengths = self.measure_cell_lengths()?;
+        build_fixed_width_row_layout(self.row_count, self.columns.len(), &cell_lengths)
     }
 
     pub(crate) fn fill_columns(&self, layout: &RowLayout, bytes: &mut [u8]) -> Result<()> {

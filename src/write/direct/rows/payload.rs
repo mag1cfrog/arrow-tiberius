@@ -6,8 +6,8 @@ use crate::{Result, write::record_batch::validate_runtime_columns};
 
 use super::super::{
     DirectEncoder, MeasuredDirectBatch, bound::BoundDirectBatch, invalid_payload,
-    layout::allocate_rows_payload_with_tokens, measure::measure_layout,
-    payload::EncodedRowsPayload, rows::fixed_width::try_encode_fixed_width_rows,
+    layout::allocate_rows_payload_with_tokens, payload::EncodedRowsPayload,
+    rows::fixed_width::try_encode_fixed_width_rows,
 };
 
 /// Encodes a runtime batch into complete raw TDS row payload bytes.
@@ -108,9 +108,10 @@ fn encode_checked_batch(
         return Ok(payload);
     }
 
-    let layout = measure_layout(encoder, batch)?;
+    let bound = BoundDirectBatch::new(encoder, batch)?;
+    let layout = bound.measure_layout()?;
     let mut bytes = allocate_rows_payload_with_tokens(&layout);
-    BoundDirectBatch::new(encoder, batch)?.fill_columns(&layout, &mut bytes)?;
+    bound.fill_columns(&layout, &mut bytes)?;
 
     EncodedRowsPayload::new(bytes, layout.row_token_offsets().to_vec())
 }

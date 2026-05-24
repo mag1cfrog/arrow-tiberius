@@ -5,23 +5,15 @@ use arrow_array::RecordBatch;
 use crate::Result;
 
 use super::{
-    DirectEncoder,
-    bound::BoundDirectBatch,
-    invalid_payload, layout,
-    layout::{build_fixed_width_row_layout, build_fixed_width_row_range_layout},
+    DirectEncoder, bound::BoundDirectBatch, invalid_payload, layout,
+    layout::build_fixed_width_row_range_layout,
 };
 
 pub(crate) fn measure_layout(
     encoder: &DirectEncoder,
     batch: &RecordBatch,
 ) -> Result<layout::RowLayout> {
-    let row_count = batch.num_rows();
-    if row_count == 0 {
-        return layout::RowLayout::new(Vec::new(), Vec::new(), Vec::new(), 0);
-    }
-
-    let cell_lengths = measure_cell_lengths(encoder, batch)?;
-    build_fixed_width_row_layout(row_count, encoder.plan.column_count(), &cell_lengths)
+    BoundDirectBatch::new(encoder, batch)?.measure_layout()
 }
 
 pub(crate) fn measure_cell_lengths(
