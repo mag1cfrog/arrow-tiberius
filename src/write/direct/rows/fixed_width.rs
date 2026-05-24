@@ -6,7 +6,7 @@ use arrow_array::{
 };
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 
 use crate::{
     Diagnostic, DiagnosticCode, Error, FieldRef, NanosecondPolicy, Result, SchemaMapping,
@@ -58,16 +58,18 @@ const ROW_TOKEN_LEN: usize = 1;
 const CELL_LEN_PREFIX_LEN: usize = 1;
 
 #[cfg(test)]
-static FIXED_WIDTH_MEASURE_CALLS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static FIXED_WIDTH_MEASURE_CALLS: Cell<usize> = const { Cell::new(0) };
+}
 
 #[cfg(test)]
 pub(crate) fn reset_fixed_width_measure_call_count() {
-    FIXED_WIDTH_MEASURE_CALLS.store(0, Ordering::Relaxed);
+    FIXED_WIDTH_MEASURE_CALLS.with(|count| count.set(0));
 }
 
 #[cfg(test)]
 pub(crate) fn fixed_width_measure_call_count() -> usize {
-    FIXED_WIDTH_MEASURE_CALLS.load(Ordering::Relaxed)
+    FIXED_WIDTH_MEASURE_CALLS.with(Cell::get)
 }
 
 #[derive(Clone, Copy)]
@@ -606,7 +608,7 @@ fn measure_fixed_width_rows(
     columns: &[FixedWidthColumn<'_>],
 ) -> Result<FixedWidthRowsLayout> {
     #[cfg(test)]
-    FIXED_WIDTH_MEASURE_CALLS.fetch_add(1, Ordering::Relaxed);
+    FIXED_WIDTH_MEASURE_CALLS.with(|count| count.set(count.get() + 1));
 
     let mut row_lengths = vec![ROW_TOKEN_LEN; row_count];
 
