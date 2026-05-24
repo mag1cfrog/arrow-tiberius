@@ -11,7 +11,6 @@ use crate::{
 };
 
 use super::super::{
-    downcast_direct_array,
     layout::{CellPosition, RowLayout},
     plan::{DirectColumnEncoding, DirectColumnPlan},
 };
@@ -24,16 +23,32 @@ const CELL_LEN_PREFIX_LEN: usize = 1;
 /// nullability. Non-nullable primitive columns use fixed-width cells with no
 /// length byte. Nullable primitive columns use the nullable TDS form with a
 /// one-byte length prefix, where null values occupy only the zero length byte.
-pub(crate) fn measure_primitive_column_cell_lengths(
-    array: &dyn Array,
+pub(crate) fn measure_fixed_primitive_column_cell_lengths<A: Array + ?Sized>(
+    array: &A,
     column: &DirectColumnPlan,
     column_index: usize,
     column_count: usize,
     cell_lengths: &mut [usize],
 ) -> Result<()> {
     let value_len = primitive_value_len(column.encoding())?;
-    validate_primitive_column_values(array, column)?;
+    measure_primitive_cell_lengths(
+        array,
+        column,
+        value_len,
+        column_index,
+        column_count,
+        cell_lengths,
+    )
+}
 
+fn measure_primitive_cell_lengths<A: Array + ?Sized>(
+    array: &A,
+    column: &DirectColumnPlan,
+    value_len: usize,
+    column_index: usize,
+    column_count: usize,
+    cell_lengths: &mut [usize],
+) -> Result<()> {
     for row_index in 0..array.len() {
         let cell_len = if array.is_null(row_index) {
             if !column.nullable() {
@@ -58,59 +73,143 @@ pub(crate) fn measure_primitive_column_cell_lengths(
     Ok(())
 }
 
-fn validate_primitive_column_values(array: &dyn Array, column: &DirectColumnPlan) -> Result<()> {
-    if matches!(
-        column.encoding(),
-        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal)
-    ) {
-        let array = downcast_direct_array::<Float32Array>(array, column)?;
-        for row_index in 0..array.len() {
-            if array.is_null(row_index) {
-                continue;
-            }
+pub(crate) fn measure_uint64_checked_bigint_column_cell_lengths(
+    array: &UInt64Array,
+    column: &DirectColumnPlan,
+    column_index: usize,
+    column_count: usize,
+    cell_lengths: &mut [usize],
+) -> Result<()> {
+    let value_len = match column.encoding() {
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt64ToCheckedBigInt) => 8,
+        other => {
+            return Err(unsupported_batch(format!(
+                "direct UInt64 checked bigint layout cannot measure mapping {other:?}"
+            )));
+        }
+    };
 
-            let value = array.value(row_index);
-            if !value.is_finite() {
+    measure_checked_primitive_column_cell_lengths(
+        array,
+        column,
+        value_len,
+        column_index,
+        column_count,
+        cell_lengths,
+        |array, row_index| {
+            uint64_checked_bigint_bytes(array.value(row_index), column, row_index).map(|_| ())
+        },
+    )
+}
+
+pub(crate) fn measure_float32_column_cell_lengths(
+    array: &Float32Array,
+    column: &DirectColumnPlan,
+    column_index: usize,
+    column_count: usize,
+    cell_lengths: &mut [usize],
+) -> Result<()> {
+    let value_len = match column.encoding() {
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal) => 4,
+        other => {
+            return Err(unsupported_batch(format!(
+                "direct Float32 layout cannot measure mapping {other:?}"
+            )));
+        }
+    };
+
+    measure_checked_primitive_column_cell_lengths(
+        array,
+        column,
+        value_len,
+        column_index,
+        column_count,
+        cell_lengths,
+        |array, row_index| validate_finite_float(column, row_index, array.value(row_index)),
+    )
+}
+
+pub(crate) fn measure_float64_column_cell_lengths(
+    array: &Float64Array,
+    column: &DirectColumnPlan,
+    column_index: usize,
+    column_count: usize,
+    cell_lengths: &mut [usize],
+) -> Result<()> {
+    let value_len = match column.encoding() {
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => 8,
+        other => {
+            return Err(unsupported_batch(format!(
+                "direct Float64 layout cannot measure mapping {other:?}"
+            )));
+        }
+    };
+
+    measure_checked_primitive_column_cell_lengths(
+        array,
+        column,
+        value_len,
+        column_index,
+        column_count,
+        cell_lengths,
+        |array, row_index| validate_finite_float(column, row_index, array.value(row_index)),
+    )
+}
+
+fn measure_checked_primitive_column_cell_lengths<A, F>(
+    array: &A,
+    column: &DirectColumnPlan,
+    value_len: usize,
+    column_index: usize,
+    column_count: usize,
+    cell_lengths: &mut [usize],
+    validate_value: F,
+) -> Result<()>
+where
+    A: Array,
+    F: Fn(&A, usize) -> Result<()>,
+{
+    for row_index in 0..array.len() {
+        let cell_len = if array.is_null(row_index) {
+            if !column.nullable() {
                 return Err(value_conversion_error(row_column_diagnostic(
                     column,
                     row_index,
-                    DiagnosticCode::NonFiniteFloat,
-                    format!("non-finite floating point value {value} is not supported"),
+                    DiagnosticCode::NullInNonNullableColumn,
+                    "null value in non-nullable direct primitive column",
                 )));
             }
-        }
-    } else if matches!(
-        column.encoding(),
-        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat)
-    ) {
-        let array = downcast_direct_array::<Float64Array>(array, column)?;
-        for row_index in 0..array.len() {
-            if array.is_null(row_index) {
-                continue;
-            }
 
-            let value = array.value(row_index);
-            if !value.is_finite() {
-                return Err(value_conversion_error(row_column_diagnostic(
-                    column,
-                    row_index,
-                    DiagnosticCode::NonFiniteFloat,
-                    format!("non-finite floating point value {value} is not supported"),
-                )));
-            }
-        }
-    } else if matches!(
-        column.encoding(),
-        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt64ToCheckedBigInt)
-    ) {
-        let array = downcast_direct_array::<UInt64Array>(array, column)?;
-        for row_index in 0..array.len() {
-            if array.is_null(row_index) {
-                continue;
-            }
+            CELL_LEN_PREFIX_LEN
+        } else {
+            validate_value(array, row_index)?;
 
-            uint64_checked_bigint_bytes(array.value(row_index), column, row_index)?;
-        }
+            if column.nullable() {
+                CELL_LEN_PREFIX_LEN + value_len
+            } else {
+                value_len
+            }
+        };
+
+        cell_lengths[row_index * column_count + column_index] = cell_len;
+    }
+
+    Ok(())
+}
+
+fn validate_finite_float(
+    column: &DirectColumnPlan,
+    row_index: usize,
+    value: impl Into<f64>,
+) -> Result<()> {
+    let value = value.into();
+    if !value.is_finite() {
+        return Err(value_conversion_error(row_column_diagnostic(
+            column,
+            row_index,
+            DiagnosticCode::NonFiniteFloat,
+            format!("non-finite floating point value {value} is not supported"),
+        )));
     }
 
     Ok(())
@@ -971,7 +1070,8 @@ mod tests {
     use super::{
         fill_boolean_column, fill_float32_column, fill_float64_column, fill_int8_column,
         fill_int16_column, fill_int32_column, fill_int64_column, fill_uint8_column,
-        fill_uint16_column, fill_uint32_column, measure_primitive_column_cell_lengths,
+        fill_uint16_column, fill_uint32_column, measure_fixed_primitive_column_cell_lengths,
+        measure_float32_column_cell_lengths, measure_float64_column_cell_lengths,
     };
     use crate::write::direct::layout::{
         allocate_rows_payload_with_tokens, build_fixed_width_row_layout,
@@ -986,8 +1086,14 @@ mod tests {
         let array = Int32Array::from(Vec::<i32>::new());
         let mut cell_lengths = Vec::new();
 
-        measure_primitive_column_cell_lengths(&array, &plan.columns()[0], 0, 1, &mut cell_lengths)
-            .unwrap();
+        measure_fixed_primitive_column_cell_lengths(
+            &array,
+            &plan.columns()[0],
+            0,
+            1,
+            &mut cell_lengths,
+        )
+        .unwrap();
 
         let layout = build_fixed_width_row_layout(0, 1, &cell_lengths).unwrap();
 
@@ -1024,7 +1130,7 @@ mod tests {
         let mut cell_lengths = vec![0; row_count * column_count];
 
         for (column_index, (array, column)) in arrays.iter().zip(plan.columns()).enumerate() {
-            measure_primitive_column_cell_lengths(
+            measure_fixed_primitive_column_cell_lengths(
                 *array,
                 column,
                 column_index,
@@ -1072,7 +1178,7 @@ mod tests {
         let mut cell_lengths = vec![0; row_count * column_count];
 
         for (column_index, (array, column)) in arrays.iter().zip(plan.columns()).enumerate() {
-            measure_primitive_column_cell_lengths(
+            measure_fixed_primitive_column_cell_lengths(
                 *array,
                 column,
                 column_index,
@@ -1129,7 +1235,7 @@ mod tests {
         let row_count = 2;
         let column_count = 1;
         let mut cell_lengths = vec![0; row_count * column_count];
-        measure_primitive_column_cell_lengths(
+        measure_fixed_primitive_column_cell_lengths(
             &array,
             &plan.columns()[0],
             0,
@@ -1167,7 +1273,7 @@ mod tests {
         let row_count = 3;
         let column_count = 1;
         let mut cell_lengths = vec![0; row_count * column_count];
-        measure_primitive_column_cell_lengths(
+        measure_fixed_primitive_column_cell_lengths(
             &array,
             &plan.columns()[0],
             0,
@@ -1233,7 +1339,7 @@ mod tests {
         let mut cell_lengths = vec![0; row_count * column_count];
 
         for (column_index, (array, column)) in arrays.iter().zip(plan.columns()).enumerate() {
-            measure_primitive_column_cell_lengths(
+            measure_fixed_primitive_column_cell_lengths(
                 *array,
                 column,
                 column_index,
@@ -1370,7 +1476,7 @@ mod tests {
         let mut cell_lengths = vec![0; row_count * column_count];
 
         for (column_index, (array, column)) in arrays.iter().zip(plan.columns()).enumerate() {
-            measure_primitive_column_cell_lengths(
+            measure_fixed_primitive_column_cell_lengths(
                 *array,
                 column,
                 column_index,
@@ -1481,7 +1587,7 @@ mod tests {
         let row_count = array.len();
         let column_count = 1;
         let mut cell_lengths = vec![0; row_count * column_count];
-        measure_primitive_column_cell_lengths(
+        measure_fixed_primitive_column_cell_lengths(
             &array,
             &plan.columns()[0],
             0,
@@ -1543,7 +1649,7 @@ mod tests {
         let row_count = array.len();
         let column_count = 1;
         let mut cell_lengths = vec![0; row_count * column_count];
-        measure_primitive_column_cell_lengths(
+        measure_fixed_primitive_column_cell_lengths(
             &array,
             &plan.columns()[0],
             0,
@@ -1581,7 +1687,7 @@ mod tests {
         let row_count = array.len();
         let column_count = 1;
         let mut cell_lengths = vec![0; row_count * column_count];
-        measure_primitive_column_cell_lengths(
+        measure_fixed_primitive_column_cell_lengths(
             &array,
             &plan.columns()[0],
             0,
@@ -1659,7 +1765,7 @@ mod tests {
         let row_count = array.len();
         let column_count = 1;
         let mut cell_lengths = vec![0; row_count * column_count];
-        measure_primitive_column_cell_lengths(
+        measure_fixed_primitive_column_cell_lengths(
             &array,
             &plan.columns()[0],
             0,
@@ -1700,7 +1806,7 @@ mod tests {
         let row_count = array.len();
         let column_count = 1;
         let mut cell_lengths = vec![0; row_count * column_count];
-        measure_primitive_column_cell_lengths(
+        measure_fixed_primitive_column_cell_lengths(
             &array,
             &plan.columns()[0],
             0,
@@ -1762,7 +1868,7 @@ mod tests {
         let row_count = array.len();
         let column_count = 1;
         let mut cell_lengths = vec![0; row_count * column_count];
-        measure_primitive_column_cell_lengths(
+        measure_fixed_primitive_column_cell_lengths(
             &array,
             &plan.columns()[0],
             0,
@@ -1803,7 +1909,7 @@ mod tests {
         let row_count = array.len();
         let column_count = 1;
         let mut cell_lengths = vec![0; row_count * column_count];
-        measure_primitive_column_cell_lengths(
+        measure_fixed_primitive_column_cell_lengths(
             &array,
             &plan.columns()[0],
             0,
@@ -1881,7 +1987,7 @@ mod tests {
         let row_count = array.len();
         let column_count = 1;
         let mut cell_lengths = vec![0; row_count * column_count];
-        measure_primitive_column_cell_lengths(
+        measure_fixed_primitive_column_cell_lengths(
             &array,
             &plan.columns()[0],
             0,
@@ -1939,7 +2045,7 @@ mod tests {
             let column_count = 1;
             let mut cell_lengths = vec![0; row_count * column_count];
 
-            let err = measure_primitive_column_cell_lengths(
+            let err = measure_float32_column_cell_lengths(
                 &array,
                 &plan.columns()[0],
                 0,
@@ -1975,7 +2081,7 @@ mod tests {
             let column_count = 1;
             let mut cell_lengths = vec![0; row_count * column_count];
 
-            let err = measure_primitive_column_cell_lengths(
+            let err = measure_float64_column_cell_lengths(
                 &array,
                 &plan.columns()[0],
                 0,
@@ -2006,7 +2112,7 @@ mod tests {
         let array = Int32Array::from(vec![Some(1), None]);
         let mut cell_lengths = vec![0; 2];
 
-        let err = measure_primitive_column_cell_lengths(
+        let err = measure_fixed_primitive_column_cell_lengths(
             &array,
             &plan.columns()[0],
             0,

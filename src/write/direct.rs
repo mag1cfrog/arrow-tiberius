@@ -1,6 +1,7 @@
 //! Direct raw TDS bulk encoder internals.
 #![allow(dead_code)]
 
+pub(crate) mod binding;
 pub(crate) mod encoder;
 pub(crate) mod layout;
 pub(crate) mod measure;
@@ -10,8 +11,8 @@ pub(crate) mod rows;
 pub(crate) mod types;
 
 pub(crate) use encoder::{
-    DirectEncoder, checked_add, downcast_direct_array, invalid_payload, row_column_diagnostic,
-    unsupported_batch, value_conversion_error,
+    DirectEncoder, checked_add, invalid_payload, row_column_diagnostic, unsupported_batch,
+    value_conversion_error,
 };
 pub(crate) use measure::{MeasuredDirectBatch, MeasuredRowRange};
 
@@ -41,7 +42,7 @@ mod tests {
     use super::types::temporal::{
         write_datetime2_cell, write_datetimeoffset_cell, write_time_cell,
     };
-    use super::{DirectEncoder, payload};
+    use super::{DirectEncoder, binding::BoundDirectBatch, payload};
 
     #[test]
     fn default_direct_encoder_accepts_empty_mapping_set() {
@@ -1771,14 +1772,10 @@ mod tests {
             ],
         );
 
-        let payload = try_encode_fixed_width_rows(
-            &batch,
-            encoder.mappings(),
-            PlanOptions::default(),
-            encoder.plan().columns(),
-        )
-        .unwrap()
-        .expect("fixed-width primitive fast path should be active");
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+        let payload = try_encode_fixed_width_rows(&bound)
+            .unwrap()
+            .expect("fixed-width primitive fast path should be active");
 
         assert_eq!(payload.row_token_offsets(), [0, 15]);
         assert_eq!(payload.row_count(), 2);
@@ -1811,14 +1808,10 @@ mod tests {
             ],
         );
 
-        let payload = try_encode_fixed_width_rows(
-            &batch,
-            encoder.mappings(),
-            PlanOptions::default(),
-            encoder.plan().columns(),
-        )
-        .unwrap()
-        .expect("fixed-width date-family fast path should be active");
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+        let payload = try_encode_fixed_width_rows(&bound)
+            .unwrap()
+            .expect("fixed-width date-family fast path should be active");
 
         assert_eq!(payload.row_token_offsets(), [0, 17]);
         assert_eq!(
@@ -1872,14 +1865,10 @@ mod tests {
             ],
         );
 
-        let payload = try_encode_fixed_width_rows(
-            &batch,
-            encoder.mappings(),
-            options,
-            encoder.plan().columns(),
-        )
-        .unwrap()
-        .expect("fixed-width timestamp datetime2 fast path should be active");
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+        let payload = try_encode_fixed_width_rows(&bound)
+            .unwrap()
+            .expect("fixed-width timestamp datetime2 fast path should be active");
 
         assert_eq!(payload.row_token_offsets(), [0, 23]);
         assert_eq!(
@@ -1950,14 +1939,10 @@ mod tests {
             ],
         );
 
-        let payload = try_encode_fixed_width_rows(
-            &batch,
-            encoder.mappings(),
-            options,
-            encoder.plan().columns(),
-        )
-        .unwrap()
-        .expect("fixed-width time fast path should be active");
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+        let payload = try_encode_fixed_width_rows(&bound)
+            .unwrap()
+            .expect("fixed-width time fast path should be active");
 
         assert_eq!(payload.row_token_offsets(), [0, 26]);
         assert_eq!(
@@ -2176,14 +2161,10 @@ mod tests {
             ],
         );
 
-        let payload = try_encode_fixed_width_rows(
-            &batch,
-            encoder.mappings(),
-            options,
-            encoder.plan().columns(),
-        )
-        .unwrap()
-        .expect("fixed-width datetimeoffset fast path should be active");
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+        let payload = try_encode_fixed_width_rows(&bound)
+            .unwrap()
+            .expect("fixed-width datetimeoffset fast path should be active");
 
         assert_eq!(payload.row_token_offsets(), [0, 49]);
         assert_eq!(

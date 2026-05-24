@@ -19,61 +19,62 @@ const PLP_TERMINATOR_LEN: usize = 4;
 const MAX_BOUNDED_TDS_VALUE_LEN: usize = 0xfffe;
 const MAX_PLP_CHUNK_LEN: usize = u32::MAX as usize;
 
-/// Measures one variable-width Arrow column into a row-major cell length matrix.
-///
-/// Bounded SQL Server variable-width cells use a two-byte byte-length prefix.
-/// `max` cells use PLP encoding: an eight-byte total-length marker followed by
-/// one chunk length, the chunk bytes, and a terminator for non-empty values.
-pub(crate) fn measure_variable_width_column_cell_lengths(
-    array: &dyn Array,
+/// Measures one Utf8-to-nvarchar column into a row-major cell length matrix.
+pub(crate) fn measure_nvarchar_column_cell_lengths(
+    array: &StringArray,
     column: &DirectColumnPlan,
     column_index: usize,
     column_count: usize,
     cell_lengths: &mut [usize],
 ) -> Result<()> {
-    match column.encoding() {
+    let length = match column.encoding() {
         DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::Utf8ToNVarChar {
             length,
-        }) => {
-            let array = downcast_direct_array::<StringArray>(array, column)?;
-            measure_nvarchar_cell_lengths(
-                array,
-                column,
-                column_index,
-                column_count,
-                length,
-                cell_lengths,
-            )
+        }) => length,
+        other => {
+            return Err(unsupported_batch(format!(
+                "direct nvarchar layout cannot measure mapping {other:?}"
+            )));
         }
+    };
+
+    measure_nvarchar_cell_lengths(
+        array,
+        column,
+        column_index,
+        column_count,
+        length,
+        cell_lengths,
+    )
+}
+
+/// Measures one Binary-to-varbinary column into a row-major cell length matrix.
+pub(crate) fn measure_varbinary_column_cell_lengths(
+    array: &BinaryArray,
+    column: &DirectColumnPlan,
+    column_index: usize,
+    column_count: usize,
+    cell_lengths: &mut [usize],
+) -> Result<()> {
+    let length = match column.encoding() {
         DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::BinaryToVarBinary {
             length,
-        }) => {
-            let array = downcast_direct_array::<BinaryArray>(array, column)?;
-            measure_varbinary_cell_lengths(
-                array,
-                column,
-                column_index,
-                column_count,
-                length,
-                cell_lengths,
-            )
+        }) => length,
+        other => {
+            return Err(unsupported_batch(format!(
+                "direct varbinary layout cannot measure mapping {other:?}"
+            )));
         }
-        DirectColumnEncoding::VariableWidth(other) => Err(unsupported_batch(format!(
-            "direct variable-width layout is not implemented yet for {other:?}"
-        ))),
-        DirectColumnEncoding::Primitive(other) => Err(unsupported_batch(format!(
-            "direct variable-width layout cannot measure primitive mapping {other:?}"
-        ))),
-        DirectColumnEncoding::UInt64Decimal20_0 => Err(unsupported_batch(
-            "direct variable-width layout cannot measure UInt64 decimal20_0",
-        )),
-        DirectColumnEncoding::Decimal(classification) => Err(unsupported_batch(format!(
-            "direct variable-width layout cannot measure decimal mapping {classification:?}"
-        ))),
-        DirectColumnEncoding::Temporal(other) => Err(unsupported_batch(format!(
-            "direct variable-width layout cannot measure temporal mapping {other:?}"
-        ))),
-    }
+    };
+
+    measure_varbinary_cell_lengths(
+        array,
+        column,
+        column_index,
+        column_count,
+        length,
+        cell_lengths,
+    )
 }
 
 /// Fills one Utf8-to-nvarchar column into an already allocated rows payload.
@@ -824,23 +825,6 @@ fn cell_position(
         .ok_or_else(|| invalid_payload("cell position is outside measured row layout"))
 }
 
-fn downcast_direct_array<'a, T: Array + 'static>(
-    array: &'a dyn Array,
-    column: &DirectColumnPlan,
-) -> Result<&'a T> {
-    array.as_any().downcast_ref::<T>().ok_or_else(|| {
-        value_conversion_error(row_column_diagnostic(
-            column,
-            0,
-            DiagnosticCode::ValueTypeMismatch,
-            format!(
-                "runtime Arrow type {} does not match planned direct column type",
-                array.data_type()
-            ),
-        ))
-    })
-}
-
 fn checked_add(lhs: usize, rhs: usize) -> Result<usize> {
     lhs.checked_add(rhs)
         .ok_or_else(|| invalid_payload("direct variable-width row layout length overflowed usize"))
@@ -916,7 +900,8 @@ mod tests {
     use super::{
         MAX_BOUNDED_TDS_VALUE_LEN, MAX_PLP_CHUNK_LEN, bounded_cell_len,
         bounded_nvarchar_encoded_bytes, fill_nvarchar_column, fill_varbinary_column,
-        measure_variable_width_column_cell_lengths, plp_cell_len, plp_nvarchar_encoded_bytes,
+        measure_nvarchar_column_cell_lengths, measure_varbinary_column_cell_lengths, plp_cell_len,
+        plp_nvarchar_encoded_bytes,
     };
 
     #[test]
@@ -931,14 +916,8 @@ mod tests {
         )]);
         let mut cell_lengths = vec![0; array.len()];
 
-        measure_variable_width_column_cell_lengths(
-            &array,
-            &plan.columns()[0],
-            0,
-            1,
-            &mut cell_lengths,
-        )
-        .unwrap();
+        measure_nvarchar_column_cell_lengths(&array, &plan.columns()[0], 0, 1, &mut cell_lengths)
+            .unwrap();
 
         assert_eq!(cell_lengths, [6, 6, 2]);
     }
@@ -955,14 +934,8 @@ mod tests {
         )]);
         let mut cell_lengths = vec![0; array.len()];
 
-        measure_variable_width_column_cell_lengths(
-            &array,
-            &plan.columns()[0],
-            0,
-            1,
-            &mut cell_lengths,
-        )
-        .unwrap();
+        measure_nvarchar_column_cell_lengths(&array, &plan.columns()[0], 0, 1, &mut cell_lengths)
+            .unwrap();
 
         assert_eq!(cell_lengths, [18, 12, 8]);
     }
@@ -979,14 +952,8 @@ mod tests {
         )]);
         let mut cell_lengths = vec![0; array.len()];
 
-        measure_variable_width_column_cell_lengths(
-            &array,
-            &plan.columns()[0],
-            0,
-            1,
-            &mut cell_lengths,
-        )
-        .unwrap();
+        measure_varbinary_column_cell_lengths(&array, &plan.columns()[0], 0, 1, &mut cell_lengths)
+            .unwrap();
 
         assert_eq!(cell_lengths, [5, 2, 2]);
     }
@@ -1003,14 +970,8 @@ mod tests {
         )]);
         let mut cell_lengths = vec![0; array.len()];
 
-        measure_variable_width_column_cell_lengths(
-            &array,
-            &plan.columns()[0],
-            0,
-            1,
-            &mut cell_lengths,
-        )
-        .unwrap();
+        measure_varbinary_column_cell_lengths(&array, &plan.columns()[0], 0, 1, &mut cell_lengths)
+            .unwrap();
 
         assert_eq!(cell_lengths, [19, 12, 8]);
     }
@@ -1027,7 +988,7 @@ mod tests {
         )]);
         let mut cell_lengths = vec![0; array.len()];
 
-        let err = measure_variable_width_column_cell_lengths(
+        let err = measure_nvarchar_column_cell_lengths(
             &array,
             &plan.columns()[0],
             0,
@@ -1056,7 +1017,7 @@ mod tests {
         )]);
         let mut cell_lengths = vec![0; array.len()];
 
-        let err = measure_variable_width_column_cell_lengths(
+        let err = measure_varbinary_column_cell_lengths(
             &array,
             &plan.columns()[0],
             0,
@@ -1085,7 +1046,7 @@ mod tests {
         )]);
         let mut cell_lengths = vec![0; array.len()];
 
-        let err = measure_variable_width_column_cell_lengths(
+        let err = measure_nvarchar_column_cell_lengths(
             &array,
             &plan.columns()[0],
             0,

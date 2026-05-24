@@ -143,23 +143,6 @@ impl DirectEncoder {
     }
 }
 
-pub(crate) fn downcast_direct_array<'a, T: arrow_array::Array + 'static>(
-    array: &'a dyn arrow_array::Array,
-    column: &super::plan::DirectColumnPlan,
-) -> Result<&'a T> {
-    array.as_any().downcast_ref::<T>().ok_or_else(|| {
-        value_conversion_error(row_column_diagnostic(
-            column,
-            0,
-            DiagnosticCode::ValueTypeMismatch,
-            format!(
-                "runtime Arrow type {} does not match planned direct column type",
-                array.data_type()
-            ),
-        ))
-    })
-}
-
 pub(crate) fn unsupported_batch(message: impl Into<String>) -> Error {
     Error::DirectEncoding {
         diagnostics: DiagnosticSet::from(vec![Diagnostic::error(
