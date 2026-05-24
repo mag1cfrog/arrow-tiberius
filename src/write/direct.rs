@@ -22,9 +22,10 @@ mod tests {
     use arrow_array::{
         ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array,
         Decimal64Array, Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int32Array,
-        Int64Array, RecordBatch, StringArray, Time32MillisecondArray, Time32SecondArray,
-        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
+        Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
+        Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray, UInt64Array,
     };
     use arrow_buffer::{NullBuffer, ScalarBuffer, i256};
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -1810,6 +1811,185 @@ mod tests {
     }
 
     #[test]
+    fn direct_encoder_encodes_large_variable_width_rows() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "large_text",
+                DataType::LargeUtf8,
+                MssqlType::NVarChar(MssqlTypeLength::Bounded(2)),
+                true,
+            ),
+            mapping(
+                2,
+                "large_bytes",
+                DataType::LargeBinary,
+                MssqlType::VarBinary(MssqlTypeLength::Max),
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("large_text", DataType::LargeUtf8, true),
+                Field::new("large_bytes", DataType::LargeBinary, true),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(LargeStringArray::from(vec![Some("🙂"), Some(""), None])),
+                Arc::new(LargeBinaryArray::from_iter(vec![
+                    Some(&b"abc"[..]),
+                    Some(&b""[..]),
+                    None,
+                ])),
+            ],
+        );
+
+        let payload = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(payload.row_token_offsets(), [0, 30, 49]);
+        assert_eq!(
+            payload.bytes(),
+            expected_rows([
+                [
+                    int32_cell(1),
+                    bounded_nvarchar_cell("🙂"),
+                    max_varbinary_cell(b"abc")
+                ],
+                [
+                    int32_cell(2),
+                    bounded_nvarchar_cell(""),
+                    max_varbinary_cell(b"")
+                ],
+                [
+                    int32_cell(3),
+                    bounded_nvarchar_null_cell(),
+                    max_varbinary_null_cell()
+                ]
+            ])
+        );
+    }
+
+    #[test]
+    fn direct_encoder_large_variable_width_measured_ranges_match_full_payload() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "large_text",
+                DataType::LargeUtf8,
+                MssqlType::NVarChar(MssqlTypeLength::Max),
+                true,
+            ),
+            mapping(
+                2,
+                "large_bytes",
+                DataType::LargeBinary,
+                MssqlType::VarBinary(MssqlTypeLength::Bounded(3)),
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("large_text", DataType::LargeUtf8, true),
+                Field::new("large_bytes", DataType::LargeBinary, true),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+                Arc::new(LargeStringArray::from(vec![
+                    Some("alpha"),
+                    Some("東京"),
+                    None,
+                    Some(""),
+                ])),
+                Arc::new(LargeBinaryArray::from_iter(vec![
+                    Some(&b"abc"[..]),
+                    None,
+                    Some(&b""[..]),
+                    Some(&b"\x00\xff"[..]),
+                ])),
+            ],
+        );
+
+        let measured = encoder.measure_batch(&batch).unwrap();
+        let full = encoder.encode_batch(&batch).unwrap();
+        let first = encoder
+            .encode_measured_batch_range(&batch, &measured, 0, 2)
+            .unwrap();
+        let second = encoder
+            .encode_measured_batch_range(&batch, &measured, 2, 2)
+            .unwrap();
+        let mut concatenated = Vec::new();
+        concatenated.extend_from_slice(first.bytes());
+        concatenated.extend_from_slice(second.bytes());
+
+        assert_eq!(measured.row_count(), 4);
+        assert_eq!(concatenated, full.bytes());
+        assert_eq!(first.row_token_offsets()[0], 0);
+        assert_eq!(second.row_token_offsets()[0], 0);
+    }
+
+    #[test]
+    fn direct_encoder_rejects_large_variable_width_runtime_type_drift() {
+        let mappings = vec![
+            mapping(
+                0,
+                "large_text",
+                DataType::LargeUtf8,
+                MssqlType::NVarChar(MssqlTypeLength::Max),
+                true,
+            ),
+            mapping(
+                1,
+                "large_bytes",
+                DataType::LargeBinary,
+                MssqlType::VarBinary(MssqlTypeLength::Max),
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let text_drift = record_batch(
+            vec![
+                Field::new("large_text", DataType::Utf8, true),
+                Field::new("large_bytes", DataType::LargeBinary, true),
+            ],
+            vec![
+                Arc::new(StringArray::from(vec![Some("not-large")])) as ArrayRef,
+                Arc::new(LargeBinaryArray::from_iter(vec![Some(&b"abc"[..])])),
+            ],
+        );
+
+        assert_value_conversion_diagnostic(
+            encoder.encode_batch(&text_drift).unwrap_err(),
+            DiagnosticCode::SchemaMismatch,
+            None,
+            Some((0, "large_text")),
+        );
+
+        let binary_drift = record_batch(
+            vec![
+                Field::new("large_text", DataType::LargeUtf8, true),
+                Field::new("large_bytes", DataType::Binary, true),
+            ],
+            vec![
+                Arc::new(LargeStringArray::from(vec![Some("large")])) as ArrayRef,
+                Arc::new(BinaryArray::from_iter(vec![Some(&b"not-large"[..])])),
+            ],
+        );
+
+        assert_value_conversion_diagnostic(
+            encoder.encode_batch(&binary_drift).unwrap_err(),
+            DiagnosticCode::SchemaMismatch,
+            None,
+            Some((1, "large_bytes")),
+        );
+    }
+
+    #[test]
     fn direct_encoder_row_range_rejects_out_of_bounds_range() {
         let mappings = vec![mapping(0, "id", DataType::Int32, MssqlType::Int, false)];
         let encoder = DirectEncoder::new(&mappings).unwrap();
@@ -3311,6 +3491,35 @@ mod tests {
 
     fn int32_cell(value: i32) -> Vec<u8> {
         value.to_le_bytes().to_vec()
+    }
+
+    fn bounded_nvarchar_cell(value: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let encoded_bytes = value.encode_utf16().count() * 2;
+        bytes.extend_from_slice(&(encoded_bytes as u16).to_le_bytes());
+        for code_unit in value.encode_utf16() {
+            bytes.extend_from_slice(&code_unit.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn bounded_nvarchar_null_cell() -> Vec<u8> {
+        u16::MAX.to_le_bytes().to_vec()
+    }
+
+    fn max_varbinary_cell(value: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0xfffffffffffffffe_u64.to_le_bytes());
+        bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(value);
+        if !value.is_empty() {
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn max_varbinary_null_cell() -> Vec<u8> {
+        u64::MAX.to_le_bytes().to_vec()
     }
 
     fn nullable_int32_cell(value: i32) -> Vec<u8> {
