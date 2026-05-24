@@ -291,105 +291,93 @@ fn bind_direct_columns<'a>(
                 }
             }
             DirectColumnEncoding::Temporal(
-                classification @ (TemporalArrowToMssql::TimestampSecondToDateTime2
-                | TemporalArrowToMssql::TimestampSecondTzToDateTime2),
+                TemporalArrowToMssql::TimestampSecondToDateTime2
+                | TemporalArrowToMssql::TimestampSecondTzToDateTime2,
             ) => BoundDirectColumn::TimestampSecond {
                 column,
                 mapping: encoder.mapping_for_column_index(column_index)?,
-                classification,
                 array: downcast_direct_array::<TimestampSecondArray>(array, column)?,
             },
             DirectColumnEncoding::Temporal(
-                classification @ (TemporalArrowToMssql::TimestampMillisecondToDateTime2
-                | TemporalArrowToMssql::TimestampMillisecondTzToDateTime2),
+                TemporalArrowToMssql::TimestampMillisecondToDateTime2
+                | TemporalArrowToMssql::TimestampMillisecondTzToDateTime2,
             ) => BoundDirectColumn::TimestampMillisecond {
                 column,
                 mapping: encoder.mapping_for_column_index(column_index)?,
-                classification,
                 array: downcast_direct_array::<TimestampMillisecondArray>(array, column)?,
             },
             DirectColumnEncoding::Temporal(
-                classification @ (TemporalArrowToMssql::TimestampMicrosecondToDateTime2
-                | TemporalArrowToMssql::TimestampMicrosecondTzToDateTime2),
+                TemporalArrowToMssql::TimestampMicrosecondToDateTime2
+                | TemporalArrowToMssql::TimestampMicrosecondTzToDateTime2,
             ) => BoundDirectColumn::TimestampMicrosecond {
                 column,
                 mapping: encoder.mapping_for_column_index(column_index)?,
-                classification,
                 array: downcast_direct_array::<TimestampMicrosecondArray>(array, column)?,
             },
             DirectColumnEncoding::Temporal(
-                classification @ (TemporalArrowToMssql::TimestampNanosecondToDateTime2
-                | TemporalArrowToMssql::TimestampNanosecondTzToDateTime2),
+                TemporalArrowToMssql::TimestampNanosecondToDateTime2
+                | TemporalArrowToMssql::TimestampNanosecondTzToDateTime2,
             ) => BoundDirectColumn::TimestampNanosecond {
                 column,
                 mapping: encoder.mapping_for_column_index(column_index)?,
-                classification,
                 nanosecond_policy: encoder.plan_options.nanosecond_policy,
                 array: downcast_direct_array::<TimestampNanosecondArray>(array, column)?,
             },
+            DirectColumnEncoding::Temporal(TemporalArrowToMssql::Time32SecondToTime) => {
+                BoundDirectColumn::Time32Second {
+                    column,
+                    mapping: encoder.mapping_for_column_index(column_index)?,
+                    array: downcast_direct_array::<Time32SecondArray>(array, column)?,
+                }
+            }
+            DirectColumnEncoding::Temporal(TemporalArrowToMssql::Time32MillisecondToTime) => {
+                BoundDirectColumn::Time32Millisecond {
+                    column,
+                    mapping: encoder.mapping_for_column_index(column_index)?,
+                    array: downcast_direct_array::<Time32MillisecondArray>(array, column)?,
+                }
+            }
+            DirectColumnEncoding::Temporal(TemporalArrowToMssql::Time64MicrosecondToTime) => {
+                BoundDirectColumn::Time64Microsecond {
+                    column,
+                    mapping: encoder.mapping_for_column_index(column_index)?,
+                    array: downcast_direct_array::<Time64MicrosecondArray>(array, column)?,
+                }
+            }
+            DirectColumnEncoding::Temporal(TemporalArrowToMssql::Time64NanosecondToTime) => {
+                BoundDirectColumn::Time64Nanosecond {
+                    column,
+                    mapping: encoder.mapping_for_column_index(column_index)?,
+                    nanosecond_policy: encoder.plan_options.nanosecond_policy,
+                    array: downcast_direct_array::<Time64NanosecondArray>(array, column)?,
+                }
+            }
             DirectColumnEncoding::Temporal(
-                classification @ TemporalArrowToMssql::Time32SecondToTime,
-            ) => BoundDirectColumn::Time32Second {
-                column,
-                mapping: encoder.mapping_for_column_index(column_index)?,
-                classification,
-                array: downcast_direct_array::<Time32SecondArray>(array, column)?,
-            },
-            DirectColumnEncoding::Temporal(
-                classification @ TemporalArrowToMssql::Time32MillisecondToTime,
-            ) => BoundDirectColumn::Time32Millisecond {
-                column,
-                mapping: encoder.mapping_for_column_index(column_index)?,
-                classification,
-                array: downcast_direct_array::<Time32MillisecondArray>(array, column)?,
-            },
-            DirectColumnEncoding::Temporal(
-                classification @ TemporalArrowToMssql::Time64MicrosecondToTime,
-            ) => BoundDirectColumn::Time64Microsecond {
-                column,
-                mapping: encoder.mapping_for_column_index(column_index)?,
-                classification,
-                array: downcast_direct_array::<Time64MicrosecondArray>(array, column)?,
-            },
-            DirectColumnEncoding::Temporal(
-                classification @ TemporalArrowToMssql::Time64NanosecondToTime,
-            ) => BoundDirectColumn::Time64Nanosecond {
-                column,
-                mapping: encoder.mapping_for_column_index(column_index)?,
-                classification,
-                nanosecond_policy: encoder.plan_options.nanosecond_policy,
-                array: downcast_direct_array::<Time64NanosecondArray>(array, column)?,
-            },
-            DirectColumnEncoding::Temporal(
-                classification @ TemporalArrowToMssql::TimestampSecondTzToDateTimeOffset,
+                TemporalArrowToMssql::TimestampSecondTzToDateTimeOffset,
             ) => BoundDirectColumn::DateTimeOffsetSecond {
                 column,
                 mapping: encoder.mapping_for_column_index(column_index)?,
-                classification,
                 array: downcast_direct_array::<TimestampSecondArray>(array, column)?,
             },
             DirectColumnEncoding::Temporal(
-                classification @ TemporalArrowToMssql::TimestampMillisecondTzToDateTimeOffset,
+                TemporalArrowToMssql::TimestampMillisecondTzToDateTimeOffset,
             ) => BoundDirectColumn::DateTimeOffsetMillisecond {
                 column,
                 mapping: encoder.mapping_for_column_index(column_index)?,
-                classification,
                 array: downcast_direct_array::<TimestampMillisecondArray>(array, column)?,
             },
             DirectColumnEncoding::Temporal(
-                classification @ TemporalArrowToMssql::TimestampMicrosecondTzToDateTimeOffset,
+                TemporalArrowToMssql::TimestampMicrosecondTzToDateTimeOffset,
             ) => BoundDirectColumn::DateTimeOffsetMicrosecond {
                 column,
                 mapping: encoder.mapping_for_column_index(column_index)?,
-                classification,
                 array: downcast_direct_array::<TimestampMicrosecondArray>(array, column)?,
             },
             DirectColumnEncoding::Temporal(
-                classification @ TemporalArrowToMssql::TimestampNanosecondTzToDateTimeOffset,
+                TemporalArrowToMssql::TimestampNanosecondTzToDateTimeOffset,
             ) => BoundDirectColumn::DateTimeOffsetNanosecond {
                 column,
                 mapping: encoder.mapping_for_column_index(column_index)?,
-                classification,
                 nanosecond_policy: encoder.plan_options.nanosecond_policy,
                 array: downcast_direct_array::<TimestampNanosecondArray>(array, column)?,
             },
@@ -491,75 +479,63 @@ pub(crate) enum BoundDirectColumn<'a> {
     TimestampSecond {
         column: &'a plan::DirectColumnPlan,
         mapping: &'a SchemaMapping,
-        classification: TemporalArrowToMssql,
         array: &'a TimestampSecondArray,
     },
     TimestampMillisecond {
         column: &'a plan::DirectColumnPlan,
         mapping: &'a SchemaMapping,
-        classification: TemporalArrowToMssql,
         array: &'a TimestampMillisecondArray,
     },
     TimestampMicrosecond {
         column: &'a plan::DirectColumnPlan,
         mapping: &'a SchemaMapping,
-        classification: TemporalArrowToMssql,
         array: &'a TimestampMicrosecondArray,
     },
     TimestampNanosecond {
         column: &'a plan::DirectColumnPlan,
         mapping: &'a SchemaMapping,
-        classification: TemporalArrowToMssql,
         nanosecond_policy: NanosecondPolicy,
         array: &'a TimestampNanosecondArray,
     },
     Time32Second {
         column: &'a plan::DirectColumnPlan,
         mapping: &'a SchemaMapping,
-        classification: TemporalArrowToMssql,
         array: &'a Time32SecondArray,
     },
     Time32Millisecond {
         column: &'a plan::DirectColumnPlan,
         mapping: &'a SchemaMapping,
-        classification: TemporalArrowToMssql,
         array: &'a Time32MillisecondArray,
     },
     Time64Microsecond {
         column: &'a plan::DirectColumnPlan,
         mapping: &'a SchemaMapping,
-        classification: TemporalArrowToMssql,
         array: &'a Time64MicrosecondArray,
     },
     Time64Nanosecond {
         column: &'a plan::DirectColumnPlan,
         mapping: &'a SchemaMapping,
-        classification: TemporalArrowToMssql,
         nanosecond_policy: NanosecondPolicy,
         array: &'a Time64NanosecondArray,
     },
     DateTimeOffsetSecond {
         column: &'a plan::DirectColumnPlan,
         mapping: &'a SchemaMapping,
-        classification: TemporalArrowToMssql,
         array: &'a TimestampSecondArray,
     },
     DateTimeOffsetMillisecond {
         column: &'a plan::DirectColumnPlan,
         mapping: &'a SchemaMapping,
-        classification: TemporalArrowToMssql,
         array: &'a TimestampMillisecondArray,
     },
     DateTimeOffsetMicrosecond {
         column: &'a plan::DirectColumnPlan,
         mapping: &'a SchemaMapping,
-        classification: TemporalArrowToMssql,
         array: &'a TimestampMicrosecondArray,
     },
     DateTimeOffsetNanosecond {
         column: &'a plan::DirectColumnPlan,
         mapping: &'a SchemaMapping,
-        classification: TemporalArrowToMssql,
         nanosecond_policy: NanosecondPolicy,
         array: &'a TimestampNanosecondArray,
     },
@@ -731,7 +707,6 @@ impl BoundDirectColumn<'_> {
                     mapping,
                     plan_options: default_options,
                     column,
-                    classification: TemporalArrowToMssql::Date32ToDate,
                     column_index,
                     column_count,
                 },
@@ -747,7 +722,6 @@ impl BoundDirectColumn<'_> {
                     mapping,
                     plan_options: default_options,
                     column,
-                    classification: TemporalArrowToMssql::Date64ToDateTime2,
                     column_index,
                     column_count,
                 },
@@ -756,7 +730,6 @@ impl BoundDirectColumn<'_> {
             Self::TimestampSecond {
                 column,
                 mapping,
-                classification,
                 array,
             } => measure_timestamp_second_column_cell_lengths(
                 array,
@@ -764,7 +737,6 @@ impl BoundDirectColumn<'_> {
                     mapping,
                     plan_options: default_options,
                     column,
-                    classification: *classification,
                     column_index,
                     column_count,
                 },
@@ -773,7 +745,6 @@ impl BoundDirectColumn<'_> {
             Self::TimestampMillisecond {
                 column,
                 mapping,
-                classification,
                 array,
             } => measure_timestamp_millisecond_column_cell_lengths(
                 array,
@@ -781,7 +752,6 @@ impl BoundDirectColumn<'_> {
                     mapping,
                     plan_options: default_options,
                     column,
-                    classification: *classification,
                     column_index,
                     column_count,
                 },
@@ -790,7 +760,6 @@ impl BoundDirectColumn<'_> {
             Self::TimestampMicrosecond {
                 column,
                 mapping,
-                classification,
                 array,
             } => measure_timestamp_microsecond_column_cell_lengths(
                 array,
@@ -798,7 +767,6 @@ impl BoundDirectColumn<'_> {
                     mapping,
                     plan_options: default_options,
                     column,
-                    classification: *classification,
                     column_index,
                     column_count,
                 },
@@ -807,7 +775,6 @@ impl BoundDirectColumn<'_> {
             Self::TimestampNanosecond {
                 column,
                 mapping,
-                classification,
                 nanosecond_policy,
                 array,
             } => measure_timestamp_nanosecond_column_cell_lengths(
@@ -819,7 +786,6 @@ impl BoundDirectColumn<'_> {
                         ..Default::default()
                     },
                     column,
-                    classification: *classification,
                     column_index,
                     column_count,
                 },
@@ -828,7 +794,6 @@ impl BoundDirectColumn<'_> {
             Self::Time32Second {
                 column,
                 mapping,
-                classification,
                 array,
             } => measure_time32_second_column_cell_lengths(
                 array,
@@ -836,7 +801,6 @@ impl BoundDirectColumn<'_> {
                     mapping,
                     plan_options: default_options,
                     column,
-                    classification: *classification,
                     column_index,
                     column_count,
                 },
@@ -845,7 +809,6 @@ impl BoundDirectColumn<'_> {
             Self::Time32Millisecond {
                 column,
                 mapping,
-                classification,
                 array,
             } => measure_time32_millisecond_column_cell_lengths(
                 array,
@@ -853,7 +816,6 @@ impl BoundDirectColumn<'_> {
                     mapping,
                     plan_options: default_options,
                     column,
-                    classification: *classification,
                     column_index,
                     column_count,
                 },
@@ -862,7 +824,6 @@ impl BoundDirectColumn<'_> {
             Self::Time64Microsecond {
                 column,
                 mapping,
-                classification,
                 array,
             } => measure_time64_microsecond_column_cell_lengths(
                 array,
@@ -870,7 +831,6 @@ impl BoundDirectColumn<'_> {
                     mapping,
                     plan_options: default_options,
                     column,
-                    classification: *classification,
                     column_index,
                     column_count,
                 },
@@ -879,7 +839,6 @@ impl BoundDirectColumn<'_> {
             Self::Time64Nanosecond {
                 column,
                 mapping,
-                classification,
                 nanosecond_policy,
                 array,
             } => measure_time64_nanosecond_column_cell_lengths(
@@ -891,7 +850,6 @@ impl BoundDirectColumn<'_> {
                         ..Default::default()
                     },
                     column,
-                    classification: *classification,
                     column_index,
                     column_count,
                 },
@@ -900,7 +858,6 @@ impl BoundDirectColumn<'_> {
             Self::DateTimeOffsetSecond {
                 column,
                 mapping,
-                classification,
                 array,
             } => measure_datetimeoffset_second_column_cell_lengths(
                 array,
@@ -908,7 +865,6 @@ impl BoundDirectColumn<'_> {
                     mapping,
                     plan_options: default_options,
                     column,
-                    classification: *classification,
                     column_index,
                     column_count,
                 },
@@ -917,7 +873,6 @@ impl BoundDirectColumn<'_> {
             Self::DateTimeOffsetMillisecond {
                 column,
                 mapping,
-                classification,
                 array,
             } => measure_datetimeoffset_millisecond_column_cell_lengths(
                 array,
@@ -925,7 +880,6 @@ impl BoundDirectColumn<'_> {
                     mapping,
                     plan_options: default_options,
                     column,
-                    classification: *classification,
                     column_index,
                     column_count,
                 },
@@ -934,7 +888,6 @@ impl BoundDirectColumn<'_> {
             Self::DateTimeOffsetMicrosecond {
                 column,
                 mapping,
-                classification,
                 array,
             } => measure_datetimeoffset_microsecond_column_cell_lengths(
                 array,
@@ -942,7 +895,6 @@ impl BoundDirectColumn<'_> {
                     mapping,
                     plan_options: default_options,
                     column,
-                    classification: *classification,
                     column_index,
                     column_count,
                 },
@@ -951,7 +903,6 @@ impl BoundDirectColumn<'_> {
             Self::DateTimeOffsetNanosecond {
                 column,
                 mapping,
-                classification,
                 nanosecond_policy,
                 array,
             } => measure_datetimeoffset_nanosecond_column_cell_lengths(
@@ -963,7 +914,6 @@ impl BoundDirectColumn<'_> {
                         ..Default::default()
                     },
                     column,
-                    classification: *classification,
                     column_index,
                     column_count,
                 },
@@ -1096,7 +1046,6 @@ impl BoundDirectColumn<'_> {
                     mapping,
                     plan_options: default_options,
                     column,
-                    classification: TemporalArrowToMssql::Date32ToDate,
                     column_index,
                     column_count,
                 },
@@ -1113,7 +1062,6 @@ impl BoundDirectColumn<'_> {
                     mapping,
                     plan_options: default_options,
                     column,
-                    classification: TemporalArrowToMssql::Date64ToDateTime2,
                     column_index,
                     column_count,
                 },
@@ -1123,7 +1071,6 @@ impl BoundDirectColumn<'_> {
             Self::TimestampSecond {
                 column,
                 mapping,
-                classification,
                 array,
             } => fill_timestamp_second_direct_column(
                 array,
@@ -1131,7 +1078,6 @@ impl BoundDirectColumn<'_> {
                     mapping,
                     plan_options: default_options,
                     column,
-                    classification: *classification,
                     column_index,
                     column_count,
                 },
@@ -1141,7 +1087,6 @@ impl BoundDirectColumn<'_> {
             Self::TimestampMillisecond {
                 column,
                 mapping,
-                classification,
                 array,
             } => fill_timestamp_millisecond_direct_column(
                 array,
@@ -1149,7 +1094,6 @@ impl BoundDirectColumn<'_> {
                     mapping,
                     plan_options: default_options,
                     column,
-                    classification: *classification,
                     column_index,
                     column_count,
                 },
@@ -1159,7 +1103,6 @@ impl BoundDirectColumn<'_> {
             Self::TimestampMicrosecond {
                 column,
                 mapping,
-                classification,
                 array,
             } => fill_timestamp_microsecond_direct_column(
                 array,
@@ -1167,7 +1110,6 @@ impl BoundDirectColumn<'_> {
                     mapping,
                     plan_options: default_options,
                     column,
-                    classification: *classification,
                     column_index,
                     column_count,
                 },
@@ -1177,7 +1119,6 @@ impl BoundDirectColumn<'_> {
             Self::TimestampNanosecond {
                 column,
                 mapping,
-                classification,
                 nanosecond_policy,
                 array,
             } => fill_timestamp_nanosecond_direct_column(
@@ -1189,7 +1130,6 @@ impl BoundDirectColumn<'_> {
                         ..Default::default()
                     },
                     column,
-                    classification: *classification,
                     column_index,
                     column_count,
                 },
@@ -1199,7 +1139,6 @@ impl BoundDirectColumn<'_> {
             Self::Time32Second {
                 column,
                 mapping,
-                classification,
                 array,
             } => fill_time32_second_direct_column(
                 array,
@@ -1207,7 +1146,6 @@ impl BoundDirectColumn<'_> {
                     mapping,
                     plan_options: default_options,
                     column,
-                    classification: *classification,
                     column_index,
                     column_count,
                 },
@@ -1217,7 +1155,6 @@ impl BoundDirectColumn<'_> {
             Self::Time32Millisecond {
                 column,
                 mapping,
-                classification,
                 array,
             } => fill_time32_millisecond_direct_column(
                 array,
@@ -1225,7 +1162,6 @@ impl BoundDirectColumn<'_> {
                     mapping,
                     plan_options: default_options,
                     column,
-                    classification: *classification,
                     column_index,
                     column_count,
                 },
@@ -1235,7 +1171,6 @@ impl BoundDirectColumn<'_> {
             Self::Time64Microsecond {
                 column,
                 mapping,
-                classification,
                 array,
             } => fill_time64_microsecond_direct_column(
                 array,
@@ -1243,7 +1178,6 @@ impl BoundDirectColumn<'_> {
                     mapping,
                     plan_options: default_options,
                     column,
-                    classification: *classification,
                     column_index,
                     column_count,
                 },
@@ -1253,7 +1187,6 @@ impl BoundDirectColumn<'_> {
             Self::Time64Nanosecond {
                 column,
                 mapping,
-                classification,
                 nanosecond_policy,
                 array,
             } => fill_time64_nanosecond_direct_column(
@@ -1265,7 +1198,6 @@ impl BoundDirectColumn<'_> {
                         ..Default::default()
                     },
                     column,
-                    classification: *classification,
                     column_index,
                     column_count,
                 },
@@ -1275,7 +1207,6 @@ impl BoundDirectColumn<'_> {
             Self::DateTimeOffsetSecond {
                 column,
                 mapping,
-                classification,
                 array,
             } => fill_datetimeoffset_second_direct_column(
                 array,
@@ -1283,7 +1214,6 @@ impl BoundDirectColumn<'_> {
                     mapping,
                     plan_options: default_options,
                     column,
-                    classification: *classification,
                     column_index,
                     column_count,
                 },
@@ -1293,7 +1223,6 @@ impl BoundDirectColumn<'_> {
             Self::DateTimeOffsetMillisecond {
                 column,
                 mapping,
-                classification,
                 array,
             } => fill_datetimeoffset_millisecond_direct_column(
                 array,
@@ -1301,7 +1230,6 @@ impl BoundDirectColumn<'_> {
                     mapping,
                     plan_options: default_options,
                     column,
-                    classification: *classification,
                     column_index,
                     column_count,
                 },
@@ -1311,7 +1239,6 @@ impl BoundDirectColumn<'_> {
             Self::DateTimeOffsetMicrosecond {
                 column,
                 mapping,
-                classification,
                 array,
             } => fill_datetimeoffset_microsecond_direct_column(
                 array,
@@ -1319,7 +1246,6 @@ impl BoundDirectColumn<'_> {
                     mapping,
                     plan_options: default_options,
                     column,
-                    classification: *classification,
                     column_index,
                     column_count,
                 },
@@ -1329,7 +1255,6 @@ impl BoundDirectColumn<'_> {
             Self::DateTimeOffsetNanosecond {
                 column,
                 mapping,
-                classification,
                 nanosecond_policy,
                 array,
             } => fill_datetimeoffset_nanosecond_direct_column(
@@ -1341,7 +1266,6 @@ impl BoundDirectColumn<'_> {
                         ..Default::default()
                     },
                     column,
-                    classification: *classification,
                     column_index,
                     column_count,
                 },
@@ -1441,13 +1365,11 @@ impl BoundDirectColumn<'_> {
             Self::TimestampSecond {
                 column,
                 mapping,
-                classification: _,
                 array,
             } => append_timestamp_second_cell(buf, array, mapping, column, row_index, measured_len),
             Self::TimestampMillisecond {
                 column,
                 mapping,
-                classification: _,
                 array,
             } => append_timestamp_millisecond_cell(
                 buf,
@@ -1460,7 +1382,6 @@ impl BoundDirectColumn<'_> {
             Self::TimestampMicrosecond {
                 column,
                 mapping,
-                classification: _,
                 array,
             } => append_timestamp_microsecond_cell(
                 buf,
@@ -1473,7 +1394,6 @@ impl BoundDirectColumn<'_> {
             Self::TimestampNanosecond {
                 column,
                 mapping,
-                classification: _,
                 nanosecond_policy,
                 array,
             } => append_timestamp_nanosecond_cell(
@@ -1488,13 +1408,11 @@ impl BoundDirectColumn<'_> {
             Self::Time32Second {
                 column,
                 mapping,
-                classification: _,
                 array,
             } => append_time32_second_cell(buf, array, mapping, column, row_index, measured_len),
             Self::Time32Millisecond {
                 column,
                 mapping,
-                classification: _,
                 array,
             } => {
                 append_time32_millisecond_cell(buf, array, mapping, column, row_index, measured_len)
@@ -1502,7 +1420,6 @@ impl BoundDirectColumn<'_> {
             Self::Time64Microsecond {
                 column,
                 mapping,
-                classification: _,
                 array,
             } => {
                 append_time64_microsecond_cell(buf, array, mapping, column, row_index, measured_len)
@@ -1510,7 +1427,6 @@ impl BoundDirectColumn<'_> {
             Self::Time64Nanosecond {
                 column,
                 mapping,
-                classification: _,
                 nanosecond_policy,
                 array,
             } => append_time64_nanosecond_cell(
@@ -1525,7 +1441,6 @@ impl BoundDirectColumn<'_> {
             Self::DateTimeOffsetSecond {
                 column,
                 mapping,
-                classification: _,
                 array,
             } => append_datetimeoffset_second_cell(
                 buf,
@@ -1538,7 +1453,6 @@ impl BoundDirectColumn<'_> {
             Self::DateTimeOffsetMillisecond {
                 column,
                 mapping,
-                classification: _,
                 array,
             } => append_datetimeoffset_millisecond_cell(
                 buf,
@@ -1551,7 +1465,6 @@ impl BoundDirectColumn<'_> {
             Self::DateTimeOffsetMicrosecond {
                 column,
                 mapping,
-                classification: _,
                 array,
             } => append_datetimeoffset_microsecond_cell(
                 buf,
@@ -1564,7 +1477,6 @@ impl BoundDirectColumn<'_> {
             Self::DateTimeOffsetNanosecond {
                 column,
                 mapping,
-                classification: _,
                 nanosecond_policy,
                 array,
             } => append_datetimeoffset_nanosecond_cell(

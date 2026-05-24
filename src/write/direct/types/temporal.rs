@@ -11,7 +11,6 @@ use arrow_array::{
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, NanosecondPolicy, PlanOptions,
     Result, SchemaMapping,
-    conversion::arrow_to_mssql::temporal::TemporalArrowToMssql,
     mssql::cell::{
         MssqlDate, MssqlDateTime2, MssqlDateTimeOffset, MssqlTime,
         from_arrow::temporal::datetime2::{
@@ -55,7 +54,6 @@ pub(crate) struct TemporalColumnContext<'a> {
     pub(crate) mapping: &'a SchemaMapping,
     pub(crate) plan_options: PlanOptions,
     pub(crate) column: &'a DirectColumnPlan,
-    pub(crate) classification: TemporalArrowToMssql,
     pub(crate) column_index: usize,
     pub(crate) column_count: usize,
 }
