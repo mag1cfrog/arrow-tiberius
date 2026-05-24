@@ -19,48 +19,47 @@ use crate::{
     write::record_batch::validate_runtime_columns,
 };
 
-pub(crate) mod decimal;
 pub(crate) mod layout;
 pub(crate) mod measure;
 pub(crate) mod payload;
 pub(crate) mod plan;
-pub(crate) mod primitive;
-pub(crate) mod temporal;
-pub(crate) mod uint64;
-pub(crate) mod variable_width;
+pub(crate) mod types;
 
-use decimal::{
-    append_decimal32_cell, append_decimal64_cell, append_decimal128_cell, append_decimal256_cell,
-    fill_decimal_column, measure_decimal_column_cell_lengths,
-};
 pub(crate) use measure::{MeasuredDirectBatch, MeasuredRowRange};
 use payload::EncodedRowsPayload;
 use plan::{CurrentDirectMappings, DirectColumnEncoding, DirectEncoderPlan};
-use primitive::{
-    allocate_rows_payload_with_tokens, append_boolean_cell, append_float32_cell,
-    append_float64_cell, append_int8_cell, append_int16_cell, append_int32_cell, append_int64_cell,
-    append_uint8_cell, append_uint16_cell, append_uint32_cell, append_uint64_checked_bigint_cell,
-    build_fixed_width_row_layout, fill_boolean_column, fill_float32_column, fill_float64_column,
-    fill_int8_column, fill_int16_column, fill_int32_column, fill_int64_column, fill_uint8_column,
-    fill_uint16_column, fill_uint32_column, fill_uint64_checked_bigint_column,
-    measure_primitive_column_cell_lengths, try_encode_fixed_width_primitive_rows,
-};
-use temporal::{
-    TemporalColumnContext, append_date32_cell, append_date64_cell,
-    append_datetimeoffset_microsecond_cell, append_datetimeoffset_millisecond_cell,
-    append_datetimeoffset_nanosecond_cell, append_datetimeoffset_second_cell,
-    append_time32_millisecond_cell, append_time32_second_cell, append_time64_microsecond_cell,
-    append_time64_nanosecond_cell, append_timestamp_microsecond_cell,
-    append_timestamp_millisecond_cell, append_timestamp_nanosecond_cell,
-    append_timestamp_second_cell, fill_temporal_column, measure_temporal_column_cell_lengths,
-};
-use uint64::{
-    append_uint64_decimal20_cell, fill_uint64_decimal20_column,
-    measure_uint64_decimal20_cell_lengths,
-};
-use variable_width::{
-    append_nvarchar_cell, append_varbinary_cell, fill_nvarchar_column, fill_varbinary_column,
-    measure_variable_width_column_cell_lengths,
+use types::{
+    decimal::{
+        append_decimal32_cell, append_decimal64_cell, append_decimal128_cell,
+        append_decimal256_cell, fill_decimal_column, measure_decimal_column_cell_lengths,
+    },
+    primitive::{
+        allocate_rows_payload_with_tokens, append_boolean_cell, append_float32_cell,
+        append_float64_cell, append_int8_cell, append_int16_cell, append_int32_cell,
+        append_int64_cell, append_uint8_cell, append_uint16_cell, append_uint32_cell,
+        append_uint64_checked_bigint_cell, build_fixed_width_row_layout, fill_boolean_column,
+        fill_float32_column, fill_float64_column, fill_int8_column, fill_int16_column,
+        fill_int32_column, fill_int64_column, fill_uint8_column, fill_uint16_column,
+        fill_uint32_column, fill_uint64_checked_bigint_column,
+        measure_primitive_column_cell_lengths, try_encode_fixed_width_primitive_rows,
+    },
+    temporal::{
+        TemporalColumnContext, append_date32_cell, append_date64_cell,
+        append_datetimeoffset_microsecond_cell, append_datetimeoffset_millisecond_cell,
+        append_datetimeoffset_nanosecond_cell, append_datetimeoffset_second_cell,
+        append_time32_millisecond_cell, append_time32_second_cell, append_time64_microsecond_cell,
+        append_time64_nanosecond_cell, append_timestamp_microsecond_cell,
+        append_timestamp_millisecond_cell, append_timestamp_nanosecond_cell,
+        append_timestamp_second_cell, fill_temporal_column, measure_temporal_column_cell_lengths,
+    },
+    uint64::{
+        append_uint64_decimal20_cell, fill_uint64_decimal20_column,
+        measure_uint64_decimal20_cell_lengths,
+    },
+    variable_width::{
+        append_nvarchar_cell, append_varbinary_cell, fill_nvarchar_column, fill_varbinary_column,
+        measure_variable_width_column_cell_lengths,
+    },
 };
 
 /// Direct raw TDS encoder facade.
@@ -1276,8 +1275,10 @@ mod tests {
     };
 
     use super::plan::{DirectColumnEncoding, DirectEncoderSupport, DirectMappingSupport};
-    use super::primitive::try_encode_fixed_width_primitive_rows;
-    use super::temporal::{write_datetime2_cell, write_datetimeoffset_cell, write_time_cell};
+    use super::types::primitive::try_encode_fixed_width_primitive_rows;
+    use super::types::temporal::{
+        write_datetime2_cell, write_datetimeoffset_cell, write_time_cell,
+    };
     use super::{DirectEncoder, payload};
 
     #[test]

@@ -2,7 +2,7 @@
 
 use crate::Result;
 
-use super::{invalid_payload, layout, primitive::build_fixed_width_row_range_layout};
+use super::{invalid_payload, layout, types::primitive::build_fixed_width_row_range_layout};
 
 /// Direct row payload measurement for one runtime batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
