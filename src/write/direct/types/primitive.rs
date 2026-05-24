@@ -58,6 +58,130 @@ pub(crate) fn measure_primitive_column_cell_lengths(
     Ok(())
 }
 
+pub(crate) fn measure_uint64_checked_bigint_column_cell_lengths(
+    array: &UInt64Array,
+    column: &DirectColumnPlan,
+    column_index: usize,
+    column_count: usize,
+    cell_lengths: &mut [usize],
+) -> Result<()> {
+    let value_len = match column.encoding() {
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt64ToCheckedBigInt) => 8,
+        other => {
+            return Err(unsupported_batch(format!(
+                "direct UInt64 checked bigint layout cannot measure mapping {other:?}"
+            )));
+        }
+    };
+
+    measure_checked_primitive_column_cell_lengths(
+        array,
+        column,
+        value_len,
+        column_index,
+        column_count,
+        cell_lengths,
+        |array, row_index| {
+            uint64_checked_bigint_bytes(array.value(row_index), column, row_index).map(|_| ())
+        },
+    )
+}
+
+pub(crate) fn measure_float32_column_cell_lengths(
+    array: &Float32Array,
+    column: &DirectColumnPlan,
+    column_index: usize,
+    column_count: usize,
+    cell_lengths: &mut [usize],
+) -> Result<()> {
+    let value_len = match column.encoding() {
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal) => 4,
+        other => {
+            return Err(unsupported_batch(format!(
+                "direct Float32 layout cannot measure mapping {other:?}"
+            )));
+        }
+    };
+
+    measure_checked_primitive_column_cell_lengths(
+        array,
+        column,
+        value_len,
+        column_index,
+        column_count,
+        cell_lengths,
+        |array, row_index| validate_finite_float(column, row_index, array.value(row_index)),
+    )
+}
+
+pub(crate) fn measure_float64_column_cell_lengths(
+    array: &Float64Array,
+    column: &DirectColumnPlan,
+    column_index: usize,
+    column_count: usize,
+    cell_lengths: &mut [usize],
+) -> Result<()> {
+    let value_len = match column.encoding() {
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => 8,
+        other => {
+            return Err(unsupported_batch(format!(
+                "direct Float64 layout cannot measure mapping {other:?}"
+            )));
+        }
+    };
+
+    measure_checked_primitive_column_cell_lengths(
+        array,
+        column,
+        value_len,
+        column_index,
+        column_count,
+        cell_lengths,
+        |array, row_index| validate_finite_float(column, row_index, array.value(row_index)),
+    )
+}
+
+fn measure_checked_primitive_column_cell_lengths<A, F>(
+    array: &A,
+    column: &DirectColumnPlan,
+    value_len: usize,
+    column_index: usize,
+    column_count: usize,
+    cell_lengths: &mut [usize],
+    validate_value: F,
+) -> Result<()>
+where
+    A: Array,
+    F: Fn(&A, usize) -> Result<()>,
+{
+    for row_index in 0..array.len() {
+        let cell_len = if array.is_null(row_index) {
+            if !column.nullable() {
+                return Err(value_conversion_error(row_column_diagnostic(
+                    column,
+                    row_index,
+                    DiagnosticCode::NullInNonNullableColumn,
+                    "null value in non-nullable direct primitive column",
+                )));
+            }
+
+            CELL_LEN_PREFIX_LEN
+        } else {
+            validate_value(array, row_index)?;
+
+            if column.nullable() {
+                CELL_LEN_PREFIX_LEN + value_len
+            } else {
+                value_len
+            }
+        };
+
+        cell_lengths[row_index * column_count + column_index] = cell_len;
+    }
+
+    Ok(())
+}
+
 fn validate_primitive_column_values(array: &dyn Array, column: &DirectColumnPlan) -> Result<()> {
     if matches!(
         column.encoding(),
@@ -111,6 +235,24 @@ fn validate_primitive_column_values(array: &dyn Array, column: &DirectColumnPlan
 
             uint64_checked_bigint_bytes(array.value(row_index), column, row_index)?;
         }
+    }
+
+    Ok(())
+}
+
+fn validate_finite_float(
+    column: &DirectColumnPlan,
+    row_index: usize,
+    value: impl Into<f64>,
+) -> Result<()> {
+    let value = value.into();
+    if !value.is_finite() {
+        return Err(value_conversion_error(row_column_diagnostic(
+            column,
+            row_index,
+            DiagnosticCode::NonFiniteFloat,
+            format!("non-finite floating point value {value} is not supported"),
+        )));
     }
 
     Ok(())
