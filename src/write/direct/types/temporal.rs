@@ -45,14 +45,10 @@ use super::super::{
 pub(crate) use value::{
     NULL_TEMPORAL_CELL_LEN, append_date_cell, append_datetime2_cell, append_datetimeoffset_cell,
     append_null_temporal_cell, append_time_cell, date_cell_len, datetime2_cell_len,
-    datetimeoffset_cell_len, time_cell_len, write_date_cell, write_datetime2_cell,
-    write_datetimeoffset_cell, write_null_temporal_cell, write_time_cell,
+    datetimeoffset_cell_len, mssql_date_from_arrow_date32, mssql_datetime2_from_arrow_date64,
+    time_cell_len, write_date_cell, write_datetime2_cell, write_datetimeoffset_cell,
+    write_null_temporal_cell, write_time_cell,
 };
-
-const SQL_SERVER_DATE_MAX_DAYS: u32 = 3_652_058;
-const SQL_SERVER_DATE_UNIX_EPOCH_DAYS: i64 = 719_162;
-const MILLISECONDS_PER_DAY: i64 = 86_400_000;
-const SQL_SERVER_DATETIME2_DATE64_SCALE: u8 = 3;
 
 #[derive(Clone, Copy)]
 pub(crate) struct TemporalColumnContext<'a> {
@@ -1208,54 +1204,6 @@ enum TemporalValue {
     Time(MssqlTime),
     DateTime2(MssqlDateTime2),
     DateTimeOffset(MssqlDateTimeOffset),
-}
-
-pub(crate) fn mssql_date_from_arrow_date32(
-    column: &DirectColumnPlan,
-    row_index: usize,
-    days_from_unix_epoch: i32,
-) -> Result<MssqlDate> {
-    let days = i64::from(days_from_unix_epoch) + SQL_SERVER_DATE_UNIX_EPOCH_DAYS;
-
-    if (0..=i64::from(SQL_SERVER_DATE_MAX_DAYS)).contains(&days) {
-        return Ok(MssqlDate::new(days as u32));
-    }
-
-    Err(value_conversion_error(row_column_diagnostic(
-        column,
-        row_index,
-        DiagnosticCode::TimestampOutOfRange,
-        format!("Arrow Date32 day offset {days_from_unix_epoch} is outside SQL Server date range"),
-    )))
-}
-
-pub(crate) fn mssql_datetime2_from_arrow_date64(
-    column: &DirectColumnPlan,
-    row_index: usize,
-    milliseconds_from_unix_epoch: i64,
-) -> Result<MssqlDateTime2> {
-    let days_from_unix_epoch = milliseconds_from_unix_epoch.div_euclid(MILLISECONDS_PER_DAY);
-    let milliseconds_since_midnight = milliseconds_from_unix_epoch.rem_euclid(MILLISECONDS_PER_DAY);
-    let days = days_from_unix_epoch + SQL_SERVER_DATE_UNIX_EPOCH_DAYS;
-
-    if !(0..=i64::from(SQL_SERVER_DATE_MAX_DAYS)).contains(&days) {
-        return Err(value_conversion_error(row_column_diagnostic(
-            column,
-            row_index,
-            DiagnosticCode::TimestampOutOfRange,
-            format!(
-                "Arrow Date64 millisecond value {milliseconds_from_unix_epoch} is outside SQL Server datetime2 range"
-            ),
-        )));
-    }
-
-    Ok(MssqlDateTime2::new(
-        MssqlDate::new(days as u32),
-        MssqlTime::new(
-            milliseconds_since_midnight as u64,
-            SQL_SERVER_DATETIME2_DATE64_SCALE,
-        ),
-    ))
 }
 
 fn datetime2_cell_len_for_value(value: MssqlDateTime2) -> Result<usize> {
