@@ -30,6 +30,9 @@ pub(crate) fn plan_arrow_data_type_as_mssql_type(
         DataType::Binary | DataType::LargeBinary => {
             plan_arrow_binary_as_mssql_type(options.binary_policy, index, field)
         }
+        DataType::FixedSizeBinary(length) => {
+            plan_arrow_fixed_size_binary_as_mssql_type(*length, index, field)
+        }
         DataType::Decimal32(precision, scale)
         | DataType::Decimal64(precision, scale)
         | DataType::Decimal128(precision, scale) => plan_arrow_decimal_as_mssql_type(
@@ -116,6 +119,32 @@ fn plan_arrow_binary_as_mssql_type(
             "ObservedVarBinary requires observed values or statistics",
         )),
     }
+}
+
+fn plan_arrow_fixed_size_binary_as_mssql_type(
+    length: i32,
+    index: usize,
+    field: &Field,
+) -> std::result::Result<MssqlType, Diagnostic> {
+    let Ok(length) = usize::try_from(length) else {
+        return Err(fixed_size_binary_out_of_range_for_arrow_to_mssql(
+            index,
+            field,
+            "fixed-size binary length must be non-negative",
+        ));
+    };
+
+    if !(1..=SQL_SERVER_MAX_BINARY_LEN).contains(&length) {
+        return Err(fixed_size_binary_out_of_range_for_arrow_to_mssql(
+            index,
+            field,
+            format!(
+                "fixed-size binary length {length} is outside SQL Server binary(n) range 1..={SQL_SERVER_MAX_BINARY_LEN}"
+            ),
+        ));
+    }
+
+    Ok(MssqlType::Binary(length))
 }
 
 fn plan_arrow_decimal_as_mssql_type(
@@ -283,6 +312,15 @@ fn decimal_out_of_range_for_arrow_to_mssql(
         .with_field(FieldRef::new(index, field.name()))
 }
 
+fn fixed_size_binary_out_of_range_for_arrow_to_mssql(
+    index: usize,
+    field: &Field,
+    message: impl Into<String>,
+) -> Diagnostic {
+    Diagnostic::error(DiagnosticCode::UnsupportedArrowType, message)
+        .with_field(FieldRef::new(index, field.name()))
+}
+
 fn unsupported_arrow_type_for_arrow_to_mssql(
     index: usize,
     field: &Field,
@@ -319,6 +357,7 @@ fn unsupported_arrow_type_family(data_type: &DataType) -> &'static str {
 }
 
 const SQL_SERVER_MAX_DECIMAL_PRECISION: u8 = 38;
+const SQL_SERVER_MAX_BINARY_LEN: usize = 8000;
 
 #[cfg(test)]
 mod tests {
@@ -354,6 +393,9 @@ mod tests {
                 DataType::LargeBinary,
                 MssqlType::VarBinary(MssqlTypeLength::Max),
             ),
+            (DataType::FixedSizeBinary(1), MssqlType::Binary(1)),
+            (DataType::FixedSizeBinary(16), MssqlType::Binary(16)),
+            (DataType::FixedSizeBinary(8000), MssqlType::Binary(8000)),
         ];
 
         for (data_type, expected) in cases {
@@ -460,6 +502,25 @@ mod tests {
             DiagnosticCode::ObservedDataRequired
         );
         assert_eq!(binary_diagnostic.field().unwrap().name(), "value");
+    }
+
+    #[test]
+    fn rejects_fixed_size_binary_lengths_outside_sqlserver_binary_range() {
+        for data_type in [
+            DataType::FixedSizeBinary(0),
+            DataType::FixedSizeBinary(8001),
+        ] {
+            let diagnostic = plan_type(data_type.clone(), PlanOptions::default()).unwrap_err();
+
+            assert_eq!(diagnostic.code(), DiagnosticCode::UnsupportedArrowType);
+            assert_eq!(diagnostic.field().unwrap().index(), 0);
+            assert_eq!(diagnostic.field().unwrap().name(), "value");
+            assert!(
+                diagnostic.message().contains("binary(n) range 1..=8000"),
+                "diagnostic should mention SQL Server binary range for {data_type:?}: {}",
+                diagnostic.message()
+            );
+        }
     }
 
     #[test]
@@ -683,7 +744,6 @@ mod tests {
             (DataType::Float16, "16-bit floating-point"),
             (DataType::Time32(TimeUnit::Microsecond), "time-only"),
             (DataType::Duration(TimeUnit::Microsecond), "duration"),
-            (DataType::FixedSizeBinary(16), "fixed-size binary"),
             (DataType::BinaryView, "view"),
             (DataType::Utf8View, "view"),
             (

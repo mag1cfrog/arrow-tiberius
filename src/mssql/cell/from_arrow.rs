@@ -95,6 +95,11 @@ pub(crate) fn mssql_cell_from_arrow_cell<'a>(
         ))),
         MssqlType::NVarChar(length) => nvar_char_cell(mapping, row_index, *length, cell),
         MssqlType::VarBinary(length) => var_binary_cell(mapping, row_index, *length, cell),
+        MssqlType::Binary(_) => Err(unsupported_value_conversion(
+            mapping,
+            row_index,
+            "planned SQL Server binary conversion is not implemented yet",
+        )),
     }
 }
 
@@ -116,6 +121,7 @@ fn null_mssql_cell<'a>(mapping: &SchemaMapping, row_index: usize) -> Result<Mssq
         MssqlType::Float { .. } => Ok(MssqlCell::Float(None)),
         MssqlType::NVarChar(_) => Ok(MssqlCell::NVarChar(None)),
         MssqlType::VarBinary(_) => Ok(MssqlCell::VarBinary(None)),
+        MssqlType::Binary(_) => Ok(MssqlCell::VarBinary(None)),
         ty => Err(unsupported_value_conversion(
             mapping,
             row_index,

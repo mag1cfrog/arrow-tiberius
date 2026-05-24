@@ -72,6 +72,8 @@ pub enum MssqlType {
     NVarChar(MssqlTypeLength),
     /// SQL Server `varbinary(n|max)`.
     VarBinary(MssqlTypeLength),
+    /// SQL Server `binary(n)`.
+    Binary(usize),
     /// SQL Server `decimal(p,s)`.
     Decimal {
         /// SQL Server decimal precision.
@@ -108,6 +110,7 @@ impl MssqlType {
             Self::Float { precision } => format!("float({precision})"),
             Self::NVarChar(length) => format!("nvarchar({})", length.render()),
             Self::VarBinary(length) => format!("varbinary({})", length.render()),
+            Self::Binary(length) => format!("binary({length})"),
             Self::Decimal { precision, scale } => format!("decimal({precision},{scale})"),
             Self::Date => "date".to_owned(),
             Self::Time(precision) => format!("time({})", precision.get()),
@@ -150,6 +153,7 @@ mod tests {
             MssqlType::VarBinary(MssqlTypeLength::Bounded(8000)).to_sql(),
             "varbinary(8000)"
         );
+        assert_eq!(MssqlType::Binary(16).to_sql(), "binary(16)");
     }
 
     #[test]
