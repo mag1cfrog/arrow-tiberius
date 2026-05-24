@@ -8,12 +8,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array,
-    Decimal64Array, Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch,
-    StringArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
-    Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
-    UInt64Array,
+    Decimal64Array, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float32Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
+    LargeStringArray, RecordBatch, StringArray, Time32MillisecondArray, Time32SecondArray,
+    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_buffer::{MutableBuffer, NullBuffer, OffsetBuffer, ScalarBuffer, i256};
 use arrow_data::ArrayData;
@@ -334,6 +334,134 @@ async fn baseline_writer_round_trips_supported_value_matrix() -> TestResult<()> 
         ensure_eq(rows[3].get::<f64, _>(4), None, "row 3 f64_value")?;
         ensure_eq(rows[3].get::<&str, _>(5), None, "row 3 text_value")?;
         ensure_eq(rows[3].get::<&[u8], _>(6), None, "row 3 bytes_value")?;
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    let drop_result = drop_table(&mut client, &table).await;
+    result?;
+    drop_result?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn baseline_writer_round_trips_fixed_size_binary_values() -> TestResult<()> {
+    let Some((connection_string, database)) = integration_config() else {
+        eprintln!(
+            "skipping SQL Server baseline fixed-size binary integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+        );
+        return Ok(());
+    };
+
+    let mut client = connect(&connection_string, &database).await?;
+    let table = unique_table_name()?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::Int32, false),
+        Field::new("one_byte", DataType::FixedSizeBinary(1), true),
+        Field::new("four_bytes", DataType::FixedSizeBinary(4), true),
+        Field::new("max_bytes", DataType::FixedSizeBinary(8000), true),
+    ]));
+    let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
+        Arc::clone(&schema),
+        MssqlProfile::sql_server_2016_compat_100(),
+        PlanOptions::default(),
+    )?
+    .into_parts();
+    let max_zero = vec![0_u8; 8000];
+    let max_ff = vec![0xff_u8; 8000];
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1_i32, 2, 3])) as ArrayRef,
+            Arc::new(FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                [Some(&b"\x00"[..]), Some(&b"\xff"[..]), None].into_iter(),
+                1,
+            )?),
+            Arc::new(FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                [Some(&b"\x00\x01\xfe\xff"[..]), Some(&b"abcd"[..]), None].into_iter(),
+                4,
+            )?),
+            Arc::new(FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                [Some(max_zero.as_slice()), Some(max_ff.as_slice()), None].into_iter(),
+                8000,
+            )?),
+        ],
+    )?;
+
+    execute_sql(
+        &mut client,
+        create_table_sql_from_mappings(&table, &mappings),
+    )
+    .await?;
+
+    let result = async {
+        let mut writer = BulkWriter::new(
+            &mut client,
+            table.clone(),
+            mappings,
+            WriteOptions {
+                backend: WriteBackend::BaselineTokenRow,
+                ..WriteOptions::default()
+            },
+        )
+        .await?;
+        let stats = writer.write_batch(&batch).await?;
+
+        ensure_eq(stats.rows_written, 3, "rows_written")?;
+        ensure_eq(stats.batches_written, 1, "batches_written")?;
+        ensure_eq(writer.finish().await?, stats, "finish stats")?;
+
+        let rows = client
+            .simple_query(format!(
+                "SELECT [row_id], [one_byte], [four_bytes], [max_bytes] FROM {} ORDER BY [row_id]",
+                table.quoted_sql()
+            ))
+            .await?
+            .into_first_result()
+            .await?;
+
+        ensure_eq(rows.len(), 3, "row count")?;
+
+        ensure_eq(rows[0].get::<i32, _>(0), Some(1), "row 0 row_id")?;
+        ensure_eq(
+            rows[0].get::<&[u8], _>(1),
+            Some(&b"\x00"[..]),
+            "row 0 one_byte",
+        )?;
+        ensure_eq(
+            rows[0].get::<&[u8], _>(2),
+            Some(&b"\x00\x01\xfe\xff"[..]),
+            "row 0 four_bytes",
+        )?;
+        ensure_eq(
+            rows[0].get::<&[u8], _>(3),
+            Some(max_zero.as_slice()),
+            "row 0 max_bytes",
+        )?;
+
+        ensure_eq(rows[1].get::<i32, _>(0), Some(2), "row 1 row_id")?;
+        ensure_eq(
+            rows[1].get::<&[u8], _>(1),
+            Some(&b"\xff"[..]),
+            "row 1 one_byte",
+        )?;
+        ensure_eq(
+            rows[1].get::<&[u8], _>(2),
+            Some(&b"abcd"[..]),
+            "row 1 four_bytes",
+        )?;
+        ensure_eq(
+            rows[1].get::<&[u8], _>(3),
+            Some(max_ff.as_slice()),
+            "row 1 max_bytes",
+        )?;
+
+        ensure_eq(rows[2].get::<i32, _>(0), Some(3), "row 2 row_id")?;
+        ensure_eq(rows[2].get::<&[u8], _>(1), None, "row 2 one_byte")?;
+        ensure_eq(rows[2].get::<&[u8], _>(2), None, "row 2 four_bytes")?;
+        ensure_eq(rows[2].get::<&[u8], _>(3), None, "row 2 max_bytes")?;
 
         Ok::<(), Box<dyn std::error::Error>>(())
     }
