@@ -1,7 +1,7 @@
 //! Bound runtime direct TDS columns.
 
 use arrow_array::{
-    BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
+    Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
     Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array,
     Int32Array, Int64Array, RecordBatch, StringArray, Time32MillisecondArray, Time32SecondArray,
     Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
@@ -16,29 +16,33 @@ use super::{
     types::{
         decimal::{
             append_decimal32_cell, append_decimal64_cell, append_decimal128_cell,
-            append_decimal256_cell,
+            append_decimal256_cell, measure_decimal_column_cell_lengths,
         },
         primitive::{
             append_boolean_cell, append_float32_cell, append_float64_cell, append_int8_cell,
             append_int16_cell, append_int32_cell, append_int64_cell, append_uint8_cell,
             append_uint16_cell, append_uint32_cell, append_uint64_checked_bigint_cell,
+            measure_primitive_column_cell_lengths,
         },
         temporal::{
-            append_date32_cell, append_date64_cell, append_datetimeoffset_microsecond_cell,
-            append_datetimeoffset_millisecond_cell, append_datetimeoffset_nanosecond_cell,
-            append_datetimeoffset_second_cell, append_time32_millisecond_cell,
-            append_time32_second_cell, append_time64_microsecond_cell,
-            append_time64_nanosecond_cell, append_timestamp_microsecond_cell,
-            append_timestamp_millisecond_cell, append_timestamp_nanosecond_cell,
-            append_timestamp_second_cell,
+            TemporalColumnContext, append_date32_cell, append_date64_cell,
+            append_datetimeoffset_microsecond_cell, append_datetimeoffset_millisecond_cell,
+            append_datetimeoffset_nanosecond_cell, append_datetimeoffset_second_cell,
+            append_time32_millisecond_cell, append_time32_second_cell,
+            append_time64_microsecond_cell, append_time64_nanosecond_cell,
+            append_timestamp_microsecond_cell, append_timestamp_millisecond_cell,
+            append_timestamp_nanosecond_cell, append_timestamp_second_cell,
+            measure_temporal_column_cell_lengths,
         },
-        uint64::append_uint64_decimal20_cell,
-        variable_width::{append_nvarchar_cell, append_varbinary_cell},
+        uint64::{append_uint64_decimal20_cell, measure_uint64_decimal20_cell_lengths},
+        variable_width::{
+            append_nvarchar_cell, append_varbinary_cell, measure_variable_width_column_cell_lengths,
+        },
     },
     unsupported_batch, value_conversion_error,
 };
 use crate::{
-    DiagnosticCode, NanosecondPolicy, Result, SchemaMapping,
+    DiagnosticCode, NanosecondPolicy, PlanOptions, Result, SchemaMapping,
     conversion::arrow_to_mssql::{
         decimal::DecimalArrowToMssql, primitive::PrimitiveArrowToMssql,
         temporal::TemporalArrowToMssql, variable_width::VariableWidthArrowToMssql,
@@ -64,6 +68,21 @@ impl<'a> BoundDirectBatch<'a> {
 
     pub(crate) const fn row_count(&self) -> usize {
         self.row_count
+    }
+
+    pub(crate) fn measure_cell_lengths(&self) -> Result<Vec<usize>> {
+        if self.row_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let column_count = self.columns.len();
+        let mut cell_lengths = vec![0; self.row_count * column_count];
+
+        for (column_index, column) in self.columns.iter().enumerate() {
+            column.measure_cell_lengths(column_index, column_count, &mut cell_lengths)?;
+        }
+
+        Ok(cell_lengths)
     }
 }
 
@@ -493,6 +512,412 @@ pub(crate) enum BoundDirectColumn<'a> {
 }
 
 impl BoundDirectColumn<'_> {
+    pub(crate) fn measure_cell_lengths(
+        &self,
+        column_index: usize,
+        column_count: usize,
+        cell_lengths: &mut [usize],
+    ) -> Result<()> {
+        let default_options = PlanOptions::default();
+
+        match self {
+            Self::Boolean { column, array } => measure_primitive_bound_column(
+                *array,
+                column,
+                column_index,
+                column_count,
+                cell_lengths,
+            ),
+            Self::UInt8 { column, array } => measure_primitive_bound_column(
+                *array,
+                column,
+                column_index,
+                column_count,
+                cell_lengths,
+            ),
+            Self::Int8 { column, array } => measure_primitive_bound_column(
+                *array,
+                column,
+                column_index,
+                column_count,
+                cell_lengths,
+            ),
+            Self::Int16 { column, array } => measure_primitive_bound_column(
+                *array,
+                column,
+                column_index,
+                column_count,
+                cell_lengths,
+            ),
+            Self::Int32 { column, array } => measure_primitive_bound_column(
+                *array,
+                column,
+                column_index,
+                column_count,
+                cell_lengths,
+            ),
+            Self::UInt16 { column, array } => measure_primitive_bound_column(
+                *array,
+                column,
+                column_index,
+                column_count,
+                cell_lengths,
+            ),
+            Self::Int64 { column, array } => measure_primitive_bound_column(
+                *array,
+                column,
+                column_index,
+                column_count,
+                cell_lengths,
+            ),
+            Self::UInt32 { column, array } => measure_primitive_bound_column(
+                *array,
+                column,
+                column_index,
+                column_count,
+                cell_lengths,
+            ),
+            Self::UInt64 { column, array } => measure_primitive_bound_column(
+                *array,
+                column,
+                column_index,
+                column_count,
+                cell_lengths,
+            ),
+            Self::Float32 { column, array } => measure_primitive_bound_column(
+                *array,
+                column,
+                column_index,
+                column_count,
+                cell_lengths,
+            ),
+            Self::Float64 { column, array } => measure_primitive_bound_column(
+                *array,
+                column,
+                column_index,
+                column_count,
+                cell_lengths,
+            ),
+            Self::UInt64Decimal20_0 { column, array } => measure_uint64_decimal20_cell_lengths(
+                array,
+                column,
+                column_index,
+                column_count,
+                cell_lengths,
+            ),
+            Self::Decimal32 {
+                column,
+                classification,
+                array,
+            } => measure_decimal_column_cell_lengths(
+                *array,
+                column,
+                *classification,
+                column_index,
+                column_count,
+                cell_lengths,
+            ),
+            Self::Decimal64 {
+                column,
+                classification,
+                array,
+            } => measure_decimal_column_cell_lengths(
+                *array,
+                column,
+                *classification,
+                column_index,
+                column_count,
+                cell_lengths,
+            ),
+            Self::Decimal128 {
+                column,
+                classification,
+                array,
+            } => measure_decimal_column_cell_lengths(
+                *array,
+                column,
+                *classification,
+                column_index,
+                column_count,
+                cell_lengths,
+            ),
+            Self::Decimal256 {
+                column,
+                classification,
+                array,
+            } => measure_decimal_column_cell_lengths(
+                *array,
+                column,
+                *classification,
+                column_index,
+                column_count,
+                cell_lengths,
+            ),
+            Self::Utf8 { column, array } => measure_variable_width_column_cell_lengths(
+                *array,
+                column,
+                column_index,
+                column_count,
+                cell_lengths,
+            ),
+            Self::Binary { column, array } => measure_variable_width_column_cell_lengths(
+                *array,
+                column,
+                column_index,
+                column_count,
+                cell_lengths,
+            ),
+            Self::Date32 {
+                column,
+                mapping,
+                array,
+            } => measure_temporal_column_cell_lengths(
+                *array,
+                TemporalColumnContext {
+                    mapping,
+                    plan_options: default_options,
+                    column,
+                    classification: TemporalArrowToMssql::Date32ToDate,
+                    column_index,
+                    column_count,
+                },
+                cell_lengths,
+            ),
+            Self::Date64 {
+                column,
+                mapping,
+                array,
+            } => measure_temporal_column_cell_lengths(
+                *array,
+                TemporalColumnContext {
+                    mapping,
+                    plan_options: default_options,
+                    column,
+                    classification: TemporalArrowToMssql::Date64ToDateTime2,
+                    column_index,
+                    column_count,
+                },
+                cell_lengths,
+            ),
+            Self::TimestampSecond {
+                column,
+                mapping,
+                classification,
+                array,
+            } => measure_temporal_column_cell_lengths(
+                *array,
+                TemporalColumnContext {
+                    mapping,
+                    plan_options: default_options,
+                    column,
+                    classification: *classification,
+                    column_index,
+                    column_count,
+                },
+                cell_lengths,
+            ),
+            Self::TimestampMillisecond {
+                column,
+                mapping,
+                classification,
+                array,
+            } => measure_temporal_column_cell_lengths(
+                *array,
+                TemporalColumnContext {
+                    mapping,
+                    plan_options: default_options,
+                    column,
+                    classification: *classification,
+                    column_index,
+                    column_count,
+                },
+                cell_lengths,
+            ),
+            Self::TimestampMicrosecond {
+                column,
+                mapping,
+                classification,
+                array,
+            } => measure_temporal_column_cell_lengths(
+                *array,
+                TemporalColumnContext {
+                    mapping,
+                    plan_options: default_options,
+                    column,
+                    classification: *classification,
+                    column_index,
+                    column_count,
+                },
+                cell_lengths,
+            ),
+            Self::TimestampNanosecond {
+                column,
+                mapping,
+                classification,
+                nanosecond_policy,
+                array,
+            } => measure_temporal_column_cell_lengths(
+                *array,
+                TemporalColumnContext {
+                    mapping,
+                    plan_options: PlanOptions {
+                        nanosecond_policy: *nanosecond_policy,
+                        ..Default::default()
+                    },
+                    column,
+                    classification: *classification,
+                    column_index,
+                    column_count,
+                },
+                cell_lengths,
+            ),
+            Self::Time32Second {
+                column,
+                mapping,
+                classification,
+                array,
+            } => measure_temporal_column_cell_lengths(
+                *array,
+                TemporalColumnContext {
+                    mapping,
+                    plan_options: default_options,
+                    column,
+                    classification: *classification,
+                    column_index,
+                    column_count,
+                },
+                cell_lengths,
+            ),
+            Self::Time32Millisecond {
+                column,
+                mapping,
+                classification,
+                array,
+            } => measure_temporal_column_cell_lengths(
+                *array,
+                TemporalColumnContext {
+                    mapping,
+                    plan_options: default_options,
+                    column,
+                    classification: *classification,
+                    column_index,
+                    column_count,
+                },
+                cell_lengths,
+            ),
+            Self::Time64Microsecond {
+                column,
+                mapping,
+                classification,
+                array,
+            } => measure_temporal_column_cell_lengths(
+                *array,
+                TemporalColumnContext {
+                    mapping,
+                    plan_options: default_options,
+                    column,
+                    classification: *classification,
+                    column_index,
+                    column_count,
+                },
+                cell_lengths,
+            ),
+            Self::Time64Nanosecond {
+                column,
+                mapping,
+                classification,
+                nanosecond_policy,
+                array,
+            } => measure_temporal_column_cell_lengths(
+                *array,
+                TemporalColumnContext {
+                    mapping,
+                    plan_options: PlanOptions {
+                        nanosecond_policy: *nanosecond_policy,
+                        ..Default::default()
+                    },
+                    column,
+                    classification: *classification,
+                    column_index,
+                    column_count,
+                },
+                cell_lengths,
+            ),
+            Self::DateTimeOffsetSecond {
+                column,
+                mapping,
+                classification,
+                array,
+            } => measure_temporal_column_cell_lengths(
+                *array,
+                TemporalColumnContext {
+                    mapping,
+                    plan_options: default_options,
+                    column,
+                    classification: *classification,
+                    column_index,
+                    column_count,
+                },
+                cell_lengths,
+            ),
+            Self::DateTimeOffsetMillisecond {
+                column,
+                mapping,
+                classification,
+                array,
+            } => measure_temporal_column_cell_lengths(
+                *array,
+                TemporalColumnContext {
+                    mapping,
+                    plan_options: default_options,
+                    column,
+                    classification: *classification,
+                    column_index,
+                    column_count,
+                },
+                cell_lengths,
+            ),
+            Self::DateTimeOffsetMicrosecond {
+                column,
+                mapping,
+                classification,
+                array,
+            } => measure_temporal_column_cell_lengths(
+                *array,
+                TemporalColumnContext {
+                    mapping,
+                    plan_options: default_options,
+                    column,
+                    classification: *classification,
+                    column_index,
+                    column_count,
+                },
+                cell_lengths,
+            ),
+            Self::DateTimeOffsetNanosecond {
+                column,
+                mapping,
+                classification,
+                nanosecond_policy,
+                array,
+            } => measure_temporal_column_cell_lengths(
+                *array,
+                TemporalColumnContext {
+                    mapping,
+                    plan_options: PlanOptions {
+                        nanosecond_policy: *nanosecond_policy,
+                        ..Default::default()
+                    },
+                    column,
+                    classification: *classification,
+                    column_index,
+                    column_count,
+                },
+                cell_lengths,
+            ),
+        }
+    }
+
     pub(crate) fn append_cell(
         &self,
         buf: &mut tiberius::RawRowsAppendBuffer<'_>,
@@ -720,4 +1145,14 @@ impl BoundDirectColumn<'_> {
             ),
         }
     }
+}
+
+fn measure_primitive_bound_column(
+    array: &dyn Array,
+    column: &plan::DirectColumnPlan,
+    column_index: usize,
+    column_count: usize,
+    cell_lengths: &mut [usize],
+) -> Result<()> {
+    measure_primitive_column_cell_lengths(array, column, column_index, column_count, cell_lengths)
 }
