@@ -17,70 +17,85 @@ const DECIMAL_SIGN_LEN: usize = 1;
 const DECIMAL_NEGATIVE_SIGN: u8 = 0;
 const DECIMAL_POSITIVE_SIGN: u8 = 1;
 
-/// Measures one Arrow decimal column into a row-major cell length matrix.
-pub(crate) fn measure_decimal_column_cell_lengths(
-    array: &dyn Array,
+/// Measures one Decimal32 column into a row-major cell length matrix.
+pub(crate) fn measure_decimal32_column_cell_lengths(
+    array: &Decimal32Array,
     column: &DirectColumnPlan,
     classification: DecimalArrowToMssql,
     column_index: usize,
     column_count: usize,
     cell_lengths: &mut [usize],
 ) -> Result<()> {
-    match classification {
-        DecimalArrowToMssql::Decimal32 { .. } => {
-            let array = downcast_direct_array::<Decimal32Array>(array, column)?;
-            measure_decimal_values(
-                array,
-                column,
-                classification,
-                column_index,
-                column_count,
-                cell_lengths,
-                |array, row_index| Ok(i128::from(array.value(row_index))),
-            )
-        }
-        DecimalArrowToMssql::Decimal64 { .. } => {
-            let array = downcast_direct_array::<Decimal64Array>(array, column)?;
-            measure_decimal_values(
-                array,
-                column,
-                classification,
-                column_index,
-                column_count,
-                cell_lengths,
-                |array, row_index| Ok(i128::from(array.value(row_index))),
-            )
-        }
-        DecimalArrowToMssql::Decimal128 { .. } => {
-            let array = downcast_direct_array::<Decimal128Array>(array, column)?;
-            measure_decimal_values(
-                array,
-                column,
-                classification,
-                column_index,
-                column_count,
-                cell_lengths,
-                |array, row_index| Ok(array.value(row_index)),
-            )
-        }
-        DecimalArrowToMssql::Decimal256CheckedDowncast { .. } => {
-            let array = downcast_direct_array::<Decimal256Array>(array, column)?;
-            measure_decimal_values(
-                array,
-                column,
-                classification,
-                column_index,
-                column_count,
-                cell_lengths,
-                |array, row_index| decimal256_to_i128(array.value(row_index), column, row_index),
-            )
-        }
-    }
+    measure_decimal_values(
+        array,
+        column,
+        classification,
+        column_index,
+        column_count,
+        cell_lengths,
+        |array, row_index| Ok(i128::from(array.value(row_index))),
+    )
 }
 
-/// Fills one Arrow decimal column into an already allocated rows payload.
-pub(crate) fn fill_decimal_column(
-    array: &dyn Array,
+pub(crate) fn measure_decimal64_column_cell_lengths(
+    array: &Decimal64Array,
+    column: &DirectColumnPlan,
+    classification: DecimalArrowToMssql,
+    column_index: usize,
+    column_count: usize,
+    cell_lengths: &mut [usize],
+) -> Result<()> {
+    measure_decimal_values(
+        array,
+        column,
+        classification,
+        column_index,
+        column_count,
+        cell_lengths,
+        |array, row_index| Ok(i128::from(array.value(row_index))),
+    )
+}
+
+pub(crate) fn measure_decimal128_column_cell_lengths(
+    array: &Decimal128Array,
+    column: &DirectColumnPlan,
+    classification: DecimalArrowToMssql,
+    column_index: usize,
+    column_count: usize,
+    cell_lengths: &mut [usize],
+) -> Result<()> {
+    measure_decimal_values(
+        array,
+        column,
+        classification,
+        column_index,
+        column_count,
+        cell_lengths,
+        |array, row_index| Ok(array.value(row_index)),
+    )
+}
+
+pub(crate) fn measure_decimal256_column_cell_lengths(
+    array: &Decimal256Array,
+    column: &DirectColumnPlan,
+    classification: DecimalArrowToMssql,
+    column_index: usize,
+    column_count: usize,
+    cell_lengths: &mut [usize],
+) -> Result<()> {
+    measure_decimal_values(
+        array,
+        column,
+        classification,
+        column_index,
+        column_count,
+        cell_lengths,
+        |array, row_index| decimal256_to_i128(array.value(row_index), column, row_index),
+    )
+}
+
+pub(crate) fn fill_decimal32_column(
+    array: &Decimal32Array,
     column: &DirectColumnPlan,
     classification: DecimalArrowToMssql,
     column_index: usize,
@@ -88,68 +103,87 @@ pub(crate) fn fill_decimal_column(
     layout: &RowLayout,
     bytes: &mut [u8],
 ) -> Result<()> {
-    match classification {
-        DecimalArrowToMssql::Decimal32 { .. } => {
-            let array = downcast_direct_array::<Decimal32Array>(array, column)?;
-            fill_decimal_values(
-                array,
-                column,
-                classification,
-                DecimalFillTarget {
-                    column_index,
-                    column_count,
-                    layout,
-                    bytes,
-                },
-                |array, row_index| Ok(i128::from(array.value(row_index))),
-            )
-        }
-        DecimalArrowToMssql::Decimal64 { .. } => {
-            let array = downcast_direct_array::<Decimal64Array>(array, column)?;
-            fill_decimal_values(
-                array,
-                column,
-                classification,
-                DecimalFillTarget {
-                    column_index,
-                    column_count,
-                    layout,
-                    bytes,
-                },
-                |array, row_index| Ok(i128::from(array.value(row_index))),
-            )
-        }
-        DecimalArrowToMssql::Decimal128 { .. } => {
-            let array = downcast_direct_array::<Decimal128Array>(array, column)?;
-            fill_decimal_values(
-                array,
-                column,
-                classification,
-                DecimalFillTarget {
-                    column_index,
-                    column_count,
-                    layout,
-                    bytes,
-                },
-                |array, row_index| Ok(array.value(row_index)),
-            )
-        }
-        DecimalArrowToMssql::Decimal256CheckedDowncast { .. } => {
-            let array = downcast_direct_array::<Decimal256Array>(array, column)?;
-            fill_decimal_values(
-                array,
-                column,
-                classification,
-                DecimalFillTarget {
-                    column_index,
-                    column_count,
-                    layout,
-                    bytes,
-                },
-                |array, row_index| decimal256_to_i128(array.value(row_index), column, row_index),
-            )
-        }
-    }
+    fill_decimal_values(
+        array,
+        column,
+        classification,
+        DecimalFillTarget {
+            column_index,
+            column_count,
+            layout,
+            bytes,
+        },
+        |array, row_index| Ok(i128::from(array.value(row_index))),
+    )
+}
+
+pub(crate) fn fill_decimal64_column(
+    array: &Decimal64Array,
+    column: &DirectColumnPlan,
+    classification: DecimalArrowToMssql,
+    column_index: usize,
+    column_count: usize,
+    layout: &RowLayout,
+    bytes: &mut [u8],
+) -> Result<()> {
+    fill_decimal_values(
+        array,
+        column,
+        classification,
+        DecimalFillTarget {
+            column_index,
+            column_count,
+            layout,
+            bytes,
+        },
+        |array, row_index| Ok(i128::from(array.value(row_index))),
+    )
+}
+
+pub(crate) fn fill_decimal128_column(
+    array: &Decimal128Array,
+    column: &DirectColumnPlan,
+    classification: DecimalArrowToMssql,
+    column_index: usize,
+    column_count: usize,
+    layout: &RowLayout,
+    bytes: &mut [u8],
+) -> Result<()> {
+    fill_decimal_values(
+        array,
+        column,
+        classification,
+        DecimalFillTarget {
+            column_index,
+            column_count,
+            layout,
+            bytes,
+        },
+        |array, row_index| Ok(array.value(row_index)),
+    )
+}
+
+pub(crate) fn fill_decimal256_column(
+    array: &Decimal256Array,
+    column: &DirectColumnPlan,
+    classification: DecimalArrowToMssql,
+    column_index: usize,
+    column_count: usize,
+    layout: &RowLayout,
+    bytes: &mut [u8],
+) -> Result<()> {
+    fill_decimal_values(
+        array,
+        column,
+        classification,
+        DecimalFillTarget {
+            column_index,
+            column_count,
+            layout,
+            bytes,
+        },
+        |array, row_index| decimal256_to_i128(array.value(row_index), column, row_index),
+    )
 }
 
 /// Appends one Arrow decimal cell to a raw bulk append buffer.
@@ -562,23 +596,6 @@ fn cell_position(
         .cell_positions()
         .get(index)
         .ok_or_else(|| invalid_payload("cell position is outside measured row layout"))
-}
-
-fn downcast_direct_array<'a, T: Array + 'static>(
-    array: &'a dyn Array,
-    column: &DirectColumnPlan,
-) -> Result<&'a T> {
-    array.as_any().downcast_ref::<T>().ok_or_else(|| {
-        value_conversion_error(row_column_diagnostic(
-            column,
-            0,
-            DiagnosticCode::ValueTypeMismatch,
-            format!(
-                "runtime Arrow type {} does not match planned direct decimal column type",
-                array.data_type()
-            ),
-        ))
-    })
 }
 
 fn add_decimal_field(err: Error, column: &DirectColumnPlan) -> Error {

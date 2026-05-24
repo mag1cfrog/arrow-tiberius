@@ -18,7 +18,10 @@ use super::{
     types::{
         decimal::{
             append_decimal32_cell, append_decimal64_cell, append_decimal128_cell,
-            append_decimal256_cell, fill_decimal_column, measure_decimal_column_cell_lengths,
+            append_decimal256_cell, fill_decimal32_column, fill_decimal64_column,
+            fill_decimal128_column, fill_decimal256_column, measure_decimal32_column_cell_lengths,
+            measure_decimal64_column_cell_lengths, measure_decimal128_column_cell_lengths,
+            measure_decimal256_column_cell_lengths,
         },
         primitive::{
             append_boolean_cell, append_float32_cell, append_float64_cell, append_int8_cell,
@@ -638,8 +641,8 @@ impl BoundDirectColumn<'_> {
                 column,
                 classification,
                 array,
-            } => measure_decimal_column_cell_lengths(
-                *array,
+            } => measure_decimal32_column_cell_lengths(
+                array,
                 column,
                 *classification,
                 column_index,
@@ -650,8 +653,8 @@ impl BoundDirectColumn<'_> {
                 column,
                 classification,
                 array,
-            } => measure_decimal_column_cell_lengths(
-                *array,
+            } => measure_decimal64_column_cell_lengths(
+                array,
                 column,
                 *classification,
                 column_index,
@@ -662,8 +665,8 @@ impl BoundDirectColumn<'_> {
                 column,
                 classification,
                 array,
-            } => measure_decimal_column_cell_lengths(
-                *array,
+            } => measure_decimal128_column_cell_lengths(
+                array,
                 column,
                 *classification,
                 column_index,
@@ -674,8 +677,8 @@ impl BoundDirectColumn<'_> {
                 column,
                 classification,
                 array,
-            } => measure_decimal_column_cell_lengths(
-                *array,
+            } => measure_decimal256_column_cell_lengths(
+                array,
                 column,
                 *classification,
                 column_index,
@@ -1001,8 +1004,8 @@ impl BoundDirectColumn<'_> {
                 column,
                 classification,
                 array,
-            } => fill_decimal_column(
-                *array,
+            } => fill_decimal32_column(
+                array,
                 column,
                 *classification,
                 column_index,
@@ -1014,8 +1017,8 @@ impl BoundDirectColumn<'_> {
                 column,
                 classification,
                 array,
-            } => fill_decimal_column(
-                *array,
+            } => fill_decimal64_column(
+                array,
                 column,
                 *classification,
                 column_index,
@@ -1027,8 +1030,8 @@ impl BoundDirectColumn<'_> {
                 column,
                 classification,
                 array,
-            } => fill_decimal_column(
-                *array,
+            } => fill_decimal128_column(
+                array,
                 column,
                 *classification,
                 column_index,
@@ -1040,8 +1043,8 @@ impl BoundDirectColumn<'_> {
                 column,
                 classification,
                 array,
-            } => fill_decimal_column(
-                *array,
+            } => fill_decimal256_column(
+                array,
                 column,
                 *classification,
                 column_index,
