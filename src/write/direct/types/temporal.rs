@@ -652,240 +652,283 @@ pub(crate) fn measure_time64_nanosecond_column_cell_lengths(
     )
 }
 
-/// Fills one Arrow date-family column into an already allocated rows payload.
-pub(crate) fn fill_temporal_column(
-    array: &dyn Array,
+pub(crate) fn fill_date32_direct_column(
+    array: &Date32Array,
     context: TemporalColumnContext<'_>,
     layout: &RowLayout,
     bytes: &mut [u8],
 ) -> Result<()> {
-    match context.classification {
-        TemporalArrowToMssql::Date32ToDate => {
-            let array = downcast_direct_array::<Date32Array>(array, context.column)?;
-            fill_date32_column(
-                array,
-                context.column,
-                context.column_index,
-                context.column_count,
-                layout,
-                bytes,
+    fill_date32_column(
+        array,
+        context.column,
+        context.column_index,
+        context.column_count,
+        layout,
+        bytes,
+    )
+}
+
+pub(crate) fn fill_date64_direct_column(
+    array: &Date64Array,
+    context: TemporalColumnContext<'_>,
+    layout: &RowLayout,
+    bytes: &mut [u8],
+) -> Result<()> {
+    fill_date64_column(
+        array,
+        context.column,
+        context.column_index,
+        context.column_count,
+        layout,
+        bytes,
+    )
+}
+
+pub(crate) fn fill_timestamp_second_direct_column(
+    array: &TimestampSecondArray,
+    context: TemporalColumnContext<'_>,
+    layout: &RowLayout,
+    bytes: &mut [u8],
+) -> Result<()> {
+    fill_timestamp_column(
+        array,
+        context,
+        layout,
+        bytes,
+        |array, mapping, row_index| {
+            mssql_datetime2_from_arrow_timestamp_second(mapping, row_index, array.value(row_index))
+        },
+    )
+}
+
+pub(crate) fn fill_timestamp_millisecond_direct_column(
+    array: &TimestampMillisecondArray,
+    context: TemporalColumnContext<'_>,
+    layout: &RowLayout,
+    bytes: &mut [u8],
+) -> Result<()> {
+    fill_timestamp_column(
+        array,
+        context,
+        layout,
+        bytes,
+        |array, mapping, row_index| {
+            mssql_datetime2_from_arrow_timestamp_millisecond(
+                mapping,
+                row_index,
+                array.value(row_index),
             )
-        }
-        TemporalArrowToMssql::Date64ToDateTime2 => {
-            let array = downcast_direct_array::<Date64Array>(array, context.column)?;
-            fill_date64_column(
-                array,
-                context.column,
-                context.column_index,
-                context.column_count,
-                layout,
-                bytes,
+        },
+    )
+}
+
+pub(crate) fn fill_timestamp_microsecond_direct_column(
+    array: &TimestampMicrosecondArray,
+    context: TemporalColumnContext<'_>,
+    layout: &RowLayout,
+    bytes: &mut [u8],
+) -> Result<()> {
+    fill_timestamp_column(
+        array,
+        context,
+        layout,
+        bytes,
+        |array, mapping, row_index| {
+            mssql_datetime2_from_arrow_timestamp_microsecond(
+                mapping,
+                row_index,
+                array.value(row_index),
             )
-        }
-        TemporalArrowToMssql::TimestampSecondToDateTime2
-        | TemporalArrowToMssql::TimestampSecondTzToDateTime2 => {
-            let array = downcast_direct_array::<TimestampSecondArray>(array, context.column)?;
-            fill_timestamp_column(
-                array,
-                context,
-                layout,
-                bytes,
-                |array, mapping, row_index| {
-                    mssql_datetime2_from_arrow_timestamp_second(
-                        mapping,
-                        row_index,
-                        array.value(row_index),
-                    )
-                },
+        },
+    )
+}
+
+pub(crate) fn fill_timestamp_nanosecond_direct_column(
+    array: &TimestampNanosecondArray,
+    context: TemporalColumnContext<'_>,
+    layout: &RowLayout,
+    bytes: &mut [u8],
+) -> Result<()> {
+    fill_timestamp_column(
+        array,
+        context,
+        layout,
+        bytes,
+        |array, mapping, row_index| {
+            mssql_datetime2_from_arrow_timestamp_nanosecond(
+                mapping,
+                row_index,
+                array.value(row_index),
+                context.plan_options.nanosecond_policy,
             )
-        }
-        TemporalArrowToMssql::TimestampMillisecondToDateTime2
-        | TemporalArrowToMssql::TimestampMillisecondTzToDateTime2 => {
-            let array = downcast_direct_array::<TimestampMillisecondArray>(array, context.column)?;
-            fill_timestamp_column(
-                array,
-                context,
-                layout,
-                bytes,
-                |array, mapping, row_index| {
-                    mssql_datetime2_from_arrow_timestamp_millisecond(
-                        mapping,
-                        row_index,
-                        array.value(row_index),
-                    )
-                },
+        },
+    )
+}
+
+pub(crate) fn fill_datetimeoffset_second_direct_column(
+    array: &TimestampSecondArray,
+    context: TemporalColumnContext<'_>,
+    layout: &RowLayout,
+    bytes: &mut [u8],
+) -> Result<()> {
+    fill_datetimeoffset_column(
+        array,
+        context,
+        layout,
+        bytes,
+        |array, mapping, row_index| {
+            let timezone = timestamp_timezone_for_datetimeoffset(mapping, row_index)?;
+            mssql_datetimeoffset_from_arrow_timestamp_second(
+                mapping,
+                row_index,
+                array.value(row_index),
+                timezone,
             )
-        }
-        TemporalArrowToMssql::TimestampMicrosecondToDateTime2
-        | TemporalArrowToMssql::TimestampMicrosecondTzToDateTime2 => {
-            let array = downcast_direct_array::<TimestampMicrosecondArray>(array, context.column)?;
-            fill_timestamp_column(
-                array,
-                context,
-                layout,
-                bytes,
-                |array, mapping, row_index| {
-                    mssql_datetime2_from_arrow_timestamp_microsecond(
-                        mapping,
-                        row_index,
-                        array.value(row_index),
-                    )
-                },
+        },
+    )
+}
+
+pub(crate) fn fill_datetimeoffset_millisecond_direct_column(
+    array: &TimestampMillisecondArray,
+    context: TemporalColumnContext<'_>,
+    layout: &RowLayout,
+    bytes: &mut [u8],
+) -> Result<()> {
+    fill_datetimeoffset_column(
+        array,
+        context,
+        layout,
+        bytes,
+        |array, mapping, row_index| {
+            let timezone = timestamp_timezone_for_datetimeoffset(mapping, row_index)?;
+            mssql_datetimeoffset_from_arrow_timestamp_millisecond(
+                mapping,
+                row_index,
+                array.value(row_index),
+                timezone,
             )
-        }
-        TemporalArrowToMssql::TimestampNanosecondToDateTime2
-        | TemporalArrowToMssql::TimestampNanosecondTzToDateTime2 => {
-            let array = downcast_direct_array::<TimestampNanosecondArray>(array, context.column)?;
-            fill_timestamp_column(
-                array,
-                context,
-                layout,
-                bytes,
-                |array, mapping, row_index| {
-                    mssql_datetime2_from_arrow_timestamp_nanosecond(
-                        mapping,
-                        row_index,
-                        array.value(row_index),
-                        context.plan_options.nanosecond_policy,
-                    )
-                },
+        },
+    )
+}
+
+pub(crate) fn fill_datetimeoffset_microsecond_direct_column(
+    array: &TimestampMicrosecondArray,
+    context: TemporalColumnContext<'_>,
+    layout: &RowLayout,
+    bytes: &mut [u8],
+) -> Result<()> {
+    fill_datetimeoffset_column(
+        array,
+        context,
+        layout,
+        bytes,
+        |array, mapping, row_index| {
+            let timezone = timestamp_timezone_for_datetimeoffset(mapping, row_index)?;
+            mssql_datetimeoffset_from_arrow_timestamp_microsecond(
+                mapping,
+                row_index,
+                array.value(row_index),
+                timezone,
             )
-        }
-        TemporalArrowToMssql::TimestampSecondTzToDateTimeOffset => {
-            let array = downcast_direct_array::<TimestampSecondArray>(array, context.column)?;
-            fill_datetimeoffset_column(
-                array,
-                context,
-                layout,
-                bytes,
-                |array, mapping, row_index| {
-                    let timezone = timestamp_timezone_for_datetimeoffset(mapping, row_index)?;
-                    mssql_datetimeoffset_from_arrow_timestamp_second(
-                        mapping,
-                        row_index,
-                        array.value(row_index),
-                        timezone,
-                    )
-                },
+        },
+    )
+}
+
+pub(crate) fn fill_datetimeoffset_nanosecond_direct_column(
+    array: &TimestampNanosecondArray,
+    context: TemporalColumnContext<'_>,
+    layout: &RowLayout,
+    bytes: &mut [u8],
+) -> Result<()> {
+    fill_datetimeoffset_column(
+        array,
+        context,
+        layout,
+        bytes,
+        |array, mapping, row_index| {
+            let timezone = timestamp_timezone_for_datetimeoffset(mapping, row_index)?;
+            mssql_datetimeoffset_from_arrow_timestamp_nanosecond(
+                mapping,
+                row_index,
+                array.value(row_index),
+                timezone,
+                context.plan_options.nanosecond_policy,
             )
-        }
-        TemporalArrowToMssql::TimestampMillisecondTzToDateTimeOffset => {
-            let array = downcast_direct_array::<TimestampMillisecondArray>(array, context.column)?;
-            fill_datetimeoffset_column(
-                array,
-                context,
-                layout,
-                bytes,
-                |array, mapping, row_index| {
-                    let timezone = timestamp_timezone_for_datetimeoffset(mapping, row_index)?;
-                    mssql_datetimeoffset_from_arrow_timestamp_millisecond(
-                        mapping,
-                        row_index,
-                        array.value(row_index),
-                        timezone,
-                    )
-                },
+        },
+    )
+}
+
+pub(crate) fn fill_time32_second_direct_column(
+    array: &Time32SecondArray,
+    context: TemporalColumnContext<'_>,
+    layout: &RowLayout,
+    bytes: &mut [u8],
+) -> Result<()> {
+    fill_time_column(
+        array,
+        context,
+        layout,
+        bytes,
+        |array, mapping, row_index| {
+            mssql_time_from_arrow_time32_second(mapping, row_index, array.value(row_index))
+        },
+    )
+}
+
+pub(crate) fn fill_time32_millisecond_direct_column(
+    array: &Time32MillisecondArray,
+    context: TemporalColumnContext<'_>,
+    layout: &RowLayout,
+    bytes: &mut [u8],
+) -> Result<()> {
+    fill_time_column(
+        array,
+        context,
+        layout,
+        bytes,
+        |array, mapping, row_index| {
+            mssql_time_from_arrow_time32_millisecond(mapping, row_index, array.value(row_index))
+        },
+    )
+}
+
+pub(crate) fn fill_time64_microsecond_direct_column(
+    array: &Time64MicrosecondArray,
+    context: TemporalColumnContext<'_>,
+    layout: &RowLayout,
+    bytes: &mut [u8],
+) -> Result<()> {
+    fill_time_column(
+        array,
+        context,
+        layout,
+        bytes,
+        |array, mapping, row_index| {
+            mssql_time_from_arrow_time64_microsecond(mapping, row_index, array.value(row_index))
+        },
+    )
+}
+
+pub(crate) fn fill_time64_nanosecond_direct_column(
+    array: &Time64NanosecondArray,
+    context: TemporalColumnContext<'_>,
+    layout: &RowLayout,
+    bytes: &mut [u8],
+) -> Result<()> {
+    fill_time_column(
+        array,
+        context,
+        layout,
+        bytes,
+        |array, mapping, row_index| {
+            mssql_time_from_arrow_time64_nanosecond(
+                mapping,
+                row_index,
+                array.value(row_index),
+                context.plan_options.nanosecond_policy,
             )
-        }
-        TemporalArrowToMssql::TimestampMicrosecondTzToDateTimeOffset => {
-            let array = downcast_direct_array::<TimestampMicrosecondArray>(array, context.column)?;
-            fill_datetimeoffset_column(
-                array,
-                context,
-                layout,
-                bytes,
-                |array, mapping, row_index| {
-                    let timezone = timestamp_timezone_for_datetimeoffset(mapping, row_index)?;
-                    mssql_datetimeoffset_from_arrow_timestamp_microsecond(
-                        mapping,
-                        row_index,
-                        array.value(row_index),
-                        timezone,
-                    )
-                },
-            )
-        }
-        TemporalArrowToMssql::TimestampNanosecondTzToDateTimeOffset => {
-            let array = downcast_direct_array::<TimestampNanosecondArray>(array, context.column)?;
-            fill_datetimeoffset_column(
-                array,
-                context,
-                layout,
-                bytes,
-                |array, mapping, row_index| {
-                    let timezone = timestamp_timezone_for_datetimeoffset(mapping, row_index)?;
-                    mssql_datetimeoffset_from_arrow_timestamp_nanosecond(
-                        mapping,
-                        row_index,
-                        array.value(row_index),
-                        timezone,
-                        context.plan_options.nanosecond_policy,
-                    )
-                },
-            )
-        }
-        TemporalArrowToMssql::Time32SecondToTime => {
-            let array = downcast_direct_array::<Time32SecondArray>(array, context.column)?;
-            fill_time_column(
-                array,
-                context,
-                layout,
-                bytes,
-                |array, mapping, row_index| {
-                    mssql_time_from_arrow_time32_second(mapping, row_index, array.value(row_index))
-                },
-            )
-        }
-        TemporalArrowToMssql::Time32MillisecondToTime => {
-            let array = downcast_direct_array::<Time32MillisecondArray>(array, context.column)?;
-            fill_time_column(
-                array,
-                context,
-                layout,
-                bytes,
-                |array, mapping, row_index| {
-                    mssql_time_from_arrow_time32_millisecond(
-                        mapping,
-                        row_index,
-                        array.value(row_index),
-                    )
-                },
-            )
-        }
-        TemporalArrowToMssql::Time64MicrosecondToTime => {
-            let array = downcast_direct_array::<Time64MicrosecondArray>(array, context.column)?;
-            fill_time_column(
-                array,
-                context,
-                layout,
-                bytes,
-                |array, mapping, row_index| {
-                    mssql_time_from_arrow_time64_microsecond(
-                        mapping,
-                        row_index,
-                        array.value(row_index),
-                    )
-                },
-            )
-        }
-        TemporalArrowToMssql::Time64NanosecondToTime => {
-            let array = downcast_direct_array::<Time64NanosecondArray>(array, context.column)?;
-            fill_time_column(
-                array,
-                context,
-                layout,
-                bytes,
-                |array, mapping, row_index| {
-                    mssql_time_from_arrow_time64_nanosecond(
-                        mapping,
-                        row_index,
-                        array.value(row_index),
-                        context.plan_options.nanosecond_policy,
-                    )
-                },
-            )
-        }
-    }
+        },
+    )
 }
 
 /// Appends one Arrow Date32 cell to a raw bulk append buffer.

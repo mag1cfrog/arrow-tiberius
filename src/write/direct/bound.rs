@@ -39,7 +39,15 @@ use super::{
             append_time32_millisecond_cell, append_time32_second_cell,
             append_time64_microsecond_cell, append_time64_nanosecond_cell,
             append_timestamp_microsecond_cell, append_timestamp_millisecond_cell,
-            append_timestamp_nanosecond_cell, append_timestamp_second_cell, fill_temporal_column,
+            append_timestamp_nanosecond_cell, append_timestamp_second_cell,
+            fill_date32_direct_column, fill_date64_direct_column,
+            fill_datetimeoffset_microsecond_direct_column,
+            fill_datetimeoffset_millisecond_direct_column,
+            fill_datetimeoffset_nanosecond_direct_column, fill_datetimeoffset_second_direct_column,
+            fill_time32_millisecond_direct_column, fill_time32_second_direct_column,
+            fill_time64_microsecond_direct_column, fill_time64_nanosecond_direct_column,
+            fill_timestamp_microsecond_direct_column, fill_timestamp_millisecond_direct_column,
+            fill_timestamp_nanosecond_direct_column, fill_timestamp_second_direct_column,
             measure_date32_column_cell_lengths, measure_date64_column_cell_lengths,
             measure_datetimeoffset_microsecond_column_cell_lengths,
             measure_datetimeoffset_millisecond_column_cell_lengths,
@@ -1080,8 +1088,8 @@ impl BoundDirectColumn<'_> {
                 column,
                 mapping,
                 array,
-            } => fill_temporal_column(
-                *array,
+            } => fill_date32_direct_column(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: default_options,
@@ -1097,8 +1105,8 @@ impl BoundDirectColumn<'_> {
                 column,
                 mapping,
                 array,
-            } => fill_temporal_column(
-                *array,
+            } => fill_date64_direct_column(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: default_options,
@@ -1115,8 +1123,8 @@ impl BoundDirectColumn<'_> {
                 mapping,
                 classification,
                 array,
-            } => fill_temporal_column(
-                *array,
+            } => fill_timestamp_second_direct_column(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: default_options,
@@ -1133,8 +1141,8 @@ impl BoundDirectColumn<'_> {
                 mapping,
                 classification,
                 array,
-            } => fill_temporal_column(
-                *array,
+            } => fill_timestamp_millisecond_direct_column(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: default_options,
@@ -1151,8 +1159,8 @@ impl BoundDirectColumn<'_> {
                 mapping,
                 classification,
                 array,
-            } => fill_temporal_column(
-                *array,
+            } => fill_timestamp_microsecond_direct_column(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: default_options,
@@ -1170,8 +1178,8 @@ impl BoundDirectColumn<'_> {
                 classification,
                 nanosecond_policy,
                 array,
-            } => fill_temporal_column(
-                *array,
+            } => fill_timestamp_nanosecond_direct_column(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: PlanOptions {
@@ -1191,8 +1199,8 @@ impl BoundDirectColumn<'_> {
                 mapping,
                 classification,
                 array,
-            } => fill_temporal_column(
-                *array,
+            } => fill_time32_second_direct_column(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: default_options,
@@ -1209,8 +1217,8 @@ impl BoundDirectColumn<'_> {
                 mapping,
                 classification,
                 array,
-            } => fill_temporal_column(
-                *array,
+            } => fill_time32_millisecond_direct_column(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: default_options,
@@ -1227,8 +1235,8 @@ impl BoundDirectColumn<'_> {
                 mapping,
                 classification,
                 array,
-            } => fill_temporal_column(
-                *array,
+            } => fill_time64_microsecond_direct_column(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: default_options,
@@ -1246,8 +1254,8 @@ impl BoundDirectColumn<'_> {
                 classification,
                 nanosecond_policy,
                 array,
-            } => fill_temporal_column(
-                *array,
+            } => fill_time64_nanosecond_direct_column(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: PlanOptions {
@@ -1267,8 +1275,8 @@ impl BoundDirectColumn<'_> {
                 mapping,
                 classification,
                 array,
-            } => fill_temporal_column(
-                *array,
+            } => fill_datetimeoffset_second_direct_column(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: default_options,
@@ -1285,8 +1293,8 @@ impl BoundDirectColumn<'_> {
                 mapping,
                 classification,
                 array,
-            } => fill_temporal_column(
-                *array,
+            } => fill_datetimeoffset_millisecond_direct_column(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: default_options,
@@ -1303,8 +1311,8 @@ impl BoundDirectColumn<'_> {
                 mapping,
                 classification,
                 array,
-            } => fill_temporal_column(
-                *array,
+            } => fill_datetimeoffset_microsecond_direct_column(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: default_options,
@@ -1322,8 +1330,8 @@ impl BoundDirectColumn<'_> {
                 classification,
                 nanosecond_policy,
                 array,
-            } => fill_temporal_column(
-                *array,
+            } => fill_datetimeoffset_nanosecond_direct_column(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: PlanOptions {
