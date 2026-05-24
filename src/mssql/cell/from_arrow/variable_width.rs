@@ -1,8 +1,12 @@
 //! Variable-length Arrow-to-MSSQL runtime cell conversion.
 
 use crate::{
-    DiagnosticCode, MssqlTypeLength, Result, SchemaMapping, arrow::cell::ArrowCell,
-    conversion::arrow_to_mssql::variable_width::VariableWidthArrowToMssql, mssql::cell::MssqlCell,
+    DiagnosticCode, MssqlTypeLength, Result, SchemaMapping,
+    arrow::cell::ArrowCell,
+    conversion::arrow_to_mssql::{
+        fixed_size_binary::FixedSizeBinaryArrowToMssql, variable_width::VariableWidthArrowToMssql,
+    },
+    mssql::cell::MssqlCell,
 };
 
 use super::{row_mapping_diagnostic, value_conversion_error, value_too_long_error};
@@ -83,6 +87,35 @@ pub(super) fn var_binary_cell<'a>(
     Ok(MssqlCell::VarBinary(Some(value)))
 }
 
+pub(super) fn binary_cell<'a>(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    length: usize,
+    cell: ArrowCell<'a>,
+) -> Result<MssqlCell<'a>> {
+    let classified = match FixedSizeBinaryArrowToMssql::classify(mapping, row_index)? {
+        FixedSizeBinaryArrowToMssql::FixedSizeBinaryToBinary { length } => length,
+    };
+    debug_assert_eq!(length, classified);
+
+    let value = mssql_varbinary_value(mapping, row_index, cell)?;
+    let bytes = value.len();
+
+    if bytes != length {
+        return Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!(
+                "binary value has {bytes} byte(s), but planned {} requires exactly {length}",
+                mapping.mssql().ty().to_sql()
+            ),
+        )));
+    }
+
+    Ok(MssqlCell::VarBinary(Some(value)))
+}
+
 fn mssql_nvarchar_value<'a>(
     mapping: &SchemaMapping,
     row_index: usize,
@@ -130,8 +163,9 @@ mod tests {
 
     use super::super::{ArrowToMssqlRuntimeMapping, mssql_cell_from_arrow_cell};
     use crate::{
-        BinaryPolicy, DiagnosticCode, MssqlProfile, PlanOptions, SchemaMapping, StringPolicy,
-        arrow::cell::ArrowCell, mssql::cell::MssqlCell, plan_arrow_schema_to_mssql_mappings,
+        BinaryPolicy, DiagnosticCode, MssqlProfile, MssqlType, PlanOptions, SchemaMapping,
+        StringPolicy, arrow::cell::ArrowCell, mssql::cell::MssqlCell,
+        plan_arrow_schema_to_mssql_mappings,
     };
 
     #[test]
@@ -263,6 +297,41 @@ mod tests {
             Some(2),
             Some((0, "bytes")),
         );
+    }
+
+    #[test]
+    fn converts_fixed_size_binary_values() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "digest",
+            DataType::FixedSizeBinary(3),
+            true,
+        )]));
+
+        assert_eq!(mappings[0].mssql().ty(), &MssqlType::Binary(3));
+        assert_eq!(
+            convert_cell(&mappings[0], ArrowCell::Binary(b"abc"), 0).unwrap(),
+            MssqlCell::VarBinary(Some(b"abc"))
+        );
+    }
+
+    #[test]
+    fn rejects_fixed_size_binary_values_with_wrong_runtime_length() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "digest",
+            DataType::FixedSizeBinary(3),
+            true,
+        )]));
+
+        for (row_index, value) in [(0, &b""[..]), (1, &b"ab"[..]), (2, &b"abcd"[..])] {
+            let err = convert_cell(&mappings[0], ArrowCell::Binary(value), row_index).unwrap_err();
+
+            assert_single_diagnostic(
+                err,
+                DiagnosticCode::ValueTypeMismatch,
+                Some(row_index),
+                Some((0, "digest")),
+            );
+        }
     }
 
     fn convert_cell<'a>(
