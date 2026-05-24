@@ -1,5 +1,6 @@
 //! Bound runtime direct TDS columns.
 
+mod fill;
 mod measure;
 
 use arrow_array::{
@@ -20,44 +21,29 @@ use super::{
     types::{
         decimal::{
             append_decimal32_cell, append_decimal64_cell, append_decimal128_cell,
-            append_decimal256_cell, fill_decimal32_column, fill_decimal64_column,
-            fill_decimal128_column, fill_decimal256_column,
+            append_decimal256_cell,
         },
         primitive::{
             append_boolean_cell, append_float32_cell, append_float64_cell, append_int8_cell,
             append_int16_cell, append_int32_cell, append_int64_cell, append_uint8_cell,
             append_uint16_cell, append_uint32_cell, append_uint64_checked_bigint_cell,
-            fill_boolean_column, fill_float32_column, fill_float64_column, fill_int8_column,
-            fill_int16_column, fill_int32_column, fill_int64_column, fill_uint8_column,
-            fill_uint16_column, fill_uint32_column, fill_uint64_checked_bigint_column,
         },
         temporal::{
-            TemporalColumnContext, append_date32_cell, append_date64_cell,
-            append_datetimeoffset_microsecond_cell, append_datetimeoffset_millisecond_cell,
-            append_datetimeoffset_nanosecond_cell, append_datetimeoffset_second_cell,
-            append_time32_millisecond_cell, append_time32_second_cell,
-            append_time64_microsecond_cell, append_time64_nanosecond_cell,
-            append_timestamp_microsecond_cell, append_timestamp_millisecond_cell,
-            append_timestamp_nanosecond_cell, append_timestamp_second_cell,
-            fill_date32_direct_column, fill_date64_direct_column,
-            fill_datetimeoffset_microsecond_direct_column,
-            fill_datetimeoffset_millisecond_direct_column,
-            fill_datetimeoffset_nanosecond_direct_column, fill_datetimeoffset_second_direct_column,
-            fill_time32_millisecond_direct_column, fill_time32_second_direct_column,
-            fill_time64_microsecond_direct_column, fill_time64_nanosecond_direct_column,
-            fill_timestamp_microsecond_direct_column, fill_timestamp_millisecond_direct_column,
-            fill_timestamp_nanosecond_direct_column, fill_timestamp_second_direct_column,
+            append_date32_cell, append_date64_cell, append_datetimeoffset_microsecond_cell,
+            append_datetimeoffset_millisecond_cell, append_datetimeoffset_nanosecond_cell,
+            append_datetimeoffset_second_cell, append_time32_millisecond_cell,
+            append_time32_second_cell, append_time64_microsecond_cell,
+            append_time64_nanosecond_cell, append_timestamp_microsecond_cell,
+            append_timestamp_millisecond_cell, append_timestamp_nanosecond_cell,
+            append_timestamp_second_cell,
         },
-        uint64::{append_uint64_decimal20_cell, fill_uint64_decimal20_column},
-        variable_width::{
-            append_nvarchar_cell, append_varbinary_cell, fill_nvarchar_column,
-            fill_varbinary_column,
-        },
+        uint64::append_uint64_decimal20_cell,
+        variable_width::{append_nvarchar_cell, append_varbinary_cell},
     },
     unsupported_batch, value_conversion_error,
 };
 use crate::{
-    DiagnosticCode, NanosecondPolicy, PlanOptions, Result, SchemaMapping,
+    DiagnosticCode, NanosecondPolicy, Result, SchemaMapping,
     conversion::arrow_to_mssql::{
         decimal::DecimalArrowToMssql, primitive::PrimitiveArrowToMssql,
         temporal::TemporalArrowToMssql, variable_width::VariableWidthArrowToMssql,
@@ -522,359 +508,6 @@ pub(crate) enum BoundDirectColumn<'a> {
 }
 
 impl BoundDirectColumn<'_> {
-    pub(crate) fn fill_column(
-        &self,
-        column_index: usize,
-        column_count: usize,
-        layout: &RowLayout,
-        bytes: &mut [u8],
-    ) -> Result<()> {
-        let default_options = PlanOptions::default();
-
-        match self {
-            Self::Boolean { column, array } => {
-                fill_boolean_column(array, column, column_index, column_count, layout, bytes)
-            }
-            Self::UInt8 { column, array } => {
-                fill_uint8_column(array, column, column_index, column_count, layout, bytes)
-            }
-            Self::Int8 { column, array } => {
-                fill_int8_column(array, column, column_index, column_count, layout, bytes)
-            }
-            Self::Int16 { column, array } => {
-                fill_int16_column(array, column, column_index, column_count, layout, bytes)
-            }
-            Self::Int32 { column, array } => {
-                fill_int32_column(array, column, column_index, column_count, layout, bytes)
-            }
-            Self::UInt16 { column, array } => {
-                fill_uint16_column(array, column, column_index, column_count, layout, bytes)
-            }
-            Self::Int64 { column, array } => {
-                fill_int64_column(array, column, column_index, column_count, layout, bytes)
-            }
-            Self::UInt32 { column, array } => {
-                fill_uint32_column(array, column, column_index, column_count, layout, bytes)
-            }
-            Self::UInt64 { column, array } => fill_uint64_checked_bigint_column(
-                array,
-                column,
-                column_index,
-                column_count,
-                layout,
-                bytes,
-            ),
-            Self::UInt64Decimal20_0 { column, array } => fill_uint64_decimal20_column(
-                array,
-                column,
-                column_index,
-                column_count,
-                layout,
-                bytes,
-            ),
-            Self::Decimal32 {
-                column,
-                classification,
-                array,
-            } => fill_decimal32_column(
-                array,
-                column,
-                *classification,
-                column_index,
-                column_count,
-                layout,
-                bytes,
-            ),
-            Self::Decimal64 {
-                column,
-                classification,
-                array,
-            } => fill_decimal64_column(
-                array,
-                column,
-                *classification,
-                column_index,
-                column_count,
-                layout,
-                bytes,
-            ),
-            Self::Decimal128 {
-                column,
-                classification,
-                array,
-            } => fill_decimal128_column(
-                array,
-                column,
-                *classification,
-                column_index,
-                column_count,
-                layout,
-                bytes,
-            ),
-            Self::Decimal256 {
-                column,
-                classification,
-                array,
-            } => fill_decimal256_column(
-                array,
-                column,
-                *classification,
-                column_index,
-                column_count,
-                layout,
-                bytes,
-            ),
-            Self::Float32 { column, array } => {
-                fill_float32_column(array, column, column_index, column_count, layout, bytes)
-            }
-            Self::Float64 { column, array } => {
-                fill_float64_column(array, column, column_index, column_count, layout, bytes)
-            }
-            Self::Utf8 { column, array } => {
-                fill_nvarchar_column(array, column, column_index, column_count, layout, bytes)
-            }
-            Self::Binary { column, array } => {
-                fill_varbinary_column(array, column, column_index, column_count, layout, bytes)
-            }
-            Self::Date32 {
-                column,
-                mapping,
-                array,
-            } => fill_date32_direct_column(
-                array,
-                TemporalColumnContext {
-                    mapping,
-                    plan_options: default_options,
-                    column,
-                    column_index,
-                    column_count,
-                },
-                layout,
-                bytes,
-            ),
-            Self::Date64 {
-                column,
-                mapping,
-                array,
-            } => fill_date64_direct_column(
-                array,
-                TemporalColumnContext {
-                    mapping,
-                    plan_options: default_options,
-                    column,
-                    column_index,
-                    column_count,
-                },
-                layout,
-                bytes,
-            ),
-            Self::TimestampSecond {
-                column,
-                mapping,
-                array,
-            } => fill_timestamp_second_direct_column(
-                array,
-                TemporalColumnContext {
-                    mapping,
-                    plan_options: default_options,
-                    column,
-                    column_index,
-                    column_count,
-                },
-                layout,
-                bytes,
-            ),
-            Self::TimestampMillisecond {
-                column,
-                mapping,
-                array,
-            } => fill_timestamp_millisecond_direct_column(
-                array,
-                TemporalColumnContext {
-                    mapping,
-                    plan_options: default_options,
-                    column,
-                    column_index,
-                    column_count,
-                },
-                layout,
-                bytes,
-            ),
-            Self::TimestampMicrosecond {
-                column,
-                mapping,
-                array,
-            } => fill_timestamp_microsecond_direct_column(
-                array,
-                TemporalColumnContext {
-                    mapping,
-                    plan_options: default_options,
-                    column,
-                    column_index,
-                    column_count,
-                },
-                layout,
-                bytes,
-            ),
-            Self::TimestampNanosecond {
-                column,
-                mapping,
-                nanosecond_policy,
-                array,
-            } => fill_timestamp_nanosecond_direct_column(
-                array,
-                TemporalColumnContext {
-                    mapping,
-                    plan_options: PlanOptions {
-                        nanosecond_policy: *nanosecond_policy,
-                        ..Default::default()
-                    },
-                    column,
-                    column_index,
-                    column_count,
-                },
-                layout,
-                bytes,
-            ),
-            Self::Time32Second {
-                column,
-                mapping,
-                array,
-            } => fill_time32_second_direct_column(
-                array,
-                TemporalColumnContext {
-                    mapping,
-                    plan_options: default_options,
-                    column,
-                    column_index,
-                    column_count,
-                },
-                layout,
-                bytes,
-            ),
-            Self::Time32Millisecond {
-                column,
-                mapping,
-                array,
-            } => fill_time32_millisecond_direct_column(
-                array,
-                TemporalColumnContext {
-                    mapping,
-                    plan_options: default_options,
-                    column,
-                    column_index,
-                    column_count,
-                },
-                layout,
-                bytes,
-            ),
-            Self::Time64Microsecond {
-                column,
-                mapping,
-                array,
-            } => fill_time64_microsecond_direct_column(
-                array,
-                TemporalColumnContext {
-                    mapping,
-                    plan_options: default_options,
-                    column,
-                    column_index,
-                    column_count,
-                },
-                layout,
-                bytes,
-            ),
-            Self::Time64Nanosecond {
-                column,
-                mapping,
-                nanosecond_policy,
-                array,
-            } => fill_time64_nanosecond_direct_column(
-                array,
-                TemporalColumnContext {
-                    mapping,
-                    plan_options: PlanOptions {
-                        nanosecond_policy: *nanosecond_policy,
-                        ..Default::default()
-                    },
-                    column,
-                    column_index,
-                    column_count,
-                },
-                layout,
-                bytes,
-            ),
-            Self::DateTimeOffsetSecond {
-                column,
-                mapping,
-                array,
-            } => fill_datetimeoffset_second_direct_column(
-                array,
-                TemporalColumnContext {
-                    mapping,
-                    plan_options: default_options,
-                    column,
-                    column_index,
-                    column_count,
-                },
-                layout,
-                bytes,
-            ),
-            Self::DateTimeOffsetMillisecond {
-                column,
-                mapping,
-                array,
-            } => fill_datetimeoffset_millisecond_direct_column(
-                array,
-                TemporalColumnContext {
-                    mapping,
-                    plan_options: default_options,
-                    column,
-                    column_index,
-                    column_count,
-                },
-                layout,
-                bytes,
-            ),
-            Self::DateTimeOffsetMicrosecond {
-                column,
-                mapping,
-                array,
-            } => fill_datetimeoffset_microsecond_direct_column(
-                array,
-                TemporalColumnContext {
-                    mapping,
-                    plan_options: default_options,
-                    column,
-                    column_index,
-                    column_count,
-                },
-                layout,
-                bytes,
-            ),
-            Self::DateTimeOffsetNanosecond {
-                column,
-                mapping,
-                nanosecond_policy,
-                array,
-            } => fill_datetimeoffset_nanosecond_direct_column(
-                array,
-                TemporalColumnContext {
-                    mapping,
-                    plan_options: PlanOptions {
-                        nanosecond_policy: *nanosecond_policy,
-                        ..Default::default()
-                    },
-                    column,
-                    column_index,
-                    column_count,
-                },
-                layout,
-                bytes,
-            ),
-        }
-    }
-
     pub(crate) fn append_cell(
         &self,
         buf: &mut tiberius::RawRowsAppendBuffer<'_>,
