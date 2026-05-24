@@ -5,12 +5,14 @@ use arrow_array::{Array, UInt64Array};
 use crate::{Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, Result, write::profile};
 
 use super::{
+    super::{
+        layout::{CellPosition, RowLayout},
+        plan::DirectColumnPlan,
+    },
     decimal::{
         NULL_DECIMAL_CELL_LEN, append_decimal_cell, append_null_decimal_cell, decimal_cell_len,
         write_decimal_cell, write_null_decimal_cell as write_null_decimal_payload_cell,
     },
-    layout::{CellPosition, RowLayout},
-    plan::DirectColumnPlan,
 };
 
 /// Measures one UInt64-to-decimal(20,0) column into a row-major cell length matrix.

@@ -2,6 +2,10 @@
 
 use crate::{Diagnostic, DiagnosticCode, DiagnosticSet, Error, Result};
 
+use super::payload::TDS_ROW_TOKEN;
+
+const ROW_TOKEN_LEN: usize = 1;
+
 /// Absolute byte position for one encoded cell inside an encoded rows payload.
 ///
 /// A cell position belongs to one row and one column, but its `offset` is
@@ -134,6 +138,75 @@ impl RowLayout {
     pub(crate) const fn payload_len(&self) -> usize {
         self.payload_len
     }
+}
+
+pub(crate) fn build_fixed_width_row_layout(
+    row_count: usize,
+    column_count: usize,
+    cell_lengths: &[usize],
+) -> Result<RowLayout> {
+    build_fixed_width_row_range_layout(0, row_count, column_count, cell_lengths)
+}
+
+pub(crate) fn build_fixed_width_row_range_layout(
+    start_row: usize,
+    row_count: usize,
+    column_count: usize,
+    cell_lengths: &[usize],
+) -> Result<RowLayout> {
+    let end_row = start_row
+        .checked_add(row_count)
+        .ok_or_else(|| invalid_layout("direct row range end overflowed usize"))?;
+    let mut row_token_offsets = Vec::with_capacity(row_count);
+    let mut row_lengths = Vec::with_capacity(row_count);
+    let mut cell_positions = Vec::with_capacity(row_count * column_count);
+    let mut offset = 0usize;
+
+    for row_index in start_row..end_row {
+        let row_offset = offset;
+        row_token_offsets.push(row_offset);
+        offset = checked_add(offset, ROW_TOKEN_LEN)?;
+
+        for column_index in 0..column_count {
+            let cell_len = cell_lengths[row_index * column_count + column_index];
+            cell_positions.push(CellPosition::new(
+                row_index - start_row,
+                column_index,
+                offset,
+                cell_len,
+            ));
+            offset = checked_add(offset, cell_len)?;
+        }
+
+        // Row length is the byte span from this row's ROW token through the
+        // last encoded cell. RowLayout uses it to prove rows are contiguous.
+        row_lengths.push(offset - row_offset);
+    }
+
+    RowLayout::new(row_token_offsets, row_lengths, cell_positions, offset)
+}
+
+/// Allocates a complete payload buffer and writes every row token.
+///
+/// The measured layout already knows where each row starts inside the payload.
+/// This function creates a zero-filled buffer of the final payload size and
+/// writes `0xD1` at every absolute row start offset. Later fill steps write
+/// encoded cell bytes into the remaining positions.
+pub(crate) fn allocate_rows_payload_with_tokens(layout: &RowLayout) -> Vec<u8> {
+    let mut bytes = vec![0; layout.payload_len()];
+
+    // One payload can contain many rows. Each row must start with the TDS ROW
+    // token byte, and row_token_offsets gives those absolute byte positions.
+    for &row_offset in layout.row_token_offsets() {
+        bytes[row_offset] = TDS_ROW_TOKEN;
+    }
+
+    bytes
+}
+
+fn checked_add(lhs: usize, rhs: usize) -> Result<usize> {
+    lhs.checked_add(rhs)
+        .ok_or_else(|| invalid_layout("direct primitive row layout length overflowed usize"))
 }
 
 fn validate_rows(

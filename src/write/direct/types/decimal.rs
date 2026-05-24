@@ -7,7 +7,7 @@ use crate::{
     conversion::arrow_to_mssql::decimal::DecimalArrowToMssql, write::profile,
 };
 
-use super::{
+use super::super::{
     layout::{CellPosition, RowLayout},
     plan::DirectColumnPlan,
 };
