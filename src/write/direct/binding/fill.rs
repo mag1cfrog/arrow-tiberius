@@ -7,6 +7,7 @@ use super::super::{
             fill_decimal32_column, fill_decimal64_column, fill_decimal128_column,
             fill_decimal256_column,
         },
+        fixed_size_binary::fill_fixed_size_binary_column,
         primitive::{
             fill_boolean_column, fill_float32_column, fill_float64_column, fill_int8_column,
             fill_int16_column, fill_int32_column, fill_int64_column, fill_uint8_column,
@@ -149,6 +150,19 @@ impl BoundDirectColumn<'_> {
             Self::LargeBinary { column, array } => {
                 fill_varbinary_column(array, column, column_index, column_count, layout, bytes)
             }
+            Self::FixedSizeBinary {
+                column,
+                classification,
+                array,
+            } => fill_fixed_size_binary_column(
+                array,
+                column,
+                *classification,
+                column_index,
+                column_count,
+                layout,
+                bytes,
+            ),
             Self::Date32 {
                 column,
                 mapping,

@@ -5,9 +5,9 @@ use arrow_schema::DataType;
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, MssqlType, Result, SchemaMapping,
     conversion::arrow_to_mssql::{
-        decimal::DecimalArrowToMssql, primitive::PrimitiveArrowToMssql,
-        temporal::TemporalArrowToMssql, uint64::UInt64ArrowToMssql,
-        variable_width::VariableWidthArrowToMssql,
+        decimal::DecimalArrowToMssql, fixed_size_binary::FixedSizeBinaryArrowToMssql,
+        primitive::PrimitiveArrowToMssql, temporal::TemporalArrowToMssql,
+        uint64::UInt64ArrowToMssql, variable_width::VariableWidthArrowToMssql,
     },
 };
 
@@ -37,6 +37,8 @@ pub(crate) enum DirectColumnEncoding {
     Decimal(DecimalArrowToMssql),
     /// Variable-width encoding.
     VariableWidth(VariableWidthArrowToMssql),
+    /// Fixed-size binary encoding.
+    FixedSizeBinary(FixedSizeBinaryArrowToMssql),
     /// Temporal encoding.
     Temporal(TemporalArrowToMssql),
 }
@@ -105,6 +107,15 @@ fn variable_width_support(mapping: &SchemaMapping) -> DirectMappingSupport {
         ) => DirectMappingSupport::Supported {
             encoding: DirectColumnEncoding::VariableWidth(classification),
         },
+        Err(_) => fixed_size_binary_support(mapping),
+    }
+}
+
+fn fixed_size_binary_support(mapping: &SchemaMapping) -> DirectMappingSupport {
+    match FixedSizeBinaryArrowToMssql::classify(mapping, 0) {
+        Ok(classification) => DirectMappingSupport::Supported {
+            encoding: DirectColumnEncoding::FixedSizeBinary(classification),
+        },
         Err(_) => temporal_support(mapping),
     }
 }
@@ -151,7 +162,7 @@ pub(crate) struct DirectColumnPlan {
 
 impl DirectColumnPlan {
     /// Creates a direct encoder column plan from a schema mapping.
-    fn from_mapping(mapping: &SchemaMapping, encoding: DirectColumnEncoding) -> Self {
+    pub(crate) fn from_mapping(mapping: &SchemaMapping, encoding: DirectColumnEncoding) -> Self {
         Self {
             source_index: mapping.arrow().index(),
             source_name: mapping.arrow().name().to_owned(),
@@ -271,8 +282,9 @@ mod tests {
         DirectMappingSupport, NoDirectMappings,
     };
     use crate::conversion::arrow_to_mssql::{
-        decimal::DecimalArrowToMssql, primitive::PrimitiveArrowToMssql,
-        temporal::TemporalArrowToMssql, variable_width::VariableWidthArrowToMssql,
+        decimal::DecimalArrowToMssql, fixed_size_binary::FixedSizeBinaryArrowToMssql,
+        primitive::PrimitiveArrowToMssql, temporal::TemporalArrowToMssql,
+        variable_width::VariableWidthArrowToMssql,
     };
 
     #[test]
@@ -660,6 +672,27 @@ mod tests {
                 VariableWidthArrowToMssql::LargeBinaryToVarBinary {
                     length: MssqlTypeLength::Max,
                 }
+            )
+        );
+    }
+
+    #[test]
+    fn current_direct_support_accepts_fixed_size_binary_mappings() {
+        let mappings = vec![mapping(
+            0,
+            "digest",
+            DataType::FixedSizeBinary(32),
+            MssqlType::Binary(32),
+        )];
+
+        let plan = DirectEncoderPlan::new(&mappings, &CurrentDirectMappings)
+            .expect("fixed-size binary mappings should be supported by the plan");
+
+        assert_eq!(plan.column_count(), 1);
+        assert_eq!(
+            plan.columns()[0].encoding(),
+            DirectColumnEncoding::FixedSizeBinary(
+                FixedSizeBinaryArrowToMssql::FixedSizeBinaryToBinary { length: 32 }
             )
         );
     }
