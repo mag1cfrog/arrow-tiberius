@@ -37,6 +37,7 @@ mod tests {
         mssql::cell::{MssqlDate, MssqlDateTime2, MssqlDateTimeOffset, MssqlTime},
     };
 
+    use super::layout::{CellPosition, RowLayout};
     use super::plan::{DirectColumnEncoding, DirectEncoderSupport, DirectMappingSupport};
     use super::rows::fixed_width::{
         fixed_width_measure_call_count, reset_fixed_width_measure_call_count,
@@ -1047,6 +1048,65 @@ mod tests {
 
         assert_eq!(payload.row_token_offsets(), [0, 6]);
         assert_eq!(fixed_width_measure_call_count(), 0);
+    }
+
+    #[test]
+    fn direct_encoder_fixed_width_with_layout_rejects_missing_cells() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(1, "quantity", DataType::Int32, MssqlType::Int, false),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("quantity", DataType::Int32, false),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![10])),
+            ],
+        );
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+        let incomplete_layout =
+            RowLayout::new(vec![0], vec![5], vec![CellPosition::new(0, 0, 1, 4)], 5).unwrap();
+
+        let err = try_encode_fixed_width_rows_with_layout(&bound, &incomplete_layout)
+            .expect_err("missing cell positions must not encode a corrupt payload");
+
+        assert_direct_encoding_diagnostic(err, DiagnosticCode::DirectEncodingInvalidPayload);
+    }
+
+    #[test]
+    fn direct_encoder_fixed_width_with_layout_rejects_shuffled_cells() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(1, "quantity", DataType::Int32, MssqlType::Int, false),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("quantity", DataType::Int32, false),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![10])),
+            ],
+        );
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+        let shuffled_layout = RowLayout::new(
+            vec![0],
+            vec![9],
+            vec![CellPosition::new(0, 1, 1, 4), CellPosition::new(0, 0, 5, 4)],
+            9,
+        )
+        .unwrap();
+
+        let err = try_encode_fixed_width_rows_with_layout(&bound, &shuffled_layout)
+            .expect_err("shuffled cell positions must not encode a corrupt payload");
+
+        assert_direct_encoding_diagnostic(err, DiagnosticCode::DirectEncodingInvalidPayload);
     }
 
     #[test]

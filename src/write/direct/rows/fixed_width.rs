@@ -506,6 +506,8 @@ struct FixedWidthRowsLayout {
 
 impl FixedWidthRowsLayout {
     fn from_row_layout(layout: &RowLayout, column_count: usize) -> Result<Self> {
+        validate_row_layout_cells(layout, column_count)?;
+
         let mut current_offsets = Vec::with_capacity(layout.row_count());
 
         if column_count == 0 {
@@ -525,6 +527,38 @@ impl FixedWidthRowsLayout {
             payload_len: layout.payload_len(),
         })
     }
+}
+
+fn validate_row_layout_cells(layout: &RowLayout, column_count: usize) -> Result<()> {
+    let expected_cell_count = layout
+        .row_count()
+        .checked_mul(column_count)
+        .ok_or_else(|| invalid_payload("fixed-width row layout cell count overflowed usize"))?;
+
+    if layout.cell_positions().len() != expected_cell_count {
+        return Err(invalid_payload(format!(
+            "fixed-width row layout has {} cell position(s), expected {expected_cell_count}",
+            layout.cell_positions().len()
+        )));
+    }
+
+    if column_count == 0 {
+        return Ok(());
+    }
+
+    for (index, cell) in layout.cell_positions().iter().enumerate() {
+        let expected_row = index / column_count;
+        let expected_column = index % column_count;
+        if cell.row_index() != expected_row || cell.column_index() != expected_column {
+            return Err(invalid_payload(format!(
+                "fixed-width row layout cell {index} is for row {} column {}, expected row {expected_row} column {expected_column}",
+                cell.row_index(),
+                cell.column_index()
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn first_cell_position(
