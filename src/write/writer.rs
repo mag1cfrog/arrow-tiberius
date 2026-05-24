@@ -879,9 +879,14 @@ mod tests {
     #[test]
     fn direct_writer_state_rejects_unsupported_mappings() {
         let mappings = vec![SchemaMapping::new(
-            ArrowFieldRef::new(0, "large_name".to_owned(), true, DataType::LargeUtf8),
+            ArrowFieldRef::new(
+                0,
+                "list_value".to_owned(),
+                true,
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            ),
             MssqlColumn::new(
-                Identifier::new("large_name").unwrap(),
+                Identifier::new("list_value").unwrap(),
                 MssqlType::NVarChar(MssqlTypeLength::Max),
                 true,
             ),
