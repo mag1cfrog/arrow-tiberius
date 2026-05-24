@@ -38,6 +38,7 @@ use crate::{
 use super::super::{
     binding::{BoundDirectBatch, BoundDirectColumn},
     checked_add, invalid_payload,
+    layout::{CellPosition, RowLayout},
     payload::{EncodedRowsPayload, TDS_ROW_TOKEN},
     plan::{DirectColumnEncoding, DirectColumnPlan},
     row_column_diagnostic,
@@ -77,6 +78,40 @@ pub(crate) fn try_encode_fixed_width_rows(
     };
 
     let layout = measure_fixed_width_rows(bound.row_count(), &columns)?;
+    encode_fixed_width_rows(&columns, layout)
+}
+
+/// Encodes fixed-size direct columns into an already measured row layout.
+///
+/// Returns `Ok(None)` when the columns require the general layout path.
+pub(crate) fn try_encode_fixed_width_rows_with_layout(
+    bound: &BoundDirectBatch<'_>,
+    layout: &RowLayout,
+) -> Result<Option<EncodedRowsPayload>> {
+    if bound.row_count() == 0 {
+        return Ok(Some(EncodedRowsPayload::new(Vec::new(), Vec::new())?));
+    }
+
+    if layout.row_count() != bound.row_count() {
+        return Err(invalid_payload(format!(
+            "fixed-width row layout has {} row(s) but bound batch has {} row(s)",
+            layout.row_count(),
+            bound.row_count()
+        )));
+    }
+
+    let Some(columns) = fixed_width_columns(bound.columns()) else {
+        return Ok(None);
+    };
+
+    let layout = FixedWidthRowsLayout::from_row_layout(layout, bound.columns().len())?;
+    encode_fixed_width_rows(&columns, layout)
+}
+
+fn encode_fixed_width_rows(
+    columns: &[FixedWidthColumn<'_>],
+    layout: FixedWidthRowsLayout,
+) -> Result<Option<EncodedRowsPayload>> {
     let mut current_offsets = layout.current_offsets.clone();
     let mut bytes = vec![0; layout.payload_len];
 
@@ -451,6 +486,45 @@ struct FixedWidthRowsLayout {
     row_token_offsets: Vec<usize>,
     current_offsets: Vec<usize>,
     payload_len: usize,
+}
+
+impl FixedWidthRowsLayout {
+    fn from_row_layout(layout: &RowLayout, column_count: usize) -> Result<Self> {
+        let mut current_offsets = Vec::with_capacity(layout.row_count());
+
+        if column_count == 0 {
+            for &row_offset in layout.row_token_offsets() {
+                current_offsets.push(checked_add(row_offset, ROW_TOKEN_LEN)?);
+            }
+        } else {
+            for row_index in 0..layout.row_count() {
+                let cell = first_cell_position(layout, row_index, column_count)?;
+                current_offsets.push(cell.offset());
+            }
+        }
+
+        Ok(Self {
+            row_token_offsets: layout.row_token_offsets().to_vec(),
+            current_offsets,
+            payload_len: layout.payload_len(),
+        })
+    }
+}
+
+fn first_cell_position(
+    layout: &RowLayout,
+    row_index: usize,
+    column_count: usize,
+) -> Result<&CellPosition> {
+    let cell_index = row_index
+        .checked_mul(column_count)
+        .ok_or_else(|| invalid_payload("fixed-width row layout cell index overflowed usize"))?;
+
+    layout.cell_positions().get(cell_index).ok_or_else(|| {
+        invalid_payload(format!(
+            "fixed-width row layout is missing first cell for row {row_index}"
+        ))
+    })
 }
 
 fn fixed_width_columns<'a>(
