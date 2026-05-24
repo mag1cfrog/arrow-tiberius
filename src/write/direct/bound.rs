@@ -10,7 +10,7 @@ use arrow_array::{
 };
 
 use super::{
-    DirectEncoder, downcast_direct_array,
+    DirectEncoder,
     layout::{RowLayout, build_fixed_width_row_layout},
     plan,
     plan::DirectColumnEncoding,
@@ -1489,6 +1489,23 @@ impl BoundDirectColumn<'_> {
             ),
         }
     }
+}
+
+fn downcast_direct_array<'a, T: Array + 'static>(
+    array: &'a dyn Array,
+    column: &plan::DirectColumnPlan,
+) -> Result<&'a T> {
+    array.as_any().downcast_ref::<T>().ok_or_else(|| {
+        value_conversion_error(row_column_diagnostic(
+            column,
+            0,
+            DiagnosticCode::ValueTypeMismatch,
+            format!(
+                "runtime Arrow type {} does not match planned direct column type",
+                array.data_type()
+            ),
+        ))
+    })
 }
 
 fn measure_primitive_bound_column(
