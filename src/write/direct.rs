@@ -37,8 +37,12 @@ mod tests {
         mssql::cell::{MssqlDate, MssqlDateTime2, MssqlDateTimeOffset, MssqlTime},
     };
 
+    use super::layout::{CellPosition, RowLayout};
     use super::plan::{DirectColumnEncoding, DirectEncoderSupport, DirectMappingSupport};
-    use super::rows::fixed_width::try_encode_fixed_width_rows;
+    use super::rows::fixed_width::{
+        fixed_width_measure_call_count, reset_fixed_width_measure_call_count,
+        try_encode_fixed_width_rows, try_encode_fixed_width_rows_with_layout,
+    };
     use super::types::temporal::{
         write_datetime2_cell, write_datetimeoffset_cell, write_time_cell,
     };
@@ -913,6 +917,196 @@ mod tests {
         assert_eq!(concatenated, full.bytes());
         assert_eq!(first.row_token_offsets()[0], 0);
         assert_eq!(second.row_token_offsets()[0], 0);
+    }
+
+    #[test]
+    fn direct_encoder_fixed_width_measured_range_uses_supplied_layout() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(1, "quantity", DataType::Int32, MssqlType::Int, true),
+            mapping(
+                2,
+                "precise_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                MssqlType::DateTime2 { precision: 7 },
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new_with_options(
+            &mappings,
+            PlanOptions {
+                nanosecond_policy: NanosecondPolicy::RoundTo100ns,
+                ..PlanOptions::default()
+            },
+        )
+        .unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("quantity", DataType::Int32, true),
+                Field::new(
+                    "precise_at",
+                    DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                    true,
+                ),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![10, 20, 30, 40])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![Some(1), None, Some(-3), Some(4)])),
+                Arc::new(
+                    TimestampNanosecondArray::from(vec![Some(150), None, Some(-50), Some(250)])
+                        .with_timezone("UTC"),
+                ),
+            ],
+        );
+
+        let measured = encoder.measure_batch(&batch).unwrap();
+        let layout = measured.range_layout(1, 2).unwrap();
+        let range_batch = batch.slice(1, 2);
+        let bound = BoundDirectBatch::new(&encoder, &range_batch).unwrap();
+        let fixed_width_range = try_encode_fixed_width_rows_with_layout(&bound, &layout)
+            .unwrap()
+            .expect("fixed-width measured range path should be active");
+        let slice_range = encoder.encode_batch_range(&batch, 1, 2).unwrap();
+
+        assert_eq!(layout.row_token_offsets(), [0, 7]);
+        assert_eq!(fixed_width_range.row_token_offsets(), [0, 7]);
+        assert_eq!(fixed_width_range.bytes(), slice_range.bytes());
+        assert_eq!(
+            fixed_width_range.bytes(),
+            expected_rows([
+                [int32_cell(20), null_cell(), null_cell()],
+                [
+                    int32_cell(30),
+                    nullable_int32_cell(-3),
+                    datetime2_7_cell(719_162, 0)
+                ]
+            ])
+        );
+    }
+
+    #[test]
+    fn direct_encoder_measured_range_fixed_width_path_falls_back_for_variable_width() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "name",
+                DataType::Utf8,
+                MssqlType::NVarChar(MssqlTypeLength::Max),
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, true),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("alpha"), None, Some("beta")])),
+            ],
+        );
+
+        let measured = encoder.measure_batch(&batch).unwrap();
+        let layout = measured.range_layout(1, 2).unwrap();
+        let range_batch = batch.slice(1, 2);
+        let bound = BoundDirectBatch::new(&encoder, &range_batch).unwrap();
+
+        assert!(
+            try_encode_fixed_width_rows_with_layout(&bound, &layout)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn direct_encoder_measured_range_does_not_remeasure_fixed_width_rows() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(1, "quantity", DataType::Int32, MssqlType::Int, true),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("quantity", DataType::Int32, true),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![Some(10), None, Some(30)])),
+            ],
+        );
+
+        let measured = encoder.measure_batch(&batch).unwrap();
+
+        reset_fixed_width_measure_call_count();
+        let payload = encoder
+            .encode_measured_batch_range(&batch, &measured, 1, 2)
+            .unwrap();
+
+        assert_eq!(payload.row_token_offsets(), [0, 6]);
+        assert_eq!(fixed_width_measure_call_count(), 0);
+    }
+
+    #[test]
+    fn direct_encoder_fixed_width_with_layout_rejects_missing_cells() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(1, "quantity", DataType::Int32, MssqlType::Int, false),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("quantity", DataType::Int32, false),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![10])),
+            ],
+        );
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+        let incomplete_layout =
+            RowLayout::new(vec![0], vec![5], vec![CellPosition::new(0, 0, 1, 4)], 5).unwrap();
+
+        let err = try_encode_fixed_width_rows_with_layout(&bound, &incomplete_layout)
+            .expect_err("missing cell positions must not encode a corrupt payload");
+
+        assert_direct_encoding_diagnostic(err, DiagnosticCode::DirectEncodingInvalidPayload);
+    }
+
+    #[test]
+    fn direct_encoder_fixed_width_with_layout_rejects_shuffled_cells() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(1, "quantity", DataType::Int32, MssqlType::Int, false),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("quantity", DataType::Int32, false),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![10])),
+            ],
+        );
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+        let shuffled_layout = RowLayout::new(
+            vec![0],
+            vec![9],
+            vec![CellPosition::new(0, 1, 1, 4), CellPosition::new(0, 0, 5, 4)],
+            9,
+        )
+        .unwrap();
+
+        let err = try_encode_fixed_width_rows_with_layout(&bound, &shuffled_layout)
+            .expect_err("shuffled cell positions must not encode a corrupt payload");
+
+        assert_direct_encoding_diagnostic(err, DiagnosticCode::DirectEncodingInvalidPayload);
     }
 
     #[test]
@@ -3118,6 +3312,12 @@ mod tests {
 
     fn int32_cell(value: i32) -> Vec<u8> {
         value.to_le_bytes().to_vec()
+    }
+
+    fn nullable_int32_cell(value: i32) -> Vec<u8> {
+        let mut bytes = vec![4];
+        bytes.extend_from_slice(&value.to_le_bytes());
+        bytes
     }
 
     fn null_cell() -> Vec<u8> {
