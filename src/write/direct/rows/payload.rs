@@ -18,6 +18,7 @@ use super::super::{
     payload::EncodedRowsPayload,
     plan::DirectColumnEncoding,
     row_column_diagnostic,
+    rows::fixed_width::try_encode_fixed_width_rows,
     types::{
         decimal::{fill_decimal_column, measure_decimal_column_cell_lengths},
         primitive::{
@@ -25,7 +26,7 @@ use super::super::{
             fill_float32_column, fill_float64_column, fill_int8_column, fill_int16_column,
             fill_int32_column, fill_int64_column, fill_uint8_column, fill_uint16_column,
             fill_uint32_column, fill_uint64_checked_bigint_column,
-            measure_primitive_column_cell_lengths, try_encode_fixed_width_primitive_rows,
+            measure_primitive_column_cell_lengths,
         },
         temporal::{
             TemporalColumnContext, fill_temporal_column, measure_temporal_column_cell_lengths,
@@ -101,7 +102,7 @@ pub(crate) fn encode_measured_batch_range(
     }
 
     let batch = batch.slice(start_row, row_count);
-    if let Some(payload) = try_encode_fixed_width_primitive_rows(
+    if let Some(payload) = try_encode_fixed_width_rows(
         &batch,
         &encoder.mappings,
         encoder.plan_options,
@@ -214,7 +215,7 @@ fn encode_checked_batch(
         return EncodedRowsPayload::new(Vec::new(), Vec::new());
     }
 
-    if let Some(payload) = try_encode_fixed_width_primitive_rows(
+    if let Some(payload) = try_encode_fixed_width_rows(
         batch,
         &encoder.mappings,
         encoder.plan_options,

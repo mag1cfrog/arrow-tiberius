@@ -230,7 +230,7 @@ mod tests {
     };
 
     use super::plan::{DirectColumnEncoding, DirectEncoderSupport, DirectMappingSupport};
-    use super::types::primitive::try_encode_fixed_width_primitive_rows;
+    use super::rows::fixed_width::try_encode_fixed_width_rows;
     use super::types::temporal::{
         write_datetime2_cell, write_datetimeoffset_cell, write_time_cell,
     };
@@ -1964,7 +1964,7 @@ mod tests {
             ],
         );
 
-        let payload = try_encode_fixed_width_primitive_rows(
+        let payload = try_encode_fixed_width_rows(
             &batch,
             encoder.mappings(),
             PlanOptions::default(),
@@ -2004,7 +2004,7 @@ mod tests {
             ],
         );
 
-        let payload = try_encode_fixed_width_primitive_rows(
+        let payload = try_encode_fixed_width_rows(
             &batch,
             encoder.mappings(),
             PlanOptions::default(),
@@ -2065,7 +2065,7 @@ mod tests {
             ],
         );
 
-        let payload = try_encode_fixed_width_primitive_rows(
+        let payload = try_encode_fixed_width_rows(
             &batch,
             encoder.mappings(),
             options,
@@ -2143,7 +2143,7 @@ mod tests {
             ],
         );
 
-        let payload = try_encode_fixed_width_primitive_rows(
+        let payload = try_encode_fixed_width_rows(
             &batch,
             encoder.mappings(),
             options,
@@ -2369,7 +2369,7 @@ mod tests {
             ],
         );
 
-        let payload = try_encode_fixed_width_primitive_rows(
+        let payload = try_encode_fixed_width_rows(
             &batch,
             encoder.mappings(),
             options,
