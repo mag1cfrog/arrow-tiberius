@@ -30,9 +30,8 @@ use super::{
             fill_boolean_column, fill_float32_column, fill_float64_column, fill_int8_column,
             fill_int16_column, fill_int32_column, fill_int64_column, fill_uint8_column,
             fill_uint16_column, fill_uint32_column, fill_uint64_checked_bigint_column,
-            measure_float32_column_cell_lengths, measure_float64_column_cell_lengths,
-            measure_primitive_column_cell_lengths,
-            measure_uint64_checked_bigint_column_cell_lengths,
+            measure_fixed_primitive_column_cell_lengths, measure_float32_column_cell_lengths,
+            measure_float64_column_cell_lengths, measure_uint64_checked_bigint_column_cell_lengths,
         },
         temporal::{
             TemporalColumnContext, append_date32_cell, append_date64_cell,
@@ -1493,11 +1492,17 @@ impl BoundDirectColumn<'_> {
 }
 
 fn measure_primitive_bound_column(
-    array: &dyn Array,
+    array: &impl Array,
     column: &plan::DirectColumnPlan,
     column_index: usize,
     column_count: usize,
     cell_lengths: &mut [usize],
 ) -> Result<()> {
-    measure_primitive_column_cell_lengths(array, column, column_index, column_count, cell_lengths)
+    measure_fixed_primitive_column_cell_lengths(
+        array,
+        column,
+        column_index,
+        column_count,
+        cell_lengths,
+    )
 }

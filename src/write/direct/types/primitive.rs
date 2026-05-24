@@ -10,8 +10,9 @@ use crate::{
     conversion::arrow_to_mssql::primitive::PrimitiveArrowToMssql, write::profile,
 };
 
+#[cfg(test)]
+use super::super::downcast_direct_array;
 use super::super::{
-    downcast_direct_array,
     layout::{CellPosition, RowLayout},
     plan::{DirectColumnEncoding, DirectColumnPlan},
 };
@@ -24,6 +25,25 @@ const CELL_LEN_PREFIX_LEN: usize = 1;
 /// nullability. Non-nullable primitive columns use fixed-width cells with no
 /// length byte. Nullable primitive columns use the nullable TDS form with a
 /// one-byte length prefix, where null values occupy only the zero length byte.
+pub(crate) fn measure_fixed_primitive_column_cell_lengths<A: Array>(
+    array: &A,
+    column: &DirectColumnPlan,
+    column_index: usize,
+    column_count: usize,
+    cell_lengths: &mut [usize],
+) -> Result<()> {
+    let value_len = primitive_value_len(column.encoding())?;
+    measure_primitive_cell_lengths(
+        array,
+        column,
+        value_len,
+        column_index,
+        column_count,
+        cell_lengths,
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn measure_primitive_column_cell_lengths(
     array: &dyn Array,
     column: &DirectColumnPlan,
@@ -33,7 +53,24 @@ pub(crate) fn measure_primitive_column_cell_lengths(
 ) -> Result<()> {
     let value_len = primitive_value_len(column.encoding())?;
     validate_primitive_column_values(array, column)?;
+    measure_primitive_cell_lengths(
+        array,
+        column,
+        value_len,
+        column_index,
+        column_count,
+        cell_lengths,
+    )
+}
 
+fn measure_primitive_cell_lengths<A: Array + ?Sized>(
+    array: &A,
+    column: &DirectColumnPlan,
+    value_len: usize,
+    column_index: usize,
+    column_count: usize,
+    cell_lengths: &mut [usize],
+) -> Result<()> {
     for row_index in 0..array.len() {
         let cell_len = if array.is_null(row_index) {
             if !column.nullable() {
@@ -182,6 +219,7 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_primitive_column_values(array: &dyn Array, column: &DirectColumnPlan) -> Result<()> {
     if matches!(
         column.encoding(),
