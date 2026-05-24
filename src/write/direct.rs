@@ -39,6 +39,7 @@ mod tests {
 
     use super::plan::{DirectColumnEncoding, DirectEncoderSupport, DirectMappingSupport};
     use super::rows::fixed_width::{
+        fixed_width_measure_call_count, reset_fixed_width_measure_call_count,
         try_encode_fixed_width_rows, try_encode_fixed_width_rows_with_layout,
     };
     use super::types::temporal::{
@@ -1017,6 +1018,35 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn direct_encoder_measured_range_does_not_remeasure_fixed_width_rows() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(1, "quantity", DataType::Int32, MssqlType::Int, true),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("quantity", DataType::Int32, true),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![Some(10), None, Some(30)])),
+            ],
+        );
+
+        let measured = encoder.measure_batch(&batch).unwrap();
+
+        reset_fixed_width_measure_call_count();
+        let payload = encoder
+            .encode_measured_batch_range(&batch, &measured, 1, 2)
+            .unwrap();
+
+        assert_eq!(payload.row_token_offsets(), [0, 6]);
+        assert_eq!(fixed_width_measure_call_count(), 0);
     }
 
     #[test]

@@ -5,6 +5,9 @@ use arrow_array::{
     Int16Array, Int32Array, Int64Array, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::{
     Diagnostic, DiagnosticCode, Error, FieldRef, NanosecondPolicy, Result, SchemaMapping,
     conversion::arrow_to_mssql::{
@@ -53,6 +56,19 @@ use super::super::{
 
 const ROW_TOKEN_LEN: usize = 1;
 const CELL_LEN_PREFIX_LEN: usize = 1;
+
+#[cfg(test)]
+static FIXED_WIDTH_MEASURE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_fixed_width_measure_call_count() {
+    FIXED_WIDTH_MEASURE_CALLS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn fixed_width_measure_call_count() -> usize {
+    FIXED_WIDTH_MEASURE_CALLS.load(Ordering::Relaxed)
+}
 
 #[derive(Clone, Copy)]
 struct FixedWidthColumn<'a> {
@@ -555,6 +571,9 @@ fn measure_fixed_width_rows(
     row_count: usize,
     columns: &[FixedWidthColumn<'_>],
 ) -> Result<FixedWidthRowsLayout> {
+    #[cfg(test)]
+    FIXED_WIDTH_MEASURE_CALLS.fetch_add(1, Ordering::Relaxed);
+
     let mut row_lengths = vec![ROW_TOKEN_LEN; row_count];
 
     for column in columns {
