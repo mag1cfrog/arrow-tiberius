@@ -1,6 +1,7 @@
 //! Direct raw TDS bulk encoder internals.
 #![allow(dead_code)]
 
+pub(crate) mod bound;
 pub(crate) mod encoder;
 pub(crate) mod layout;
 pub(crate) mod measure;
