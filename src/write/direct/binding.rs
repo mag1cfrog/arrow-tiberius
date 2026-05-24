@@ -516,3 +516,79 @@ fn downcast_direct_array<'a, T: Array + 'static>(
         ))
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, Int32Array};
+    use arrow_schema::{DataType, Field, Schema};
+
+    use super::*;
+    use crate::{
+        ArrowFieldRef, Identifier, MssqlColumn, MssqlType, MssqlTypeLength, SchemaMapping,
+    };
+
+    #[test]
+    fn binds_large_variable_width_arrays_to_large_runtime_variants() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "large_text",
+                DataType::LargeUtf8,
+                MssqlType::NVarChar(MssqlTypeLength::Max),
+                true,
+            ),
+            mapping(
+                2,
+                "large_bytes",
+                DataType::LargeBinary,
+                MssqlType::VarBinary(MssqlTypeLength::Max),
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("large_text", DataType::LargeUtf8, true),
+                Field::new("large_bytes", DataType::LargeBinary, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![7])) as ArrayRef,
+                Arc::new(LargeStringArray::from(vec![Some("large")])) as ArrayRef,
+                Arc::new(LargeBinaryArray::from_iter(vec![Some(&b"bytes"[..])])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+
+        assert!(matches!(
+            bound.columns()[0],
+            BoundDirectColumn::Int32 { .. }
+        ));
+        let BoundDirectColumn::LargeUtf8 { array, .. } = bound.columns()[1] else {
+            panic!("LargeUtf8 mapping should bind to LargeStringArray");
+        };
+        assert_eq!(array.value(0), "large");
+        let BoundDirectColumn::LargeBinary { array, .. } = bound.columns()[2] else {
+            panic!("LargeBinary mapping should bind to LargeBinaryArray");
+        };
+        assert_eq!(array.value(0), b"bytes");
+    }
+
+    fn mapping(
+        index: usize,
+        name: &str,
+        arrow_type: DataType,
+        mssql_type: MssqlType,
+        nullable: bool,
+    ) -> SchemaMapping {
+        SchemaMapping::new(
+            ArrowFieldRef::new(index, name.to_owned(), nullable, arrow_type),
+            MssqlColumn::new(Identifier::new(name).unwrap(), mssql_type, nullable),
+        )
+    }
+}
