@@ -73,18 +73,14 @@ pub(crate) fn encode_measured_batch_range(
     }
 
     let batch = batch.slice(start_row, row_count);
-    if let Some(payload) = try_encode_fixed_width_rows(
-        &batch,
-        &encoder.mappings,
-        encoder.plan_options,
-        encoder.plan.columns(),
-    )? {
+    let bound = BoundDirectBatch::new(encoder, &batch)?;
+    if let Some(payload) = try_encode_fixed_width_rows(&bound)? {
         return Ok(payload);
     }
 
     let layout = measured.range_layout(start_row, row_count)?;
     let mut bytes = allocate_rows_payload_with_tokens(&layout);
-    BoundDirectBatch::new(encoder, &batch)?.fill_columns(&layout, &mut bytes)?;
+    bound.fill_columns(&layout, &mut bytes)?;
 
     EncodedRowsPayload::new(bytes, layout.row_token_offsets().to_vec())
 }
@@ -99,16 +95,11 @@ fn encode_checked_batch(
         return EncodedRowsPayload::new(Vec::new(), Vec::new());
     }
 
-    if let Some(payload) = try_encode_fixed_width_rows(
-        batch,
-        &encoder.mappings,
-        encoder.plan_options,
-        encoder.plan.columns(),
-    )? {
+    let bound = BoundDirectBatch::new(encoder, batch)?;
+    if let Some(payload) = try_encode_fixed_width_rows(&bound)? {
         return Ok(payload);
     }
 
-    let bound = BoundDirectBatch::new(encoder, batch)?;
     let layout = bound.measure_layout()?;
     let mut bytes = allocate_rows_payload_with_tokens(&layout);
     bound.fill_columns(&layout, &mut bytes)?;

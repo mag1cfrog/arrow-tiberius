@@ -2,15 +2,11 @@
 
 use arrow_array::{
     Array, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, RecordBatch, Time32MillisecondArray, Time32SecondArray,
-    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
+    Int16Array, Int32Array, Int64Array, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 
 use crate::{
-    Diagnostic, DiagnosticCode, Error, FieldRef, NanosecondPolicy, PlanOptions, Result,
-    SchemaMapping,
+    Diagnostic, DiagnosticCode, Error, FieldRef, NanosecondPolicy, Result, SchemaMapping,
     conversion::arrow_to_mssql::{
         primitive::PrimitiveArrowToMssql, temporal::TemporalArrowToMssql,
     },
@@ -40,7 +36,8 @@ use crate::{
 };
 
 use super::super::{
-    checked_add, downcast_direct_array, invalid_payload,
+    bound::{BoundDirectBatch, BoundDirectColumn},
+    checked_add, invalid_payload,
     payload::{EncodedRowsPayload, TDS_ROW_TOKEN},
     plan::{DirectColumnEncoding, DirectColumnPlan},
     row_column_diagnostic,
@@ -56,10 +53,11 @@ use super::super::{
 const ROW_TOKEN_LEN: usize = 1;
 const CELL_LEN_PREFIX_LEN: usize = 1;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct FixedWidthColumn<'a> {
+    column: &'a BoundDirectColumn<'a>,
     plan: &'a DirectColumnPlan,
-    mapping: &'a SchemaMapping,
+    mapping: Option<&'a SchemaMapping>,
     non_null_cell_len: usize,
 }
 
@@ -68,20 +66,17 @@ struct FixedWidthColumn<'a> {
 ///
 /// Returns `Ok(None)` when the columns require the general layout path.
 pub(crate) fn try_encode_fixed_width_rows(
-    batch: &RecordBatch,
-    mappings: &[SchemaMapping],
-    plan_options: PlanOptions,
-    columns: &[DirectColumnPlan],
+    bound: &BoundDirectBatch<'_>,
 ) -> Result<Option<EncodedRowsPayload>> {
-    if batch.num_rows() == 0 {
+    if bound.row_count() == 0 {
         return Ok(Some(EncodedRowsPayload::new(Vec::new(), Vec::new())?));
     }
 
-    let Some(columns) = fixed_width_columns(mappings, columns)? else {
+    let Some(columns) = fixed_width_columns(bound.columns()) else {
         return Ok(None);
     };
 
-    let layout = measure_fixed_width_rows(batch, &columns)?;
+    let layout = measure_fixed_width_rows(bound.row_count(), &columns)?;
     let mut current_offsets = layout.current_offsets.clone();
     let mut bytes = vec![0; layout.payload_len];
 
@@ -90,197 +85,187 @@ pub(crate) fn try_encode_fixed_width_rows(
     }
 
     for column in columns {
-        let Some(array) = batch
-            .columns()
-            .get(column.plan.source_index())
-            .map(AsRef::as_ref)
-        else {
-            return Err(value_conversion_error(row_column_diagnostic(
-                column.plan,
-                0,
-                DiagnosticCode::ValueTypeMismatch,
-                "planned direct column index is outside the runtime batch",
-            )));
-        };
-
-        match column.plan.encoding() {
-            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::BooleanToBit) => {
-                let array = downcast_direct_array::<BooleanArray>(array, column.plan)?;
-                fill_boolean_fixed_width_column(
-                    array,
-                    column.plan,
-                    &mut current_offsets,
-                    &mut bytes,
-                );
+        match column.column {
+            BoundDirectColumn::Boolean {
+                column: plan,
+                array,
+            } => {
+                fill_boolean_fixed_width_column(array, plan, &mut current_offsets, &mut bytes);
             }
-            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt8ToTinyInt) => {
-                let array = downcast_direct_array::<UInt8Array>(array, column.plan)?;
-                fill_uint8_fixed_width_column(array, column.plan, &mut current_offsets, &mut bytes);
+            BoundDirectColumn::UInt8 {
+                column: plan,
+                array,
+            } => {
+                fill_uint8_fixed_width_column(array, plan, &mut current_offsets, &mut bytes);
             }
-            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int8ToSmallInt) => {
-                let array = downcast_direct_array::<Int8Array>(array, column.plan)?;
-                fill_int8_fixed_width_column(array, column.plan, &mut current_offsets, &mut bytes);
+            BoundDirectColumn::Int8 {
+                column: plan,
+                array,
+            } => {
+                fill_int8_fixed_width_column(array, plan, &mut current_offsets, &mut bytes);
             }
-            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int16ToSmallInt) => {
-                let array = downcast_direct_array::<Int16Array>(array, column.plan)?;
-                fill_int16_fixed_width_column(array, column.plan, &mut current_offsets, &mut bytes);
+            BoundDirectColumn::Int16 {
+                column: plan,
+                array,
+            } => {
+                fill_int16_fixed_width_column(array, plan, &mut current_offsets, &mut bytes);
             }
-            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int32ToInt) => {
-                let array = downcast_direct_array::<Int32Array>(array, column.plan)?;
-                fill_int32_fixed_width_column(array, column.plan, &mut current_offsets, &mut bytes);
+            BoundDirectColumn::Int32 {
+                column: plan,
+                array,
+            } => {
+                fill_int32_fixed_width_column(array, plan, &mut current_offsets, &mut bytes);
             }
-            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt16ToInt) => {
-                let array = downcast_direct_array::<UInt16Array>(array, column.plan)?;
-                fill_uint16_fixed_width_column(
-                    array,
-                    column.plan,
-                    &mut current_offsets,
-                    &mut bytes,
-                );
+            BoundDirectColumn::UInt16 {
+                column: plan,
+                array,
+            } => {
+                fill_uint16_fixed_width_column(array, plan, &mut current_offsets, &mut bytes);
             }
-            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int64ToBigInt) => {
-                let array = downcast_direct_array::<Int64Array>(array, column.plan)?;
-                fill_int64_fixed_width_column(array, column.plan, &mut current_offsets, &mut bytes);
+            BoundDirectColumn::Int64 {
+                column: plan,
+                array,
+            } => {
+                fill_int64_fixed_width_column(array, plan, &mut current_offsets, &mut bytes);
             }
-            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt32ToBigInt) => {
-                let array = downcast_direct_array::<UInt32Array>(array, column.plan)?;
-                fill_uint32_fixed_width_column(
-                    array,
-                    column.plan,
-                    &mut current_offsets,
-                    &mut bytes,
-                );
+            BoundDirectColumn::UInt32 {
+                column: plan,
+                array,
+            } => {
+                fill_uint32_fixed_width_column(array, plan, &mut current_offsets, &mut bytes);
             }
-            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt64ToCheckedBigInt) => {
-                let array = downcast_direct_array::<UInt64Array>(array, column.plan)?;
+            BoundDirectColumn::UInt64 {
+                column: plan,
+                array,
+            } => {
                 fill_uint64_checked_bigint_fixed_width_column(
                     array,
-                    column.plan,
+                    plan,
                     &mut current_offsets,
                     &mut bytes,
                 )?;
             }
-            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal) => {
-                let array = downcast_direct_array::<Float32Array>(array, column.plan)?;
-                fill_float32_fixed_width_column(
-                    array,
-                    column.plan,
-                    &mut current_offsets,
-                    &mut bytes,
-                )?;
+            BoundDirectColumn::Float32 {
+                column: plan,
+                array,
+            } => {
+                fill_float32_fixed_width_column(array, plan, &mut current_offsets, &mut bytes)?;
             }
-            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => {
-                let array = downcast_direct_array::<Float64Array>(array, column.plan)?;
-                fill_float64_fixed_width_column(
-                    array,
-                    column.plan,
-                    &mut current_offsets,
-                    &mut bytes,
-                )?;
+            BoundDirectColumn::Float64 {
+                column: plan,
+                array,
+            } => {
+                fill_float64_fixed_width_column(array, plan, &mut current_offsets, &mut bytes)?;
             }
-            DirectColumnEncoding::UInt64Decimal20_0 => {
-                return Ok(None);
+            BoundDirectColumn::Date32 {
+                column: plan,
+                array,
+                ..
+            } => {
+                fill_date32_fixed_width_column(array, plan, &mut current_offsets, &mut bytes)?;
             }
-            DirectColumnEncoding::Decimal(_) => {
-                return Ok(None);
+            BoundDirectColumn::Date64 {
+                column: plan,
+                array,
+                ..
+            } => {
+                fill_date64_fixed_width_column(array, plan, &mut current_offsets, &mut bytes)?;
             }
-            DirectColumnEncoding::VariableWidth(_) => {
-                return Ok(None);
-            }
-            DirectColumnEncoding::Temporal(TemporalArrowToMssql::Date32ToDate) => {
-                let array = downcast_direct_array::<Date32Array>(array, column.plan)?;
-                fill_date32_fixed_width_column(
-                    array,
-                    column.plan,
-                    &mut current_offsets,
-                    &mut bytes,
-                )?;
-            }
-            DirectColumnEncoding::Temporal(TemporalArrowToMssql::Date64ToDateTime2) => {
-                let array = downcast_direct_array::<Date64Array>(array, column.plan)?;
-                fill_date64_fixed_width_column(
-                    array,
-                    column.plan,
-                    &mut current_offsets,
-                    &mut bytes,
-                )?;
-            }
-            DirectColumnEncoding::Temporal(
-                TemporalArrowToMssql::TimestampSecondToDateTime2
-                | TemporalArrowToMssql::TimestampSecondTzToDateTime2,
-            ) => {
-                let array = downcast_direct_array::<TimestampSecondArray>(array, column.plan)?;
+            BoundDirectColumn::TimestampSecond {
+                column: plan,
+                mapping,
+                array,
+            } => {
                 fill_timestamp_fixed_width_column(
                     array,
-                    column.mapping,
-                    column.plan,
+                    mapping,
+                    plan,
                     &mut current_offsets,
                     &mut bytes,
-                    |mapping, row_index, value, _policy| {
-                        mssql_datetime2_from_arrow_timestamp_second(mapping, row_index, value)
-                    },
-                    plan_options.nanosecond_policy,
-                )?;
-            }
-            DirectColumnEncoding::Temporal(
-                TemporalArrowToMssql::TimestampMillisecondToDateTime2
-                | TemporalArrowToMssql::TimestampMillisecondTzToDateTime2,
-            ) => {
-                let array = downcast_direct_array::<TimestampMillisecondArray>(array, column.plan)?;
-                fill_timestamp_fixed_width_column(
-                    array,
-                    column.mapping,
-                    column.plan,
-                    &mut current_offsets,
-                    &mut bytes,
-                    |mapping, row_index, value, _policy| {
-                        mssql_datetime2_from_arrow_timestamp_millisecond(mapping, row_index, value)
-                    },
-                    plan_options.nanosecond_policy,
-                )?;
-            }
-            DirectColumnEncoding::Temporal(
-                TemporalArrowToMssql::TimestampMicrosecondToDateTime2
-                | TemporalArrowToMssql::TimestampMicrosecondTzToDateTime2,
-            ) => {
-                let array = downcast_direct_array::<TimestampMicrosecondArray>(array, column.plan)?;
-                fill_timestamp_fixed_width_column(
-                    array,
-                    column.mapping,
-                    column.plan,
-                    &mut current_offsets,
-                    &mut bytes,
-                    |mapping, row_index, value, _policy| {
-                        mssql_datetime2_from_arrow_timestamp_microsecond(mapping, row_index, value)
-                    },
-                    plan_options.nanosecond_policy,
-                )?;
-            }
-            DirectColumnEncoding::Temporal(
-                TemporalArrowToMssql::TimestampNanosecondToDateTime2
-                | TemporalArrowToMssql::TimestampNanosecondTzToDateTime2,
-            ) => {
-                let array = downcast_direct_array::<TimestampNanosecondArray>(array, column.plan)?;
-                fill_timestamp_fixed_width_column(
-                    array,
-                    column.mapping,
-                    column.plan,
-                    &mut current_offsets,
-                    &mut bytes,
-                    |mapping, row_index, value, policy| {
-                        mssql_datetime2_from_arrow_timestamp_nanosecond(
-                            mapping, row_index, value, policy,
+                    |array, mapping, row_index, _policy| {
+                        mssql_datetime2_from_arrow_timestamp_second(
+                            mapping,
+                            row_index,
+                            array.value(row_index),
                         )
                     },
-                    plan_options.nanosecond_policy,
+                    NanosecondPolicy::default(),
                 )?;
             }
-            DirectColumnEncoding::Temporal(TemporalArrowToMssql::Time32SecondToTime) => {
-                let array = downcast_direct_array::<Time32SecondArray>(array, column.plan)?;
+            BoundDirectColumn::TimestampMillisecond {
+                column: plan,
+                mapping,
+                array,
+            } => {
+                fill_timestamp_fixed_width_column(
+                    array,
+                    mapping,
+                    plan,
+                    &mut current_offsets,
+                    &mut bytes,
+                    |array, mapping, row_index, _policy| {
+                        mssql_datetime2_from_arrow_timestamp_millisecond(
+                            mapping,
+                            row_index,
+                            array.value(row_index),
+                        )
+                    },
+                    NanosecondPolicy::default(),
+                )?;
+            }
+            BoundDirectColumn::TimestampMicrosecond {
+                column: plan,
+                mapping,
+                array,
+            } => {
+                fill_timestamp_fixed_width_column(
+                    array,
+                    mapping,
+                    plan,
+                    &mut current_offsets,
+                    &mut bytes,
+                    |array, mapping, row_index, _policy| {
+                        mssql_datetime2_from_arrow_timestamp_microsecond(
+                            mapping,
+                            row_index,
+                            array.value(row_index),
+                        )
+                    },
+                    NanosecondPolicy::default(),
+                )?;
+            }
+            BoundDirectColumn::TimestampNanosecond {
+                column: plan,
+                mapping,
+                nanosecond_policy,
+                array,
+            } => {
+                fill_timestamp_fixed_width_column(
+                    array,
+                    mapping,
+                    plan,
+                    &mut current_offsets,
+                    &mut bytes,
+                    |array, mapping, row_index, policy| {
+                        mssql_datetime2_from_arrow_timestamp_nanosecond(
+                            mapping,
+                            row_index,
+                            array.value(row_index),
+                            policy,
+                        )
+                    },
+                    *nanosecond_policy,
+                )?;
+            }
+            BoundDirectColumn::Time32Second {
+                column: plan,
+                mapping,
+                array,
+            } => {
                 fill_time_fixed_width_column(
                     array,
-                    column.mapping,
-                    column.plan,
+                    mapping,
+                    plan,
                     &mut current_offsets,
                     &mut bytes,
                     |array, mapping, row_index, _policy| {
@@ -290,15 +275,18 @@ pub(crate) fn try_encode_fixed_width_rows(
                             array.value(row_index),
                         )
                     },
-                    plan_options.nanosecond_policy,
+                    NanosecondPolicy::default(),
                 )?;
             }
-            DirectColumnEncoding::Temporal(TemporalArrowToMssql::Time32MillisecondToTime) => {
-                let array = downcast_direct_array::<Time32MillisecondArray>(array, column.plan)?;
+            BoundDirectColumn::Time32Millisecond {
+                column: plan,
+                mapping,
+                array,
+            } => {
                 fill_time_fixed_width_column(
                     array,
-                    column.mapping,
-                    column.plan,
+                    mapping,
+                    plan,
                     &mut current_offsets,
                     &mut bytes,
                     |array, mapping, row_index, _policy| {
@@ -308,15 +296,18 @@ pub(crate) fn try_encode_fixed_width_rows(
                             array.value(row_index),
                         )
                     },
-                    plan_options.nanosecond_policy,
+                    NanosecondPolicy::default(),
                 )?;
             }
-            DirectColumnEncoding::Temporal(TemporalArrowToMssql::Time64MicrosecondToTime) => {
-                let array = downcast_direct_array::<Time64MicrosecondArray>(array, column.plan)?;
+            BoundDirectColumn::Time64Microsecond {
+                column: plan,
+                mapping,
+                array,
+            } => {
                 fill_time_fixed_width_column(
                     array,
-                    column.mapping,
-                    column.plan,
+                    mapping,
+                    plan,
                     &mut current_offsets,
                     &mut bytes,
                     |array, mapping, row_index, _policy| {
@@ -326,15 +317,19 @@ pub(crate) fn try_encode_fixed_width_rows(
                             array.value(row_index),
                         )
                     },
-                    plan_options.nanosecond_policy,
+                    NanosecondPolicy::default(),
                 )?;
             }
-            DirectColumnEncoding::Temporal(TemporalArrowToMssql::Time64NanosecondToTime) => {
-                let array = downcast_direct_array::<Time64NanosecondArray>(array, column.plan)?;
+            BoundDirectColumn::Time64Nanosecond {
+                column: plan,
+                mapping,
+                nanosecond_policy,
+                array,
+            } => {
                 fill_time_fixed_width_column(
                     array,
-                    column.mapping,
-                    column.plan,
+                    mapping,
+                    plan,
                     &mut current_offsets,
                     &mut bytes,
                     |array, mapping, row_index, policy| {
@@ -345,17 +340,18 @@ pub(crate) fn try_encode_fixed_width_rows(
                             policy,
                         )
                     },
-                    plan_options.nanosecond_policy,
+                    *nanosecond_policy,
                 )?;
             }
-            DirectColumnEncoding::Temporal(
-                TemporalArrowToMssql::TimestampSecondTzToDateTimeOffset,
-            ) => {
-                let array = downcast_direct_array::<TimestampSecondArray>(array, column.plan)?;
+            BoundDirectColumn::DateTimeOffsetSecond {
+                column: plan,
+                mapping,
+                array,
+            } => {
                 fill_datetimeoffset_fixed_width_column(
                     array,
-                    column.mapping,
-                    column.plan,
+                    mapping,
+                    plan,
                     &mut current_offsets,
                     &mut bytes,
                     |array, mapping, row_index, _policy| {
@@ -367,17 +363,18 @@ pub(crate) fn try_encode_fixed_width_rows(
                             timezone,
                         )
                     },
-                    plan_options.nanosecond_policy,
+                    NanosecondPolicy::default(),
                 )?;
             }
-            DirectColumnEncoding::Temporal(
-                TemporalArrowToMssql::TimestampMillisecondTzToDateTimeOffset,
-            ) => {
-                let array = downcast_direct_array::<TimestampMillisecondArray>(array, column.plan)?;
+            BoundDirectColumn::DateTimeOffsetMillisecond {
+                column: plan,
+                mapping,
+                array,
+            } => {
                 fill_datetimeoffset_fixed_width_column(
                     array,
-                    column.mapping,
-                    column.plan,
+                    mapping,
+                    plan,
                     &mut current_offsets,
                     &mut bytes,
                     |array, mapping, row_index, _policy| {
@@ -389,17 +386,18 @@ pub(crate) fn try_encode_fixed_width_rows(
                             timezone,
                         )
                     },
-                    plan_options.nanosecond_policy,
+                    NanosecondPolicy::default(),
                 )?;
             }
-            DirectColumnEncoding::Temporal(
-                TemporalArrowToMssql::TimestampMicrosecondTzToDateTimeOffset,
-            ) => {
-                let array = downcast_direct_array::<TimestampMicrosecondArray>(array, column.plan)?;
+            BoundDirectColumn::DateTimeOffsetMicrosecond {
+                column: plan,
+                mapping,
+                array,
+            } => {
                 fill_datetimeoffset_fixed_width_column(
                     array,
-                    column.mapping,
-                    column.plan,
+                    mapping,
+                    plan,
                     &mut current_offsets,
                     &mut bytes,
                     |array, mapping, row_index, _policy| {
@@ -411,17 +409,19 @@ pub(crate) fn try_encode_fixed_width_rows(
                             timezone,
                         )
                     },
-                    plan_options.nanosecond_policy,
+                    NanosecondPolicy::default(),
                 )?;
             }
-            DirectColumnEncoding::Temporal(
-                TemporalArrowToMssql::TimestampNanosecondTzToDateTimeOffset,
-            ) => {
-                let array = downcast_direct_array::<TimestampNanosecondArray>(array, column.plan)?;
+            BoundDirectColumn::DateTimeOffsetNanosecond {
+                column: plan,
+                mapping,
+                nanosecond_policy,
+                array,
+            } => {
                 fill_datetimeoffset_fixed_width_column(
                     array,
-                    column.mapping,
-                    column.plan,
+                    mapping,
+                    plan,
                     &mut current_offsets,
                     &mut bytes,
                     |array, mapping, row_index, policy| {
@@ -434,9 +434,10 @@ pub(crate) fn try_encode_fixed_width_rows(
                             policy,
                         )
                     },
-                    plan_options.nanosecond_policy,
+                    *nanosecond_policy,
                 )?;
             }
+            _ => return Ok(None),
         }
     }
 
@@ -453,58 +454,41 @@ struct FixedWidthRowsLayout {
 }
 
 fn fixed_width_columns<'a>(
-    mappings: &'a [SchemaMapping],
-    columns: &'a [DirectColumnPlan],
-) -> Result<Option<Vec<FixedWidthColumn<'a>>>> {
+    columns: &'a [BoundDirectColumn<'a>],
+) -> Option<Vec<FixedWidthColumn<'a>>> {
     if profile::direct_fixed_width_fast_path_disabled() {
-        return Ok(None);
+        return None;
     }
 
     let mut fixed_width_columns = Vec::with_capacity(columns.len());
 
-    for (column_index, column) in columns.iter().enumerate() {
-        let Some(non_null_cell_len) = fixed_width_non_null_cell_len(column) else {
-            return Ok(None);
-        };
-        let Some(mapping) = mappings.get(column_index) else {
-            return Err(invalid_payload(format!(
-                "direct mapping index {column_index} is outside mapping count {}",
-                mappings.len()
-            )));
-        };
+    for column in columns {
+        let (plan, mapping) = fixed_width_column_parts(column)?;
+        let non_null_cell_len = fixed_width_non_null_cell_len(plan)?;
 
         fixed_width_columns.push(FixedWidthColumn {
-            plan: column,
+            column,
+            plan,
             mapping,
             non_null_cell_len,
         });
     }
 
-    Ok(Some(fixed_width_columns))
+    Some(fixed_width_columns)
 }
 
 fn measure_fixed_width_rows(
-    batch: &RecordBatch,
+    row_count: usize,
     columns: &[FixedWidthColumn<'_>],
 ) -> Result<FixedWidthRowsLayout> {
-    let row_count = batch.num_rows();
     let mut row_lengths = vec![ROW_TOKEN_LEN; row_count];
 
     for column in columns {
-        let Some(array) = batch
-            .columns()
-            .get(column.plan.source_index())
-            .map(AsRef::as_ref)
-        else {
-            return Err(value_conversion_error(row_column_diagnostic(
-                column.plan,
-                0,
-                DiagnosticCode::ValueTypeMismatch,
-                "planned direct column index is outside the runtime batch",
-            )));
-        };
+        let array = fixed_width_column_array(column.column);
 
-        validate_fixed_width_timestamp_timezone_metadata(array, column.mapping, column.plan)?;
+        if let Some(mapping) = column.mapping {
+            validate_fixed_width_timestamp_timezone_metadata(array, mapping, column.plan)?;
+        }
 
         if column.plan.nullable() {
             add_nullable_fixed_width_column_lengths(
@@ -539,6 +523,110 @@ fn measure_fixed_width_rows(
         current_offsets,
         payload_len,
     })
+}
+
+fn fixed_width_column_parts<'a>(
+    column: &'a BoundDirectColumn<'a>,
+) -> Option<(&'a DirectColumnPlan, Option<&'a SchemaMapping>)> {
+    match column {
+        BoundDirectColumn::Boolean { column, .. }
+        | BoundDirectColumn::UInt8 { column, .. }
+        | BoundDirectColumn::Int8 { column, .. }
+        | BoundDirectColumn::Int16 { column, .. }
+        | BoundDirectColumn::Int32 { column, .. }
+        | BoundDirectColumn::UInt16 { column, .. }
+        | BoundDirectColumn::Int64 { column, .. }
+        | BoundDirectColumn::UInt32 { column, .. }
+        | BoundDirectColumn::UInt64 { column, .. }
+        | BoundDirectColumn::Float32 { column, .. }
+        | BoundDirectColumn::Float64 { column, .. } => Some((column, None)),
+        BoundDirectColumn::Date32 {
+            column, mapping, ..
+        }
+        | BoundDirectColumn::Date64 {
+            column, mapping, ..
+        }
+        | BoundDirectColumn::TimestampSecond {
+            column, mapping, ..
+        }
+        | BoundDirectColumn::TimestampMillisecond {
+            column, mapping, ..
+        }
+        | BoundDirectColumn::TimestampMicrosecond {
+            column, mapping, ..
+        }
+        | BoundDirectColumn::TimestampNanosecond {
+            column, mapping, ..
+        }
+        | BoundDirectColumn::Time32Second {
+            column, mapping, ..
+        }
+        | BoundDirectColumn::Time32Millisecond {
+            column, mapping, ..
+        }
+        | BoundDirectColumn::Time64Microsecond {
+            column, mapping, ..
+        }
+        | BoundDirectColumn::Time64Nanosecond {
+            column, mapping, ..
+        }
+        | BoundDirectColumn::DateTimeOffsetSecond {
+            column, mapping, ..
+        }
+        | BoundDirectColumn::DateTimeOffsetMillisecond {
+            column, mapping, ..
+        }
+        | BoundDirectColumn::DateTimeOffsetMicrosecond {
+            column, mapping, ..
+        }
+        | BoundDirectColumn::DateTimeOffsetNanosecond {
+            column, mapping, ..
+        } => Some((column, Some(mapping))),
+        BoundDirectColumn::UInt64Decimal20_0 { .. }
+        | BoundDirectColumn::Decimal32 { .. }
+        | BoundDirectColumn::Decimal64 { .. }
+        | BoundDirectColumn::Decimal128 { .. }
+        | BoundDirectColumn::Decimal256 { .. }
+        | BoundDirectColumn::Utf8 { .. }
+        | BoundDirectColumn::Binary { .. } => None,
+    }
+}
+
+fn fixed_width_column_array<'a>(column: &'a BoundDirectColumn<'a>) -> &'a dyn Array {
+    match column {
+        BoundDirectColumn::Boolean { array, .. } => *array,
+        BoundDirectColumn::UInt8 { array, .. } => *array,
+        BoundDirectColumn::Int8 { array, .. } => *array,
+        BoundDirectColumn::Int16 { array, .. } => *array,
+        BoundDirectColumn::Int32 { array, .. } => *array,
+        BoundDirectColumn::UInt16 { array, .. } => *array,
+        BoundDirectColumn::Int64 { array, .. } => *array,
+        BoundDirectColumn::UInt32 { array, .. } => *array,
+        BoundDirectColumn::UInt64 { array, .. } => *array,
+        BoundDirectColumn::Float32 { array, .. } => *array,
+        BoundDirectColumn::Float64 { array, .. } => *array,
+        BoundDirectColumn::Date32 { array, .. } => *array,
+        BoundDirectColumn::Date64 { array, .. } => *array,
+        BoundDirectColumn::TimestampSecond { array, .. } => *array,
+        BoundDirectColumn::TimestampMillisecond { array, .. } => *array,
+        BoundDirectColumn::TimestampMicrosecond { array, .. } => *array,
+        BoundDirectColumn::TimestampNanosecond { array, .. } => *array,
+        BoundDirectColumn::Time32Second { array, .. } => *array,
+        BoundDirectColumn::Time32Millisecond { array, .. } => *array,
+        BoundDirectColumn::Time64Microsecond { array, .. } => *array,
+        BoundDirectColumn::Time64Nanosecond { array, .. } => *array,
+        BoundDirectColumn::DateTimeOffsetSecond { array, .. } => *array,
+        BoundDirectColumn::DateTimeOffsetMillisecond { array, .. } => *array,
+        BoundDirectColumn::DateTimeOffsetMicrosecond { array, .. } => *array,
+        BoundDirectColumn::DateTimeOffsetNanosecond { array, .. } => *array,
+        BoundDirectColumn::UInt64Decimal20_0 { .. }
+        | BoundDirectColumn::Decimal32 { .. }
+        | BoundDirectColumn::Decimal64 { .. }
+        | BoundDirectColumn::Decimal128 { .. }
+        | BoundDirectColumn::Decimal256 { .. }
+        | BoundDirectColumn::Utf8 { .. }
+        | BoundDirectColumn::Binary { .. } => unreachable!("only fixed-width columns are measured"),
+    }
 }
 
 fn add_non_nullable_fixed_width_column_lengths(
@@ -1002,7 +1090,7 @@ fn fill_timestamp_fixed_width_column<A, F>(
 ) -> Result<()>
 where
     A: Array,
-    F: Fn(&SchemaMapping, usize, i64, NanosecondPolicy) -> Result<MssqlDateTime2>,
+    F: Fn(&A, &SchemaMapping, usize, NanosecondPolicy) -> Result<MssqlDateTime2>,
 {
     for (row_index, current_offset) in current_offsets.iter_mut().enumerate().take(array.len()) {
         let offset = *current_offset;
@@ -1015,12 +1103,7 @@ where
         }
 
         validate_mapping_timestamp_timezone_metadata(mapping, row_index)?;
-        let value = value(
-            mapping,
-            row_index,
-            timestamp_value(array, row_index),
-            nanosecond_policy,
-        )?;
+        let value = value(array, mapping, row_index, nanosecond_policy)?;
         let cell_len = datetime2_cell_len(value.time().scale())?;
         let cell_bytes = bytes.get_mut(offset..offset + cell_len).ok_or_else(|| {
             invalid_payload("fixed-width timestamp temporal cell range is outside payload")
@@ -1030,20 +1113,6 @@ where
     }
 
     Ok(())
-}
-
-fn timestamp_value(array: &dyn Array, row_index: usize) -> i64 {
-    if let Some(array) = array.as_any().downcast_ref::<TimestampSecondArray>() {
-        array.value(row_index)
-    } else if let Some(array) = array.as_any().downcast_ref::<TimestampMillisecondArray>() {
-        array.value(row_index)
-    } else if let Some(array) = array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-        array.value(row_index)
-    } else if let Some(array) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {
-        array.value(row_index)
-    } else {
-        unreachable!("timestamp fixed-width fill only receives timestamp arrays")
-    }
 }
 
 fn fill_time_fixed_width_column<A, F>(
