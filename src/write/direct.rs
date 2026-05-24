@@ -1,7 +1,7 @@
 //! Direct raw TDS bulk encoder internals.
 #![allow(dead_code)]
 
-pub(crate) mod bound;
+pub(crate) mod binding;
 pub(crate) mod encoder;
 pub(crate) mod layout;
 pub(crate) mod measure;
@@ -42,7 +42,7 @@ mod tests {
     use super::types::temporal::{
         write_datetime2_cell, write_datetimeoffset_cell, write_time_cell,
     };
-    use super::{DirectEncoder, bound::BoundDirectBatch, payload};
+    use super::{DirectEncoder, binding::BoundDirectBatch, payload};
 
     #[test]
     fn default_direct_encoder_accepts_empty_mapping_set() {

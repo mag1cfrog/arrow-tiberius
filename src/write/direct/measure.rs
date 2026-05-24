@@ -5,7 +5,7 @@ use arrow_array::RecordBatch;
 use crate::Result;
 
 use super::{
-    DirectEncoder, bound::BoundDirectBatch, invalid_payload, layout,
+    DirectEncoder, binding::BoundDirectBatch, invalid_payload, layout,
     layout::build_fixed_width_row_range_layout,
 };
 

@@ -5,7 +5,7 @@ use arrow_array::RecordBatch;
 use crate::{Result, write::record_batch::validate_runtime_columns};
 
 use super::super::{
-    DirectEncoder, MeasuredDirectBatch, bound::BoundDirectBatch, invalid_payload,
+    DirectEncoder, MeasuredDirectBatch, binding::BoundDirectBatch, invalid_payload,
     layout::allocate_rows_payload_with_tokens, payload::EncodedRowsPayload,
     rows::fixed_width::try_encode_fixed_width_rows,
 };

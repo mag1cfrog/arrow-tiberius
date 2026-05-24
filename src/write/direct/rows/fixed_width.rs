@@ -36,7 +36,7 @@ use crate::{
 };
 
 use super::super::{
-    bound::{BoundDirectBatch, BoundDirectColumn},
+    binding::{BoundDirectBatch, BoundDirectColumn},
     checked_add, invalid_payload,
     payload::{EncodedRowsPayload, TDS_ROW_TOKEN},
     plan::{DirectColumnEncoding, DirectColumnPlan},
