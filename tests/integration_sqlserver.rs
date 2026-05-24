@@ -9,10 +9,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
     Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, RecordBatch, StringArray, Time32MillisecondArray, Time32SecondArray,
-    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
+    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
+    Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_buffer::i256;
 use arrow_data::ArrayData;
@@ -904,6 +904,130 @@ async fn direct_raw_writer_round_trips_variable_width_matrix() -> TestResult<()>
             rows[3].get::<&[u8], _>(8),
             Some(large_bytes.as_slice()),
             "row 3 bytes_value",
+        )?;
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    let drop_result = drop_table(&mut client, &table).await;
+    result?;
+    drop_result?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn direct_raw_writer_round_trips_large_variable_width_values() -> TestResult<()> {
+    let Some((connection_string, database)) = integration_config() else {
+        eprintln!(
+            "skipping SQL Server direct raw large variable-width integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+        );
+        return Ok(());
+    };
+
+    let mut client = connect(&connection_string, &database).await?;
+    let table = unique_table_name()?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::Int32, false),
+        Field::new("large_text", DataType::LargeUtf8, true),
+        Field::new("large_bytes", DataType::LargeBinary, true),
+    ]));
+    let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
+        Arc::clone(&schema),
+        MssqlProfile::sql_server_2016_compat_100(),
+        PlanOptions::default(),
+    )?
+    .into_parts();
+    let long_text = "x".repeat(5000);
+    let long_bytes = vec![0xab; 9000];
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1_i32, 2, 3, 4])) as ArrayRef,
+            Arc::new(LargeStringArray::from(vec![
+                Some(""),
+                Some("ascii"),
+                Some("Tokyo 東京 🙂"),
+                Some(long_text.as_str()),
+            ])),
+            Arc::new(LargeBinaryArray::from_iter(vec![
+                Some(&b""[..]),
+                Some(&b"\x00\x01\xfe\xff"[..]),
+                None,
+                Some(long_bytes.as_slice()),
+            ])),
+        ],
+    )?;
+
+    execute_sql(
+        &mut client,
+        create_table_sql_from_mappings(&table, &mappings),
+    )
+    .await?;
+
+    let result = async {
+        let mut writer = BulkWriter::new(
+            &mut client,
+            table.clone(),
+            mappings,
+            WriteOptions {
+                backend: WriteBackend::DirectRawBulk,
+                ..WriteOptions::default()
+            },
+        )
+        .await?;
+        let stats = writer.write_batch(&batch).await?;
+
+        ensure_eq(stats.rows_written, 4, "rows_written")?;
+        ensure_eq(stats.batches_written, 1, "batches_written")?;
+        ensure_eq(writer.finish().await?, stats, "finish stats")?;
+
+        let rows = client
+            .simple_query(format!(
+                "SELECT [row_id], [large_text], [large_bytes] FROM {} ORDER BY [row_id]",
+                table.quoted_sql()
+            ))
+            .await?
+            .into_first_result()
+            .await?;
+
+        ensure_eq(rows.len(), 4, "row count")?;
+
+        ensure_eq(rows[0].get::<i32, _>(0), Some(1), "row 0 row_id")?;
+        ensure_eq(rows[0].get::<&str, _>(1), Some(""), "row 0 large_text")?;
+        ensure_eq(
+            rows[0].get::<&[u8], _>(2),
+            Some(&b""[..]),
+            "row 0 large_bytes",
+        )?;
+
+        ensure_eq(rows[1].get::<i32, _>(0), Some(2), "row 1 row_id")?;
+        ensure_eq(rows[1].get::<&str, _>(1), Some("ascii"), "row 1 large_text")?;
+        ensure_eq(
+            rows[1].get::<&[u8], _>(2),
+            Some(&b"\x00\x01\xfe\xff"[..]),
+            "row 1 large_bytes",
+        )?;
+
+        ensure_eq(rows[2].get::<i32, _>(0), Some(3), "row 2 row_id")?;
+        ensure_eq(
+            rows[2].get::<&str, _>(1),
+            Some("Tokyo 東京 🙂"),
+            "row 2 large_text",
+        )?;
+        ensure_eq(rows[2].get::<&[u8], _>(2), None, "row 2 large_bytes")?;
+
+        ensure_eq(rows[3].get::<i32, _>(0), Some(4), "row 3 row_id")?;
+        ensure_eq(
+            rows[3].get::<&str, _>(1),
+            Some(long_text.as_str()),
+            "row 3 large_text",
+        )?;
+        ensure_eq(
+            rows[3].get::<&[u8], _>(2),
+            Some(long_bytes.as_slice()),
+            "row 3 large_bytes",
         )?;
 
         Ok::<(), Box<dyn std::error::Error>>(())
