@@ -40,7 +40,19 @@ use super::{
             append_time64_microsecond_cell, append_time64_nanosecond_cell,
             append_timestamp_microsecond_cell, append_timestamp_millisecond_cell,
             append_timestamp_nanosecond_cell, append_timestamp_second_cell, fill_temporal_column,
-            measure_temporal_column_cell_lengths,
+            measure_date32_column_cell_lengths, measure_date64_column_cell_lengths,
+            measure_datetimeoffset_microsecond_column_cell_lengths,
+            measure_datetimeoffset_millisecond_column_cell_lengths,
+            measure_datetimeoffset_nanosecond_column_cell_lengths,
+            measure_datetimeoffset_second_column_cell_lengths,
+            measure_time32_millisecond_column_cell_lengths,
+            measure_time32_second_column_cell_lengths,
+            measure_time64_microsecond_column_cell_lengths,
+            measure_time64_nanosecond_column_cell_lengths,
+            measure_timestamp_microsecond_column_cell_lengths,
+            measure_timestamp_millisecond_column_cell_lengths,
+            measure_timestamp_nanosecond_column_cell_lengths,
+            measure_timestamp_second_column_cell_lengths,
         },
         uint64::{
             append_uint64_decimal20_cell, fill_uint64_decimal20_column,
@@ -703,8 +715,8 @@ impl BoundDirectColumn<'_> {
                 column,
                 mapping,
                 array,
-            } => measure_temporal_column_cell_lengths(
-                *array,
+            } => measure_date32_column_cell_lengths(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: default_options,
@@ -719,8 +731,8 @@ impl BoundDirectColumn<'_> {
                 column,
                 mapping,
                 array,
-            } => measure_temporal_column_cell_lengths(
-                *array,
+            } => measure_date64_column_cell_lengths(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: default_options,
@@ -736,8 +748,8 @@ impl BoundDirectColumn<'_> {
                 mapping,
                 classification,
                 array,
-            } => measure_temporal_column_cell_lengths(
-                *array,
+            } => measure_timestamp_second_column_cell_lengths(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: default_options,
@@ -753,8 +765,8 @@ impl BoundDirectColumn<'_> {
                 mapping,
                 classification,
                 array,
-            } => measure_temporal_column_cell_lengths(
-                *array,
+            } => measure_timestamp_millisecond_column_cell_lengths(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: default_options,
@@ -770,8 +782,8 @@ impl BoundDirectColumn<'_> {
                 mapping,
                 classification,
                 array,
-            } => measure_temporal_column_cell_lengths(
-                *array,
+            } => measure_timestamp_microsecond_column_cell_lengths(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: default_options,
@@ -788,8 +800,8 @@ impl BoundDirectColumn<'_> {
                 classification,
                 nanosecond_policy,
                 array,
-            } => measure_temporal_column_cell_lengths(
-                *array,
+            } => measure_timestamp_nanosecond_column_cell_lengths(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: PlanOptions {
@@ -808,8 +820,8 @@ impl BoundDirectColumn<'_> {
                 mapping,
                 classification,
                 array,
-            } => measure_temporal_column_cell_lengths(
-                *array,
+            } => measure_time32_second_column_cell_lengths(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: default_options,
@@ -825,8 +837,8 @@ impl BoundDirectColumn<'_> {
                 mapping,
                 classification,
                 array,
-            } => measure_temporal_column_cell_lengths(
-                *array,
+            } => measure_time32_millisecond_column_cell_lengths(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: default_options,
@@ -842,8 +854,8 @@ impl BoundDirectColumn<'_> {
                 mapping,
                 classification,
                 array,
-            } => measure_temporal_column_cell_lengths(
-                *array,
+            } => measure_time64_microsecond_column_cell_lengths(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: default_options,
@@ -860,8 +872,8 @@ impl BoundDirectColumn<'_> {
                 classification,
                 nanosecond_policy,
                 array,
-            } => measure_temporal_column_cell_lengths(
-                *array,
+            } => measure_time64_nanosecond_column_cell_lengths(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: PlanOptions {
@@ -880,8 +892,8 @@ impl BoundDirectColumn<'_> {
                 mapping,
                 classification,
                 array,
-            } => measure_temporal_column_cell_lengths(
-                *array,
+            } => measure_datetimeoffset_second_column_cell_lengths(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: default_options,
@@ -897,8 +909,8 @@ impl BoundDirectColumn<'_> {
                 mapping,
                 classification,
                 array,
-            } => measure_temporal_column_cell_lengths(
-                *array,
+            } => measure_datetimeoffset_millisecond_column_cell_lengths(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: default_options,
@@ -914,8 +926,8 @@ impl BoundDirectColumn<'_> {
                 mapping,
                 classification,
                 array,
-            } => measure_temporal_column_cell_lengths(
-                *array,
+            } => measure_datetimeoffset_microsecond_column_cell_lengths(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: default_options,
@@ -932,8 +944,8 @@ impl BoundDirectColumn<'_> {
                 classification,
                 nanosecond_policy,
                 array,
-            } => measure_temporal_column_cell_lengths(
-                *array,
+            } => measure_datetimeoffset_nanosecond_column_cell_lengths(
+                array,
                 TemporalColumnContext {
                     mapping,
                     plan_options: PlanOptions {
