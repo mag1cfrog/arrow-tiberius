@@ -99,14 +99,11 @@ fn variable_width_support(mapping: &SchemaMapping) -> DirectMappingSupport {
     match VariableWidthArrowToMssql::classify(mapping, 0) {
         Ok(
             classification @ (VariableWidthArrowToMssql::Utf8ToNVarChar { .. }
-            | VariableWidthArrowToMssql::BinaryToVarBinary { .. }),
+            | VariableWidthArrowToMssql::LargeUtf8ToNVarChar { .. }
+            | VariableWidthArrowToMssql::BinaryToVarBinary { .. }
+            | VariableWidthArrowToMssql::LargeBinaryToVarBinary { .. }),
         ) => DirectMappingSupport::Supported {
             encoding: DirectColumnEncoding::VariableWidth(classification),
-        },
-        Ok(classification) => DirectMappingSupport::Unsupported {
-            reason: format!(
-                "direct encoding support for variable-width mapping {classification:?} is not implemented yet"
-            ),
         },
         Err(_) => temporal_support(mapping),
     }
@@ -632,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn current_direct_support_rejects_large_variable_width_until_dedicated_slice() {
+    fn current_direct_support_accepts_large_variable_width_mappings() {
         let mappings = vec![
             mapping(
                 0,
@@ -649,28 +646,21 @@ mod tests {
         ];
 
         let err = DirectEncoderPlan::new(&mappings, &CurrentDirectMappings)
-            .expect_err("large variable-width mappings are implemented in a later slice");
+            .expect("large variable-width mappings should be supported by the plan");
 
-        let Error::DirectEncoding { diagnostics } = err else {
-            panic!("expected direct encoding error");
-        };
-
-        assert_eq!(diagnostics.len(), 2);
         assert_eq!(
-            diagnostics.all()[0].code(),
-            DiagnosticCode::DirectEncodingUnsupportedMapping
+            err.columns()[0].encoding(),
+            DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::LargeUtf8ToNVarChar {
+                length: MssqlTypeLength::Max,
+            })
         );
-        assert_eq!(diagnostics.all()[0].field().unwrap().name(), "large_name");
-        assert!(
-            diagnostics.all()[0]
-                .message()
-                .contains("LargeUtf8ToNVarChar")
-        );
-        assert_eq!(diagnostics.all()[1].field().unwrap().name(), "large_bytes");
-        assert!(
-            diagnostics.all()[1]
-                .message()
-                .contains("LargeBinaryToVarBinary")
+        assert_eq!(
+            err.columns()[1].encoding(),
+            DirectColumnEncoding::VariableWidth(
+                VariableWidthArrowToMssql::LargeBinaryToVarBinary {
+                    length: MssqlTypeLength::Max,
+                }
+            )
         );
     }
 

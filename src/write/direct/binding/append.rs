@@ -98,7 +98,13 @@ impl BoundDirectColumn<'_> {
             Self::Utf8 { column, array } => {
                 append_nvarchar_cell(buf, array, column, row_index, measured_len)
             }
+            Self::LargeUtf8 { column, array } => {
+                append_nvarchar_cell(buf, array, column, row_index, measured_len)
+            }
             Self::Binary { column, array } => {
+                append_varbinary_cell(buf, array, column, row_index, measured_len)
+            }
+            Self::LargeBinary { column, array } => {
                 append_varbinary_cell(buf, array, column, row_index, measured_len)
             }
             Self::Date32 {

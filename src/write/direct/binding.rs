@@ -7,10 +7,10 @@ mod measure;
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
     Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, RecordBatch, StringArray, Time32MillisecondArray, Time32SecondArray,
-    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
+    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
+    Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 
 use super::{
@@ -18,7 +18,7 @@ use super::{
     layout::{RowLayout, build_fixed_width_row_layout},
     plan,
     plan::DirectColumnEncoding,
-    row_column_diagnostic, unsupported_batch, value_conversion_error,
+    row_column_diagnostic, value_conversion_error,
 };
 use crate::{
     DiagnosticCode, NanosecondPolicy, Result, SchemaMapping,
@@ -209,17 +209,24 @@ fn bind_direct_columns<'a>(
                 column,
                 array: downcast_direct_array::<StringArray>(array, column)?,
             },
+            DirectColumnEncoding::VariableWidth(
+                VariableWidthArrowToMssql::LargeUtf8ToNVarChar { .. },
+            ) => BoundDirectColumn::LargeUtf8 {
+                column,
+                array: downcast_direct_array::<LargeStringArray>(array, column)?,
+            },
             DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::BinaryToVarBinary {
                 ..
             }) => BoundDirectColumn::Binary {
                 column,
                 array: downcast_direct_array::<BinaryArray>(array, column)?,
             },
-            DirectColumnEncoding::VariableWidth(other) => {
-                return Err(unsupported_batch(format!(
-                    "direct variable-width append is not implemented yet for {other:?}"
-                )));
-            }
+            DirectColumnEncoding::VariableWidth(
+                VariableWidthArrowToMssql::LargeBinaryToVarBinary { .. },
+            ) => BoundDirectColumn::LargeBinary {
+                column,
+                array: downcast_direct_array::<LargeBinaryArray>(array, column)?,
+            },
             DirectColumnEncoding::Temporal(TemporalArrowToMssql::Date32ToDate) => {
                 BoundDirectColumn::Date32 {
                     column,
@@ -406,9 +413,17 @@ pub(crate) enum BoundDirectColumn<'a> {
         column: &'a plan::DirectColumnPlan,
         array: &'a StringArray,
     },
+    LargeUtf8 {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a LargeStringArray,
+    },
     Binary {
         column: &'a plan::DirectColumnPlan,
         array: &'a BinaryArray,
+    },
+    LargeBinary {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a LargeBinaryArray,
     },
     Date32 {
         column: &'a plan::DirectColumnPlan,

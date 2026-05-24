@@ -140,7 +140,13 @@ impl BoundDirectColumn<'_> {
             Self::Utf8 { column, array } => {
                 fill_nvarchar_column(array, column, column_index, column_count, layout, bytes)
             }
+            Self::LargeUtf8 { column, array } => {
+                fill_nvarchar_column(array, column, column_index, column_count, layout, bytes)
+            }
             Self::Binary { column, array } => {
+                fill_varbinary_column(array, column, column_index, column_count, layout, bytes)
+            }
+            Self::LargeBinary { column, array } => {
                 fill_varbinary_column(array, column, column_index, column_count, layout, bytes)
             }
             Self::Date32 {

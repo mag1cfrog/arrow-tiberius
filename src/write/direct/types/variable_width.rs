@@ -1,6 +1,6 @@
 //! Variable-width direct TDS row layout measurement.
 
-use arrow_array::{Array, BinaryArray, StringArray};
+use arrow_array::{Array, GenericBinaryArray, GenericStringArray, OffsetSizeTrait};
 
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, MssqlTypeLength, Result,
@@ -21,16 +21,17 @@ const MAX_PLP_CHUNK_LEN: usize = u32::MAX as usize;
 
 /// Measures one Utf8-to-nvarchar column into a row-major cell length matrix.
 pub(crate) fn measure_nvarchar_column_cell_lengths(
-    array: &StringArray,
+    array: &GenericStringArray<impl OffsetSizeTrait>,
     column: &DirectColumnPlan,
     column_index: usize,
     column_count: usize,
     cell_lengths: &mut [usize],
 ) -> Result<()> {
     let length = match column.encoding() {
-        DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::Utf8ToNVarChar {
-            length,
-        }) => length,
+        DirectColumnEncoding::VariableWidth(
+            VariableWidthArrowToMssql::Utf8ToNVarChar { length }
+            | VariableWidthArrowToMssql::LargeUtf8ToNVarChar { length },
+        ) => length,
         other => {
             return Err(unsupported_batch(format!(
                 "direct nvarchar layout cannot measure mapping {other:?}"
@@ -50,16 +51,17 @@ pub(crate) fn measure_nvarchar_column_cell_lengths(
 
 /// Measures one Binary-to-varbinary column into a row-major cell length matrix.
 pub(crate) fn measure_varbinary_column_cell_lengths(
-    array: &BinaryArray,
+    array: &GenericBinaryArray<impl OffsetSizeTrait>,
     column: &DirectColumnPlan,
     column_index: usize,
     column_count: usize,
     cell_lengths: &mut [usize],
 ) -> Result<()> {
     let length = match column.encoding() {
-        DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::BinaryToVarBinary {
-            length,
-        }) => length,
+        DirectColumnEncoding::VariableWidth(
+            VariableWidthArrowToMssql::BinaryToVarBinary { length }
+            | VariableWidthArrowToMssql::LargeBinaryToVarBinary { length },
+        ) => length,
         other => {
             return Err(unsupported_batch(format!(
                 "direct varbinary layout cannot measure mapping {other:?}"
@@ -79,7 +81,7 @@ pub(crate) fn measure_varbinary_column_cell_lengths(
 
 /// Fills one Utf8-to-nvarchar column into an already allocated rows payload.
 pub(crate) fn fill_nvarchar_column(
-    array: &StringArray,
+    array: &GenericStringArray<impl OffsetSizeTrait>,
     column: &DirectColumnPlan,
     column_index: usize,
     column_count: usize,
@@ -87,9 +89,10 @@ pub(crate) fn fill_nvarchar_column(
     bytes: &mut [u8],
 ) -> Result<()> {
     let length = match column.encoding() {
-        DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::Utf8ToNVarChar {
-            length,
-        }) => length,
+        DirectColumnEncoding::VariableWidth(
+            VariableWidthArrowToMssql::Utf8ToNVarChar { length }
+            | VariableWidthArrowToMssql::LargeUtf8ToNVarChar { length },
+        ) => length,
         other => {
             return Err(unsupported_batch(format!(
                 "direct nvarchar fill cannot encode mapping {other:?}"
@@ -119,7 +122,7 @@ pub(crate) fn fill_nvarchar_column(
 
 /// Fills one Binary-to-varbinary column into an already allocated rows payload.
 pub(crate) fn fill_varbinary_column(
-    array: &BinaryArray,
+    array: &GenericBinaryArray<impl OffsetSizeTrait>,
     column: &DirectColumnPlan,
     column_index: usize,
     column_count: usize,
@@ -127,9 +130,10 @@ pub(crate) fn fill_varbinary_column(
     bytes: &mut [u8],
 ) -> Result<()> {
     let length = match column.encoding() {
-        DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::BinaryToVarBinary {
-            length,
-        }) => length,
+        DirectColumnEncoding::VariableWidth(
+            VariableWidthArrowToMssql::BinaryToVarBinary { length }
+            | VariableWidthArrowToMssql::LargeBinaryToVarBinary { length },
+        ) => length,
         other => {
             return Err(unsupported_batch(format!(
                 "direct varbinary fill cannot encode mapping {other:?}"
@@ -160,15 +164,16 @@ pub(crate) fn fill_varbinary_column(
 /// Appends one Utf8-to-nvarchar cell to a raw bulk append buffer.
 pub(crate) fn append_nvarchar_cell(
     buf: &mut tiberius::RawRowsAppendBuffer<'_>,
-    array: &StringArray,
+    array: &GenericStringArray<impl OffsetSizeTrait>,
     column: &DirectColumnPlan,
     row_index: usize,
     measured_len: usize,
 ) -> Result<()> {
     let length = match column.encoding() {
-        DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::Utf8ToNVarChar {
-            length,
-        }) => length,
+        DirectColumnEncoding::VariableWidth(
+            VariableWidthArrowToMssql::Utf8ToNVarChar { length }
+            | VariableWidthArrowToMssql::LargeUtf8ToNVarChar { length },
+        ) => length,
         other => {
             return Err(unsupported_batch(format!(
                 "direct nvarchar append cannot encode mapping {other:?}"
@@ -220,15 +225,16 @@ pub(crate) fn append_nvarchar_cell(
 /// Appends one Binary-to-varbinary cell to a raw bulk append buffer.
 pub(crate) fn append_varbinary_cell(
     buf: &mut tiberius::RawRowsAppendBuffer<'_>,
-    array: &BinaryArray,
+    array: &GenericBinaryArray<impl OffsetSizeTrait>,
     column: &DirectColumnPlan,
     row_index: usize,
     measured_len: usize,
 ) -> Result<()> {
     let length = match column.encoding() {
-        DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::BinaryToVarBinary {
-            length,
-        }) => length,
+        DirectColumnEncoding::VariableWidth(
+            VariableWidthArrowToMssql::BinaryToVarBinary { length }
+            | VariableWidthArrowToMssql::LargeBinaryToVarBinary { length },
+        ) => length,
         other => {
             return Err(unsupported_batch(format!(
                 "direct varbinary append cannot encode mapping {other:?}"
@@ -265,7 +271,7 @@ pub(crate) fn append_varbinary_cell(
 }
 
 fn measure_nvarchar_cell_lengths(
-    array: &StringArray,
+    array: &GenericStringArray<impl OffsetSizeTrait>,
     column: &DirectColumnPlan,
     column_index: usize,
     column_count: usize,
@@ -306,7 +312,7 @@ fn measure_nvarchar_cell_lengths(
 }
 
 fn measure_varbinary_cell_lengths(
-    array: &BinaryArray,
+    array: &GenericBinaryArray<impl OffsetSizeTrait>,
     column: &DirectColumnPlan,
     column_index: usize,
     column_count: usize,

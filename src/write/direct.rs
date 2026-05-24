@@ -11,8 +11,7 @@ pub(crate) mod rows;
 pub(crate) mod types;
 
 pub(crate) use encoder::{
-    DirectEncoder, checked_add, invalid_payload, row_column_diagnostic, unsupported_batch,
-    value_conversion_error,
+    DirectEncoder, checked_add, invalid_payload, row_column_diagnostic, value_conversion_error,
 };
 pub(crate) use measure::{MeasuredDirectBatch, MeasuredRowRange};
 
