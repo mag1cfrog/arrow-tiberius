@@ -2081,6 +2081,39 @@ mod tests {
     }
 
     #[test]
+    fn direct_encoder_rejects_fixed_size_binary_null_in_non_nullable_column() {
+        let mappings = vec![mapping(
+            0,
+            "digest",
+            DataType::FixedSizeBinary(3),
+            MssqlType::Binary(3),
+            false,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![Field::new("digest", DataType::FixedSizeBinary(3), true)],
+            vec![Arc::new(
+                FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    [Some(&b"abc"[..]), None].into_iter(),
+                    3,
+                )
+                .unwrap(),
+            )],
+        );
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+
+        let err = try_encode_fixed_width_rows(&bound)
+            .expect_err("fixed-size binary null in non-nullable column must fail");
+
+        assert_value_conversion_diagnostic(
+            err,
+            DiagnosticCode::NullInNonNullableColumn,
+            Some(1),
+            Some((0, "digest")),
+        );
+    }
+
+    #[test]
     fn direct_encoder_row_range_rejects_out_of_bounds_range() {
         let mappings = vec![mapping(0, "id", DataType::Int32, MssqlType::Int, false)];
         let encoder = DirectEncoder::new(&mappings).unwrap();

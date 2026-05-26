@@ -698,6 +698,30 @@ mod tests {
     }
 
     #[test]
+    fn current_direct_support_rejects_fixed_size_binary_length_mismatch() {
+        let mappings = vec![mapping(
+            0,
+            "digest",
+            DataType::FixedSizeBinary(16),
+            MssqlType::Binary(32),
+        )];
+
+        let err = DirectEncoderPlan::new(&mappings, &CurrentDirectMappings)
+            .expect_err("fixed-size binary length drift must not be supported");
+
+        let Error::DirectEncoding { diagnostics } = err else {
+            panic!("expected direct encoding error");
+        };
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics.all()[0].code(),
+            DiagnosticCode::DirectEncodingUnsupportedMapping
+        );
+        assert_eq!(diagnostics.all()[0].field().unwrap().name(), "digest");
+    }
+
+    #[test]
     fn current_direct_support_accepts_date_mappings() {
         let mappings = vec![
             mapping(0, "created_on", DataType::Date32, MssqlType::Date),
