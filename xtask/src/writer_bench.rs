@@ -10,9 +10,10 @@ use std::time::{Duration, Instant};
 
 use crate::{odbc_runner, sqlserver};
 use arrow_array::{
-    ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array,
-    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
-    TimestampMillisecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
+    FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, RecordBatch, StringArray, TimestampMillisecondArray, UInt8Array, UInt16Array,
+    UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow_tiberius::{
@@ -2223,6 +2224,13 @@ const MIXED_NULLABLE_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDe
     columns: mixed_nullable_columns,
 };
 
+const FIXED_SIZE_BINARY_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
+    name: "fixed_size_binary",
+    description: "Fixed-size binary columns planned as SQL Server binary(n)",
+    schema: fixed_size_binary_schema,
+    columns: fixed_size_binary_columns,
+};
+
 const WIDE_MIXED_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
     name: "wide_mixed",
     description: "Ingestion-style ids, event time, categories, text, and binary payloads",
@@ -2309,6 +2317,7 @@ const DIRECT_RAW_SUPPORTED_SCENARIOS: &[&str] = &[
     UINT64_POLICY_SCENARIO.name,
     DATE_FAST_PATH_SCENARIO.name,
     MIXED_NULLABLE_SCENARIO.name,
+    FIXED_SIZE_BINARY_SCENARIO.name,
     DECIMAL_TEMPORAL_SCENARIO.name,
     STRING_HEAVY_SCENARIO.name,
     STRING_HEAVY_TEXT_ONLY_SCENARIO.name,
@@ -2332,6 +2341,7 @@ const SCENARIOS: &[BenchmarkScenarioDefinition] = &[
     UINT64_POLICY_SCENARIO,
     DATE_FAST_PATH_SCENARIO,
     MIXED_NULLABLE_SCENARIO,
+    FIXED_SIZE_BINARY_SCENARIO,
     WIDE_MIXED_SCENARIO,
     DECIMAL_TEMPORAL_SCENARIO,
     STRING_HEAVY_SCENARIO,
@@ -4490,6 +4500,55 @@ fn deterministic_payload(row: usize) -> Vec<u8> {
         .collect()
 }
 
+fn fixed_size_binary_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::Int64, false),
+        Field::new("hash16", DataType::FixedSizeBinary(16), false),
+        Field::new("nullable_code4", DataType::FixedSizeBinary(4), true),
+        Field::new("payload64", DataType::FixedSizeBinary(64), false),
+    ]))
+}
+
+fn fixed_size_binary_columns(offset: usize, len: usize) -> Result<Vec<ArrayRef>, WriterBenchError> {
+    let row_id = (offset..offset + len)
+        .map(|row| row as i64)
+        .collect::<Int64Array>();
+    let hash16 = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+        (offset..offset + len).map(|row| Some(fixed_size_payload(row, 16))),
+        16,
+    )
+    .map_err(WriterBenchError::Arrow)?;
+    let nullable_code4 = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+        (offset..offset + len).map(|row| {
+            if row % 7 == 0 {
+                None
+            } else {
+                Some(fixed_size_payload(row, 4))
+            }
+        }),
+        4,
+    )
+    .map_err(WriterBenchError::Arrow)?;
+    let payload64 = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+        (offset..offset + len).map(|row| Some(fixed_size_payload(row, 64))),
+        64,
+    )
+    .map_err(WriterBenchError::Arrow)?;
+
+    Ok(vec![
+        Arc::new(row_id),
+        Arc::new(hash16),
+        Arc::new(nullable_code4),
+        Arc::new(payload64),
+    ])
+}
+
+fn fixed_size_payload(row: usize, len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|index| ((row.wrapping_mul(37) + index.wrapping_mul(19)) % 251) as u8)
+        .collect()
+}
+
 fn decimal_temporal_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("transaction_id", DataType::Int64, false),
@@ -5224,9 +5283,10 @@ mod tests {
         WriterBenchError, WriterBenchOptions, sqlserver_profile,
     };
     use arrow_array::{
-        Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array,
-        Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
-        TimestampMillisecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+        Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
+        FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+        Int64Array, RecordBatch, StringArray, TimestampMillisecondArray, UInt8Array, UInt16Array,
+        UInt32Array, UInt64Array,
     };
     use arrow_schema::{DataType, TimeUnit};
     use arrow_tiberius::MssqlType;
@@ -6170,6 +6230,7 @@ mod tests {
             "uint64_policy",
             "date_fast_path",
             "mixed_nullable",
+            "fixed_size_binary",
             "decimal_temporal",
             "string_heavy",
             "string_heavy_text_only",
@@ -6222,6 +6283,7 @@ mod tests {
                         && message.contains("uint64_policy")
                         && message.contains("date_fast_path")
                         && message.contains("mixed_nullable")
+                        && message.contains("fixed_size_binary")
                         && message.contains("decimal_temporal")
                         && message.contains("string_heavy")
                         && message.contains("string_heavy_text_only")
@@ -7164,6 +7226,50 @@ odbc-bcp runner
     }
 
     #[test]
+    fn fixed_size_binary_scenario_maps_to_binary_columns() {
+        let options = WriterBenchOptions {
+            rows: 8,
+            batch_size: 8,
+            scenario: super::scenario_by_name("fixed_size_binary").unwrap(),
+            repeat: 1,
+            output: BenchmarkOutput::Human,
+        };
+
+        let batches = generated_batches(&options);
+        let batch = &batches[0];
+        let schema = batch.schema();
+
+        assert_eq!(schema.field(1).data_type(), &DataType::FixedSizeBinary(16));
+        assert!(!schema.field(1).is_nullable());
+        assert_eq!(schema.field(2).data_type(), &DataType::FixedSizeBinary(4));
+        assert!(schema.field(2).is_nullable());
+        assert_eq!(schema.field(3).data_type(), &DataType::FixedSizeBinary(64));
+        assert!(!schema.field(3).is_nullable());
+
+        let hash16 = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        let nullable_code4 = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(hash16.value_length(), 16);
+        assert_eq!(hash16.value(1).len(), 16);
+        assert_eq!(nullable_code4.null_count(), 2);
+        assert!(nullable_code4.is_null(0));
+        assert!(nullable_code4.is_valid(1));
+
+        let mappings = super::benchmark_mappings_for_scenario(options.scenario).unwrap();
+        assert_eq!(mappings[1].mssql().ty(), &MssqlType::Binary(16));
+        assert_eq!(mappings[2].mssql().ty(), &MssqlType::Binary(4));
+        assert_eq!(mappings[3].mssql().ty(), &MssqlType::Binary(64));
+        super::ensure_direct_raw_supported_scenario(&options).unwrap();
+    }
+
+    #[test]
     fn extended_primitive_schema_matches_definition() {
         let options = WriterBenchOptions {
             rows: 1,
@@ -7936,6 +8042,7 @@ odbc-bcp runner
                 "uint64_policy",
                 "date_fast_path",
                 "mixed_nullable",
+                "fixed_size_binary",
                 "wide_mixed",
                 "decimal_temporal",
                 "string_heavy",
