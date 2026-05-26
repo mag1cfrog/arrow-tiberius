@@ -30,6 +30,7 @@ Current scenarios are:
 - `narrow_numeric`: primitive numeric throughput.
 - `extended_primitive`: small integer and real primitive throughput.
 - `mixed_nullable`: nullable primitives and short strings.
+- `fixed_size_binary`: fixed-size binary values planned as `binary(n)`.
 - `wide_mixed`: ingestion-style ids, event time, categories, text, and binary
   payloads.
 - `decimal_temporal`: finance-style decimals, dates, and timestamps.
@@ -85,7 +86,7 @@ extension:
 ```sh
 cargo xtask writer-bench compare \
   --container-runtime podman \
-  --backends baseline,arrow-odbc,odbc-bcp \
+  --backends baseline,direct-raw,arrow-odbc,odbc-bcp \
   --scenario narrow_numeric \
   --rows 10000 \
   --batch-size 8192 \
@@ -122,6 +123,12 @@ cargo xtask writer-bench compare \
 The shared IPC file is the fairness boundary. It keeps data generation outside
 the backend timing and ensures every backend sees the same rows, null pattern,
 string values, binary values, and temporal values.
+
+Use `direct-raw` in compare runs to measure this crate's raw TDS encoder through
+the normal `WriteBackend::DirectRawBulk` writer path. Current direct benchmark
+coverage includes primitive rows, variable-width text and binary rows, UInt64
+policy rows, decimal and temporal rows, fixed-size binary rows, and mixed
+direct-supported schemas.
 
 For stable comparisons, prefer runs long enough that setup noise and timer
 resolution do not dominate the result. Very short runs are useful as smoke
