@@ -124,4 +124,21 @@ mod tests {
             "CREATE TABLE [dbo].[events] (\n    [amount] decimal(38,9) NOT NULL,\n    [event_date] date NULL,\n    [event_time] time(7) NULL,\n    [created_at] datetime2(7) NOT NULL,\n    [source_offset] datetimeoffset(7) NULL\n);"
         );
     }
+
+    #[test]
+    fn renders_fixed_binary_columns() {
+        let table = TableName::new("dbo", "binary_values").unwrap();
+        let columns = vec![MssqlColumn::new(
+            Identifier::new("digest").unwrap(),
+            MssqlType::Binary(32),
+            false,
+        )];
+
+        let sql = create_table_sql(&table, &columns, CreateTableOptions);
+
+        assert_eq!(
+            sql,
+            "CREATE TABLE [dbo].[binary_values] (\n    [digest] binary(32) NOT NULL\n);"
+        );
+    }
 }

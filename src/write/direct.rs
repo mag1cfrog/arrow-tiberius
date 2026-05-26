@@ -21,11 +21,11 @@ mod tests {
 
     use arrow_array::{
         ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array,
-        Decimal64Array, Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int32Array,
-        Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
-        Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
-        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-        TimestampSecondArray, UInt64Array,
+        Decimal64Array, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float32Array,
+        Float64Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch,
+        StringArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
+        Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
     };
     use arrow_buffer::{NullBuffer, ScalarBuffer, i256};
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -1934,6 +1934,97 @@ mod tests {
     }
 
     #[test]
+    fn direct_encoder_encodes_fixed_size_binary_rows() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "digest",
+                DataType::FixedSizeBinary(3),
+                MssqlType::Binary(3),
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("digest", DataType::FixedSizeBinary(3), true),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                        [Some(&b"\x00\xff\x7f"[..]), None, Some(&b"abc"[..])].into_iter(),
+                        3,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        );
+
+        let payload = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(payload.row_token_offsets(), [0, 10, 17]);
+        assert_eq!(
+            payload.bytes(),
+            expected_rows([
+                [int32_cell(1), fixed_binary_cell(b"\x00\xff\x7f")],
+                [int32_cell(2), fixed_binary_null_cell()],
+                [int32_cell(3), fixed_binary_cell(b"abc")],
+            ])
+        );
+    }
+
+    #[test]
+    fn direct_encoder_fixed_size_binary_measured_ranges_match_full_payload() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "digest",
+                DataType::FixedSizeBinary(3),
+                MssqlType::Binary(3),
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("digest", DataType::FixedSizeBinary(3), true),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                        [Some(&b"abc"[..]), None, Some(&b"xyz"[..])].into_iter(),
+                        3,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        );
+
+        let measured = encoder.measure_batch(&batch).unwrap();
+        let full = encoder.encode_batch(&batch).unwrap();
+        let first = encoder
+            .encode_measured_batch_range(&batch, &measured, 0, 1)
+            .unwrap();
+        let second = encoder
+            .encode_measured_batch_range(&batch, &measured, 1, 2)
+            .unwrap();
+        let mut concatenated = Vec::new();
+        concatenated.extend_from_slice(first.bytes());
+        concatenated.extend_from_slice(second.bytes());
+
+        assert_eq!(measured.row_count(), 3);
+        assert_eq!(concatenated, full.bytes());
+        assert_eq!(first.row_token_offsets()[0], 0);
+        assert_eq!(second.row_token_offsets()[0], 0);
+    }
+
+    #[test]
     fn direct_encoder_rejects_large_variable_width_runtime_type_drift() {
         let mappings = vec![
             mapping(
@@ -1986,6 +2077,39 @@ mod tests {
             DiagnosticCode::SchemaMismatch,
             None,
             Some((1, "large_bytes")),
+        );
+    }
+
+    #[test]
+    fn direct_encoder_rejects_fixed_size_binary_null_in_non_nullable_column() {
+        let mappings = vec![mapping(
+            0,
+            "digest",
+            DataType::FixedSizeBinary(3),
+            MssqlType::Binary(3),
+            false,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![Field::new("digest", DataType::FixedSizeBinary(3), true)],
+            vec![Arc::new(
+                FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    [Some(&b"abc"[..]), None].into_iter(),
+                    3,
+                )
+                .unwrap(),
+            )],
+        );
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+
+        let err = try_encode_fixed_width_rows(&bound)
+            .expect_err("fixed-size binary null in non-nullable column must fail");
+
+        assert_value_conversion_diagnostic(
+            err,
+            DiagnosticCode::NullInNonNullableColumn,
+            Some(1),
+            Some((0, "digest")),
         );
     }
 
@@ -2190,6 +2314,95 @@ mod tests {
         assert_eq!(
             payload.bytes(),
             encoder.encode_batch(&batch).unwrap().bytes()
+        );
+    }
+
+    #[test]
+    fn direct_encoder_fixed_width_fast_path_is_active_for_fixed_size_binary_columns() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "digest",
+                DataType::FixedSizeBinary(3),
+                MssqlType::Binary(3),
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("digest", DataType::FixedSizeBinary(3), true),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                        [Some(&b"abc"[..]), None, Some(&b"\x00\xff\x7f"[..])].into_iter(),
+                        3,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        );
+
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+        let payload = try_encode_fixed_width_rows(&bound)
+            .unwrap()
+            .expect("fixed-width fixed-size binary fast path should be active");
+
+        assert_eq!(payload.row_token_offsets(), [0, 10, 17]);
+        assert_eq!(
+            payload.bytes(),
+            encoder.encode_batch(&batch).unwrap().bytes()
+        );
+    }
+
+    #[test]
+    fn direct_encoder_fixed_width_fast_path_is_active_for_fixed_size_binary_measured_ranges() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "digest",
+                DataType::FixedSizeBinary(3),
+                MssqlType::Binary(3),
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("digest", DataType::FixedSizeBinary(3), true),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                        [Some(&b"abc"[..]), None, Some(&b"\x00\xff\x7f"[..])].into_iter(),
+                        3,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        );
+
+        let measured = encoder.measure_batch(&batch).unwrap();
+
+        reset_fixed_width_measure_call_count();
+        let range = encoder
+            .encode_measured_batch_range(&batch, &measured, 1, 2)
+            .unwrap();
+        assert_eq!(fixed_width_measure_call_count(), 0);
+        assert_eq!(range.row_token_offsets(), [0, 7]);
+        assert_eq!(
+            range.bytes(),
+            expected_rows([
+                [int32_cell(2), fixed_binary_null_cell()],
+                [int32_cell(3), fixed_binary_cell(b"\x00\xff\x7f")]
+            ])
         );
     }
 
@@ -3520,6 +3733,17 @@ mod tests {
 
     fn max_varbinary_null_cell() -> Vec<u8> {
         u64::MAX.to_le_bytes().to_vec()
+    }
+
+    fn fixed_binary_cell(value: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(value);
+        bytes
+    }
+
+    fn fixed_binary_null_cell() -> Vec<u8> {
+        u16::MAX.to_le_bytes().to_vec()
     }
 
     fn nullable_int32_cell(value: i32) -> Vec<u8> {

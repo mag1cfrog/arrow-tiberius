@@ -1000,6 +1000,9 @@ fn primitive_value_len(encoding: DirectColumnEncoding) -> Result<usize> {
         DirectColumnEncoding::VariableWidth(other) => Err(unsupported_batch(format!(
             "direct primitive layout is not implemented for variable-width mapping {other:?}"
         ))),
+        DirectColumnEncoding::FixedSizeBinary(other) => Err(unsupported_batch(format!(
+            "direct primitive layout is not implemented for fixed-size binary mapping {other:?}"
+        ))),
         DirectColumnEncoding::Temporal(other) => Err(unsupported_batch(format!(
             "direct primitive layout is not implemented for temporal mapping {other:?}"
         ))),

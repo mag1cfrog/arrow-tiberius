@@ -2,8 +2,8 @@
 
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
-    Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
+    Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
     Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
     TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
     TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
@@ -216,6 +216,10 @@ pub(crate) fn extract_arrow_cell<'a>(
             let array = downcast_array::<LargeBinaryArray>(array, mapping, row_index)?;
             Ok(ArrowCell::Binary(array.value(row_index)))
         }
+        DataType::FixedSizeBinary(_) => {
+            let array = downcast_array::<FixedSizeBinaryArray>(array, mapping, row_index)?;
+            Ok(ArrowCell::Binary(array.value(row_index)))
+        }
         other => Err(unsupported_value_conversion(
             mapping,
             row_index,
@@ -282,11 +286,12 @@ mod tests {
 
     use arrow_array::{
         ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array,
-        Decimal64Array, Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array,
-        Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
-        Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
-        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-        TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+        Decimal64Array, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float32Array,
+        Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
+        LargeStringArray, StringArray, Time32MillisecondArray, Time32SecondArray,
+        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+        UInt16Array, UInt32Array, UInt64Array,
     };
     use arrow_buffer::i256;
     use arrow_schema::{DataType, TimeUnit};
@@ -366,6 +371,17 @@ mod tests {
                 mapping("large_bytes", DataType::LargeBinary),
                 Arc::new(LargeBinaryArray::from(vec![Some(&b"large"[..]), None])),
                 ArrowCell::Binary(b"large"),
+            ),
+            (
+                mapping("fixed_bytes", DataType::FixedSizeBinary(3)),
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                        [Some(&b"abc"[..]), None].into_iter(),
+                        3,
+                    )
+                    .unwrap(),
+                ),
+                ArrowCell::Binary(b"abc"),
             ),
         ];
 

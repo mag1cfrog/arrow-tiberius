@@ -5,6 +5,7 @@ use super::super::types::{
         append_decimal32_cell, append_decimal64_cell, append_decimal128_cell,
         append_decimal256_cell,
     },
+    fixed_size_binary::append_fixed_size_binary_cell,
     primitive::{
         append_boolean_cell, append_float32_cell, append_float64_cell, append_int8_cell,
         append_int16_cell, append_int32_cell, append_int64_cell, append_uint8_cell,
@@ -107,6 +108,18 @@ impl BoundDirectColumn<'_> {
             Self::LargeBinary { column, array } => {
                 append_varbinary_cell(buf, array, column, row_index, measured_len)
             }
+            Self::FixedSizeBinary {
+                column,
+                classification,
+                array,
+            } => append_fixed_size_binary_cell(
+                buf,
+                array,
+                column,
+                *classification,
+                row_index,
+                measured_len,
+            ),
             Self::Date32 {
                 column,
                 mapping,

@@ -21,8 +21,8 @@ use super::{
     token_row::tiberius_row_owned,
 };
 use crate::conversion::arrow_to_mssql::{
-    primitive::PrimitiveArrowToMssql, temporal::TemporalArrowToMssql,
-    variable_width::VariableWidthArrowToMssql,
+    fixed_size_binary::FixedSizeBinaryArrowToMssql, primitive::PrimitiveArrowToMssql,
+    temporal::TemporalArrowToMssql, variable_width::VariableWidthArrowToMssql,
 };
 
 const DIRECT_RAW_MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
@@ -473,6 +473,9 @@ fn expected_direct_bulk_column_type(column: &DirectColumnPlan) -> Option<tiberiu
             VariableWidthArrowToMssql::BinaryToVarBinary { .. }
             | VariableWidthArrowToMssql::LargeBinaryToVarBinary { .. },
         ) => Some(tiberius::ColumnType::BigVarBin),
+        DirectColumnEncoding::FixedSizeBinary(
+            FixedSizeBinaryArrowToMssql::FixedSizeBinaryToBinary { .. },
+        ) => Some(tiberius::ColumnType::BigBinary),
         DirectColumnEncoding::Temporal(TemporalArrowToMssql::Date32ToDate) => {
             Some(tiberius::ColumnType::Daten)
         }
@@ -1338,6 +1341,65 @@ mod tests {
     }
 
     #[test]
+    fn direct_bulk_target_type_validation_accepts_fixed_size_binary_metadata() {
+        let mappings = vec![fixed_size_binary_mapping_at(0, "digest", 32)];
+        let state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let columns = vec![bulk_target_column_with_type(
+            0,
+            "digest",
+            false,
+            tiberius::ColumnType::BigBinary,
+        )];
+
+        validate_direct_bulk_target_column_types(
+            columns.into_iter(),
+            state.direct_encoder().unwrap().plan(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn direct_bulk_target_type_validation_rejects_fixed_size_binary_as_varbinary() {
+        let mappings = vec![fixed_size_binary_mapping_at(0, "digest", 32)];
+        let state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let columns = vec![bulk_target_column_with_type(
+            0,
+            "digest",
+            false,
+            tiberius::ColumnType::BigVarBin,
+        )];
+
+        let err = validate_direct_bulk_target_column_types(
+            columns.into_iter(),
+            state.direct_encoder().unwrap().plan(),
+        )
+        .unwrap_err();
+
+        let Error::ValueConversion { diagnostics } = err else {
+            panic!("expected value conversion error");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics.all()[0];
+        assert_eq!(diagnostic.code(), DiagnosticCode::SchemaMismatch);
+        assert_eq!(diagnostic.field().map(|field| field.name()), Some("digest"));
+        assert!(diagnostic.message().contains(
+            "bulk target column type BigVarBin does not match direct encoder type BigBinary"
+        ));
+    }
+
+    #[test]
     fn direct_bulk_target_type_validation_accepts_date_metadata() {
         let mappings = vec![
             SchemaMapping::new(
@@ -1825,6 +1887,22 @@ mod tests {
             MssqlColumn::new(
                 Identifier::new(name).unwrap(),
                 MssqlType::VarBinary(MssqlTypeLength::Max),
+                false,
+            ),
+        )
+    }
+
+    fn fixed_size_binary_mapping_at(index: usize, name: &str, length: usize) -> SchemaMapping {
+        SchemaMapping::new(
+            ArrowFieldRef::new(
+                index,
+                name.to_owned(),
+                false,
+                DataType::FixedSizeBinary(i32::try_from(length).unwrap()),
+            ),
+            MssqlColumn::new(
+                Identifier::new(name).unwrap(),
+                MssqlType::Binary(length),
                 false,
             ),
         )

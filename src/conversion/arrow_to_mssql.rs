@@ -2,6 +2,8 @@
 
 /// Decimal Arrow-to-SQL Server conversion classification.
 pub(crate) mod decimal;
+/// Fixed-size binary Arrow-to-SQL Server conversion classification.
+pub(crate) mod fixed_size_binary;
 /// Primitive Arrow-to-SQL Server conversion classification.
 pub(crate) mod primitive;
 /// Temporal Arrow-to-SQL Server conversion classification.

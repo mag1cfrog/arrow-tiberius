@@ -6,11 +6,12 @@ mod measure;
 
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
-    Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
-    Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch,
+    StringArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
+    Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
 };
 
 use super::{
@@ -23,8 +24,9 @@ use super::{
 use crate::{
     DiagnosticCode, NanosecondPolicy, Result, SchemaMapping,
     conversion::arrow_to_mssql::{
-        decimal::DecimalArrowToMssql, primitive::PrimitiveArrowToMssql,
-        temporal::TemporalArrowToMssql, variable_width::VariableWidthArrowToMssql,
+        decimal::DecimalArrowToMssql, fixed_size_binary::FixedSizeBinaryArrowToMssql,
+        primitive::PrimitiveArrowToMssql, temporal::TemporalArrowToMssql,
+        variable_width::VariableWidthArrowToMssql,
     },
 };
 
@@ -227,6 +229,13 @@ fn bind_direct_columns<'a>(
                 column,
                 array: downcast_direct_array::<LargeBinaryArray>(array, column)?,
             },
+            DirectColumnEncoding::FixedSizeBinary(classification) => {
+                BoundDirectColumn::FixedSizeBinary {
+                    column,
+                    classification,
+                    array: downcast_direct_array::<FixedSizeBinaryArray>(array, column)?,
+                }
+            }
             DirectColumnEncoding::Temporal(TemporalArrowToMssql::Date32ToDate) => {
                 BoundDirectColumn::Date32 {
                     column,
@@ -425,6 +434,11 @@ pub(crate) enum BoundDirectColumn<'a> {
         column: &'a plan::DirectColumnPlan,
         array: &'a LargeBinaryArray,
     },
+    FixedSizeBinary {
+        column: &'a plan::DirectColumnPlan,
+        classification: FixedSizeBinaryArrowToMssql,
+        array: &'a FixedSizeBinaryArray,
+    },
     Date32 {
         column: &'a plan::DirectColumnPlan,
         mapping: &'a SchemaMapping,
@@ -521,7 +535,7 @@ fn downcast_direct_array<'a, T: Array + 'static>(
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, Int32Array};
+    use arrow_array::{ArrayRef, FixedSizeBinaryArray, Int32Array};
     use arrow_schema::{DataType, Field, Schema};
 
     use super::*;
@@ -577,6 +591,54 @@ mod tests {
             panic!("LargeBinary mapping should bind to LargeBinaryArray");
         };
         assert_eq!(array.value(0), b"bytes");
+    }
+
+    #[test]
+    fn binds_fixed_size_binary_arrays_to_runtime_variant() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "digest",
+                DataType::FixedSizeBinary(3),
+                MssqlType::Binary(3),
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("digest", DataType::FixedSizeBinary(3), true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![7])) as ArrayRef,
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                        [Some(&b"abc"[..])].into_iter(),
+                        3,
+                    )
+                    .unwrap(),
+                ) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+
+        let BoundDirectColumn::FixedSizeBinary {
+            classification,
+            array,
+            ..
+        } = bound.columns()[1]
+        else {
+            panic!("FixedSizeBinary mapping should bind to FixedSizeBinaryArray");
+        };
+        assert_eq!(
+            classification,
+            FixedSizeBinaryArrowToMssql::FixedSizeBinaryToBinary { length: 3 }
+        );
+        assert_eq!(array.value(0), b"abc");
     }
 
     fn mapping(
