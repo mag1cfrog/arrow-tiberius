@@ -1821,6 +1821,36 @@ mod tests {
     }
 
     #[test]
+    fn write_direct_batch_to_sink_send_failure_preserves_error_and_keeps_stats() {
+        let mappings = vec![mapping("id")];
+        let mut state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingRawSink {
+            fail_on_send: true,
+            payloads: Vec::new(),
+        };
+        let batch = int32_batch("id", &[1, 2, 3]);
+
+        let err =
+            poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch)).unwrap_err();
+
+        let Error::Tiberius { source } = err else {
+            panic!("expected tiberius error");
+        };
+        assert_eq!(
+            source.to_string(),
+            "BULK UPLOAD input failure: fake raw send failure"
+        );
+        assert!(sink.payloads.is_empty());
+        assert_eq!(state.stats(), WriteStats::default());
+    }
+
+    #[test]
     fn writer_types_are_exported_from_crate_root() {
         assert_eq!(crate::WriteBackend::default(), WriteBackend::Auto);
         assert_eq!(crate::WriteOptions::default(), WriteOptions::default());
