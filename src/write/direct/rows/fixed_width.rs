@@ -1,8 +1,9 @@
 //! Fixed-width primitive direct TDS row layout.
 
 use arrow_array::{
-    Array, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, BooleanArray, Date32Array, Date64Array, FixedSizeBinaryArray, Float32Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, UInt8Array, UInt16Array,
+    UInt32Array, UInt64Array,
 };
 
 #[cfg(test)]
@@ -11,7 +12,8 @@ use std::cell::Cell;
 use crate::{
     Diagnostic, DiagnosticCode, Error, FieldRef, NanosecondPolicy, Result, SchemaMapping,
     conversion::arrow_to_mssql::{
-        primitive::PrimitiveArrowToMssql, temporal::TemporalArrowToMssql,
+        fixed_size_binary::FixedSizeBinaryArrowToMssql, primitive::PrimitiveArrowToMssql,
+        temporal::TemporalArrowToMssql,
     },
     mssql::cell::{
         MssqlDateTime2, MssqlDateTimeOffset, MssqlTime,
@@ -56,6 +58,9 @@ use super::super::{
 
 const ROW_TOKEN_LEN: usize = 1;
 const CELL_LEN_PREFIX_LEN: usize = 1;
+// TDS `BigBinary` cells, used for SQL Server `binary(n)`, carry a two-byte
+// little-endian length prefix. Null uses the same two bytes as `0xffff`.
+const FIXED_SIZE_BINARY_LEN_PREFIX_LEN: usize = 2;
 
 #[cfg(test)]
 thread_local! {
@@ -78,6 +83,7 @@ struct FixedWidthColumn<'a> {
     plan: &'a DirectColumnPlan,
     mapping: Option<&'a SchemaMapping>,
     non_null_cell_len: usize,
+    null_cell_len: usize,
 }
 
 /// Encodes fixed-size direct columns without building a full per-cell row
@@ -209,6 +215,19 @@ fn encode_fixed_width_rows(
                 array,
             } => {
                 fill_float64_fixed_width_column(array, plan, &mut current_offsets, &mut bytes)?;
+            }
+            BoundDirectColumn::FixedSizeBinary {
+                column: plan,
+                classification,
+                array,
+            } => {
+                fill_fixed_size_binary_fixed_width_column(
+                    array,
+                    plan,
+                    *classification,
+                    &mut current_offsets,
+                    &mut bytes,
+                )?;
             }
             BoundDirectColumn::Date32 {
                 column: plan,
@@ -591,12 +610,14 @@ fn fixed_width_columns<'a>(
     for column in columns {
         let (plan, mapping) = fixed_width_column_parts(column)?;
         let non_null_cell_len = fixed_width_non_null_cell_len(plan)?;
+        let null_cell_len = fixed_width_null_cell_len(plan)?;
 
         fixed_width_columns.push(FixedWidthColumn {
             column,
             plan,
             mapping,
             non_null_cell_len,
+            null_cell_len,
         });
     }
 
@@ -623,6 +644,7 @@ fn measure_fixed_width_rows(
             add_nullable_fixed_width_column_lengths(
                 array,
                 column.non_null_cell_len,
+                column.null_cell_len,
                 &mut row_lengths,
             )?;
         } else {
@@ -668,7 +690,8 @@ fn fixed_width_column_parts<'a>(
         | BoundDirectColumn::UInt32 { column, .. }
         | BoundDirectColumn::UInt64 { column, .. }
         | BoundDirectColumn::Float32 { column, .. }
-        | BoundDirectColumn::Float64 { column, .. } => Some((column, None)),
+        | BoundDirectColumn::Float64 { column, .. }
+        | BoundDirectColumn::FixedSizeBinary { column, .. } => Some((column, None)),
         BoundDirectColumn::Date32 {
             column, mapping, ..
         }
@@ -719,8 +742,7 @@ fn fixed_width_column_parts<'a>(
         | BoundDirectColumn::Utf8 { .. }
         | BoundDirectColumn::LargeUtf8 { .. }
         | BoundDirectColumn::Binary { .. }
-        | BoundDirectColumn::LargeBinary { .. }
-        | BoundDirectColumn::FixedSizeBinary { .. } => None,
+        | BoundDirectColumn::LargeBinary { .. } => None,
     }
 }
 
@@ -737,6 +759,7 @@ fn fixed_width_column_array<'a>(column: &'a BoundDirectColumn<'a>) -> &'a dyn Ar
         BoundDirectColumn::UInt64 { array, .. } => *array,
         BoundDirectColumn::Float32 { array, .. } => *array,
         BoundDirectColumn::Float64 { array, .. } => *array,
+        BoundDirectColumn::FixedSizeBinary { array, .. } => *array,
         BoundDirectColumn::Date32 { array, .. } => *array,
         BoundDirectColumn::Date64 { array, .. } => *array,
         BoundDirectColumn::TimestampSecond { array, .. } => *array,
@@ -759,8 +782,7 @@ fn fixed_width_column_array<'a>(column: &'a BoundDirectColumn<'a>) -> &'a dyn Ar
         | BoundDirectColumn::Utf8 { .. }
         | BoundDirectColumn::LargeUtf8 { .. }
         | BoundDirectColumn::Binary { .. }
-        | BoundDirectColumn::LargeBinary { .. }
-        | BoundDirectColumn::FixedSizeBinary { .. } => {
+        | BoundDirectColumn::LargeBinary { .. } => {
             unreachable!("only fixed-width columns are measured")
         }
     }
@@ -780,11 +802,12 @@ fn add_non_nullable_fixed_width_column_lengths(
 fn add_nullable_fixed_width_column_lengths(
     array: &dyn Array,
     non_null_cell_len: usize,
+    null_cell_len: usize,
     row_lengths: &mut [usize],
 ) -> Result<()> {
     for (row_index, row_length) in row_lengths.iter_mut().enumerate() {
         let cell_len = if array.is_null(row_index) {
-            CELL_LEN_PREFIX_LEN
+            null_cell_len
         } else {
             non_null_cell_len
         };
@@ -833,6 +856,9 @@ fn validate_fixed_width_timestamp_timezone_metadata(
 
 fn fixed_width_non_null_cell_len(column: &DirectColumnPlan) -> Option<usize> {
     match column.encoding() {
+        DirectColumnEncoding::FixedSizeBinary(
+            FixedSizeBinaryArrowToMssql::FixedSizeBinaryToBinary { length },
+        ) => length.checked_add(FIXED_SIZE_BINARY_LEN_PREFIX_LEN),
         DirectColumnEncoding::Temporal(
             TemporalArrowToMssql::Date32ToDate | TemporalArrowToMssql::Date64ToDateTime2,
         ) if profile::direct_date_fast_path_disabled() => None,
@@ -879,6 +905,13 @@ fn fixed_width_non_null_cell_len(column: &DirectColumnPlan) -> Option<usize> {
     }
 }
 
+fn fixed_width_null_cell_len(column: &DirectColumnPlan) -> Option<usize> {
+    match column.encoding() {
+        DirectColumnEncoding::FixedSizeBinary(_) => Some(FIXED_SIZE_BINARY_LEN_PREFIX_LEN),
+        _ => Some(CELL_LEN_PREFIX_LEN),
+    }
+}
+
 fn fixed_width_value_len(encoding: DirectColumnEncoding) -> Option<usize> {
     match encoding {
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::BooleanToBit) => Some(1),
@@ -893,10 +926,10 @@ fn fixed_width_value_len(encoding: DirectColumnEncoding) -> Option<usize> {
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt64ToCheckedBigInt) => Some(8),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal) => Some(4),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => Some(8),
+        DirectColumnEncoding::FixedSizeBinary(_) => None,
         DirectColumnEncoding::UInt64Decimal20_0 => None,
         DirectColumnEncoding::Decimal(_) => None,
         DirectColumnEncoding::VariableWidth(_) => None,
-        DirectColumnEncoding::FixedSizeBinary(_) => None,
         DirectColumnEncoding::Temporal(_) => None,
     }
 }
@@ -1157,6 +1190,56 @@ fn fill_float64_fixed_width_column(
         } else {
             bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
             *current_offset += 8;
+        }
+    }
+
+    Ok(())
+}
+
+fn fill_fixed_size_binary_fixed_width_column(
+    array: &FixedSizeBinaryArray,
+    column: &DirectColumnPlan,
+    classification: FixedSizeBinaryArrowToMssql,
+    current_offsets: &mut [usize],
+    bytes: &mut [u8],
+) -> Result<()> {
+    let length = match classification {
+        FixedSizeBinaryArrowToMssql::FixedSizeBinaryToBinary { length } => length,
+    };
+    let prefix = u16::try_from(length)
+        .map_err(|_| invalid_payload("fixed-size binary length does not fit u16"))?
+        .to_le_bytes();
+
+    for row_index in 0..array.len() {
+        let offset = current_offsets[row_index];
+        if array.is_null(row_index) {
+            if !column.nullable() {
+                return Err(first_null_error(array, column));
+            }
+
+            bytes[offset..offset + FIXED_SIZE_BINARY_LEN_PREFIX_LEN]
+                .copy_from_slice(&u16::MAX.to_le_bytes());
+            current_offsets[row_index] += FIXED_SIZE_BINARY_LEN_PREFIX_LEN;
+        } else {
+            let value = array.value(row_index);
+            if value.len() != length {
+                return Err(value_conversion_error(row_column_diagnostic(
+                    column,
+                    row_index,
+                    DiagnosticCode::ValueTypeMismatch,
+                    format!(
+                        "fixed-size binary value has {} byte(s), but planned {} requires exactly {length}",
+                        value.len(),
+                        column.target_type().to_sql()
+                    ),
+                )));
+            }
+
+            bytes[offset..offset + FIXED_SIZE_BINARY_LEN_PREFIX_LEN].copy_from_slice(&prefix);
+            bytes[offset + FIXED_SIZE_BINARY_LEN_PREFIX_LEN
+                ..offset + FIXED_SIZE_BINARY_LEN_PREFIX_LEN + length]
+                .copy_from_slice(value);
+            current_offsets[row_index] += FIXED_SIZE_BINARY_LEN_PREFIX_LEN + length;
         }
     }
 
