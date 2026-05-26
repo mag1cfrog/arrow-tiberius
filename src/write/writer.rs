@@ -1669,6 +1669,49 @@ mod tests {
     }
 
     #[test]
+    fn write_direct_batch_to_sink_accumulates_multi_batch_stats() {
+        let mappings = vec![mapping("id")];
+        let mut state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingRawSink::default();
+
+        let first = poll_ready(write_direct_batch_to_sink(
+            &mut state,
+            &mut sink,
+            &int32_batch("id", &[10, 20]),
+        ))
+        .unwrap();
+        let second = poll_ready(write_direct_batch_to_sink(
+            &mut state,
+            &mut sink,
+            &int32_batch("id", &[30]),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            first,
+            WriteStats {
+                rows_written: 2,
+                batches_written: 1
+            }
+        );
+        assert_eq!(
+            second,
+            WriteStats {
+                rows_written: 3,
+                batches_written: 2
+            }
+        );
+        assert_eq!(sink.payloads.len(), 2);
+        assert_eq!(sink.payloads[1].bytes, vec![0xD1, 30, 0, 0, 0]);
+    }
+
+    #[test]
     fn write_direct_batch_to_sink_chunks_measured_payloads_by_byte_limit() {
         let mappings = vec![binary_mapping_at(0, "payload")];
         let mut state = WriterState::new(
@@ -1815,6 +1858,36 @@ mod tests {
             diagnostics.all()[0]
                 .message()
                 .contains("runtime Arrow type Float64")
+        );
+        assert!(sink.payloads.is_empty());
+        assert_eq!(state.stats(), WriteStats::default());
+    }
+
+    #[test]
+    fn write_direct_batch_to_sink_send_failure_preserves_error_and_keeps_stats() {
+        let mappings = vec![mapping("id")];
+        let mut state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingRawSink {
+            fail_on_send: true,
+            payloads: Vec::new(),
+        };
+        let batch = int32_batch("id", &[1, 2, 3]);
+
+        let err =
+            poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch)).unwrap_err();
+
+        let Error::Tiberius { source } = err else {
+            panic!("expected tiberius error");
+        };
+        assert_eq!(
+            source.to_string(),
+            "BULK UPLOAD input failure: fake raw send failure"
         );
         assert!(sink.payloads.is_empty());
         assert_eq!(state.stats(), WriteStats::default());
