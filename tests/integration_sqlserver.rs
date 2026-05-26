@@ -20,9 +20,9 @@ use arrow_data::ArrayData;
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use arrow_tiberius::{
     ArrowFieldRef, BulkWriter, Date64Policy, DecimalPolicy, DiagnosticCode, Error, Identifier,
-    MssqlColumn, MssqlProfile, MssqlType, NanosecondPolicy, PlanOptions, SchemaMapping, TableName,
-    TimezonePolicy, UInt64Policy, WriteBackend, WriteOptions, create_table_sql_from_mappings,
-    plan_arrow_schema_to_mssql_mappings,
+    MssqlColumn, MssqlProfile, MssqlType, MssqlTypeLength, NanosecondPolicy, PlanOptions,
+    SchemaMapping, TableName, TimezonePolicy, UInt64Policy, WriteBackend, WriteOptions,
+    create_table_sql_from_mappings, plan_arrow_schema_to_mssql_mappings,
 };
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -3053,6 +3053,90 @@ async fn baseline_writer_rejects_target_table_schema_drift() -> TestResult<()> {
             writer.finish().await?.rows_written,
             0,
             "finish rows_written",
+        )?;
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    let drop_result = drop_table(&mut client, &table).await;
+    result?;
+    drop_result?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn direct_raw_writer_rejects_unsupported_schema_without_partial_insert() -> TestResult<()> {
+    let Some((connection_string, database)) = integration_config() else {
+        eprintln!(
+            "skipping SQL Server direct raw unsupported schema integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+        );
+        return Ok(());
+    };
+
+    let mut client = connect(&connection_string, &database).await?;
+    let table = unique_table_name()?;
+    let mappings = vec![SchemaMapping::new(
+        ArrowFieldRef::new(
+            0,
+            "list_value".to_owned(),
+            true,
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+        ),
+        MssqlColumn::new(
+            Identifier::new("list_value")?,
+            MssqlType::NVarChar(MssqlTypeLength::Max),
+            true,
+        ),
+    )];
+
+    execute_sql(
+        &mut client,
+        create_table_sql_from_mappings(&table, &mappings),
+    )
+    .await?;
+
+    let result = async {
+        let err = match BulkWriter::new(
+            &mut client,
+            table.clone(),
+            mappings,
+            WriteOptions {
+                backend: WriteBackend::DirectRawBulk,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        {
+            Ok(writer) => {
+                let _stats = writer.finish().await?;
+                return Err(test_error("unsupported direct raw schema was accepted"));
+            }
+            Err(err) => err,
+        };
+
+        let diagnostics = match err {
+            Error::DirectEncoding { diagnostics } => diagnostics,
+            other => {
+                return Err(test_error(format!(
+                    "expected direct encoding error, got {other}"
+                )));
+            }
+        };
+
+        ensure(
+            diagnostics.all().iter().any(|diagnostic| {
+                diagnostic.code() == DiagnosticCode::DirectEncodingUnsupportedMapping
+                    && diagnostic.message().contains("list_value")
+            }),
+            "unsupported direct schema diagnostic should mention list_value",
+        )?;
+
+        ensure_eq(
+            select_count(&mut client, &table).await?,
+            0,
+            "row count after rejected direct writer creation",
         )?;
 
         Ok::<(), Box<dyn std::error::Error>>(())
