@@ -11,6 +11,10 @@ Selected local result notes live under `docs/benchmark-results/` when they are
 useful for development decisions and include enough environment detail to be
 interpretable.
 
+The current curated direct raw comparison summary lives in
+`docs/direct-raw-benchmark-comparison.md`. Prefer that summary over raw local
+benchmark logs when evaluating the direct backend.
+
 ## Prerequisites
 
 - Rust toolchain for this workspace.
@@ -34,6 +38,10 @@ Current scenarios are:
 - `wide_mixed`: ingestion-style ids, event time, categories, text, and binary
   payloads.
 - `decimal_temporal`: finance-style decimals, dates, and timestamps.
+- `fixed_width_128`: one hundred twenty-eight small fixed-width primitive
+  columns for encoder-path isolation.
+- `decimal_temporal_128`: one hundred twenty-eight decimal and temporal
+  columns for encoder-path isolation.
 - `string_heavy`: large variable text and binary payload rows.
 - `wide_sparse`: thirty-two mixed columns with sparse nullable values.
 - `tpch_lineitem_like`: TPC-H lineitem-inspired transport workload without
@@ -127,8 +135,8 @@ string values, binary values, and temporal values.
 Use `direct-raw` in compare runs to measure this crate's raw TDS encoder through
 the normal `WriteBackend::DirectRawBulk` writer path. Current direct benchmark
 coverage includes primitive rows, variable-width text and binary rows, UInt64
-policy rows, decimal and temporal rows, fixed-size binary rows, and mixed
-direct-supported schemas.
+policy rows, decimal and temporal rows, fixed-size binary rows, wide fixed-width
+rows, wide decimal and temporal rows, and mixed direct-supported schemas.
 
 For stable comparisons, prefer runs long enough that setup noise and timer
 resolution do not dominate the result. Very short runs are useful as smoke
