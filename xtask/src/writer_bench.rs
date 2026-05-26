@@ -2309,6 +2309,7 @@ const DIRECT_RAW_SUPPORTED_SCENARIOS: &[&str] = &[
     UINT64_POLICY_SCENARIO.name,
     DATE_FAST_PATH_SCENARIO.name,
     MIXED_NULLABLE_SCENARIO.name,
+    DECIMAL_TEMPORAL_SCENARIO.name,
     STRING_HEAVY_SCENARIO.name,
     STRING_HEAVY_TEXT_ONLY_SCENARIO.name,
     STRING_HEAVY_BINARY_ONLY_SCENARIO.name,
@@ -6169,6 +6170,7 @@ mod tests {
             "uint64_policy",
             "date_fast_path",
             "mixed_nullable",
+            "decimal_temporal",
             "string_heavy",
             "string_heavy_text_only",
             "string_heavy_binary_only",
@@ -6200,7 +6202,7 @@ mod tests {
 
     #[test]
     fn compare_rejects_direct_raw_for_unsupported_scenarios() {
-        for scenario in ["wide_mixed", "decimal_temporal", "tpch_lineitem_like"] {
+        for scenario in ["wide_mixed", "tpch_lineitem_like"] {
             let args = [
                 OsString::from("--scenario"),
                 OsString::from(scenario),
@@ -6220,6 +6222,7 @@ mod tests {
                         && message.contains("uint64_policy")
                         && message.contains("date_fast_path")
                         && message.contains("mixed_nullable")
+                        && message.contains("decimal_temporal")
                         && message.contains("string_heavy")
                         && message.contains("string_heavy_text_only")
                         && message.contains("string_heavy_binary_only")
