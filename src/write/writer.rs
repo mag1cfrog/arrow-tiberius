@@ -1669,6 +1669,49 @@ mod tests {
     }
 
     #[test]
+    fn write_direct_batch_to_sink_accumulates_multi_batch_stats() {
+        let mappings = vec![mapping("id")];
+        let mut state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingRawSink::default();
+
+        let first = poll_ready(write_direct_batch_to_sink(
+            &mut state,
+            &mut sink,
+            &int32_batch("id", &[10, 20]),
+        ))
+        .unwrap();
+        let second = poll_ready(write_direct_batch_to_sink(
+            &mut state,
+            &mut sink,
+            &int32_batch("id", &[30]),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            first,
+            WriteStats {
+                rows_written: 2,
+                batches_written: 1
+            }
+        );
+        assert_eq!(
+            second,
+            WriteStats {
+                rows_written: 3,
+                batches_written: 2
+            }
+        );
+        assert_eq!(sink.payloads.len(), 2);
+        assert_eq!(sink.payloads[1].bytes, vec![0xD1, 30, 0, 0, 0]);
+    }
+
+    #[test]
     fn write_direct_batch_to_sink_chunks_measured_payloads_by_byte_limit() {
         let mappings = vec![binary_mapping_at(0, "payload")];
         let mut state = WriterState::new(
