@@ -1210,8 +1210,8 @@ fn fill_fixed_size_binary_fixed_width_column(
         .map_err(|_| invalid_payload("fixed-size binary length does not fit u16"))?
         .to_le_bytes();
 
-    for row_index in 0..array.len() {
-        let offset = current_offsets[row_index];
+    for (row_index, current_offset) in current_offsets.iter_mut().enumerate().take(array.len()) {
+        let offset = *current_offset;
         if array.is_null(row_index) {
             if !column.nullable() {
                 return Err(first_null_error(array, column));
@@ -1219,7 +1219,7 @@ fn fill_fixed_size_binary_fixed_width_column(
 
             bytes[offset..offset + FIXED_SIZE_BINARY_LEN_PREFIX_LEN]
                 .copy_from_slice(&u16::MAX.to_le_bytes());
-            current_offsets[row_index] += FIXED_SIZE_BINARY_LEN_PREFIX_LEN;
+            *current_offset += FIXED_SIZE_BINARY_LEN_PREFIX_LEN;
         } else {
             let value = array.value(row_index);
             if value.len() != length {
@@ -1239,7 +1239,7 @@ fn fill_fixed_size_binary_fixed_width_column(
             bytes[offset + FIXED_SIZE_BINARY_LEN_PREFIX_LEN
                 ..offset + FIXED_SIZE_BINARY_LEN_PREFIX_LEN + length]
                 .copy_from_slice(value);
-            current_offsets[row_index] += FIXED_SIZE_BINARY_LEN_PREFIX_LEN + length;
+            *current_offset += FIXED_SIZE_BINARY_LEN_PREFIX_LEN + length;
         }
     }
 
