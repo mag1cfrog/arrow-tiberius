@@ -3255,7 +3255,7 @@ async fn direct_raw_writer_rejects_unsupported_schema_without_partial_insert() -
         ensure(
             diagnostics.all().iter().any(|diagnostic| {
                 diagnostic.code() == DiagnosticCode::DirectEncodingUnsupportedMapping
-                    && diagnostic.message().contains("list_value")
+                    && diagnostic.field().map(|field| field.name()) == Some("list_value")
             }),
             "unsupported direct schema diagnostic should mention list_value",
         )?;
