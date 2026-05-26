@@ -364,6 +364,103 @@ async fn direct_raw_writer_round_trips_fixed_size_binary_values() -> TestResult<
     .await
 }
 
+#[tokio::test]
+async fn direct_raw_writer_round_trips_fixed_size_binary_with_variable_width_values()
+-> TestResult<()> {
+    let Some((connection_string, database)) = integration_config() else {
+        eprintln!(
+            "skipping SQL Server direct raw fixed-size binary mixed integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+        );
+        return Ok(());
+    };
+
+    let mut client = connect(&connection_string, &database).await?;
+    let table = unique_table_name()?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::Int32, false),
+        Field::new("label", DataType::Utf8, true),
+        Field::new("digest", DataType::FixedSizeBinary(3), true),
+    ]));
+    let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
+        Arc::clone(&schema),
+        MssqlProfile::sql_server_2016_compat_100(),
+        PlanOptions::default(),
+    )?
+    .into_parts();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1_i32, 2, 3])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("alpha"), None, Some("Tokyo")])),
+            Arc::new(FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                [Some(&b"abc"[..]), None, Some(&b"\x00\xff\x7f"[..])].into_iter(),
+                3,
+            )?),
+        ],
+    )?;
+
+    execute_sql(
+        &mut client,
+        create_table_sql_from_mappings(&table, &mappings),
+    )
+    .await?;
+
+    let result = async {
+        let mut writer = BulkWriter::new(
+            &mut client,
+            table.clone(),
+            mappings,
+            WriteOptions {
+                backend: WriteBackend::DirectRawBulk,
+                ..WriteOptions::default()
+            },
+        )
+        .await?;
+        let stats = writer.write_batch(&batch).await?;
+
+        ensure_eq(stats.rows_written, 3, "rows_written")?;
+        ensure_eq(stats.batches_written, 1, "batches_written")?;
+        ensure_eq(writer.finish().await?, stats, "finish stats")?;
+
+        let rows = client
+            .simple_query(format!(
+                "SELECT [row_id], [label], [digest] FROM {} ORDER BY [row_id]",
+                table.quoted_sql()
+            ))
+            .await?
+            .into_first_result()
+            .await?;
+
+        ensure_eq(rows.len(), 3, "row count")?;
+        ensure_eq(rows[0].get::<i32, _>(0), Some(1), "row 0 row_id")?;
+        ensure_eq(rows[0].get::<&str, _>(1), Some("alpha"), "row 0 label")?;
+        ensure_eq(
+            rows[0].get::<&[u8], _>(2),
+            Some(&b"abc"[..]),
+            "row 0 digest",
+        )?;
+        ensure_eq(rows[1].get::<i32, _>(0), Some(2), "row 1 row_id")?;
+        ensure_eq(rows[1].get::<&str, _>(1), None, "row 1 label")?;
+        ensure_eq(rows[1].get::<&[u8], _>(2), None, "row 1 digest")?;
+        ensure_eq(rows[2].get::<i32, _>(0), Some(3), "row 2 row_id")?;
+        ensure_eq(rows[2].get::<&str, _>(1), Some("Tokyo"), "row 2 label")?;
+        ensure_eq(
+            rows[2].get::<&[u8], _>(2),
+            Some(&b"\x00\xff\x7f"[..]),
+            "row 2 digest",
+        )?;
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    let drop_result = drop_table(&mut client, &table).await;
+    result?;
+    drop_result?;
+
+    Ok(())
+}
+
 async fn round_trip_fixed_size_binary_values(
     backend: WriteBackend,
     skip_context: &str,
