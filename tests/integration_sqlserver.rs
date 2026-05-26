@@ -20,9 +20,9 @@ use arrow_data::ArrayData;
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use arrow_tiberius::{
     ArrowFieldRef, BulkWriter, Date64Policy, DecimalPolicy, DiagnosticCode, Error, Identifier,
-    MssqlColumn, MssqlProfile, MssqlType, NanosecondPolicy, PlanOptions, SchemaMapping, TableName,
-    TimezonePolicy, UInt64Policy, WriteBackend, WriteOptions, create_table_sql_from_mappings,
-    plan_arrow_schema_to_mssql_mappings,
+    MssqlColumn, MssqlProfile, MssqlType, MssqlTypeLength, NanosecondPolicy, PlanOptions,
+    SchemaMapping, TableName, TimezonePolicy, UInt64Policy, WriteBackend, WriteOptions,
+    create_table_sql_from_mappings, plan_arrow_schema_to_mssql_mappings,
 };
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -342,6 +342,133 @@ async fn baseline_writer_round_trips_supported_value_matrix() -> TestResult<()> 
     let drop_result = drop_table(&mut client, &table).await;
     result?;
     drop_result?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn writer_round_trips_empty_and_multi_batch_values_across_supported_backends()
+-> TestResult<()> {
+    let Some((connection_string, database)) = integration_config() else {
+        eprintln!(
+            "skipping SQL Server writer empty and multi-batch parity test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+        );
+        return Ok(());
+    };
+
+    let mut client = connect(&connection_string, &database).await?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::Int32, false),
+        Field::new("label", DataType::Utf8, true),
+        Field::new("payload", DataType::Binary, true),
+    ]));
+    let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
+        Arc::clone(&schema),
+        MssqlProfile::sql_server_2016_compat_100(),
+        PlanOptions::default(),
+    )?
+    .into_parts();
+    let empty_batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int32Array::from(Vec::<i32>::new())) as ArrayRef,
+            Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
+            Arc::new(BinaryArray::from_iter(Vec::<Option<&[u8]>>::new())),
+        ],
+    )?;
+    let first_batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int32Array::from(vec![1_i32, 2])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some(""), Some("東京")])),
+            Arc::new(BinaryArray::from_iter(vec![
+                Some(&b""[..]),
+                Some(&b"\x00\xff"[..]),
+            ])),
+        ],
+    )?;
+    let second_batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int32Array::from(vec![3_i32, 4])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("emoji 😀"), None])),
+            Arc::new(BinaryArray::from_iter(vec![Some(&b"abc"[..]), None])),
+        ],
+    )?;
+
+    for backend in [WriteBackend::BaselineTokenRow, WriteBackend::DirectRawBulk] {
+        let table = unique_table_name()?;
+
+        execute_sql(
+            &mut client,
+            create_table_sql_from_mappings(&table, &mappings),
+        )
+        .await?;
+
+        let result = async {
+            let mut writer = BulkWriter::new(
+                &mut client,
+                table.clone(),
+                mappings.clone(),
+                WriteOptions {
+                    backend,
+                    ..WriteOptions::default()
+                },
+            )
+            .await?;
+
+            let empty_stats = writer.write_batch(&empty_batch).await?;
+            ensure_eq(empty_stats.rows_written, 0, "empty rows_written")?;
+            ensure_eq(empty_stats.batches_written, 1, "empty batches_written")?;
+
+            let first_stats = writer.write_batch(&first_batch).await?;
+            ensure_eq(first_stats.rows_written, 2, "first rows_written")?;
+            ensure_eq(first_stats.batches_written, 2, "first batches_written")?;
+
+            let second_stats = writer.write_batch(&second_batch).await?;
+            ensure_eq(second_stats.rows_written, 4, "second rows_written")?;
+            ensure_eq(second_stats.batches_written, 3, "second batches_written")?;
+            ensure_eq(writer.finish().await?, second_stats, "finish stats")?;
+
+            let rows = client
+                .simple_query(format!(
+                    "SELECT [row_id], [label], [payload] FROM {} ORDER BY [row_id]",
+                    table.quoted_sql()
+                ))
+                .await?
+                .into_first_result()
+                .await?;
+
+            ensure_eq(rows.len(), 4, "row count")?;
+            ensure_eq(rows[0].get::<i32, _>(0), Some(1), "row 0 row_id")?;
+            ensure_eq(rows[0].get::<&str, _>(1), Some(""), "row 0 label")?;
+            ensure_eq(rows[0].get::<&[u8], _>(2), Some(&b""[..]), "row 0 payload")?;
+            ensure_eq(rows[1].get::<i32, _>(0), Some(2), "row 1 row_id")?;
+            ensure_eq(rows[1].get::<&str, _>(1), Some("東京"), "row 1 label")?;
+            ensure_eq(
+                rows[1].get::<&[u8], _>(2),
+                Some(&b"\x00\xff"[..]),
+                "row 1 payload",
+            )?;
+            ensure_eq(rows[2].get::<i32, _>(0), Some(3), "row 2 row_id")?;
+            ensure_eq(rows[2].get::<&str, _>(1), Some("emoji 😀"), "row 2 label")?;
+            ensure_eq(
+                rows[2].get::<&[u8], _>(2),
+                Some(&b"abc"[..]),
+                "row 2 payload",
+            )?;
+            ensure_eq(rows[3].get::<i32, _>(0), Some(4), "row 3 row_id")?;
+            ensure_eq(rows[3].get::<&str, _>(1), None, "row 3 label")?;
+            ensure_eq(rows[3].get::<&[u8], _>(2), None, "row 3 payload")?;
+
+            Ok::<(), Box<dyn std::error::Error>>(())
+        }
+        .await;
+
+        let drop_result = drop_table(&mut client, &table).await;
+        result?;
+        drop_result?;
+    }
 
     Ok(())
 }
@@ -3053,6 +3180,90 @@ async fn baseline_writer_rejects_target_table_schema_drift() -> TestResult<()> {
             writer.finish().await?.rows_written,
             0,
             "finish rows_written",
+        )?;
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    let drop_result = drop_table(&mut client, &table).await;
+    result?;
+    drop_result?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn direct_raw_writer_rejects_unsupported_schema_without_partial_insert() -> TestResult<()> {
+    let Some((connection_string, database)) = integration_config() else {
+        eprintln!(
+            "skipping SQL Server direct raw unsupported schema integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+        );
+        return Ok(());
+    };
+
+    let mut client = connect(&connection_string, &database).await?;
+    let table = unique_table_name()?;
+    let mappings = vec![SchemaMapping::new(
+        ArrowFieldRef::new(
+            0,
+            "list_value".to_owned(),
+            true,
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+        ),
+        MssqlColumn::new(
+            Identifier::new("list_value")?,
+            MssqlType::NVarChar(MssqlTypeLength::Max),
+            true,
+        ),
+    )];
+
+    execute_sql(
+        &mut client,
+        create_table_sql_from_mappings(&table, &mappings),
+    )
+    .await?;
+
+    let result = async {
+        let err = match BulkWriter::new(
+            &mut client,
+            table.clone(),
+            mappings,
+            WriteOptions {
+                backend: WriteBackend::DirectRawBulk,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        {
+            Ok(writer) => {
+                let _stats = writer.finish().await?;
+                return Err(test_error("unsupported direct raw schema was accepted"));
+            }
+            Err(err) => err,
+        };
+
+        let diagnostics = match err {
+            Error::DirectEncoding { diagnostics } => diagnostics,
+            other => {
+                return Err(test_error(format!(
+                    "expected direct encoding error, got {other}"
+                )));
+            }
+        };
+
+        ensure(
+            diagnostics.all().iter().any(|diagnostic| {
+                diagnostic.code() == DiagnosticCode::DirectEncodingUnsupportedMapping
+                    && diagnostic.field().map(|field| field.name()) == Some("list_value")
+            }),
+            "unsupported direct schema diagnostic should mention list_value",
+        )?;
+
+        ensure_eq(
+            select_count(&mut client, &table).await?,
+            0,
+            "row count after rejected direct writer creation",
         )?;
 
         Ok::<(), Box<dyn std::error::Error>>(())
