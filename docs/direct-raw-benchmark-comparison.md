@@ -43,6 +43,10 @@ size, SQL Server image, machine, and benchmark command shape.
 - `decimal_temporal_128` is intentionally excluded from `arrow-odbc` and
   `odbc-bcp` comparisons because this scenario includes time mappings that the
   benchmark reference runners do not support consistently.
+- `string_heavy_unicode` is intentionally excluded from `arrow-odbc`
+  comparisons. The runner writes this scenario without preserving the BMP
+  Unicode tenant sentinel, so it is not a lossless reference backend for this
+  workload.
 
 ## Results
 
@@ -331,11 +335,97 @@ cost. `direct-raw` spent 38.701s in `append_encode`, compared with 9.909s in
 the `decimal_temporal` profile rerun. Unlike `fixed_width_128`, the
 fixed-width fast path is also modestly faster end-to-end here.
 
+### string_heavy_binary_only
+
+Command:
+
+```sh
+cargo run --release -p xtask -- writer-bench compare \
+  --container-runtime podman \
+  --backends baseline,direct-framed,direct-raw,arrow-odbc,odbc-bcp \
+  --rows 1000000 \
+  --batch-size 8192 \
+  --repeat 3 \
+  --scenario string_heavy_binary_only \
+  --keep-runner-image
+```
+
+Rows written per backend: 3,000,000.
+
+| Backend | Rows/sec | Relative to baseline | Measured write time |
+| --- | ---: | ---: | ---: |
+| `baseline` | 23,798.27 | 1.00x | 126.060s |
+| `direct-framed` | 30,510.24 | 1.28x | 98.328s |
+| `direct-raw` | 29,612.96 | 1.24x | 101.307s |
+| `arrow-odbc` | 15,677.26 | 0.66x | 191.360s |
+| `odbc-bcp` | 21,315.14 | 0.90x | 140.745s |
+
+Observation: for large binary-heavy `varbinary(max)` rows, both direct Tiberius
+paths are faster than the baseline and both ODBC reference paths. This scenario
+is a payload-heavy end-to-end comparison rather than an encoder isolation
+benchmark, so the result mostly reflects the full write path for large binary
+values.
+
+### string_heavy_unicode
+
+Command:
+
+```sh
+cargo run --release -p xtask -- writer-bench compare \
+  --container-runtime podman \
+  --backends baseline,direct-framed,direct-raw,odbc-bcp \
+  --rows 250000 \
+  --batch-size 8192 \
+  --repeat 3 \
+  --scenario string_heavy_unicode \
+  --keep-runner-image
+```
+
+Rows written per backend: 750,000.
+
+| Backend | Rows/sec | Relative to baseline | Measured write time |
+| --- | ---: | ---: | ---: |
+| `baseline` | 8,765.53 | 1.00x | 85.562s |
+| `direct-framed` | 9,304.07 | 1.06x | 80.609s |
+| `direct-raw` | 9,201.36 | 1.05x | 81.509s |
+| `odbc-bcp` | 7,815.92 | 0.89x | 95.958s |
+
+Observation: for large BMP Unicode `nvarchar(max)` rows, both direct Tiberius
+paths are modestly faster than the baseline and the BCP reference path. The
+improvement is smaller than `string_heavy_binary_only`, which is expected for a
+Unicode text workload dominated by payload encoding and SQL Server write costs.
+
+### wide_sparse
+
+Command:
+
+```sh
+cargo run --release -p xtask -- writer-bench compare \
+  --container-runtime podman \
+  --backends baseline,direct-framed,direct-raw,arrow-odbc,odbc-bcp \
+  --rows 3000000 \
+  --batch-size 8192 \
+  --repeat 3 \
+  --scenario wide_sparse \
+  --keep-runner-image
+```
+
+Rows written per backend: 9,000,000.
+
+| Backend | Rows/sec | Relative to baseline | Measured write time |
+| --- | ---: | ---: | ---: |
+| `baseline` | 117,177.04 | 1.00x | 76.807s |
+| `direct-framed` | 117,992.18 | 1.01x | 76.276s |
+| `direct-raw` | 119,461.34 | 1.02x | 75.338s |
+| `arrow-odbc` | 86,279.62 | 0.74x | 104.312s |
+| `odbc-bcp` | 95,192.77 | 0.81x | 94.545s |
+
+Observation: for thirty-two sparse mixed columns with short nullable strings,
+the Tiberius backends are close together. `direct-raw` is slightly faster than
+the baseline and `direct-framed`, while both direct paths remain faster than the
+ODBC reference paths.
+
 ## Pending Scenarios
 
-The following issue 59 comparison scenarios still need formal rows/sec records
-in this document:
-
-- `string_heavy_binary_only`
-- `string_heavy_unicode`
-- `wide_sparse`
+All issue 59 comparison scenarios currently selected for this document have
+formal rows/sec records.

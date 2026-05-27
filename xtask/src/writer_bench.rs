@@ -2351,6 +2351,7 @@ const ARROW_ODBC_UNSUPPORTED_SCENARIOS: &[&str] = &[
     DATE_FAST_PATH_SCENARIO.name,
     FIXED_SIZE_BINARY_SCENARIO.name,
     DECIMAL_TEMPORAL_128_SCENARIO.name,
+    STRING_HEAVY_UNICODE_SCENARIO.name,
 ];
 const ODBC_BCP_UNSUPPORTED_SCENARIOS: &[&str] = &[
     UINT64_POLICY_SCENARIO.name,
@@ -6723,6 +6724,27 @@ mod tests {
             WriterBenchError::Validation(message)
                 if message.contains("arrow-odbc")
                     && message.contains("decimal_temporal_128")
+                    && message.contains("one or more Arrow mappings")
+        ));
+    }
+
+    #[test]
+    fn compare_rejects_string_heavy_unicode_for_arrow_odbc() {
+        let args = [
+            OsString::from("--scenario"),
+            OsString::from("string_heavy_unicode"),
+            OsString::from("--backends"),
+            OsString::from("baseline,arrow-odbc"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+        let err = super::run_compare_benchmark(&options).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("arrow-odbc")
+                    && message.contains("string_heavy_unicode")
                     && message.contains("one or more Arrow mappings")
         ));
     }
