@@ -11,6 +11,10 @@ Selected local result notes live under `docs/benchmark-results/` when they are
 useful for development decisions and include enough environment detail to be
 interpretable.
 
+The current curated direct raw comparison summary lives in
+`docs/direct-raw-benchmark-comparison.md`. Prefer that summary over raw local
+benchmark logs when evaluating the direct backend.
+
 ## Prerequisites
 
 - Rust toolchain for this workspace.
@@ -30,9 +34,14 @@ Current scenarios are:
 - `narrow_numeric`: primitive numeric throughput.
 - `extended_primitive`: small integer and real primitive throughput.
 - `mixed_nullable`: nullable primitives and short strings.
+- `fixed_size_binary`: fixed-size binary values planned as `binary(n)`.
 - `wide_mixed`: ingestion-style ids, event time, categories, text, and binary
   payloads.
 - `decimal_temporal`: finance-style decimals, dates, and timestamps.
+- `fixed_width_128`: one hundred twenty-eight small fixed-width primitive
+  columns for encoder-path isolation.
+- `decimal_temporal_128`: one hundred twenty-eight decimal and temporal
+  columns for encoder-path isolation.
 - `string_heavy`: large variable text and binary payload rows.
 - `wide_sparse`: thirty-two mixed columns with sparse nullable values.
 - `tpch_lineitem_like`: TPC-H lineitem-inspired transport workload without
@@ -85,7 +94,7 @@ extension:
 ```sh
 cargo xtask writer-bench compare \
   --container-runtime podman \
-  --backends baseline,arrow-odbc,odbc-bcp \
+  --backends baseline,direct-raw,arrow-odbc,odbc-bcp \
   --scenario narrow_numeric \
   --rows 10000 \
   --batch-size 8192 \
@@ -122,6 +131,12 @@ cargo xtask writer-bench compare \
 The shared IPC file is the fairness boundary. It keeps data generation outside
 the backend timing and ensures every backend sees the same rows, null pattern,
 string values, binary values, and temporal values.
+
+Use `direct-raw` in compare runs to measure this crate's raw TDS encoder through
+the normal `WriteBackend::DirectRawBulk` writer path. Current direct benchmark
+coverage includes primitive rows, variable-width text and binary rows, UInt64
+policy rows, decimal and temporal rows, fixed-size binary rows, wide fixed-width
+rows, wide decimal and temporal rows, and mixed direct-supported schemas.
 
 For stable comparisons, prefer runs long enough that setup noise and timer
 resolution do not dominate the result. Very short runs are useful as smoke

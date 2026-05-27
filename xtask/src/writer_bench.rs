@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 
 use crate::{odbc_runner, sqlserver};
 use arrow_array::{
-    ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array,
-    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
+    FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, RecordBatch, StringArray, Time32MillisecondArray, Time64MicrosecondArray,
     TimestampMillisecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -1540,7 +1541,7 @@ fn ensure_arrow_odbc_supported_scenario(
     }
 
     Err(WriterBenchError::Validation(format!(
-        "writer-bench arrow-odbc does not support scenario `{}` because this benchmark path does not support the unsigned integer mappings used by that scenario; choose a backend that supports this scenario",
+        "writer-bench arrow-odbc does not support scenario `{}` because this benchmark path does not support one or more Arrow mappings used by that scenario; choose a backend that supports this scenario",
         benchmark.scenario.name
     )))
 }
@@ -1553,7 +1554,7 @@ fn ensure_odbc_bcp_supported_scenario(
     }
 
     Err(WriterBenchError::Validation(format!(
-        "writer-bench odbc-bcp does not support scenario `{}` because the ODBC BCP runner does not support UInt64 columns yet; use baseline, direct-framed, or direct-raw",
+        "writer-bench odbc-bcp does not support scenario `{}` because the ODBC BCP runner does not support one or more Arrow mappings used by that scenario; use baseline, direct-framed, or direct-raw",
         benchmark.scenario.name
     )))
 }
@@ -2223,6 +2224,13 @@ const MIXED_NULLABLE_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDe
     columns: mixed_nullable_columns,
 };
 
+const FIXED_SIZE_BINARY_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
+    name: "fixed_size_binary",
+    description: "Fixed-size binary columns planned as SQL Server binary(n)",
+    schema: fixed_size_binary_schema,
+    columns: fixed_size_binary_columns,
+};
+
 const WIDE_MIXED_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
     name: "wide_mixed",
     description: "Ingestion-style ids, event time, categories, text, and binary payloads",
@@ -2235,6 +2243,20 @@ const DECIMAL_TEMPORAL_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenario
     description: "Finance-style decimals, dates, and timestamps",
     schema: decimal_temporal_schema,
     columns: decimal_temporal_columns,
+};
+
+const FIXED_WIDTH_128_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
+    name: "fixed_width_128",
+    description: "One hundred twenty-eight small fixed-width primitive columns",
+    schema: fixed_width_128_schema,
+    columns: fixed_width_128_columns,
+};
+
+const DECIMAL_TEMPORAL_128_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
+    name: "decimal_temporal_128",
+    description: "One hundred twenty-eight decimal and temporal columns",
+    schema: decimal_temporal_128_schema,
+    columns: decimal_temporal_128_columns,
 };
 
 const STRING_HEAVY_SCENARIO: BenchmarkScenarioDefinition = BenchmarkScenarioDefinition {
@@ -2309,6 +2331,8 @@ const DIRECT_RAW_SUPPORTED_SCENARIOS: &[&str] = &[
     UINT64_POLICY_SCENARIO.name,
     DATE_FAST_PATH_SCENARIO.name,
     MIXED_NULLABLE_SCENARIO.name,
+    FIXED_SIZE_BINARY_SCENARIO.name,
+    DECIMAL_TEMPORAL_SCENARIO.name,
     STRING_HEAVY_SCENARIO.name,
     STRING_HEAVY_TEXT_ONLY_SCENARIO.name,
     STRING_HEAVY_BINARY_ONLY_SCENARIO.name,
@@ -2317,13 +2341,24 @@ const DIRECT_RAW_SUPPORTED_SCENARIOS: &[&str] = &[
     STRING_HEAVY_LOB_9K_SCENARIO.name,
     STRING_HEAVY_UNICODE_SCENARIO.name,
     WIDE_SPARSE_SCENARIO.name,
+    FIXED_WIDTH_128_SCENARIO.name,
+    DECIMAL_TEMPORAL_128_SCENARIO.name,
 ];
 
 const ARROW_ODBC_UNSUPPORTED_SCENARIOS: &[&str] = &[
     EXTENDED_PRIMITIVE_SCENARIO.name,
     UINT64_POLICY_SCENARIO.name,
+    DATE_FAST_PATH_SCENARIO.name,
+    FIXED_SIZE_BINARY_SCENARIO.name,
+    DECIMAL_TEMPORAL_128_SCENARIO.name,
+    STRING_HEAVY_UNICODE_SCENARIO.name,
 ];
-const ODBC_BCP_UNSUPPORTED_SCENARIOS: &[&str] = &[UINT64_POLICY_SCENARIO.name];
+const ODBC_BCP_UNSUPPORTED_SCENARIOS: &[&str] = &[
+    UINT64_POLICY_SCENARIO.name,
+    DATE_FAST_PATH_SCENARIO.name,
+    FIXED_SIZE_BINARY_SCENARIO.name,
+    DECIMAL_TEMPORAL_128_SCENARIO.name,
+];
 
 const SCENARIOS: &[BenchmarkScenarioDefinition] = &[
     NARROW_NUMERIC_SCENARIO,
@@ -2331,8 +2366,11 @@ const SCENARIOS: &[BenchmarkScenarioDefinition] = &[
     UINT64_POLICY_SCENARIO,
     DATE_FAST_PATH_SCENARIO,
     MIXED_NULLABLE_SCENARIO,
+    FIXED_SIZE_BINARY_SCENARIO,
     WIDE_MIXED_SCENARIO,
     DECIMAL_TEMPORAL_SCENARIO,
+    FIXED_WIDTH_128_SCENARIO,
+    DECIMAL_TEMPORAL_128_SCENARIO,
     STRING_HEAVY_SCENARIO,
     STRING_HEAVY_TEXT_ONLY_SCENARIO,
     STRING_HEAVY_BINARY_ONLY_SCENARIO,
@@ -4489,6 +4527,55 @@ fn deterministic_payload(row: usize) -> Vec<u8> {
         .collect()
 }
 
+fn fixed_size_binary_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::Int64, false),
+        Field::new("hash16", DataType::FixedSizeBinary(16), false),
+        Field::new("nullable_code4", DataType::FixedSizeBinary(4), true),
+        Field::new("payload64", DataType::FixedSizeBinary(64), false),
+    ]))
+}
+
+fn fixed_size_binary_columns(offset: usize, len: usize) -> Result<Vec<ArrayRef>, WriterBenchError> {
+    let row_id = (offset..offset + len)
+        .map(|row| row as i64)
+        .collect::<Int64Array>();
+    let hash16 = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+        (offset..offset + len).map(|row| Some(fixed_size_payload(row, 16))),
+        16,
+    )
+    .map_err(WriterBenchError::Arrow)?;
+    let nullable_code4 = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+        (offset..offset + len).map(|row| {
+            if row % 7 == 0 {
+                None
+            } else {
+                Some(fixed_size_payload(row, 4))
+            }
+        }),
+        4,
+    )
+    .map_err(WriterBenchError::Arrow)?;
+    let payload64 = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+        (offset..offset + len).map(|row| Some(fixed_size_payload(row, 64))),
+        64,
+    )
+    .map_err(WriterBenchError::Arrow)?;
+
+    Ok(vec![
+        Arc::new(row_id),
+        Arc::new(hash16),
+        Arc::new(nullable_code4),
+        Arc::new(payload64),
+    ])
+}
+
+fn fixed_size_payload(row: usize, len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|index| ((row.wrapping_mul(37) + index.wrapping_mul(19)) % 251) as u8)
+        .collect()
+}
+
 fn decimal_temporal_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("transaction_id", DataType::Int64, false),
@@ -4556,6 +4643,227 @@ fn decimal_temporal_columns(offset: usize, len: usize) -> Result<Vec<ArrayRef>, 
         Arc::new(posted_at_ms),
         Arc::new(approved),
     ])
+}
+
+fn fixed_width_128_schema() -> SchemaRef {
+    let mut fields = Vec::with_capacity(128);
+
+    for group in 0..16 {
+        fields.push(Field::new(
+            format!("i32_value_{group:02}"),
+            DataType::Int32,
+            false,
+        ));
+        fields.push(Field::new(
+            format!("maybe_i32_{group:02}"),
+            DataType::Int32,
+            true,
+        ));
+        fields.push(Field::new(
+            format!("i64_value_{group:02}"),
+            DataType::Int64,
+            false,
+        ));
+        fields.push(Field::new(
+            format!("maybe_i64_{group:02}"),
+            DataType::Int64,
+            true,
+        ));
+        fields.push(Field::new(
+            format!("f64_value_{group:02}"),
+            DataType::Float64,
+            false,
+        ));
+        fields.push(Field::new(
+            format!("maybe_f64_{group:02}"),
+            DataType::Float64,
+            true,
+        ));
+        fields.push(Field::new(
+            format!("flag_{group:02}"),
+            DataType::Boolean,
+            false,
+        ));
+        fields.push(Field::new(
+            format!("maybe_flag_{group:02}"),
+            DataType::Boolean,
+            true,
+        ));
+    }
+
+    Arc::new(Schema::new(fields))
+}
+
+fn fixed_width_128_columns(offset: usize, len: usize) -> Result<Vec<ArrayRef>, WriterBenchError> {
+    let mut columns = Vec::with_capacity(128);
+
+    for group in 0..16 {
+        columns.push(Arc::new(
+            (offset..offset + len)
+                .map(|row| deterministic_i32(row + group * 101))
+                .collect::<Int32Array>(),
+        ) as ArrayRef);
+        columns.push(Arc::new(
+            (offset..offset + len)
+                .map(|row| {
+                    (row % (11 + group) != 0).then_some(deterministic_i32(row + group * 103))
+                })
+                .collect::<Int32Array>(),
+        ));
+        columns.push(Arc::new(
+            (offset..offset + len)
+                .map(|row| i64::from(deterministic_i32(row + group * 107)) * 10_000)
+                .collect::<Int64Array>(),
+        ));
+        columns.push(Arc::new(
+            (offset..offset + len)
+                .map(|row| {
+                    (row % (13 + group) != 0)
+                        .then_some(i64::from(deterministic_i32(row + group * 109)) * 100_000)
+                })
+                .collect::<Int64Array>(),
+        ));
+        columns.push(Arc::new(
+            (offset..offset + len)
+                .map(|row| deterministic_score(row + group * 113))
+                .collect::<Float64Array>(),
+        ));
+        columns.push(Arc::new(
+            (offset..offset + len)
+                .map(|row| {
+                    (row % (17 + group) != 0).then_some(deterministic_score(row + group * 127))
+                })
+                .collect::<Float64Array>(),
+        ));
+        columns.push(Arc::new(
+            (offset..offset + len)
+                .map(|row| Some((row + group).is_multiple_of(2)))
+                .collect::<BooleanArray>(),
+        ));
+        columns.push(Arc::new(
+            (offset..offset + len)
+                .map(|row| (row % (19 + group) != 0).then_some((row + group).is_multiple_of(3)))
+                .collect::<BooleanArray>(),
+        ));
+    }
+
+    Ok(columns)
+}
+
+fn decimal_temporal_128_schema() -> SchemaRef {
+    let mut fields = Vec::with_capacity(128);
+
+    for group in 0..16 {
+        fields.push(Field::new(
+            format!("amount_{group:02}"),
+            DataType::Decimal128(18, 4),
+            false,
+        ));
+        fields.push(Field::new(
+            format!("maybe_fee_{group:02}"),
+            DataType::Decimal128(12, 4),
+            true,
+        ));
+        fields.push(Field::new(
+            format!("trade_date_{group:02}"),
+            DataType::Date32,
+            false,
+        ));
+        fields.push(Field::new(
+            format!("maybe_trade_date_{group:02}"),
+            DataType::Date32,
+            true,
+        ));
+        fields.push(Field::new(
+            format!("posted_at_ms_{group:02}"),
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ));
+        fields.push(Field::new(
+            format!("settlement_time_ms_{group:02}"),
+            DataType::Time32(TimeUnit::Millisecond),
+            false,
+        ));
+        fields.push(Field::new(
+            format!("capture_time_us_{group:02}"),
+            DataType::Time64(TimeUnit::Microsecond),
+            false,
+        ));
+        fields.push(Field::new(
+            format!("maybe_approved_{group:02}"),
+            DataType::Boolean,
+            true,
+        ));
+    }
+
+    Arc::new(Schema::new(fields))
+}
+
+fn decimal_temporal_128_columns(
+    offset: usize,
+    len: usize,
+) -> Result<Vec<ArrayRef>, WriterBenchError> {
+    let mut columns = Vec::with_capacity(128);
+
+    for group in 0..16 {
+        columns.push(Arc::new(decimal128_array(
+            (offset..offset + len).map(|row| {
+                let sign = if (row + group) % 13 == 0 {
+                    -1_i128
+                } else {
+                    1_i128
+                };
+                Some(sign * (1_000_000_i128 + ((row + group * 997) % 50_000_000) as i128))
+            }),
+            18,
+            4,
+        )?) as ArrayRef);
+        columns.push(Arc::new(decimal128_array(
+            (offset..offset + len).map(|row| {
+                if row % (11 + group) == 0 {
+                    None
+                } else {
+                    Some(25_i128 + ((row + group * 53) % 10_000) as i128)
+                }
+            }),
+            12,
+            4,
+        )?));
+        columns.push(Arc::new(Date32Array::from_iter_values(
+            (offset..offset + len).map(|row| 19_723_i32 + ((row + group * 17) % 365) as i32),
+        )));
+        columns.push(Arc::new(
+            (offset..offset + len)
+                .map(|row| {
+                    (row % (13 + group) != 0)
+                        .then_some(19_723_i32 + ((row + group * 19) % 365) as i32)
+                })
+                .collect::<Date32Array>(),
+        ));
+        columns.push(Arc::new(TimestampMillisecondArray::from_iter_values(
+            (offset..offset + len)
+                .map(|row| 1_735_689_600_000_i64 + ((row + group * 31) as i64 * 17_000)),
+        )));
+        columns.push(Arc::new(Time32MillisecondArray::from_iter_values(
+            (offset..offset + len).map(|row| ((row * 37 + group * 1_003) % 86_400_000) as i32),
+        )));
+        columns.push(Arc::new(Time64MicrosecondArray::from_iter_values(
+            (offset..offset + len).map(|row| ((row * 41 + group * 1_009) % 86_400_000_000) as i64),
+        )));
+        columns.push(Arc::new(
+            (offset..offset + len)
+                .map(|row| {
+                    if row % (17 + group) == 0 {
+                        None
+                    } else {
+                        Some((row + group).is_multiple_of(3))
+                    }
+                })
+                .collect::<BooleanArray>(),
+        ));
+    }
+
+    Ok(columns)
 }
 
 fn string_heavy_schema() -> SchemaRef {
@@ -5223,8 +5531,9 @@ mod tests {
         WriterBenchError, WriterBenchOptions, sqlserver_profile,
     };
     use arrow_array::{
-        Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array,
-        Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
+        Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
+        FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+        Int64Array, RecordBatch, StringArray, Time32MillisecondArray, Time64MicrosecondArray,
         TimestampMillisecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     };
     use arrow_schema::{DataType, TimeUnit};
@@ -6169,6 +6478,8 @@ mod tests {
             "uint64_policy",
             "date_fast_path",
             "mixed_nullable",
+            "fixed_size_binary",
+            "decimal_temporal",
             "string_heavy",
             "string_heavy_text_only",
             "string_heavy_binary_only",
@@ -6177,6 +6488,8 @@ mod tests {
             "string_heavy_lob_9k",
             "string_heavy_unicode",
             "wide_sparse",
+            "fixed_width_128",
+            "decimal_temporal_128",
         ] {
             let args = [
                 OsString::from("--scenario"),
@@ -6200,7 +6513,7 @@ mod tests {
 
     #[test]
     fn compare_rejects_direct_raw_for_unsupported_scenarios() {
-        for scenario in ["wide_mixed", "decimal_temporal", "tpch_lineitem_like"] {
+        for scenario in ["wide_mixed", "tpch_lineitem_like"] {
             let args = [
                 OsString::from("--scenario"),
                 OsString::from(scenario),
@@ -6220,11 +6533,15 @@ mod tests {
                         && message.contains("uint64_policy")
                         && message.contains("date_fast_path")
                         && message.contains("mixed_nullable")
+                        && message.contains("fixed_size_binary")
+                        && message.contains("decimal_temporal")
                         && message.contains("string_heavy")
                         && message.contains("string_heavy_text_only")
                         && message.contains("string_heavy_binary_only")
                         && message.contains("string_heavy_unicode")
                         && message.contains("wide_sparse")
+                        && message.contains("fixed_width_128")
+                        && message.contains("decimal_temporal_128")
                         && message.contains(scenario)
             ));
         }
@@ -6344,7 +6661,91 @@ mod tests {
             WriterBenchError::Validation(message)
                 if message.contains("arrow-odbc")
                     && message.contains("extended_primitive")
-                    && message.contains("unsigned integer mappings")
+                    && message.contains("one or more Arrow mappings")
+        ));
+    }
+
+    #[test]
+    fn compare_rejects_fixed_size_binary_for_arrow_odbc() {
+        let args = [
+            OsString::from("--scenario"),
+            OsString::from("fixed_size_binary"),
+            OsString::from("--backends"),
+            OsString::from("baseline,arrow-odbc"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+        let err = super::run_compare_benchmark(&options).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("arrow-odbc")
+                    && message.contains("fixed_size_binary")
+                    && message.contains("one or more Arrow mappings")
+        ));
+    }
+
+    #[test]
+    fn compare_rejects_date_fast_path_for_arrow_odbc() {
+        let args = [
+            OsString::from("--scenario"),
+            OsString::from("date_fast_path"),
+            OsString::from("--backends"),
+            OsString::from("baseline,arrow-odbc"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+        let err = super::run_compare_benchmark(&options).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("arrow-odbc")
+                    && message.contains("date_fast_path")
+                    && message.contains("one or more Arrow mappings")
+        ));
+    }
+
+    #[test]
+    fn compare_rejects_decimal_temporal_128_for_arrow_odbc() {
+        let args = [
+            OsString::from("--scenario"),
+            OsString::from("decimal_temporal_128"),
+            OsString::from("--backends"),
+            OsString::from("baseline,arrow-odbc"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+        let err = super::run_compare_benchmark(&options).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("arrow-odbc")
+                    && message.contains("decimal_temporal_128")
+                    && message.contains("one or more Arrow mappings")
+        ));
+    }
+
+    #[test]
+    fn compare_rejects_string_heavy_unicode_for_arrow_odbc() {
+        let args = [
+            OsString::from("--scenario"),
+            OsString::from("string_heavy_unicode"),
+            OsString::from("--backends"),
+            OsString::from("baseline,arrow-odbc"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+        let err = super::run_compare_benchmark(&options).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("arrow-odbc")
+                    && message.contains("string_heavy_unicode")
+                    && message.contains("one or more Arrow mappings")
         ));
     }
 
@@ -6365,7 +6766,70 @@ mod tests {
             WriterBenchError::Validation(message)
                 if message.contains("odbc-bcp")
                     && message.contains("uint64_policy")
-                    && message.contains("UInt64")
+                    && message.contains("one or more Arrow mappings")
+        ));
+    }
+
+    #[test]
+    fn compare_rejects_fixed_size_binary_for_odbc_bcp() {
+        let args = [
+            OsString::from("--scenario"),
+            OsString::from("fixed_size_binary"),
+            OsString::from("--backends"),
+            OsString::from("baseline,odbc-bcp"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+        let err = super::run_compare_benchmark(&options).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("odbc-bcp")
+                    && message.contains("fixed_size_binary")
+                    && message.contains("one or more Arrow mappings")
+        ));
+    }
+
+    #[test]
+    fn compare_rejects_date_fast_path_for_odbc_bcp() {
+        let args = [
+            OsString::from("--scenario"),
+            OsString::from("date_fast_path"),
+            OsString::from("--backends"),
+            OsString::from("baseline,odbc-bcp"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+        let err = super::run_compare_benchmark(&options).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("odbc-bcp")
+                    && message.contains("date_fast_path")
+                    && message.contains("one or more Arrow mappings")
+        ));
+    }
+
+    #[test]
+    fn compare_rejects_decimal_temporal_128_for_odbc_bcp() {
+        let args = [
+            OsString::from("--scenario"),
+            OsString::from("decimal_temporal_128"),
+            OsString::from("--backends"),
+            OsString::from("baseline,odbc-bcp"),
+        ];
+
+        let options = super::CompareBenchOptions::parse(&args).unwrap();
+        let err = super::run_compare_benchmark(&options).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WriterBenchError::Validation(message)
+                if message.contains("odbc-bcp")
+                    && message.contains("decimal_temporal_128")
+                    && message.contains("one or more Arrow mappings")
         ));
     }
 
@@ -7070,7 +7534,7 @@ odbc-bcp runner
             WriterBenchError::Validation(message)
                 if message.contains("arrow-odbc")
                     && message.contains("extended_primitive")
-                    && message.contains("unsigned integer mappings")
+                    && message.contains("one or more Arrow mappings")
         ));
     }
 
@@ -7158,6 +7622,50 @@ odbc-bcp runner
         assert!(schema.field(2).is_nullable());
         assert_eq!(schema.field(3).data_type(), &DataType::Utf8);
         assert!(schema.field(3).is_nullable());
+    }
+
+    #[test]
+    fn fixed_size_binary_scenario_maps_to_binary_columns() {
+        let options = WriterBenchOptions {
+            rows: 8,
+            batch_size: 8,
+            scenario: super::scenario_by_name("fixed_size_binary").unwrap(),
+            repeat: 1,
+            output: BenchmarkOutput::Human,
+        };
+
+        let batches = generated_batches(&options);
+        let batch = &batches[0];
+        let schema = batch.schema();
+
+        assert_eq!(schema.field(1).data_type(), &DataType::FixedSizeBinary(16));
+        assert!(!schema.field(1).is_nullable());
+        assert_eq!(schema.field(2).data_type(), &DataType::FixedSizeBinary(4));
+        assert!(schema.field(2).is_nullable());
+        assert_eq!(schema.field(3).data_type(), &DataType::FixedSizeBinary(64));
+        assert!(!schema.field(3).is_nullable());
+
+        let hash16 = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        let nullable_code4 = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(hash16.value_length(), 16);
+        assert_eq!(hash16.value(1).len(), 16);
+        assert_eq!(nullable_code4.null_count(), 2);
+        assert!(nullable_code4.is_null(0));
+        assert!(nullable_code4.is_valid(1));
+
+        let mappings = super::benchmark_mappings_for_scenario(options.scenario).unwrap();
+        assert_eq!(mappings[1].mssql().ty(), &MssqlType::Binary(16));
+        assert_eq!(mappings[2].mssql().ty(), &MssqlType::Binary(4));
+        assert_eq!(mappings[3].mssql().ty(), &MssqlType::Binary(64));
+        super::ensure_direct_raw_supported_scenario(&options).unwrap();
     }
 
     #[test]
@@ -7278,6 +7786,124 @@ odbc-bcp runner
                 .count(),
             16
         );
+    }
+
+    #[test]
+    fn fixed_width_128_schema_is_small_payload_wide_fixed_width() {
+        let scenario = super::scenario_by_name("fixed_width_128").unwrap();
+        let options = WriterBenchOptions {
+            rows: 64,
+            batch_size: 64,
+            scenario,
+            repeat: 1,
+            output: BenchmarkOutput::Human,
+        };
+
+        let batch = &generated_batches(&options)[0];
+        let schema = batch.schema();
+        let mappings = super::benchmark_mappings_for_scenario(scenario).unwrap();
+
+        assert_eq!(schema.fields().len(), 128);
+        assert_eq!(batch.num_columns(), 128);
+        assert_eq!(schema.field(0).data_type(), &DataType::Int32);
+        assert_eq!(schema.field(1).data_type(), &DataType::Int32);
+        assert!(schema.field(1).is_nullable());
+        assert_eq!(schema.field(2).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(4).data_type(), &DataType::Float64);
+        assert_eq!(schema.field(6).data_type(), &DataType::Boolean);
+        assert!(batch.column(0).as_any().is::<Int32Array>());
+        assert!(batch.column(1).as_any().is::<Int32Array>());
+        assert!(batch.column(1).null_count() > 0);
+        assert!(batch.column(2).as_any().is::<Int64Array>());
+        assert!(batch.column(4).as_any().is::<Float64Array>());
+        assert!(batch.column(6).as_any().is::<BooleanArray>());
+        assert!(mappings.iter().all(|mapping| {
+            matches!(
+                mapping.mssql().ty(),
+                MssqlType::Int
+                    | MssqlType::BigInt
+                    | MssqlType::Float { precision: 53 }
+                    | MssqlType::Bit
+            )
+        }));
+        super::ensure_direct_raw_supported_scenario(&options).unwrap();
+    }
+
+    #[test]
+    fn decimal_temporal_128_schema_is_wide_decimal_temporal() {
+        let scenario = super::scenario_by_name("decimal_temporal_128").unwrap();
+        let options = WriterBenchOptions {
+            rows: 64,
+            batch_size: 64,
+            scenario,
+            repeat: 1,
+            output: BenchmarkOutput::Human,
+        };
+
+        let batch = &generated_batches(&options)[0];
+        let schema = batch.schema();
+        let mappings = super::benchmark_mappings_for_scenario(scenario).unwrap();
+        let mssql_types = mappings
+            .iter()
+            .map(|mapping| mapping.mssql().ty())
+            .collect::<Vec<_>>();
+
+        assert_eq!(schema.fields().len(), 128);
+        assert_eq!(batch.num_columns(), 128);
+        assert_eq!(schema.field(0).data_type(), &DataType::Decimal128(18, 4));
+        assert_eq!(schema.field(1).data_type(), &DataType::Decimal128(12, 4));
+        assert!(schema.field(1).is_nullable());
+        assert_eq!(schema.field(2).data_type(), &DataType::Date32);
+        assert_eq!(
+            schema.field(4).data_type(),
+            &DataType::Timestamp(TimeUnit::Millisecond, None)
+        );
+        assert_eq!(
+            schema.field(5).data_type(),
+            &DataType::Time32(TimeUnit::Millisecond)
+        );
+        assert_eq!(
+            schema.field(6).data_type(),
+            &DataType::Time64(TimeUnit::Microsecond)
+        );
+        assert_eq!(schema.field(7).data_type(), &DataType::Boolean);
+        assert!(batch.column(0).as_any().is::<Decimal128Array>());
+        assert!(batch.column(1).as_any().is::<Decimal128Array>());
+        assert!(batch.column(1).null_count() > 0);
+        assert!(batch.column(2).as_any().is::<Date32Array>());
+        assert!(batch.column(4).as_any().is::<TimestampMillisecondArray>());
+        assert!(batch.column(5).as_any().is::<Time32MillisecondArray>());
+        assert!(batch.column(6).as_any().is::<Time64MicrosecondArray>());
+        assert!(batch.column(7).as_any().is::<BooleanArray>());
+        assert_eq!(
+            mssql_types
+                .iter()
+                .filter(|ty| matches!(ty, &&MssqlType::Decimal { .. }))
+                .count(),
+            32
+        );
+        assert_eq!(
+            mssql_types
+                .iter()
+                .filter(|ty| matches!(ty, &&MssqlType::Date))
+                .count(),
+            32
+        );
+        assert_eq!(
+            mssql_types
+                .iter()
+                .filter(|ty| matches!(ty, &&MssqlType::DateTime2 { precision: 7 }))
+                .count(),
+            16
+        );
+        assert_eq!(
+            mssql_types
+                .iter()
+                .filter(|ty| matches!(ty, &&MssqlType::Time(_)))
+                .count(),
+            32
+        );
+        super::ensure_direct_raw_supported_scenario(&options).unwrap();
     }
 
     #[test]
@@ -7819,6 +8445,8 @@ odbc-bcp runner
             "date_fast_path",
             "wide_mixed",
             "decimal_temporal",
+            "fixed_width_128",
+            "decimal_temporal_128",
             "string_heavy",
             "string_heavy_text_only",
             "string_heavy_binary_only",
@@ -7933,8 +8561,11 @@ odbc-bcp runner
                 "uint64_policy",
                 "date_fast_path",
                 "mixed_nullable",
+                "fixed_size_binary",
                 "wide_mixed",
                 "decimal_temporal",
+                "fixed_width_128",
+                "decimal_temporal_128",
                 "string_heavy",
                 "string_heavy_text_only",
                 "string_heavy_binary_only",
