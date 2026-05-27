@@ -30,7 +30,7 @@ name = "arrow_tiberius"
 path = "src/lib.rs"
 
 [features]
-bench-profile = []
+bench-profile = ["tiberius/bulk-load-profile"]
 integration-tests = []
 
 [dependencies]
@@ -40,7 +40,7 @@ arrow-schema = "58.2.0"
 chrono = { version = "0.4.40", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["io"] }
 snafu = "0.9.0"
-tiberius = { package = "tiberius-raw-bulk", version = "=0.12.3-raw-bulk.11" }
+tiberius = { package = "tiberius-raw-bulk", version = "=0.12.3-raw-bulk.12" }
 
 [dev-dependencies]
 arrow-data = "58.2.0"
