@@ -13,8 +13,9 @@ use super::super::{
         },
         fixed_size_binary::measure_fixed_size_binary_column_cell_lengths,
         primitive::{
-            measure_fixed_primitive_column_cell_lengths, measure_float32_column_cell_lengths,
-            measure_float64_column_cell_lengths, measure_uint64_checked_bigint_column_cell_lengths,
+            measure_fixed_primitive_column_cell_lengths, measure_float16_column_cell_lengths,
+            measure_float32_column_cell_lengths, measure_float64_column_cell_lengths,
+            measure_uint64_checked_bigint_column_cell_lengths,
         },
         temporal::{
             TemporalColumnContext, measure_date32_column_cell_lengths,
@@ -107,6 +108,13 @@ impl BoundDirectColumn<'_> {
                 cell_lengths,
             ),
             Self::UInt64 { column, array } => measure_uint64_checked_bigint_column_cell_lengths(
+                array,
+                column,
+                column_index,
+                column_count,
+                cell_lengths,
+            ),
+            Self::Float16 { column, array } => measure_float16_column_cell_lengths(
                 array,
                 column,
                 column_index,

@@ -1,9 +1,9 @@
 //! Fixed-width primitive direct TDS row layout.
 
 use arrow_array::{
-    Array, BooleanArray, Date32Array, Date64Array, FixedSizeBinaryArray, Float32Array,
-    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, UInt8Array, UInt16Array,
-    UInt32Array, UInt64Array,
+    Array, BooleanArray, Date32Array, Date64Array, FixedSizeBinaryArray, Float16Array,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 
 #[cfg(test)]
@@ -203,6 +203,12 @@ fn encode_fixed_width_rows(
                     &mut current_offsets,
                     &mut bytes,
                 )?;
+            }
+            BoundDirectColumn::Float16 {
+                column: plan,
+                array,
+            } => {
+                fill_float16_fixed_width_column(array, plan, &mut current_offsets, &mut bytes)?;
             }
             BoundDirectColumn::Float32 {
                 column: plan,
@@ -689,6 +695,7 @@ fn fixed_width_column_parts<'a>(
         | BoundDirectColumn::Int64 { column, .. }
         | BoundDirectColumn::UInt32 { column, .. }
         | BoundDirectColumn::UInt64 { column, .. }
+        | BoundDirectColumn::Float16 { column, .. }
         | BoundDirectColumn::Float32 { column, .. }
         | BoundDirectColumn::Float64 { column, .. }
         | BoundDirectColumn::FixedSizeBinary { column, .. } => Some((column, None)),
@@ -757,6 +764,7 @@ fn fixed_width_column_array<'a>(column: &'a BoundDirectColumn<'a>) -> &'a dyn Ar
         BoundDirectColumn::Int64 { array, .. } => *array,
         BoundDirectColumn::UInt32 { array, .. } => *array,
         BoundDirectColumn::UInt64 { array, .. } => *array,
+        BoundDirectColumn::Float16 { array, .. } => *array,
         BoundDirectColumn::Float32 { array, .. } => *array,
         BoundDirectColumn::Float64 { array, .. } => *array,
         BoundDirectColumn::FixedSizeBinary { array, .. } => *array,
@@ -924,7 +932,9 @@ fn fixed_width_value_len(encoding: DirectColumnEncoding) -> Option<usize> {
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int64ToBigInt) => Some(8),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt32ToBigInt) => Some(8),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt64ToCheckedBigInt) => Some(8),
-        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal) => Some(4),
+        DirectColumnEncoding::Primitive(
+            PrimitiveArrowToMssql::Float16ToReal | PrimitiveArrowToMssql::Float32ToReal,
+        ) => Some(4),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => Some(8),
         DirectColumnEncoding::FixedSizeBinary(_) => None,
         DirectColumnEncoding::UInt64Decimal20_0 => None,
@@ -1135,6 +1145,44 @@ fn fill_float32_fixed_width_column(
         }
 
         let value = array.value(row_index);
+        if !value.is_finite() {
+            return Err(value_conversion_error(row_column_diagnostic(
+                column,
+                row_index,
+                DiagnosticCode::NonFiniteFloat,
+                format!("non-finite floating point value {value} is not supported"),
+            )));
+        }
+
+        if column.nullable() {
+            bytes[offset] = 4;
+            bytes[offset + CELL_LEN_PREFIX_LEN..offset + CELL_LEN_PREFIX_LEN + 4]
+                .copy_from_slice(&value.to_le_bytes());
+            *current_offset += CELL_LEN_PREFIX_LEN + 4;
+        } else {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            *current_offset += 4;
+        }
+    }
+
+    Ok(())
+}
+
+fn fill_float16_fixed_width_column(
+    array: &Float16Array,
+    column: &DirectColumnPlan,
+    current_offsets: &mut [usize],
+    bytes: &mut [u8],
+) -> Result<()> {
+    for (row_index, current_offset) in current_offsets.iter_mut().enumerate().take(array.len()) {
+        let offset = *current_offset;
+        if column.nullable() && array.is_null(row_index) {
+            bytes[offset] = 0;
+            *current_offset += CELL_LEN_PREFIX_LEN;
+            continue;
+        }
+
+        let value = array.value(row_index).to_f32();
         if !value.is_finite() {
             return Err(value_conversion_error(row_column_diagnostic(
                 column,

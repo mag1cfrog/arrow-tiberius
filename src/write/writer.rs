@@ -456,9 +456,9 @@ fn expected_direct_bulk_column_type(column: &DirectColumnPlan) -> Option<tiberiu
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt64ToCheckedBigInt) => {
             Some(tiberius::ColumnType::Int8)
         }
-        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal) => {
-            Some(tiberius::ColumnType::Float4)
-        }
+        DirectColumnEncoding::Primitive(
+            PrimitiveArrowToMssql::Float16ToReal | PrimitiveArrowToMssql::Float32ToReal,
+        ) => Some(tiberius::ColumnType::Float4),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => {
             Some(tiberius::ColumnType::Float8)
         }

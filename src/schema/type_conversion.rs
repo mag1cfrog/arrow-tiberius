@@ -22,7 +22,7 @@ pub(crate) fn plan_arrow_data_type_as_mssql_type(
         DataType::UInt16 => Ok(MssqlType::Int),
         DataType::UInt32 => Ok(MssqlType::BigInt),
         DataType::UInt64 => plan_arrow_uint64_as_mssql_type(options.uint64_policy, index, field),
-        DataType::Float32 => Ok(MssqlType::Real),
+        DataType::Float16 | DataType::Float32 => Ok(MssqlType::Real),
         DataType::Float64 => Ok(MssqlType::Float { precision: 53 }),
         DataType::Utf8 | DataType::LargeUtf8 => {
             plan_arrow_string_as_mssql_type(options.string_policy, index, field)
@@ -381,6 +381,7 @@ mod tests {
             (DataType::UInt8, MssqlType::TinyInt),
             (DataType::UInt16, MssqlType::Int),
             (DataType::UInt32, MssqlType::BigInt),
+            (DataType::Float16, MssqlType::Real),
             (DataType::Float32, MssqlType::Real),
             (DataType::Float64, MssqlType::Float { precision: 53 }),
             (DataType::Utf8, MssqlType::NVarChar(MssqlTypeLength::Max)),
@@ -741,7 +742,6 @@ mod tests {
     fn unsupported_type_diagnostics_name_arrow_type_family() {
         let cases = [
             (DataType::Null, "null"),
-            (DataType::Float16, "16-bit floating-point"),
             (DataType::Time32(TimeUnit::Microsecond), "time-only"),
             (DataType::Duration(TimeUnit::Microsecond), "duration"),
             (DataType::BinaryView, "view"),

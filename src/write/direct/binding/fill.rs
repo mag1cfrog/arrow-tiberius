@@ -9,9 +9,10 @@ use super::super::{
         },
         fixed_size_binary::fill_fixed_size_binary_column,
         primitive::{
-            fill_boolean_column, fill_float32_column, fill_float64_column, fill_int8_column,
-            fill_int16_column, fill_int32_column, fill_int64_column, fill_uint8_column,
-            fill_uint16_column, fill_uint32_column, fill_uint64_checked_bigint_column,
+            fill_boolean_column, fill_float16_column, fill_float32_column, fill_float64_column,
+            fill_int8_column, fill_int16_column, fill_int32_column, fill_int64_column,
+            fill_uint8_column, fill_uint16_column, fill_uint32_column,
+            fill_uint64_checked_bigint_column,
         },
         temporal::{
             TemporalColumnContext, fill_date32_direct_column, fill_date64_direct_column,
@@ -132,6 +133,9 @@ impl BoundDirectColumn<'_> {
                 layout,
                 bytes,
             ),
+            Self::Float16 { column, array } => {
+                fill_float16_column(array, column, column_index, column_count, layout, bytes)
+            }
             Self::Float32 { column, array } => {
                 fill_float32_column(array, column, column_index, column_count, layout, bytes)
             }

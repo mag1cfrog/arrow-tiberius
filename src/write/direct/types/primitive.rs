@@ -1,8 +1,8 @@
 //! Primitive direct TDS row payload helpers.
 
 use arrow_array::{
-    Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, BooleanArray, Float16Array, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 
 use crate::{
@@ -126,6 +126,35 @@ pub(crate) fn measure_float32_column_cell_lengths(
         column_count,
         cell_lengths,
         |array, row_index| validate_finite_float(column, row_index, array.value(row_index)),
+    )
+}
+
+pub(crate) fn measure_float16_column_cell_lengths(
+    array: &Float16Array,
+    column: &DirectColumnPlan,
+    column_index: usize,
+    column_count: usize,
+    cell_lengths: &mut [usize],
+) -> Result<()> {
+    let value_len = match column.encoding() {
+        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float16ToReal) => 4,
+        other => {
+            return Err(unsupported_batch(format!(
+                "direct Float16 layout cannot measure mapping {other:?}"
+            )));
+        }
+    };
+
+    measure_checked_primitive_column_cell_lengths(
+        array,
+        column,
+        value_len,
+        column_index,
+        column_count,
+        cell_lengths,
+        |array, row_index| {
+            validate_finite_float(column, row_index, array.value(row_index).to_f32())
+        },
     )
 }
 
@@ -481,6 +510,47 @@ pub(crate) fn fill_float32_column(
     Ok(())
 }
 
+/// Fills one Float16-to-real column into an already allocated rows payload.
+pub(crate) fn fill_float16_column(
+    array: &Float16Array,
+    column: &DirectColumnPlan,
+    column_index: usize,
+    column_count: usize,
+    layout: &RowLayout,
+    bytes: &mut [u8],
+) -> Result<()> {
+    for row_index in 0..array.len() {
+        let cell = cell_position(layout, row_index, column_index, column_count)?;
+
+        if array.is_null(row_index) {
+            if !column.nullable() {
+                return Err(value_conversion_error(row_column_diagnostic(
+                    column,
+                    row_index,
+                    DiagnosticCode::NullInNonNullableColumn,
+                    "null value in non-nullable direct primitive column",
+                )));
+            }
+
+            write_null_cell(bytes, cell)?;
+        } else {
+            let value = array.value(row_index).to_f32();
+            if !value.is_finite() {
+                return Err(value_conversion_error(row_column_diagnostic(
+                    column,
+                    row_index,
+                    DiagnosticCode::NonFiniteFloat,
+                    format!("non-finite floating point value {value} is not supported"),
+                )));
+            }
+
+            write_primitive_cell(bytes, cell, column, &value.to_le_bytes())?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Fills one Float64-to-float column into an already allocated rows payload.
 pub(crate) fn fill_float64_column(
     array: &Float64Array,
@@ -764,6 +834,31 @@ pub(crate) fn append_float32_cell(
     append_primitive_cell(buf, column, measured_len, &value.to_le_bytes())
 }
 
+/// Appends one Float16-to-real cell to a raw bulk append buffer.
+pub(crate) fn append_float16_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    array: &Float16Array,
+    column: &DirectColumnPlan,
+    row_index: usize,
+    measured_len: usize,
+) -> Result<()> {
+    if array.is_null(row_index) {
+        return append_null_cell(buf, column, row_index, measured_len);
+    }
+
+    let value = array.value(row_index).to_f32();
+    if !value.is_finite() {
+        return Err(value_conversion_error(row_column_diagnostic(
+            column,
+            row_index,
+            DiagnosticCode::NonFiniteFloat,
+            format!("non-finite floating point value {value} is not supported"),
+        )));
+    }
+
+    append_primitive_cell(buf, column, measured_len, &value.to_le_bytes())
+}
+
 /// Appends one Float64-to-float cell to a raw bulk append buffer.
 pub(crate) fn append_float64_cell(
     buf: &mut tiberius::RawRowsAppendBuffer<'_>,
@@ -989,7 +1084,9 @@ fn primitive_value_len(encoding: DirectColumnEncoding) -> Result<usize> {
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Int64ToBigInt) => Ok(8),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt32ToBigInt) => Ok(8),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::UInt64ToCheckedBigInt) => Ok(8),
-        DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal) => Ok(4),
+        DirectColumnEncoding::Primitive(
+            PrimitiveArrowToMssql::Float16ToReal | PrimitiveArrowToMssql::Float32ToReal,
+        ) => Ok(4),
         DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat) => Ok(8),
         DirectColumnEncoding::UInt64Decimal20_0 => Err(unsupported_batch(
             "direct primitive layout is not implemented for UInt64 decimal20_0",

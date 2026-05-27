@@ -21,11 +21,12 @@ mod tests {
 
     use arrow_array::{
         ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array,
-        Decimal64Array, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float32Array,
-        Float64Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch,
-        StringArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
-        Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-        TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
+        Decimal64Array, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float16Array,
+        Float32Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
+        RecordBatch, StringArray, Time32MillisecondArray, Time32SecondArray,
+        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
+        types::{ArrowPrimitiveType, Float16Type},
     };
     use arrow_buffer::{NullBuffer, ScalarBuffer, i256};
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -36,6 +37,8 @@ mod tests {
         conversion::arrow_to_mssql::primitive::PrimitiveArrowToMssql,
         mssql::cell::{MssqlDate, MssqlDateTime2, MssqlDateTimeOffset, MssqlTime},
     };
+
+    type F16 = <Float16Type as ArrowPrimitiveType>::Native;
 
     use super::layout::{CellPosition, RowLayout};
     use super::plan::{DirectColumnEncoding, DirectEncoderSupport, DirectMappingSupport};
@@ -2165,6 +2168,60 @@ mod tests {
                 0,
                 0
             ]
+        );
+    }
+
+    #[test]
+    fn direct_encoder_encodes_float16_real_cells() {
+        let mappings = vec![mapping(
+            0,
+            "ratio",
+            DataType::Float16,
+            MssqlType::Real,
+            true,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![Field::new("ratio", DataType::Float16, true)],
+            vec![Arc::new(Float16Array::from(vec![
+                Some(F16::from_f32(1.5)),
+                None,
+                Some(F16::from_f32(-2.25)),
+            ]))],
+        );
+
+        let payload = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(payload.row_token_offsets(), [0, 6, 8]);
+        assert_eq!(
+            payload.bytes(),
+            [
+                payload::TDS_ROW_TOKEN,
+                4,
+                0,
+                0,
+                0xC0,
+                0x3F,
+                payload::TDS_ROW_TOKEN,
+                0,
+                payload::TDS_ROW_TOKEN,
+                4,
+                0,
+                0,
+                0x10,
+                0xC0,
+            ]
+        );
+
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+        let fast_payload = try_encode_fixed_width_rows(&bound)
+            .unwrap()
+            .expect("Float16 real fixed-width fast path should be active");
+
+        assert_eq!(fast_payload.bytes(), payload.bytes());
+        assert_eq!(
+            fast_payload.row_token_offsets(),
+            payload.row_token_offsets()
         );
     }
 
