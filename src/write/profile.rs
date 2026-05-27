@@ -523,9 +523,6 @@ mod disabled {
 
     pub(crate) fn record_null_cell() {}
 
-    #[allow(dead_code)]
-    pub(crate) fn record_bulk_load_stats(_stats: tiberius::BulkLoadStats) {}
-
     pub(crate) fn direct_date_fast_path_disabled() -> bool {
         false
     }
