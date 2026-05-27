@@ -28,6 +28,8 @@ pub(crate) enum PrimitiveArrowToMssql {
     UInt32ToBigInt,
     /// Arrow UInt64 to SQL Server `bigint` with a checked range conversion.
     UInt64ToCheckedBigInt,
+    /// Arrow Float16 to SQL Server `real`.
+    Float16ToReal,
     /// Arrow Float32 to SQL Server `real`.
     Float32ToReal,
     /// Arrow Float64 to SQL Server `float(53)`.
@@ -50,6 +52,7 @@ impl PrimitiveArrowToMssql {
                 UInt64ArrowToMssql::classify(mapping, row_index)?;
                 Self::UInt64ToCheckedBigInt
             }
+            (DataType::Float16, MssqlType::Real) => Self::Float16ToReal,
             (DataType::Float32, MssqlType::Real) => Self::Float32ToReal,
             (DataType::Float64, MssqlType::Float { precision: 53 }) => Self::Float64ToFloat,
             _ => {
@@ -145,6 +148,11 @@ mod tests {
                 DataType::UInt64,
                 MssqlType::BigInt,
                 PrimitiveArrowToMssql::UInt64ToCheckedBigInt,
+            ),
+            (
+                DataType::Float16,
+                MssqlType::Real,
+                PrimitiveArrowToMssql::Float16ToReal,
             ),
             (
                 DataType::Float32,

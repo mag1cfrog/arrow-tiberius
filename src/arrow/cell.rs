@@ -2,11 +2,12 @@
 
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
-    Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
-    Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float16Array, Float32Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
+    LargeStringArray, StringArray, Time32MillisecondArray, Time32SecondArray,
+    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_buffer::i256;
 use arrow_schema::{DataType, TimeUnit};
@@ -66,6 +67,8 @@ pub(crate) enum ArrowCell<'a> {
     TimestampNanosecond(i64),
     /// Arrow 32-bit floating point value.
     Float32(f32),
+    /// Arrow 16-bit floating point value widened to f32.
+    Float16(f32),
     /// Arrow 64-bit floating point value.
     Float64(f64),
     /// Arrow UTF-8 string value.
@@ -192,6 +195,10 @@ pub(crate) fn extract_arrow_cell<'a>(
                 Ok(ArrowCell::TimestampNanosecond(array.value(row_index)))
             }
         },
+        DataType::Float16 => {
+            let array = downcast_array::<Float16Array>(array, mapping, row_index)?;
+            Ok(ArrowCell::Float16(array.value(row_index).to_f32()))
+        }
         DataType::Float32 => {
             let array = downcast_array::<Float32Array>(array, mapping, row_index)?;
             Ok(ArrowCell::Float32(array.value(row_index)))
@@ -286,18 +293,21 @@ mod tests {
 
     use arrow_array::{
         ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array,
-        Decimal64Array, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float32Array,
-        Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
-        LargeStringArray, StringArray, Time32MillisecondArray, Time32SecondArray,
+        Decimal64Array, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float16Array,
+        Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        LargeBinaryArray, LargeStringArray, StringArray, Time32MillisecondArray, Time32SecondArray,
         Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
         TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
         UInt16Array, UInt32Array, UInt64Array,
+        types::{ArrowPrimitiveType, Float16Type},
     };
     use arrow_buffer::i256;
     use arrow_schema::{DataType, TimeUnit};
 
     use super::{ArrowCell, extract_arrow_cell};
     use crate::{ArrowFieldRef, Identifier, MssqlColumn, MssqlType, SchemaMapping};
+
+    type F16 = <Float16Type as ArrowPrimitiveType>::Native;
 
     #[test]
     fn extracts_arrow_cells_for_supported_initial_primitives() {
@@ -341,6 +351,11 @@ mod tests {
                 mapping("unsigned_large", DataType::UInt32),
                 Arc::new(UInt32Array::from(vec![Some(32_u32), None])),
                 ArrowCell::UInt32(32),
+            ),
+            (
+                mapping("half_value", DataType::Float16),
+                Arc::new(Float16Array::from(vec![Some(F16::from_f32(1.5)), None])),
+                ArrowCell::Float16(1.5),
             ),
             (
                 mapping("real_value", DataType::Float32),

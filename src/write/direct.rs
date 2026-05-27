@@ -21,11 +21,12 @@ mod tests {
 
     use arrow_array::{
         ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array,
-        Decimal64Array, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float32Array,
-        Float64Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch,
-        StringArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
-        Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-        TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
+        Decimal64Array, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float16Array,
+        Float32Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
+        RecordBatch, StringArray, Time32MillisecondArray, Time32SecondArray,
+        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
+        types::{ArrowPrimitiveType, Float16Type},
     };
     use arrow_buffer::{NullBuffer, ScalarBuffer, i256};
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -36,6 +37,8 @@ mod tests {
         conversion::arrow_to_mssql::primitive::PrimitiveArrowToMssql,
         mssql::cell::{MssqlDate, MssqlDateTime2, MssqlDateTimeOffset, MssqlTime},
     };
+
+    type F16 = <Float16Type as ArrowPrimitiveType>::Native;
 
     use super::layout::{CellPosition, RowLayout};
     use super::plan::{DirectColumnEncoding, DirectEncoderSupport, DirectMappingSupport};
@@ -2169,6 +2172,60 @@ mod tests {
     }
 
     #[test]
+    fn direct_encoder_encodes_float16_real_cells() {
+        let mappings = vec![mapping(
+            0,
+            "ratio",
+            DataType::Float16,
+            MssqlType::Real,
+            true,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![Field::new("ratio", DataType::Float16, true)],
+            vec![Arc::new(Float16Array::from(vec![
+                Some(F16::from_f32(1.5)),
+                None,
+                Some(F16::from_f32(-2.25)),
+            ]))],
+        );
+
+        let payload = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(payload.row_token_offsets(), [0, 6, 8]);
+        assert_eq!(
+            payload.bytes(),
+            [
+                payload::TDS_ROW_TOKEN,
+                4,
+                0,
+                0,
+                0xC0,
+                0x3F,
+                payload::TDS_ROW_TOKEN,
+                0,
+                payload::TDS_ROW_TOKEN,
+                4,
+                0,
+                0,
+                0x10,
+                0xC0,
+            ]
+        );
+
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+        let fast_payload = try_encode_fixed_width_rows(&bound)
+            .unwrap()
+            .expect("Float16 real fixed-width fast path should be active");
+
+        assert_eq!(fast_payload.bytes(), payload.bytes());
+        assert_eq!(
+            fast_payload.row_token_offsets(),
+            payload.row_token_offsets()
+        );
+    }
+
+    #[test]
     fn direct_encoder_fast_path_encodes_mixed_nullable_and_non_nullable_rows() {
         let mappings = vec![
             mapping(0, "quantity", DataType::Int32, MssqlType::Int, true),
@@ -3524,6 +3581,43 @@ mod tests {
     }
 
     #[test]
+    fn direct_encoder_fast_path_does_not_read_non_finite_float16_from_null_slot() {
+        let mappings = vec![mapping(
+            0,
+            "half_value",
+            DataType::Float16,
+            MssqlType::Real,
+            true,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let array = Float16Array::new(
+            ScalarBuffer::from(vec![F16::from_f32(f32::NAN), F16::from_f32(1.5)]),
+            Some(NullBuffer::from(vec![false, true])),
+        );
+        let batch = record_batch(
+            vec![Field::new("half_value", DataType::Float16, true)],
+            vec![Arc::new(array)],
+        );
+
+        let payload = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(payload.row_token_offsets(), [0, 2]);
+        assert_eq!(
+            payload.bytes(),
+            [
+                payload::TDS_ROW_TOKEN,
+                0,
+                payload::TDS_ROW_TOKEN,
+                4,
+                0x00,
+                0x00,
+                0xC0,
+                0x3F
+            ]
+        );
+    }
+
+    #[test]
     fn direct_encoder_fast_path_rejects_non_finite_nullable_float_when_non_null() {
         let mappings = vec![mapping(
             0,
@@ -3554,6 +3648,36 @@ mod tests {
     }
 
     #[test]
+    fn direct_encoder_fast_path_rejects_non_finite_float16_when_non_null() {
+        let mappings = vec![mapping(
+            0,
+            "half_value",
+            DataType::Float16,
+            MssqlType::Real,
+            true,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![Field::new("half_value", DataType::Float16, true)],
+            vec![Arc::new(Float16Array::from(vec![
+                Some(F16::from_f32(1.0)),
+                Some(F16::from_f32(f32::NAN)),
+            ]))],
+        );
+
+        let err = encoder
+            .encode_batch(&batch)
+            .expect_err("non-null non-finite Float16 must fail");
+
+        assert_value_conversion_diagnostic(
+            err,
+            DiagnosticCode::NonFiniteFloat,
+            Some(1),
+            Some((0, "half_value")),
+        );
+    }
+
+    #[test]
     fn direct_encoder_fast_path_rejects_null_in_non_nullable_column() {
         let mappings = vec![mapping(
             0,
@@ -3577,6 +3701,36 @@ mod tests {
             DiagnosticCode::NullInNonNullableColumn,
             Some(1),
             Some((0, "quantity")),
+        );
+    }
+
+    #[test]
+    fn direct_encoder_fast_path_rejects_float16_null_in_non_nullable_column() {
+        let mappings = vec![mapping(
+            0,
+            "half_value",
+            DataType::Float16,
+            MssqlType::Real,
+            false,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![Field::new("half_value", DataType::Float16, true)],
+            vec![Arc::new(Float16Array::from(vec![
+                Some(F16::from_f32(1.0)),
+                None,
+            ]))],
+        );
+
+        let err = encoder
+            .encode_batch(&batch)
+            .expect_err("Float16 null in non-nullable direct column must fail");
+
+        assert_value_conversion_diagnostic(
+            err,
+            DiagnosticCode::NullInNonNullableColumn,
+            Some(1),
+            Some((0, "half_value")),
         );
     }
 

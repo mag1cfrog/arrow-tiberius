@@ -7,9 +7,10 @@ use super::super::types::{
     },
     fixed_size_binary::append_fixed_size_binary_cell,
     primitive::{
-        append_boolean_cell, append_float32_cell, append_float64_cell, append_int8_cell,
-        append_int16_cell, append_int32_cell, append_int64_cell, append_uint8_cell,
-        append_uint16_cell, append_uint32_cell, append_uint64_checked_bigint_cell,
+        append_boolean_cell, append_float16_cell, append_float32_cell, append_float64_cell,
+        append_int8_cell, append_int16_cell, append_int32_cell, append_int64_cell,
+        append_uint8_cell, append_uint16_cell, append_uint32_cell,
+        append_uint64_checked_bigint_cell,
     },
     temporal::{
         append_date32_cell, append_date64_cell, append_datetimeoffset_microsecond_cell,
@@ -89,6 +90,9 @@ impl BoundDirectColumn<'_> {
                 array,
             } => {
                 append_decimal256_cell(buf, array, column, *classification, row_index, measured_len)
+            }
+            Self::Float16 { column, array } => {
+                append_float16_cell(buf, array, column, row_index, measured_len)
             }
             Self::Float32 { column, array } => {
                 append_float32_cell(buf, array, column, row_index, measured_len)

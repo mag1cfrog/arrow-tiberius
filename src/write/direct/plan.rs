@@ -382,9 +382,10 @@ mod tests {
             mapping(6, "total", DataType::Int64, MssqlType::BigInt),
             mapping(7, "unsigned_total", DataType::UInt32, MssqlType::BigInt),
             mapping(8, "unsigned_huge", DataType::UInt64, MssqlType::BigInt),
-            mapping(9, "real_value", DataType::Float32, MssqlType::Real),
+            mapping(9, "half_value", DataType::Float16, MssqlType::Real),
+            mapping(10, "real_value", DataType::Float32, MssqlType::Real),
             mapping(
-                10,
+                11,
                 "ratio",
                 DataType::Float64,
                 MssqlType::Float { precision: 53 },
@@ -394,7 +395,7 @@ mod tests {
         let plan = DirectEncoderPlan::new(&mappings, &CurrentDirectMappings)
             .expect("implemented primitive mappings should be supported");
 
-        assert_eq!(plan.column_count(), 11);
+        assert_eq!(plan.column_count(), 12);
         assert_eq!(plan.columns()[0].target_type(), &MssqlType::Bit);
         assert_eq!(plan.columns()[1].target_type(), &MssqlType::TinyInt);
         assert_eq!(plan.columns()[2].target_type(), &MssqlType::SmallInt);
@@ -405,8 +406,9 @@ mod tests {
         assert_eq!(plan.columns()[7].target_type(), &MssqlType::BigInt);
         assert_eq!(plan.columns()[8].target_type(), &MssqlType::BigInt);
         assert_eq!(plan.columns()[9].target_type(), &MssqlType::Real);
+        assert_eq!(plan.columns()[10].target_type(), &MssqlType::Real);
         assert_eq!(
-            plan.columns()[10].target_type(),
+            plan.columns()[11].target_type(),
             &MssqlType::Float { precision: 53 }
         );
         assert_eq!(
@@ -447,10 +449,14 @@ mod tests {
         );
         assert_eq!(
             plan.columns()[9].encoding(),
-            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal)
+            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float16ToReal)
         );
         assert_eq!(
             plan.columns()[10].encoding(),
+            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal)
+        );
+        assert_eq!(
+            plan.columns()[11].encoding(),
             DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float64ToFloat)
         );
     }

@@ -51,12 +51,14 @@ pub(super) fn primitive_mssql_cell<'a>(
                 })
                 .map(|value| MssqlCell::BigInt(Some(value)))
         }
-        (Some(PrimitiveArrowToMssql::Float32ToReal), ArrowCell::Float32(value))
+        (Some(PrimitiveArrowToMssql::Float16ToReal), ArrowCell::Float16(value))
+        | (Some(PrimitiveArrowToMssql::Float32ToReal), ArrowCell::Float32(value))
             if value.is_finite() =>
         {
             Ok(MssqlCell::Real(Some(value)))
         }
-        (Some(PrimitiveArrowToMssql::Float32ToReal), ArrowCell::Float32(value)) => {
+        (Some(PrimitiveArrowToMssql::Float16ToReal), ArrowCell::Float16(value))
+        | (Some(PrimitiveArrowToMssql::Float32ToReal), ArrowCell::Float32(value)) => {
             Err(non_finite_float_error(mapping, row_index, value))
         }
         (Some(PrimitiveArrowToMssql::Float64ToFloat), ArrowCell::Float64(value))
@@ -112,6 +114,7 @@ mod tests {
             Field::new("unsigned_tiny", DataType::UInt8, true),
             Field::new("unsigned_medium", DataType::UInt16, true),
             Field::new("unsigned_large", DataType::UInt32, true),
+            Field::new("half_value", DataType::Float16, true),
             Field::new("real_value", DataType::Float32, true),
             Field::new("float_value", DataType::Float64, true),
             Field::new("text", DataType::Utf8, true),
@@ -128,25 +131,26 @@ mod tests {
             (5, ArrowCell::UInt8(8), MssqlCell::TinyInt(Some(8))),
             (6, ArrowCell::UInt16(16), MssqlCell::Int(Some(16))),
             (7, ArrowCell::UInt32(32), MssqlCell::BigInt(Some(32))),
-            (8, ArrowCell::Float32(1.25), MssqlCell::Real(Some(1.25))),
-            (9, ArrowCell::Float64(2.5), MssqlCell::Float(Some(2.5))),
+            (8, ArrowCell::Float16(1.5), MssqlCell::Real(Some(1.5))),
+            (9, ArrowCell::Float32(1.25), MssqlCell::Real(Some(1.25))),
+            (10, ArrowCell::Float64(2.5), MssqlCell::Float(Some(2.5))),
             (
-                10,
+                11,
                 ArrowCell::Utf8("hello"),
                 MssqlCell::NVarChar(Some("hello")),
             ),
             (
-                11,
+                12,
                 ArrowCell::Utf8("Tokyo"),
                 MssqlCell::NVarChar(Some("Tokyo")),
             ),
             (
-                12,
+                13,
                 ArrowCell::Binary(b"abc"),
                 MssqlCell::VarBinary(Some(b"abc")),
             ),
             (
-                13,
+                14,
                 ArrowCell::Binary(b"large"),
                 MssqlCell::VarBinary(Some(b"large")),
             ),
@@ -169,11 +173,12 @@ mod tests {
             (6, MssqlCell::Int(None)),
             (7, MssqlCell::BigInt(None)),
             (8, MssqlCell::Real(None)),
-            (9, MssqlCell::Float(None)),
-            (10, MssqlCell::NVarChar(None)),
+            (9, MssqlCell::Real(None)),
+            (10, MssqlCell::Float(None)),
             (11, MssqlCell::NVarChar(None)),
-            (12, MssqlCell::VarBinary(None)),
+            (12, MssqlCell::NVarChar(None)),
             (13, MssqlCell::VarBinary(None)),
+            (14, MssqlCell::VarBinary(None)),
         ];
 
         for (index, expected) in null_cases {
@@ -345,6 +350,29 @@ mod tests {
             .enumerate()
         {
             let err = convert_cell(&mappings[0], ArrowCell::Float32(value), row_index).unwrap_err();
+
+            assert_single_diagnostic(
+                err,
+                DiagnosticCode::NonFiniteFloat,
+                Some(row_index),
+                Some((0, "ratio")),
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_finite_float16_values() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "ratio",
+            DataType::Float16,
+            true,
+        )]));
+
+        for (row_index, value) in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY]
+            .into_iter()
+            .enumerate()
+        {
+            let err = convert_cell(&mappings[0], ArrowCell::Float16(value), row_index).unwrap_err();
 
             assert_single_diagnostic(
                 err,

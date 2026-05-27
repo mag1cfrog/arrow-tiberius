@@ -6,12 +6,12 @@ mod measure;
 
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
-    Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch,
-    StringArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
-    Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
-    UInt64Array,
+    Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float16Array, Float32Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
+    LargeStringArray, RecordBatch, StringArray, Time32MillisecondArray, Time32SecondArray,
+    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 
 use super::{
@@ -159,6 +159,12 @@ fn bind_direct_columns<'a>(
                 BoundDirectColumn::UInt64 {
                     column,
                     array: downcast_direct_array::<UInt64Array>(array, column)?,
+                }
+            }
+            DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float16ToReal) => {
+                BoundDirectColumn::Float16 {
+                    column,
+                    array: downcast_direct_array::<Float16Array>(array, column)?,
                 }
             }
             DirectColumnEncoding::Primitive(PrimitiveArrowToMssql::Float32ToReal) => {
@@ -413,6 +419,10 @@ pub(crate) enum BoundDirectColumn<'a> {
     Float32 {
         column: &'a plan::DirectColumnPlan,
         array: &'a Float32Array,
+    },
+    Float16 {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a Float16Array,
     },
     Float64 {
         column: &'a plan::DirectColumnPlan,
