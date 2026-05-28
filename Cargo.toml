@@ -15,8 +15,10 @@ panic = "deny"
 name = "arrow-tiberius"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/mag1cfrog/arrow-tiberius"
+documentation = "https://docs.rs/arrow-tiberius"
 description = "Apache Arrow and SQL Server bridge through Tiberius"
 readme = "README.md"
 keywords = ["arrow", "sql-server", "tiberius", "tds"]
@@ -32,6 +34,11 @@ path = "src/lib.rs"
 [features]
 bench-profile = ["tiberius/bulk-load-profile"]
 integration-tests = []
+
+[package.metadata.docs.rs]
+all-features = true
+targets = []
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 arrow-array = { version = "58.3.0", features = ["chrono-tz"] }

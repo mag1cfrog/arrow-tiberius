@@ -1,8 +1,254 @@
 # arrow-tiberius
-Arrow RecordBatch to SQL Server bulk load through Tiberius
 
-See [docs/type-mapping.md](docs/type-mapping.md) for Arrow-to-SQL Server type mappings and policy-dependent write support.
+[![Crates.io](https://img.shields.io/crates/v/arrow-tiberius.svg)](https://crates.io/crates/arrow-tiberius)
+[![Docs.rs](https://docs.rs/arrow-tiberius/badge.svg)](https://docs.rs/arrow-tiberius)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-See [docs/integration-tests.md](docs/integration-tests.md) for the SQL Server integration test harness.
+`arrow-tiberius` is a Rust library for bridging Apache Arrow and Microsoft SQL
+Server through the Tiberius TDS driver.
 
-See [docs/benchmarks.md](docs/benchmarks.md) for writer benchmark commands and interpretation guidance.
+The crate is designed around a bidirectional boundary:
+
+```text
+Arrow Schema + RecordBatch values
+    -> SQL Server write plan and DDL
+    -> SQL Server bulk load through Tiberius
+
+SQL Server metadata and rows through Tiberius
+    -> Arrow schema and RecordBatch values
+```
+
+The v0.1 release implements the Arrow-to-SQL Server write path first. The public
+API is still intentionally shaped around Arrow, SQL Server profiles, structured
+diagnostics, and directional modules so a SQL Server-to-Arrow read path can be
+added without renaming the crate or replacing the core model.
+
+> [!NOTE]
+> v0.1 implements the Arrow-to-SQL Server direction only. SQL Server-to-Arrow
+> reading is reserved for a later release. Callers own data sources, runtime
+> configuration, orchestration, and table publishing workflows.
+
+## Scope
+
+In v0.1, `arrow-tiberius` provides:
+
+- Arrow-to-SQL Server schema planning.
+- SQL Server identifiers, type metadata, compatibility profile, and DDL helpers.
+- Structured planning and runtime diagnostics.
+- Arrow `RecordBatch` bulk writing through Tiberius.
+- Baseline and optimized writer backend selection.
+- SQL Server integration tests and writer benchmark harnesses.
+
+It does not provide SQL Server-to-Arrow reads yet, and it does not manage
+application runtime concerns such as source reads, configuration, connection
+pooling, retries, scheduling, or publish workflows.
+
+## Quick Start
+
+Add the crate:
+
+```toml
+[dependencies]
+arrow-tiberius = "0.1"
+```
+
+Plan an Arrow schema and render deterministic `CREATE TABLE` SQL:
+
+```rust
+use arrow_schema::{DataType, Field, Schema};
+use arrow_tiberius::{
+    MssqlProfile, PlanOptions, TableName, create_table_sql_from_mappings,
+    plan_arrow_schema_to_mssql_mappings,
+};
+
+fn main() -> arrow_tiberius::Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+    ]);
+
+    let outcome = plan_arrow_schema_to_mssql_mappings(
+        &schema,
+        MssqlProfile::sql_server_2016_compat_100(),
+        PlanOptions::default(),
+    )?;
+
+    let table = TableName::new("dbo", "people")?;
+    let ddl = create_table_sql_from_mappings(&table, outcome.value());
+
+    assert!(ddl.contains("CREATE TABLE [dbo].[people]"));
+    Ok(())
+}
+```
+
+Write batches to an existing SQL Server table with `BulkWriter`:
+
+```rust
+use arrow_array::RecordBatch;
+use arrow_tiberius::{
+    BulkWriter, MssqlProfile, PlanOptions, TableName, WriteBackend, WriteOptions,
+    plan_arrow_schema_to_mssql_mappings,
+};
+use futures_util::io::{AsyncRead, AsyncWrite};
+
+async fn write_batch<S>(
+    client: &mut tiberius::Client<S>,
+    batch: &RecordBatch,
+) -> arrow_tiberius::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let outcome = plan_arrow_schema_to_mssql_mappings(
+        batch.schema().as_ref(),
+        MssqlProfile::sql_server_2016_compat_100(),
+        PlanOptions::default(),
+    )?;
+
+    let table = TableName::new("dbo", "people")?;
+    let mut writer = BulkWriter::new(
+        client,
+        table,
+        outcome.value().to_vec(),
+        WriteOptions {
+            backend: WriteBackend::DirectRawBulk,
+            ..WriteOptions::default()
+        },
+    )
+    .await?;
+
+    writer.write_batch(batch).await?;
+    writer.finish().await?;
+    Ok(())
+}
+```
+
+`BulkWriter` validates the target table metadata before sending rows. It does
+not create the target table automatically; callers can use the DDL helpers when
+they want this crate to produce the table definition.
+
+## Diagnostics
+
+Planning and write failures return structured diagnostics instead of relying on
+string parsing. Callers can inspect severity, machine-readable code, field, row,
+and message.
+
+```rust
+use arrow_schema::{DataType, Field, Schema};
+use arrow_tiberius::{
+    Error, MssqlProfile, PlanOptions, plan_arrow_schema_to_mssql_mappings,
+};
+
+let schema = Schema::new(vec![Field::new("raw", DataType::UInt64, false)]);
+let err = plan_arrow_schema_to_mssql_mappings(
+    &schema,
+    MssqlProfile::sql_server_2016_compat_100(),
+    PlanOptions::default(),
+)
+.expect_err("UInt64 requires an explicit policy by default");
+
+if let Error::Planning { diagnostics } = err {
+    for diagnostic in diagnostics.all() {
+        println!("{:?}: {}", diagnostic.code(), diagnostic.message());
+    }
+}
+```
+
+See [Arrow to SQL Server Type Mapping](docs/type-mapping.md) for the full
+supported and unsupported mapping surface.
+
+## Writer Backends
+
+`WriteBackend` controls how planned Arrow rows are sent to SQL Server:
+
+| Backend | Purpose |
+| --- | --- |
+| `Auto` | Default selection. Currently resolves to `DirectRawBulk`. |
+| `BaselineTokenRow` | Compatibility and reference path using Tiberius `TokenRow` bulk load. |
+| `DirectFramedBulk` | Direct Arrow-to-TDS row encoding through Tiberius framed writes. |
+| `DirectRawBulk` | Optimized direct encoder plus raw bulk packet writes from the Tiberius fork. |
+
+The direct raw backend is the optimized production path for currently supported
+mappings. The baseline backend remains useful for compatibility checks,
+debugging, and parity tests.
+
+## SQL Server Compatibility
+
+The v0.1 profile targets SQL Server 2016 with database compatibility level 100:
+
+```rust
+use arrow_tiberius::MssqlProfile;
+
+let profile = MssqlProfile::sql_server_2016_compat_100();
+```
+
+See [Integration Tests](docs/integration-tests.md) for the SQL Server validation
+path used by this repository.
+
+## Tiberius Dependency Model
+
+`arrow-tiberius` depends on the published `tiberius-raw-bulk` package as the
+crate name `tiberius`:
+
+```toml
+tiberius = { package = "tiberius-raw-bulk", version = "=0.12.3-raw-bulk.12" }
+```
+
+If a downstream crate also constructs the SQL Server client passed to
+`BulkWriter`, it must use the same package identity:
+
+```toml
+[dependencies]
+arrow-tiberius = "0.1"
+tiberius = { package = "tiberius-raw-bulk", version = "=0.12.3-raw-bulk.12" }
+```
+
+Depending on upstream `tiberius` separately creates a distinct crate type. A
+client from upstream `tiberius` is not the same type as a client from
+`tiberius-raw-bulk` and will not match the `BulkWriter` API.
+
+The fork exists because upstream Tiberius does not expose the raw bulk packet
+APIs needed by the optimized direct writer. The baseline writer and direct
+writer use the same forked package dependency; only the optimized backend calls
+the raw-row APIs.
+
+## Feature Flags
+
+| Feature | Default | Purpose |
+| --- | --- | --- |
+| `bench-profile` | no | Enables benchmark-only direct write profiling hooks and forwards to `tiberius/bulk-load-profile`. |
+| `integration-tests` | no | Enables SQL Server integration tests that require explicit environment setup or the xtask runner. |
+
+Docs.rs is configured to build with all features so feature-gated public items
+are documented. Normal library use does not require either feature.
+
+## Validation
+
+Default local validation does not require SQL Server:
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace
+```
+
+Run SQL Server integration tests through the xtask harness:
+
+```bash
+cargo xtask sqlserver-test
+```
+
+The harness starts SQL Server when possible, configures compatibility level 100,
+runs feature-gated integration tests, and cleans up managed resources. See
+[Integration Tests](docs/integration-tests.md) for container runtime and
+existing-server options.
+
+Writer benchmark commands and interpretation guidance are in
+[Writer Benchmarks](docs/benchmarks.md). The curated direct raw benchmark
+summary is in [Direct Raw Benchmark Comparison](docs/direct-raw-benchmark-comparison.md).
+
+## Project Status
+
+`arrow-tiberius` is preparing its first v0.1 release. The v0.1 release focus is
+Arrow-to-SQL Server writing. SQL Server-to-Arrow reading, production
+orchestration, and broader SQL Server administration remain outside the current
+release scope.
