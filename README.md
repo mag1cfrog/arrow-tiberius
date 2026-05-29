@@ -282,3 +282,6 @@ for the measured numbers and setup.
 `arrow-tiberius` is preparing its first v0.1 release. The v0.1 release focus is
 Arrow-to-SQL Server writing. SQL Server-to-Arrow reading is reserved for a later
 release.
+
+See [v0.1 Release Boundary](docs/release-v0.1.md) for the maintainer release
+scope, gates, and publication checklist.
