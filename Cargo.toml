@@ -37,7 +37,7 @@ integration-tests = []
 
 [package.metadata.docs.rs]
 all-features = true
-targets = []
+targets = ["x86_64-unknown-linux-gnu"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]

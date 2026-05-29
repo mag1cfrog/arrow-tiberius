@@ -40,8 +40,14 @@ In v0.1, `arrow-tiberius` provides:
 - SQL Server integration tests and writer benchmark harnesses.
 
 It does not provide SQL Server-to-Arrow reads yet, and it does not manage
-application runtime concerns such as source reads, configuration, connection
-pooling, retries, scheduling, or publish workflows.
+application runtime concerns such as Delta Lake reads, S3 or object-store
+access, CLI runtime, configuration, secrets, connection pooling, retries,
+scheduling, table publish or synonym swaps, or broad SQL Server administration.
+Those concerns belong in downstream applications.
+
+A planned downstream Delta Lake to SQL Server exporter should own Delta,
+object-store, runtime, configuration, and orchestration concerns. It should use
+this crate only for Arrow-to-SQL Server planning, DDL, diagnostics, and writing.
 
 ## Quick Start
 
@@ -190,7 +196,11 @@ path used by this repository.
 crate name `tiberius`:
 
 ```toml
-tiberius = { package = "tiberius-raw-bulk", version = "=0.12.3-raw-bulk.12" }
+tiberius = { package = "tiberius-raw-bulk", version = "=0.12.3-raw-bulk.13", default-features = false, features = [
+    "tds73",
+    "winauth",
+    "native-tls",
+] }
 ```
 
 If a downstream crate also constructs the SQL Server client passed to
@@ -199,7 +209,11 @@ If a downstream crate also constructs the SQL Server client passed to
 ```toml
 [dependencies]
 arrow-tiberius = "0.1"
-tiberius = { package = "tiberius-raw-bulk", version = "=0.12.3-raw-bulk.12" }
+tiberius = { package = "tiberius-raw-bulk", version = "=0.12.3-raw-bulk.13", default-features = false, features = [
+    "tds73",
+    "winauth",
+    "native-tls",
+] }
 ```
 
 Depending on upstream `tiberius` separately creates a distinct crate type. A

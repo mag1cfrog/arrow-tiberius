@@ -9,8 +9,14 @@
 //! The v0.1 API implements the Arrow-to-SQL Server write path first: plan an
 //! Arrow schema for SQL Server, render deterministic DDL, inspect structured
 //! diagnostics, and bulk load one or more record batches. Callers own data
-//! sources, runtime configuration, retries, scheduling, and table publishing
-//! workflows.
+//! sources, Delta Lake reads, S3 or object-store access, CLI runtime,
+//! configuration, secrets, connection pooling, retries, scheduling, table
+//! publishing or synonym swaps, and broader SQL Server administration.
+//!
+//! A future downstream Delta Lake to SQL Server exporter should own Delta,
+//! object-store, runtime, configuration, and orchestration concerns. It should
+//! depend on this crate for Arrow-to-SQL Server planning, DDL, diagnostics, and
+//! writing only.
 //!
 //! [`RecordBatch`]: arrow_array::RecordBatch
 //!
@@ -122,7 +128,11 @@
 //! ```toml
 //! [dependencies]
 //! arrow-tiberius = "0.1"
-//! tiberius = { package = "tiberius-raw-bulk", version = "=0.12.3-raw-bulk.12" }
+//! tiberius = { package = "tiberius-raw-bulk", version = "=0.12.3-raw-bulk.13", default-features = false, features = [
+//!     "tds73",
+//!     "winauth",
+//!     "native-tls",
+//! ] }
 //! ```
 //!
 //! Depending on upstream `tiberius` separately creates a distinct crate type and
