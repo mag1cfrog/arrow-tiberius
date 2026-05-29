@@ -724,9 +724,9 @@ fn usize_to_u64_saturating(value: usize) -> u64 {
 
 fn resolve_backend(requested_backend: WriteBackend) -> Result<WriteBackend> {
     match requested_backend {
-        WriteBackend::Auto | WriteBackend::BaselineTokenRow => Ok(WriteBackend::BaselineTokenRow),
+        WriteBackend::Auto | WriteBackend::DirectRawBulk => Ok(WriteBackend::DirectRawBulk),
+        WriteBackend::BaselineTokenRow => Ok(WriteBackend::BaselineTokenRow),
         WriteBackend::DirectFramedBulk => Ok(WriteBackend::DirectFramedBulk),
-        WriteBackend::DirectRawBulk => Ok(WriteBackend::DirectRawBulk),
     }
 }
 
@@ -805,19 +805,19 @@ mod tests {
     }
 
     #[test]
-    fn auto_backend_resolves_to_baseline_token_row() {
+    fn auto_backend_resolves_to_direct_raw_bulk() {
         assert_eq!(
             resolve_backend(WriteBackend::Auto).unwrap(),
-            WriteBackend::BaselineTokenRow
-        );
-        assert_eq!(
-            resolve_backend(WriteBackend::BaselineTokenRow).unwrap(),
-            WriteBackend::BaselineTokenRow
+            WriteBackend::DirectRawBulk
         );
     }
 
     #[test]
-    fn direct_bulk_backends_resolve_to_requested_backend() {
+    fn explicit_backends_resolve_to_requested_backend() {
+        assert_eq!(
+            resolve_backend(WriteBackend::BaselineTokenRow).unwrap(),
+            WriteBackend::BaselineTokenRow
+        );
         assert_eq!(
             resolve_backend(WriteBackend::DirectFramedBulk).unwrap(),
             WriteBackend::DirectFramedBulk
@@ -840,8 +840,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(state.backend(), WriteBackend::BaselineTokenRow);
-        assert!(state.direct_encoder().is_none());
+        assert_eq!(state.backend(), WriteBackend::DirectRawBulk);
+        assert!(state.direct_encoder().is_some());
         assert_eq!(state.schema_check(), SchemaCheck::Strict);
         assert_eq!(state.mappings(), mappings.as_slice());
         assert_eq!(state.stats(), WriteStats::default());
