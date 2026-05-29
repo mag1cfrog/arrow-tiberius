@@ -251,6 +251,32 @@ Writer benchmark commands and interpretation guidance are in
 [Writer Benchmarks](docs/benchmarks.md). The curated direct raw benchmark
 summary is in [Direct Raw Benchmark Comparison](docs/direct-raw-benchmark-comparison.md).
 
+## Related Crates
+
+[`arrow-odbc`](https://docs.rs/arrow-odbc/) is the broader Arrow/ODBC crate. It
+targets ODBC data sources generally and supports reading and writing Arrow
+arrays through ODBC drivers. Use it when you need a database-agnostic ODBC path
+or SQL-to-Arrow reads today.
+
+`arrow-tiberius` is narrower: it targets Microsoft SQL Server through Tiberius
+and focuses v0.1 on Arrow-to-SQL Server bulk writes. That narrower scope lets
+the direct raw backend use SQL Server-specific TDS bulk-load encoding instead of
+going through ODBC.
+
+For the SQL Server write workloads this crate is built around, the local
+benchmark data generally favors `DirectRawBulk`: it is much faster than
+`arrow-odbc` on primitive and mixed nullable rows while using far less memory.
+Representative runs show about 3.05x throughput on primitive numeric rows
+with about 20 MiB peak RSS versus about 998 MiB, and about 1.66x throughput on
+mixed nullable rows with about 21 MiB peak RSS versus about 157 MiB. The main
+exception is some large variable-width text/binary workloads, where `arrow-odbc`
+can write about 1.28x to 1.37x faster but with roughly 1.4 GiB peak RSS versus
+about 100 MiB for `DirectRawBulk`. See
+[primitive direct raw comparison](docs/benchmark-results/2026-05-19-primitive-direct-raw-compare.md)
+and
+[variable-width direct raw comparison](docs/benchmark-results/2026-05-19-variable-width-direct-raw-compare.md)
+for the measured numbers and setup.
+
 ## Project Status
 
 `arrow-tiberius` is preparing its first v0.1 release. The v0.1 release focus is
