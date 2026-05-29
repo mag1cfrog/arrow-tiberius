@@ -185,6 +185,19 @@ The examples cover [schema to DDL](examples/schema_to_ddl.rs),
 [backend selection](examples/backend_selection.rs), and
 [policy-dependent planning](examples/policy_dependent_planning.rs).
 
+An environment-gated SQL Server write example is also available:
+
+```bash
+ARROW_TIBERIUS_EXAMPLE_MSSQL_URL='server=tcp:localhost,1433;user=sa;password=...;TrustServerCertificate=true' \
+  cargo run --example sqlserver_batch_write
+```
+
+By default it creates, writes to, and drops `[dbo].[arrow_tiberius_example_write]`.
+Set `ARROW_TIBERIUS_EXAMPLE_KEEP_TABLE=1` to keep the disposable table, or set
+`ARROW_TIBERIUS_EXAMPLE_MSSQL_SCHEMA`, `ARROW_TIBERIUS_EXAMPLE_MSSQL_TABLE`,
+and `ARROW_TIBERIUS_EXAMPLE_EXISTING_TABLE=1` to write to an existing table
+explicitly.
+
 ## SQL Server Compatibility
 
 The v0.1 profile targets SQL Server 2016 with database compatibility level 100:

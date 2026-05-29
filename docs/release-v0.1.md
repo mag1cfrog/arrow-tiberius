@@ -169,7 +169,7 @@ Run examples before publishing:
 
 ```bash
 cargo test --examples
-ARROW_TIBERIUS_EXAMPLE_MSSQL_URL=... cargo run --example <sqlserver-example-name>
+ARROW_TIBERIUS_EXAMPLE_MSSQL_URL=... cargo run --example sqlserver_batch_write
 ```
 
 The manual example command should use a real SQL Server connection string. The
