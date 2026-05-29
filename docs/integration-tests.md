@@ -83,6 +83,21 @@ cargo test --features integration-tests
 
 Prefer `cargo xtask sqlserver-test` for local development.
 
+## CI
+
+GitHub Actions runs the same xtask entrypoint in `.github/workflows/ci.yml`.
+The fast Rust job runs formatting, clippy, and normal workspace tests first.
+The SQL Server job then runs:
+
+```bash
+cargo xtask sqlserver-test
+```
+
+The CI SQL Server job assumes a Linux runner with Docker available and network
+access to pull `mcr.microsoft.com/mssql/server:2017-latest`. Container startup,
+readiness, database creation, compatibility-level setup, test execution, and
+cleanup remain owned by the xtask harness.
+
 ## Debugging
 
 Keep the container after a failed run:
