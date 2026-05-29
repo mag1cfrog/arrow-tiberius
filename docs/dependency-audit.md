@@ -57,11 +57,91 @@ RustSec warning, and also contributes to duplicate legacy dependency versions.
 The first remediation to test should be making the `tiberius` dependency use
 explicit features instead of accepting all defaults.
 
-## Direct Dependencies
+## Phase 2 Update
+
+Date: 2026-05-29
+
+Issue #124 was applied after the `tiberius-raw-bulk` fork audit was completed
+and `tiberius-raw-bulk 0.12.3-raw-bulk.13` was published.
+
+Changes made in this phase:
+
+- Updated `tiberius-raw-bulk` from `=0.12.3-raw-bulk.12` to
+  `=0.12.3-raw-bulk.13` in `arrow-tiberius` and `xtask`.
+- Disabled inherited `tiberius` defaults and explicitly enabled `tds73`,
+  `winauth`, and `native-tls`. This preserves TDS 7.3, Windows
+  authentication, and native TLS behavior while making the feature decision
+  visible in this crate.
+- Updated root Arrow dependencies from `58.2.0` to `58.3.0` across
+  `arrow-tiberius` and `xtask`.
+- Updated `snafu` from `0.9.0` to `0.9.1`.
+- Added `deny.toml` with advisory, duplicate-version, and source policy.
+- Documented the local dependency-audit checks for advisories, dependency
+  policy, unused dependencies, outdated root dependencies, and
+  duplicate-version reporting.
+
+Phase 2 commands:
+
+```sh
+cargo check --workspace
+cargo audit
+cargo deny check advisories bans sources
+cargo machete
+cargo outdated --workspace --root-deps-only --exit-code 1
+cargo tree --target all --duplicates
+cargo tree -p arrow-tiberius --edges features
+cargo metadata --format-version 1
+```
+
+Phase 2 results:
+
+- `cargo check --workspace` passed.
+- `cargo test --workspace` passed: 381 library tests, 148 `xtask` tests, and
+  0 integration tests with the current environment.
+- `cargo audit` passed with no RustSec findings in the workspace lockfile.
+- `cargo deny check advisories bans sources` passed. It still warns about
+  `getrandom 0.2.17` and `getrandom 0.3.4`.
+- `cargo machete` found no unused dependencies.
+- `cargo outdated --workspace --root-deps-only --exit-code 1` reported all
+  root dependencies up to date.
+- `cargo tree --target all --duplicates` no longer reports the legacy
+  `bitflags 1.3.2`, `getrandom 0.1.16`, or `wasi 0.9.0` paths from the old
+  `winauth` dependency.
+
+The fork-level change removes the previous `winauth -> rand 0.7.3` path from
+the `arrow-tiberius` lockfile. The lockfile also no longer contains
+`winauth 0.0.4`, `md5 0.6.1`, or `winapi 0.3.9`.
+
+The remaining `getrandom` duplicate is inherited through current maintained
+dependencies:
+
+- `getrandom 0.2.17` through `arrow-array -> ahash -> const-random`.
+- `getrandom 0.3.4` through `arrow-array -> ahash` and
+  `tiberius-raw-bulk -> native-tls -> tempfile`.
+
+No direct dependency removal is recommended from this phase. The direct
+dependencies are used by source code, tests, or `xtask`, and the remaining
+duplicate-version finding is warning-level policy rather than a current
+security failure.
+
+Excluded runner crate spot checks:
+
+- `xtask/arrow-odbc-runner`: `cargo check`, `cargo audit`, and
+  `cargo machete` passed. `cargo outdated --root-deps-only` reports
+  `arrow-odbc 23.2.0` behind `25.1.1`. Duplicate-version output is driven by
+  the `arrow-odbc -> odbc-api -> winit` stack plus Arrow.
+- `xtask/odbc-bcp-runner`: `cargo check`, `cargo audit`, and
+  `cargo machete` passed. `cargo outdated --root-deps-only` reports
+  `libloading 0.8.9` behind `0.9.0`. Duplicate-version output reports the
+  Arrow `getrandom` split also seen in the main workspace.
+
+No excluded runner manifest changes were made in this phase.
+
+## Phase 1 Direct Dependencies
 
 Runtime dependencies:
 
-| Dependency | Current requirement | Default features | Notes |
+| Dependency | Baseline requirement | Default features | Notes |
 | --- | --- | --- | --- |
 | `arrow-array` | `58.2.0` | yes | Enables `chrono-tz`; part of public data model. |
 | `arrow-buffer` | `58.2.0` | yes | Arrow buffer types. |
@@ -73,7 +153,7 @@ Runtime dependencies:
 
 Dev dependencies:
 
-| Dependency | Current requirement | Default features | Notes |
+| Dependency | Baseline requirement | Default features | Notes |
 | --- | --- | --- | --- |
 | `arrow-data` | `58.2.0` | yes | Test support. |
 | `tokio` | `1` | yes | Test runtime with `macros`, `net`, `rt`. |
@@ -81,7 +161,7 @@ Dev dependencies:
 
 `cargo machete` did not find unused direct dependencies.
 
-## Security
+## Phase 1 Security
 
 `cargo audit` reported one warning:
 
@@ -96,7 +176,7 @@ This warning is caused by the `winauth` feature enabled through
 sources passing under the default config, but it also emitted duplicate-version
 warnings described below.
 
-## Duplicate Versions
+## Phase 1 Duplicate Versions
 
 `cargo deny` and `cargo tree --target all --duplicates` found notable duplicate
 entries:
@@ -111,7 +191,7 @@ The duplicates are not all actionable directly, but the legacy `rand 0.7` path
 is actionable if Windows authentication is not required by this crate's default
 behavior.
 
-## Tiberius Feature Surface
+## Phase 1 Tiberius Feature Surface
 
 `tiberius-raw-bulk` exposes this default feature set:
 
@@ -137,7 +217,7 @@ Recommended follow-up:
 4. Consider a rustls feature path if the fork supports it cleanly and the target
    users do not require platform-native TLS.
 
-## Outdated Root Dependencies
+## Phase 1 Outdated Root Dependencies
 
 `cargo outdated --workspace --root-deps-only` reported:
 
@@ -154,7 +234,7 @@ Recommended follow-up:
 These look like normal patch/minor updates in the Arrow family and should be
 handled together in one follow-up.
 
-## Maintenance Snapshot
+## Phase 1 Maintenance Snapshot
 
 Crates.io metadata checked on 2026-05-28:
 
@@ -178,7 +258,7 @@ The main direct dependencies look actively maintained. The notable maintenance
 questions are in transitive dependencies under `tiberius-raw-bulk`, especially
 `winauth` and `connection-string`.
 
-## Recommended Follow-ups
+## Phase 1 Recommended Follow-ups
 
 1. Add a branch that disables `tiberius` defaults and opts back into only the
    features that are required by `arrow-tiberius`.
