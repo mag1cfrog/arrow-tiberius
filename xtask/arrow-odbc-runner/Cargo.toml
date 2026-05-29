@@ -9,4 +9,4 @@ resolver = "3"
 
 [dependencies]
 arrow-ipc = "58.3.0"
-arrow-odbc = { version = "23.2.0", features = ["narrow"] }
+arrow-odbc = { version = "25.1.1", features = ["narrow"] }
