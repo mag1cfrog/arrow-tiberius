@@ -8,15 +8,8 @@
 //!
 //! The v0.1 API implements the Arrow-to-SQL Server write path first: plan an
 //! Arrow schema for SQL Server, render deterministic DDL, inspect structured
-//! diagnostics, and bulk load one or more record batches. Callers own data
-//! sources, Delta Lake reads, S3 or object-store access, CLI runtime,
-//! configuration, secrets, connection pooling, retries, scheduling, table
-//! publishing or synonym swaps, and broader SQL Server administration.
-//!
-//! A future downstream Delta Lake to SQL Server exporter should own Delta,
-//! object-store, runtime, configuration, and orchestration concerns. It should
-//! depend on this crate for Arrow-to-SQL Server planning, DDL, diagnostics, and
-//! writing only.
+//! diagnostics, and bulk load one or more record batches. SQL Server-to-Arrow
+//! reads are reserved for a later release.
 //!
 //! [`RecordBatch`]: arrow_array::RecordBatch
 //!

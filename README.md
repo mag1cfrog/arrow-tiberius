@@ -25,8 +25,7 @@ added without renaming the crate or replacing the core model.
 
 > [!NOTE]
 > v0.1 implements the Arrow-to-SQL Server direction only. SQL Server-to-Arrow
-> reading is reserved for a later release. Callers own data sources, runtime
-> configuration, orchestration, and table publishing workflows.
+> reading is reserved for a later release.
 
 ## Scope
 
@@ -39,15 +38,7 @@ In v0.1, `arrow-tiberius` provides:
 - Baseline and optimized writer backend selection.
 - SQL Server integration tests and writer benchmark harnesses.
 
-It does not provide SQL Server-to-Arrow reads yet, and it does not manage
-application runtime concerns such as Delta Lake reads, S3 or object-store
-access, CLI runtime, configuration, secrets, connection pooling, retries,
-scheduling, table publish or synonym swaps, or broad SQL Server administration.
-Those concerns belong in downstream applications.
-
-A planned downstream Delta Lake to SQL Server exporter should own Delta,
-object-store, runtime, configuration, and orchestration concerns. It should use
-this crate only for Arrow-to-SQL Server planning, DDL, diagnostics, and writing.
+It does not provide SQL Server-to-Arrow reads yet.
 
 ## Quick Start
 
@@ -263,6 +254,5 @@ summary is in [Direct Raw Benchmark Comparison](docs/direct-raw-benchmark-compar
 ## Project Status
 
 `arrow-tiberius` is preparing its first v0.1 release. The v0.1 release focus is
-Arrow-to-SQL Server writing. SQL Server-to-Arrow reading, production
-orchestration, and broader SQL Server administration remain outside the current
-release scope.
+Arrow-to-SQL Server writing. SQL Server-to-Arrow reading is reserved for a later
+release.
