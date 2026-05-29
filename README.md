@@ -168,6 +168,23 @@ The direct raw backend is the optimized production path for currently supported
 mappings. The baseline backend remains useful for compatibility checks,
 debugging, and parity tests.
 
+## Examples
+
+Compile-checked examples are available under `examples/` and do not require SQL
+Server:
+
+```bash
+cargo run --example schema_to_ddl
+cargo run --example planning_diagnostics
+cargo run --example backend_selection
+cargo run --example policy_dependent_planning
+```
+
+The examples cover [schema to DDL](examples/schema_to_ddl.rs),
+[planning diagnostics](examples/planning_diagnostics.rs),
+[backend selection](examples/backend_selection.rs), and
+[policy-dependent planning](examples/policy_dependent_planning.rs).
+
 ## SQL Server Compatibility
 
 The v0.1 profile targets SQL Server 2016 with database compatibility level 100:
