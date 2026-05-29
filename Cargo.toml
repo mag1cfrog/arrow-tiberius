@@ -23,6 +23,28 @@ description = "Apache Arrow and SQL Server bridge through Tiberius"
 readme = "README.md"
 keywords = ["arrow", "sql-server", "tiberius", "tds"]
 categories = ["database"]
+# Keep package contents focused on source, examples, tests, and user-facing docs
+# linked from README or crate rustdoc. Cargo.lock is included intentionally as
+# the validated release dependency graph for the packaged examples and tests; it
+# does not constrain library consumers.
+include = [
+    "Cargo.lock",
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+    "src/**",
+    "tests/**",
+    "examples/**",
+    "docs/benchmarks.md",
+    "docs/benchmark-results/2026-05-19-primitive-direct-raw-compare.md",
+    "docs/benchmark-results/2026-05-19-variable-width-direct-raw-compare.md",
+    "docs/benchmark-results/README.md",
+    "docs/dependency-audit.md",
+    "docs/direct-raw-benchmark-comparison.md",
+    "docs/integration-tests.md",
+    "docs/release-v0.1.md",
+    "docs/type-mapping.md",
+]
 
 [lints]
 workspace = true
