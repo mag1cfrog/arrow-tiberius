@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 `arrow-tiberius` is a Rust library for bridging Apache Arrow and Microsoft SQL
-Server through the Tiberius TDS driver.
+Server through the [Tiberius TDS driver](https://github.com/prisma/tiberius).
 
 The crate is designed around a bidirectional boundary:
 
