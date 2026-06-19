@@ -744,7 +744,7 @@ mod tests {
         future::Future,
         pin::Pin,
         sync::Arc,
-        task::{Context, Poll, Wake, Waker},
+        task::{Context, Poll, Waker},
     };
 
     use arrow_array::{BinaryArray, Float64Array, Int32Array, RecordBatch, UInt64Array};
@@ -2052,8 +2052,7 @@ mod tests {
     where
         F: Future,
     {
-        let waker = Waker::from(Arc::new(NoopWake));
-        let mut context = Context::from_waker(&waker);
+        let mut context = Context::from_waker(Waker::noop());
         let mut future = Box::pin(future);
 
         match future.as_mut().poll(&mut context) {
@@ -2149,12 +2148,6 @@ mod tests {
         fn decimal_precision_scale(&self) -> Option<(u8, u8)> {
             self.decimal_precision_scale
         }
-    }
-
-    struct NoopWake;
-
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
     }
 
     #[derive(Debug)]

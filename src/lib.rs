@@ -179,5 +179,6 @@ pub use schema::{
 pub use write::{
     BinaryPolicy, BulkWriter, Date64Policy, Decimal256Policy, DecimalPolicy, FloatPolicy,
     NanosecondPolicy, PlanOptions, SchemaCheck, StringPolicy, TimezonePolicy, UInt64Policy,
-    WriteBackend, WriteOptions, WriteStats,
+    WriteBackend, WriteOptions, WriteStats, validate_arrow_schema_against_mappings,
+    validate_record_batch_schema_against_mappings,
 };
