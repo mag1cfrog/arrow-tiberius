@@ -79,6 +79,27 @@ pub enum Error {
         source: tiberius::error::Error,
     },
 
+    /// SQL Server table-existence metadata query failed.
+    #[snafu(display("SQL Server table existence query failed: {source}"))]
+    TableExistsQuery {
+        /// Source error returned by Tiberius.
+        source: tiberius::error::Error,
+    },
+
+    /// SQL Server table-existence metadata query returned an unexpected shape.
+    #[snafu(display("SQL Server table existence query returned an unexpected result: {reason}"))]
+    TableExistsUnexpectedResult {
+        /// Human-readable reason the metadata result could not be interpreted.
+        reason: String,
+    },
+
+    /// SQL Server lifecycle statement execution failed.
+    #[snafu(display("SQL Server statement execution failed: {source}"))]
+    SqlExecution {
+        /// Source error returned by Tiberius.
+        source: tiberius::error::Error,
+    },
+
     /// Tiberius returned an error while executing a SQL Server operation.
     #[snafu(display("tiberius operation failed: {source}"))]
     Tiberius {

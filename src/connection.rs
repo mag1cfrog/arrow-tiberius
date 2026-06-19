@@ -5,7 +5,7 @@ use std::fmt;
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
-use crate::{Error, Result};
+use crate::{Error, Result, TableName};
 
 type CompatibleMssqlTransport = Compat<TcpStream>;
 
@@ -16,7 +16,7 @@ type CompatibleMssqlTransport = Compat<TcpStream>;
 /// so downstream crates do not have to name or match `tiberius-raw-bulk`
 /// directly.
 pub struct ConnectedMssqlClient {
-    _client: tiberius::Client<CompatibleMssqlTransport>,
+    client: tiberius::Client<CompatibleMssqlTransport>,
 }
 
 impl fmt::Debug for ConnectedMssqlClient {
@@ -45,6 +45,52 @@ impl SqlExecutionOutcome {
     }
 }
 
+impl ConnectedMssqlClient {
+    /// Returns whether the target table exists in SQL Server metadata.
+    ///
+    /// This is a narrow metadata probe, not a generic query API. For
+    /// schema-qualified names it checks the exact schema and table. For
+    /// unqualified names it checks whether any table with that name exists in
+    /// the current database.
+    pub async fn table_exists(&mut self, table: &TableName) -> Result<bool> {
+        let query = table_exists_query(table);
+        let row = self
+            .client
+            .simple_query(query)
+            .await
+            .map_err(|source| Error::TableExistsQuery { source })?
+            .into_row()
+            .await
+            .map_err(|source| Error::TableExistsQuery { source })?
+            .ok_or_else(|| Error::TableExistsUnexpectedResult {
+                reason: "metadata query returned no rows".to_owned(),
+            })?;
+
+        row.try_get("exists")
+            .map_err(|source| Error::TableExistsQuery { source })?
+            .ok_or_else(|| Error::TableExistsUnexpectedResult {
+                reason: "metadata query returned NULL".to_owned(),
+            })
+    }
+
+    /// Executes a prepared lifecycle SQL statement.
+    ///
+    /// This method accepts statement text but intentionally returns only
+    /// affected-row metadata. It does not expose a generic result-row mapping
+    /// API.
+    pub async fn execute_statement(&mut self, sql: &str) -> Result<SqlExecutionOutcome> {
+        let result = self
+            .client
+            .execute(sql, &[])
+            .await
+            .map_err(|source| Error::SqlExecution { source })?;
+
+        Ok(SqlExecutionOutcome {
+            rows_affected: result.rows_affected().to_vec(),
+        })
+    }
+}
+
 /// Connects to SQL Server from an ADO-style connection string.
 ///
 /// The connection uses this crate's `tiberius-raw-bulk` dependency identity and
@@ -67,7 +113,28 @@ pub async fn connect_mssql_client_from_ado_string(
         .await
         .map_err(|source| Error::ConnectionClientSetup { source })?;
 
-    Ok(ConnectedMssqlClient { _client: client })
+    Ok(ConnectedMssqlClient { client })
+}
+
+fn table_exists_query(table: &TableName) -> String {
+    let mut conditions = vec![format!(
+        "t.name = {}",
+        sql_string_literal(table.table().as_str())
+    )];
+    if let Some(schema) = table.schema() {
+        conditions.push(format!("s.name = {}", sql_string_literal(schema.as_str())));
+    }
+
+    format!(
+        "SELECT CASE WHEN EXISTS (SELECT 1 FROM sys.tables AS t \
+         INNER JOIN sys.schemas AS s ON s.schema_id = t.schema_id \
+         WHERE {}) THEN CAST(1 AS bit) ELSE CAST(0 AS bit) END AS [exists]",
+        conditions.join(" AND ")
+    )
+}
+
+fn sql_string_literal(value: &str) -> String {
+    format!("N'{}'", value.replace('\'', "''"))
 }
 
 #[cfg(test)]
@@ -82,6 +149,38 @@ mod tests {
 
         assert_eq!(outcome.rows_affected, vec![2, 3, 5]);
         assert_eq!(outcome.total_rows_affected(), 10);
+    }
+
+    #[test]
+    fn table_exists_query_filters_schema_and_table() -> crate::Result<()> {
+        let table = crate::TableName::new("tenant", "people")?;
+        let query = super::table_exists_query(&table);
+
+        assert!(query.contains("FROM sys.tables AS t"));
+        assert!(query.contains("INNER JOIN sys.schemas AS s"));
+        assert!(query.contains("t.name = N'people'"));
+        assert!(query.contains("s.name = N'tenant'"));
+        Ok(())
+    }
+
+    #[test]
+    fn table_exists_query_escapes_string_literals() -> crate::Result<()> {
+        let table = crate::TableName::new("tenant's", "people's")?;
+        let query = super::table_exists_query(&table);
+
+        assert!(query.contains("t.name = N'people''s'"));
+        assert!(query.contains("s.name = N'tenant''s'"));
+        Ok(())
+    }
+
+    #[test]
+    fn unqualified_table_exists_query_filters_only_table_name() -> crate::Result<()> {
+        let table = crate::TableName::unqualified("people")?;
+        let query = super::table_exists_query(&table);
+
+        assert!(query.contains("t.name = N'people'"));
+        assert!(!query.contains("s.name ="));
+        Ok(())
     }
 
     #[test]
