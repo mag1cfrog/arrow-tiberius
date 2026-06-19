@@ -61,6 +61,24 @@ pub enum Error {
         reason: String,
     },
 
+    /// A SQL Server ADO-style connection string is invalid.
+    #[snafu(display("SQL Server connection string is invalid"))]
+    InvalidConnectionString,
+
+    /// Opening the TCP connection to SQL Server failed.
+    #[snafu(display("TCP connection to SQL Server failed: {source}"))]
+    ConnectionTcpConnect {
+        /// Source I/O error returned by the TCP transport.
+        source: std::io::Error,
+    },
+
+    /// Tiberius failed while establishing the SQL Server client session.
+    #[snafu(display("SQL Server client setup failed: {source}"))]
+    ConnectionClientSetup {
+        /// Source error returned by Tiberius.
+        source: tiberius::error::Error,
+    },
+
     /// Tiberius returned an error while executing a SQL Server operation.
     #[snafu(display("tiberius operation failed: {source}"))]
     Tiberius {
@@ -128,6 +146,13 @@ mod tests {
             err.to_string(),
             "write backend DirectRawBulk is unavailable: not implemented"
         );
+    }
+
+    #[test]
+    fn invalid_connection_string_error_display_is_redacted() {
+        let err = Error::InvalidConnectionString;
+
+        assert_eq!(err.to_string(), "SQL Server connection string is invalid");
     }
 
     #[test]
