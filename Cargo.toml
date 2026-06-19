@@ -13,7 +13,7 @@ panic = "deny"
 
 [package]
 name = "arrow-tiberius"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -74,8 +74,9 @@ tiberius = { package = "tiberius-raw-bulk", version = "=0.12.3-raw-bulk.13", def
     "winauth",
     "native-tls",
 ] }
+tokio = { version = "1", default-features = false, features = ["net"] }
+tokio-util = { version = "0.7", default-features = false, features = ["compat"] }
 
 [dev-dependencies]
 arrow-data = "58.3.0"
 tokio = { version = "1", features = ["macros", "net", "rt"] }
-tokio-util = { version = "0.7", features = ["compat"] }

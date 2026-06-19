@@ -82,9 +82,11 @@ tiberius = { package = "tiberius-raw-bulk", version = "=0.12.3-raw-bulk.13", def
 ```
 
 The crate imports that package as `tiberius`, but the Cargo package name is
-`tiberius-raw-bulk`. Downstream users should not add upstream `tiberius` as a
-separate dependency for clients passed to `BulkWriter`; that creates a distinct
-crate type.
+`tiberius-raw-bulk`. Downstream orchestration crates should normally use
+`connect_mssql_client_from_ado_string`, `ConnectedMssqlClient`, and
+`ConnectedBulkWriter` instead of constructing raw Tiberius clients. Downstream
+users should not add upstream `tiberius` as a separate dependency for clients
+passed to writer internals; that creates a distinct crate type.
 
 The fork is required for v0.1 because the optimized direct raw writer depends on
 bulk-load packet APIs that are not exposed by upstream Tiberius. The fork should
@@ -113,6 +115,8 @@ These capabilities must be present before publishing v0.1:
 - Runtime write validation for values that cannot be represented in the chosen
   SQL Server target type.
 - `BulkWriter` execution through Tiberius.
+- Connected-client lifecycle SQL and writer initialization through
+  `ConnectedMssqlClient`.
 - `BaselineTokenRow` writer backend.
 - `DirectRawBulk` writer backend.
 - `Auto` backend selection that resolves to `DirectRawBulk`.

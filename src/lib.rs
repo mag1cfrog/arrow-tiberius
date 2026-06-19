@@ -43,43 +43,17 @@
 //! # }
 //! ```
 //!
-//! Write a planned batch to an existing table:
+//! Connect through the crate-owned Tiberius compatibility boundary:
 //!
 //! ```no_run
-//! use arrow_array::RecordBatch;
 //! use arrow_tiberius::{
-//!     BulkWriter, MssqlProfile, PlanOptions, TableName, WriteBackend,
-//!     WriteOptions, plan_arrow_schema_to_mssql_mappings,
+//!     ConnectedMssqlClient, connect_mssql_client_from_ado_string,
 //! };
-//! use futures_util::io::{AsyncRead, AsyncWrite};
 //!
-//! async fn write_batch<S>(
-//!     client: &mut tiberius::Client<S>,
-//!     batch: &RecordBatch,
-//! ) -> arrow_tiberius::Result<()>
-//! where
-//!     S: AsyncRead + AsyncWrite + Unpin + Send,
-//! {
-//!     let outcome = plan_arrow_schema_to_mssql_mappings(
-//!         batch.schema().as_ref(),
-//!         MssqlProfile::sql_server_2016_compat_100(),
-//!         PlanOptions::default(),
-//!     )?;
-//!
-//!     let mut writer = BulkWriter::new(
-//!         client,
-//!         TableName::new("dbo", "people")?,
-//!         outcome.value().to_vec(),
-//!         WriteOptions {
-//!             backend: WriteBackend::DirectRawBulk,
-//!             ..WriteOptions::default()
-//!         },
-//!     )
-//!     .await?;
-//!
-//!     writer.write_batch(batch).await?;
-//!     writer.finish().await?;
-//!     Ok(())
+//! async fn connect(
+//!     connection_string: &str,
+//! ) -> arrow_tiberius::Result<ConnectedMssqlClient> {
+//!     connect_mssql_client_from_ado_string(connection_string).await
 //! }
 //! ```
 //!
@@ -115,21 +89,18 @@
 //! # Tiberius Dependency Model
 //!
 //! This crate depends on the published `tiberius-raw-bulk` package as the crate
-//! name `tiberius`. Downstream crates that construct the Tiberius client passed
-//! to [`BulkWriter`] should use the same package identity:
+//! name `tiberius` and owns that compatibility boundary. Downstream crates
+//! should use [`connect_mssql_client_from_ado_string`] and
+//! [`ConnectedMssqlClient`] instead of constructing a raw Tiberius client for
+//! [`BulkWriter`].
 //!
 //! ```toml
 //! [dependencies]
 //! arrow-tiberius = "0.1"
-//! tiberius = { package = "tiberius-raw-bulk", version = "=0.12.3-raw-bulk.13", default-features = false, features = [
-//!     "tds73",
-//!     "winauth",
-//!     "native-tls",
-//! ] }
 //! ```
 //!
 //! Depending on upstream `tiberius` separately creates a distinct crate type and
-//! will not produce a client compatible with [`BulkWriter`].
+//! will not produce a client compatible with this crate's writer internals.
 //!
 //! # Feature Flags
 //!
@@ -149,6 +120,8 @@
 
 /// Arrow-side schema metadata.
 pub mod arrow;
+/// SQL Server connection helpers.
+pub mod connection;
 /// Directional conversion semantics between Arrow and SQL Server.
 pub(crate) mod conversion;
 /// Structured diagnostics for planning and writing.
@@ -163,6 +136,10 @@ pub mod schema;
 pub mod write;
 
 pub use arrow::ArrowFieldRef;
+pub use connection::{
+    ConnectedBulkWriter, ConnectedMssqlClient, SqlExecutionOutcome,
+    connect_mssql_client_from_ado_string,
+};
 pub use diagnostic::{
     Diagnostic, DiagnosticCode, DiagnosticSet, DiagnosticSeverity, FieldRef, PlanOutcome,
 };
