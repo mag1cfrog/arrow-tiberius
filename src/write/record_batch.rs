@@ -216,6 +216,97 @@ mod tests {
     }
 
     #[test]
+    fn public_schema_validation_rejects_missing_field() {
+        let mappings = mappings_for_schema(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("active", DataType::Boolean, true),
+        ]));
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+
+        let err = validate_arrow_schema_against_mappings(&schema, &mappings).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::SchemaMismatch,
+            None,
+            Some((1, "active")),
+        );
+    }
+
+    #[test]
+    fn public_schema_validation_rejects_extra_field() {
+        let mappings =
+            mappings_for_schema(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("extra", DataType::Boolean, true),
+        ]);
+
+        let err = validate_arrow_schema_against_mappings(&schema, &mappings).unwrap_err();
+
+        assert_single_diagnostic(err, DiagnosticCode::SchemaMismatch, None, None);
+    }
+
+    #[test]
+    fn public_schema_validation_rejects_reordered_fields() {
+        let mappings = mappings_for_schema(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("amount", DataType::Int32, false),
+        ]));
+        let schema = Schema::new(vec![
+            Field::new("amount", DataType::Int32, false),
+            Field::new("id", DataType::Int32, false),
+        ]);
+
+        let err = validate_arrow_schema_against_mappings(&schema, &mappings).unwrap_err();
+
+        assert_single_diagnostic(err, DiagnosticCode::SchemaMismatch, None, Some((0, "id")));
+    }
+
+    #[test]
+    fn public_schema_validation_rejects_field_name_mismatch() {
+        let mappings =
+            mappings_for_schema(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let schema = Schema::new(vec![Field::new("renamed_id", DataType::Int32, false)]);
+
+        let err = validate_arrow_schema_against_mappings(&schema, &mappings).unwrap_err();
+
+        assert_single_diagnostic(err, DiagnosticCode::SchemaMismatch, None, Some((0, "id")));
+    }
+
+    #[test]
+    fn public_schema_validation_rejects_arrow_data_type_mismatch() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "number",
+            DataType::Int32,
+            true,
+        )]));
+        let schema = Schema::new(vec![Field::new("number", DataType::Int64, true)]);
+
+        let err = validate_arrow_schema_against_mappings(&schema, &mappings).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::SchemaMismatch,
+            None,
+            Some((0, "number")),
+        );
+    }
+
+    #[test]
+    fn public_schema_validation_rejects_mapping_position_mismatch() {
+        let mappings = vec![SchemaMapping::new(
+            ArrowFieldRef::new(1, "id".to_owned(), false, DataType::Int32),
+            MssqlColumn::new(Identifier::new("id").unwrap(), MssqlType::Int, false),
+        )];
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+
+        let err = validate_arrow_schema_against_mappings(&schema, &mappings).unwrap_err();
+
+        assert_single_diagnostic(err, DiagnosticCode::SchemaMismatch, None, Some((1, "id")));
+    }
+
+    #[test]
     fn converts_runtime_row_to_mssql_cells_in_mapping_order() {
         let mappings = mappings_for_schema(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
