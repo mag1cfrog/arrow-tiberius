@@ -78,23 +78,21 @@ fn main() -> arrow_tiberius::Result<()> {
 }
 ```
 
-Write batches to an existing SQL Server table with `BulkWriter`:
+Write batches to an existing SQL Server table with a crate-owned compatible
+SQL Server client:
 
 ```rust
 use arrow_array::RecordBatch;
 use arrow_tiberius::{
-    BulkWriter, MssqlProfile, PlanOptions, TableName, WriteBackend, WriteOptions,
-    plan_arrow_schema_to_mssql_mappings,
+    MssqlProfile, PlanOptions, TableName, WriteBackend, WriteOptions,
+    connect_mssql_client_from_ado_string, plan_arrow_schema_to_mssql_mappings,
 };
-use futures_util::io::{AsyncRead, AsyncWrite};
 
-async fn write_batch<S>(
-    client: &mut tiberius::Client<S>,
+async fn write_batch(
+    connection_string: &str,
     batch: &RecordBatch,
-) -> arrow_tiberius::Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-{
+) -> arrow_tiberius::Result<()> {
+    let mut client = connect_mssql_client_from_ado_string(connection_string).await?;
     let outcome = plan_arrow_schema_to_mssql_mappings(
         batch.schema().as_ref(),
         MssqlProfile::sql_server_2016_compat_100(),
@@ -102,16 +100,16 @@ where
     )?;
 
     let table = TableName::new("dbo", "people")?;
-    let mut writer = BulkWriter::new(
-        client,
-        table,
-        outcome.value().to_vec(),
-        WriteOptions {
-            backend: WriteBackend::DirectRawBulk,
-            ..WriteOptions::default()
-        },
-    )
-    .await?;
+    let mut writer = client
+        .bulk_writer(
+            table,
+            outcome.value().to_vec(),
+            WriteOptions {
+                backend: WriteBackend::DirectRawBulk,
+                ..WriteOptions::default()
+            },
+        )
+        .await?;
 
     writer.write_batch(batch).await?;
     writer.finish().await?;
@@ -119,9 +117,9 @@ where
 }
 ```
 
-`BulkWriter` validates the target table metadata before sending rows. It does
-not create the target table automatically; callers can use the DDL helpers when
-they want this crate to produce the table definition.
+The connected writer validates the target table metadata before sending rows.
+It does not create the target table automatically; callers can use the DDL
+helpers when they want this crate to produce the table definition.
 
 ## Diagnostics
 
@@ -214,7 +212,7 @@ path used by this repository.
 ## Tiberius Dependency Model
 
 `arrow-tiberius` depends on the published `tiberius-raw-bulk` package as the
-crate name `tiberius`:
+crate name `tiberius` and owns that compatibility boundary internally:
 
 ```toml
 tiberius = { package = "tiberius-raw-bulk", version = "=0.12.3-raw-bulk.13", default-features = false, features = [
@@ -224,22 +222,19 @@ tiberius = { package = "tiberius-raw-bulk", version = "=0.12.3-raw-bulk.13", def
 ] }
 ```
 
-If a downstream crate also constructs the SQL Server client passed to
-`BulkWriter`, it must use the same package identity:
+Downstream crates should normally depend only on `arrow-tiberius` and construct
+SQL Server clients through the connected-client API:
 
 ```toml
 [dependencies]
 arrow-tiberius = "0.1"
-tiberius = { package = "tiberius-raw-bulk", version = "=0.12.3-raw-bulk.13", default-features = false, features = [
-    "tds73",
-    "winauth",
-    "native-tls",
-] }
 ```
 
-Depending on upstream `tiberius` separately creates a distinct crate type. A
-client from upstream `tiberius` is not the same type as a client from
-`tiberius-raw-bulk` and will not match the `BulkWriter` API.
+Use `connect_mssql_client_from_ado_string`, `ConnectedMssqlClient`, and
+`ConnectedBulkWriter` when lifecycle SQL and bulk loading must run on the same
+connection. Depending on upstream `tiberius` separately creates a distinct crate
+type. A client from upstream `tiberius` is not the same type as a client from
+`tiberius-raw-bulk` and will not match this crate's writer internals.
 
 The fork exists because upstream Tiberius does not expose the raw bulk packet
 APIs needed by the optimized direct writer. The baseline writer and direct
