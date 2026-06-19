@@ -137,7 +137,8 @@ pub mod write;
 
 pub use arrow::ArrowFieldRef;
 pub use connection::{
-    ConnectedMssqlClient, SqlExecutionOutcome, connect_mssql_client_from_ado_string,
+    ConnectedBulkWriter, ConnectedMssqlClient, SqlExecutionOutcome,
+    connect_mssql_client_from_ado_string,
 };
 pub use diagnostic::{
     Diagnostic, DiagnosticCode, DiagnosticSet, DiagnosticSeverity, FieldRef, PlanOutcome,

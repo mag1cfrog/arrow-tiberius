@@ -2,10 +2,11 @@
 
 use std::fmt;
 
+use arrow_array::RecordBatch;
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
-use crate::{Error, Result, TableName};
+use crate::{BulkWriter, Error, Result, SchemaMapping, TableName, WriteOptions, WriteStats};
 
 type CompatibleMssqlTransport = Compat<TcpStream>;
 
@@ -19,10 +20,27 @@ pub struct ConnectedMssqlClient {
     client: tiberius::Client<CompatibleMssqlTransport>,
 }
 
+/// Bulk writer created from a [`ConnectedMssqlClient`].
+///
+/// This wrapper keeps the compatible Tiberius client and transport types out of
+/// downstream signatures while exposing the same write and finish operations as
+/// [`BulkWriter`].
+pub struct ConnectedBulkWriter<'client> {
+    writer: BulkWriter<'client, CompatibleMssqlTransport>,
+}
+
 impl fmt::Debug for ConnectedMssqlClient {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ConnectedMssqlClient")
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for ConnectedBulkWriter<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConnectedBulkWriter")
             .finish_non_exhaustive()
     }
 }
@@ -88,6 +106,34 @@ impl ConnectedMssqlClient {
         Ok(SqlExecutionOutcome {
             rows_affected: result.rows_affected().to_vec(),
         })
+    }
+
+    /// Starts a bulk writer on this same SQL Server connection.
+    ///
+    /// The returned writer borrows the connected client, so lifecycle SQL and
+    /// bulk loading cannot accidentally use two different connections through
+    /// this API.
+    pub async fn bulk_writer(
+        &mut self,
+        table: TableName,
+        mappings: Vec<SchemaMapping>,
+        options: WriteOptions,
+    ) -> Result<ConnectedBulkWriter<'_>> {
+        let writer = BulkWriter::new(&mut self.client, table, mappings, options).await?;
+
+        Ok(ConnectedBulkWriter { writer })
+    }
+}
+
+impl ConnectedBulkWriter<'_> {
+    /// Writes one Arrow record batch.
+    pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteStats> {
+        self.writer.write_batch(batch).await
+    }
+
+    /// Finalizes the bulk writer and returns cumulative write statistics.
+    pub async fn finish(self) -> Result<WriteStats> {
+        self.writer.finish().await
     }
 }
 
@@ -189,6 +235,15 @@ mod tests {
 
         assert!(type_name.contains("ConnectedMssqlClient"));
         assert!(!type_name.contains("tiberius::Client"));
+    }
+
+    #[test]
+    fn connected_writer_type_is_public_without_raw_transport_signature() {
+        let type_name = std::any::type_name::<crate::ConnectedBulkWriter<'static>>();
+
+        assert!(type_name.contains("ConnectedBulkWriter"));
+        assert!(!type_name.contains("tiberius::Client"));
+        assert!(!type_name.contains("tokio::net::TcpStream"));
     }
 
     #[tokio::test]
