@@ -17,4 +17,7 @@ pub use policy::{
     BinaryPolicy, Date64Policy, Decimal256Policy, DecimalPolicy, FloatPolicy, NanosecondPolicy,
     PlanOptions, SchemaCheck, StringPolicy, TimezonePolicy, UInt64Policy,
 };
+pub use record_batch::{
+    validate_arrow_schema_against_mappings, validate_record_batch_schema_against_mappings,
+};
 pub use writer::{BulkWriter, WriteBackend, WriteOptions, WriteStats};

@@ -2,7 +2,7 @@
 
 use arrow_array::RecordBatch;
 
-use crate::{Result, write::record_batch::validate_runtime_columns};
+use crate::{Result, write::record_batch::validate_record_batch_encoding_shape};
 
 use super::super::{
     DirectEncoder, MeasuredDirectBatch,
@@ -92,7 +92,7 @@ fn encode_checked_batch(
     encoder: &DirectEncoder,
     batch: &RecordBatch,
 ) -> Result<EncodedRowsPayload> {
-    validate_runtime_columns(batch, &encoder.mappings)?;
+    validate_record_batch_encoding_shape(batch, &encoder.mappings)?;
 
     if encoder.plan.is_empty() && batch.num_rows() == 0 {
         return EncodedRowsPayload::new(Vec::new(), Vec::new());

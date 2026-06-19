@@ -12,7 +12,10 @@ use crate::{
         from_arrow::{ArrowToMssqlRuntimeMapping, mssql_cell_from_arrow_cell},
     },
 };
-pub(crate) use validate::validate_runtime_columns;
+pub(crate) use validate::validate_record_batch_encoding_shape;
+pub use validate::{
+    validate_arrow_schema_against_mappings, validate_record_batch_schema_against_mappings,
+};
 
 /// Borrowed conversion view over one Arrow record batch and schema mappings.
 #[derive(Debug)]
@@ -35,7 +38,7 @@ impl<'a> RecordBatchView<'a> {
         mappings: &'a [SchemaMapping],
         plan_options: &PlanOptions,
     ) -> Result<Self> {
-        validate_runtime_columns(batch, mappings)?;
+        validate_record_batch_encoding_shape(batch, mappings)?;
 
         Ok(Self {
             batch,
@@ -152,6 +155,7 @@ mod tests {
     use crate::{
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlProfile, MssqlType,
         PlanOptions, SchemaMapping, plan_arrow_schema_to_mssql_mappings,
+        validate_arrow_schema_against_mappings, validate_record_batch_schema_against_mappings,
     };
 
     #[test]
@@ -177,6 +181,38 @@ mod tests {
         assert_eq!(view.row_count(), 2);
         assert_eq!(view.mappings().len(), 2);
         view.check_row_index(1).unwrap();
+    }
+
+    #[test]
+    fn public_schema_validation_accepts_matching_schema_and_mappings() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("active", DataType::Boolean, true),
+        ]);
+        let mappings = mappings_for_schema(schema.clone());
+
+        validate_arrow_schema_against_mappings(&schema, &mappings).unwrap();
+    }
+
+    #[test]
+    fn public_record_batch_validation_accepts_matching_batch_and_mappings() {
+        let mappings = mappings_for_schema(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("active", DataType::Boolean, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("active", DataType::Boolean, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1_i32, 2])) as ArrayRef,
+                Arc::new(BooleanArray::from(vec![Some(true), None])),
+            ],
+        )
+        .unwrap();
+
+        validate_record_batch_schema_against_mappings(&batch, &mappings).unwrap();
     }
 
     #[test]
@@ -392,6 +428,65 @@ mod tests {
             DiagnosticCode::SchemaMismatch,
             None,
             Some((0, "number")),
+        );
+    }
+
+    #[test]
+    fn rejects_runtime_arrow_nullability_mismatch() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "number",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "number",
+                DataType::Int32,
+                true,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![1_i32]))],
+        )
+        .unwrap();
+
+        let err = validate_record_batch_schema_against_mappings(&batch, &mappings).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::SchemaMismatch,
+            None,
+            Some((0, "number")),
+        );
+    }
+
+    #[test]
+    fn public_validation_and_record_batch_view_reject_same_schema_shape_failure() {
+        let mappings =
+            mappings_for_schema(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "renamed_id",
+                DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![1_i32]))],
+        )
+        .unwrap();
+
+        let public_err =
+            validate_record_batch_schema_against_mappings(&batch, &mappings).unwrap_err();
+        let view_err = RecordBatchView::new(&batch, &mappings).unwrap_err();
+
+        assert_single_diagnostic(
+            public_err,
+            DiagnosticCode::SchemaMismatch,
+            None,
+            Some((0, "id")),
+        );
+        assert_single_diagnostic(
+            view_err,
+            DiagnosticCode::SchemaMismatch,
+            None,
+            Some((0, "id")),
         );
     }
 

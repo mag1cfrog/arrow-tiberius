@@ -4,7 +4,7 @@ use arrow_array::RecordBatch;
 
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, Error, PlanOptions, Result, SchemaMapping,
-    write::record_batch::validate_runtime_columns,
+    write::record_batch::validate_record_batch_encoding_shape,
 };
 
 use super::{
@@ -82,7 +82,7 @@ impl DirectEncoder {
 
     /// Measures and validates a runtime batch without allocating encoded bytes.
     pub(crate) fn measure_batch(&self, batch: &RecordBatch) -> Result<MeasuredDirectBatch> {
-        validate_runtime_columns(batch, &self.mappings)?;
+        validate_record_batch_encoding_shape(batch, &self.mappings)?;
 
         let row_count = batch.num_rows();
         let column_count = self.plan.column_count();
