@@ -20,10 +20,10 @@ use arrow_buffer::{MutableBuffer, NullBuffer, OffsetBuffer, ScalarBuffer, i256};
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use arrow_tiberius::{
-    ArrowFieldRef, BulkWriter, Date64Policy, DecimalPolicy, DiagnosticCode, Error, Identifier,
-    MssqlColumn, MssqlProfile, MssqlType, MssqlTypeLength, NanosecondPolicy, PlanOptions,
-    SchemaMapping, TableName, TimezonePolicy, UInt64Policy, WriteBackend, WriteOptions,
-    create_table_sql_from_mappings, plan_arrow_schema_to_mssql_mappings,
+    ArrowFieldRef, BulkWriter, Date64Policy, DecimalPolicy, DiagnosticCode, DiagnosticSet, Error,
+    Identifier, MssqlColumn, MssqlProfile, MssqlType, MssqlTypeLength, NanosecondPolicy,
+    PlanOptions, SchemaMapping, TableName, TimezonePolicy, UInt64Policy, WriteBackend,
+    WriteOptions, WritePhase, create_table_sql_from_mappings, plan_arrow_schema_to_mssql_mappings,
 };
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -1941,14 +1941,7 @@ async fn writer_rejects_uint64_checked_bigint_overflow_without_partial_insert() 
                 Err(err) => err,
             };
 
-            let diagnostics = match err {
-                Error::ValueConversion { diagnostics } => diagnostics,
-                other => {
-                    return Err(test_error(format!(
-                        "expected value conversion error, got {other}"
-                    )));
-                }
-            };
+            let diagnostics = value_conversion_diagnostics(&err, WritePhase::ValueConversion)?;
             ensure(
                 diagnostics.all().iter().any(|diagnostic| {
                     diagnostic.code() == DiagnosticCode::IntegerOutOfRange
@@ -3122,14 +3115,7 @@ async fn baseline_writer_rejects_decimal_precision_overflow_without_partial_inse
             Err(err) => err,
         };
 
-        let diagnostics = match err {
-            Error::ValueConversion { diagnostics } => diagnostics,
-            other => {
-                return Err(test_error(format!(
-                    "expected value conversion error, got {other}"
-                )));
-            }
-        };
+        let diagnostics = value_conversion_diagnostics(&err, WritePhase::ValueConversion)?;
         ensure(
             diagnostics.all().iter().any(|diagnostic| {
                 diagnostic.code() == DiagnosticCode::DecimalOutOfRange
@@ -3213,14 +3199,7 @@ async fn baseline_writer_rejects_target_table_schema_drift() -> TestResult<()> {
             Err(err) => err,
         };
 
-        let diagnostics = match err {
-            Error::ValueConversion { diagnostics } => diagnostics,
-            other => {
-                return Err(test_error(format!(
-                    "expected value conversion error, got {other}"
-                )));
-            }
-        };
+        let diagnostics = value_conversion_diagnostics(&err, WritePhase::TargetMetadataValidation)?;
 
         ensure(
             diagnostics.all().iter().any(|diagnostic| {
@@ -3255,14 +3234,7 @@ async fn baseline_writer_rejects_target_table_schema_drift() -> TestResult<()> {
             Err(err) => err,
         };
 
-        let diagnostics = match err {
-            Error::ValueConversion { diagnostics } => diagnostics,
-            other => {
-                return Err(test_error(format!(
-                    "expected value conversion error, got {other}"
-                )));
-            }
-        };
+        let diagnostics = value_conversion_diagnostics(&err, WritePhase::BatchSchemaValidation)?;
         ensure(
             diagnostics.all().iter().any(|diagnostic| {
                 diagnostic.code() == DiagnosticCode::SchemaMismatch
@@ -3340,14 +3312,7 @@ async fn direct_raw_writer_rejects_unsupported_schema_without_partial_insert() -
             Err(err) => err,
         };
 
-        let diagnostics = match err {
-            Error::DirectEncoding { diagnostics } => diagnostics,
-            other => {
-                return Err(test_error(format!(
-                    "expected direct encoding error, got {other}"
-                )));
-            }
-        };
+        let diagnostics = direct_encoding_diagnostics(&err, WritePhase::WriterInitialization)?;
 
         ensure(
             diagnostics.all().iter().any(|diagnostic| {
@@ -3393,6 +3358,38 @@ where
         actual == expected,
         format!("{context}: expected {expected:?}, got {actual:?}"),
     )
+}
+
+fn ensure_write_phase(error: &Error, expected: WritePhase) -> TestResult<()> {
+    ensure_eq(error.write_phase(), Some(expected), "write phase")
+}
+
+fn value_conversion_diagnostics(
+    error: &Error,
+    expected_phase: WritePhase,
+) -> TestResult<&DiagnosticSet> {
+    ensure_write_phase(error, expected_phase)?;
+
+    match error.without_write_phase() {
+        Error::ValueConversion { diagnostics } => Ok(diagnostics),
+        other => Err(test_error(format!(
+            "expected value conversion error, got {other}"
+        ))),
+    }
+}
+
+fn direct_encoding_diagnostics(
+    error: &Error,
+    expected_phase: WritePhase,
+) -> TestResult<&DiagnosticSet> {
+    ensure_write_phase(error, expected_phase)?;
+
+    match error.without_write_phase() {
+        Error::DirectEncoding { diagnostics } => Ok(diagnostics),
+        other => Err(test_error(format!(
+            "expected direct encoding error, got {other}"
+        ))),
+    }
 }
 
 fn test_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
