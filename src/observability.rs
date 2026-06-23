@@ -51,6 +51,33 @@ pub(crate) const TARGET_METADATA_VALIDATION_COMPLETED_EVENT: &str =
 pub(crate) const TARGET_METADATA_VALIDATION_FAILED_EVENT: &str =
     "arrow_tiberius.target_metadata_validation.failed";
 
+/// Stable phase name for bulk writer batch write telemetry.
+pub(crate) const BATCH_WRITE_PHASE: &str = "batch_write";
+
+/// Stable phase name for batch schema validation telemetry.
+pub(crate) const BATCH_SCHEMA_VALIDATION_PHASE: &str = "batch_schema_validation";
+
+/// Stable phase name for batch value conversion telemetry.
+pub(crate) const VALUE_CONVERSION_PHASE: &str = "value_conversion";
+
+/// Stable phase name for direct encoding telemetry.
+pub(crate) const DIRECT_ENCODING_PHASE: &str = "direct_encoding";
+
+/// Stable phase name for packet write telemetry.
+pub(crate) const PACKET_WRITE_PHASE: &str = "packet_write";
+
+/// Stable span name for bulk writer batch write telemetry.
+pub(crate) const BATCH_WRITE_SPAN: &str = "arrow_tiberius.batch_write";
+
+/// Stable event marker emitted when batch writing starts.
+pub(crate) const BATCH_WRITE_STARTED_EVENT: &str = "arrow_tiberius.batch_write.started";
+
+/// Stable event marker emitted when batch writing completes successfully.
+pub(crate) const BATCH_WRITE_COMPLETED_EVENT: &str = "arrow_tiberius.batch_write.completed";
+
+/// Stable event marker emitted when batch writing fails.
+pub(crate) const BATCH_WRITE_FAILED_EVENT: &str = "arrow_tiberius.batch_write.failed";
+
 /// Test-only span name used to prove tracing capture support.
 #[cfg(test)]
 pub(crate) const TEST_CAPTURE_SPAN: &str = "arrow_tiberius.test_capture";
