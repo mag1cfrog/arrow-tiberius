@@ -172,7 +172,11 @@ pub(crate) mod test_support {
         let subscriber = Registry::default().with(CaptureLayer {
             records: Arc::clone(&records),
         });
-        let result = tracing::subscriber::with_default(subscriber, operation);
+        let result = tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            operation()
+        });
+        tracing::callsite::rebuild_interest_cache();
 
         (result, CapturedTraces { records })
     }
