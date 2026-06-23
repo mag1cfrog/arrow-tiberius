@@ -323,6 +323,30 @@ pub(crate) mod test_support {
         (result, CapturedTraces { records })
     }
 
+    pub(crate) fn trace_event<'a>(
+        records: &'a [CapturedTrace],
+        telemetry_event: &str,
+    ) -> Result<&'a CapturedTrace, String> {
+        records
+            .iter()
+            .find(|record| {
+                record.kind() == CapturedTraceKind::Event
+                    && record
+                        .fields()
+                        .get("telemetry_event")
+                        .is_some_and(|value| value == telemetry_event)
+            })
+            .ok_or_else(|| format!("missing trace event {telemetry_event}: {records:#?}"))
+    }
+
+    pub(crate) fn assert_trace_field(record: &CapturedTrace, field: &str, expected: &str) {
+        assert_eq!(
+            record.fields().get(field).map(String::as_str),
+            Some(expected),
+            "trace record: {record:#?}"
+        );
+    }
+
     struct CaptureLayer {
         records: Arc<Mutex<Vec<CapturedTrace>>>,
     }

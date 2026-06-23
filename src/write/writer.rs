@@ -967,7 +967,7 @@ mod tests {
     use super::{
         BulkTargetColumnMetadata, DIRECT_RAW_MAX_PAYLOAD_BYTES, DirectEncoder, FinishSink,
         MeasuredDirectBatch, MeasuredRowRange, RawRowsSink, TokenRowSink, WriteBackend,
-        WriteOptions, WriteStats, WriterInitializationTrace, WriterState, bulk_insert_table_sql,
+        WriteOptions, WriteStats, WriterState, bulk_insert_table_sql,
         emit_direct_raw_packet_write_completed, finish_writer_to_sink, record_batch_view,
         resolve_backend, tiberius_row_owned, validate_batch_rows, validate_bulk_target_columns,
         validate_direct_bulk_target_column_types, write_batch_to_sink, write_direct_batch_to_sink,
@@ -977,10 +977,7 @@ mod tests {
         BATCH_WRITE_PHASE, BATCH_WRITE_SPAN, DIRECT_ENCODING_PHASE, DIRECT_RAW_MEASURED_EVENT,
         DIRECT_RAW_PACKET_WRITE_COMPLETED_EVENT, DIRECT_RAW_RANGES_PLANNED_EVENT, FINALIZE_PHASE,
         FINISH_COMPLETED_EVENT, FINISH_FAILED_EVENT, FINISH_PHASE, FINISH_SPAN, PACKET_WRITE_PHASE,
-        TARGET_METADATA_VALIDATION_COMPLETED_EVENT, TARGET_METADATA_VALIDATION_FAILED_EVENT,
-        TARGET_METADATA_VALIDATION_PHASE, VALUE_CONVERSION_PHASE,
-        WRITER_INITIALIZATION_COMPLETED_EVENT, WRITER_INITIALIZATION_PHASE,
-        WRITER_INITIALIZATION_SPAN,
+        VALUE_CONVERSION_PHASE,
         test_support::{CapturedTrace, CapturedTraceKind, capture_traces},
     };
     use crate::{
@@ -1060,198 +1057,6 @@ mod tests {
             resolve_backend(WriteBackend::DirectRawBulk).unwrap(),
             WriteBackend::DirectRawBulk
         );
-    }
-
-    #[test]
-    fn writer_initialization_trace_records_auto_backend_resolution() -> Result<(), String> {
-        let table = TableName::new("dbo", "target").unwrap();
-        let mappings = vec![mapping("id")];
-
-        let (state, traces) = capture_traces(|| {
-            let mut trace =
-                WriterInitializationTrace::new(&table, WriteBackend::Auto, mappings.len());
-            trace.emit_started();
-            let state = WriterState::new(
-                WriteBackend::Auto,
-                SchemaCheck::Strict,
-                PlanOptions::default(),
-                mappings,
-            )
-            .unwrap();
-            trace.record_resolved_backend(state.backend());
-            trace.record_direct_target_validation_required(true);
-            trace.emit_completed();
-            state
-        });
-
-        assert_eq!(state.backend(), WriteBackend::DirectRawBulk);
-        let records = traces.records()?;
-        let event = trace_event(&records, WRITER_INITIALIZATION_COMPLETED_EVENT)?;
-        assert_eq!(event.span_name(), Some(WRITER_INITIALIZATION_SPAN));
-        assert_trace_field(event, "phase", WRITER_INITIALIZATION_PHASE);
-        assert_trace_field(event, "requested_backend", "Auto");
-        assert_trace_field(event, "resolved_backend", "DirectRawBulk");
-        assert_trace_field(event, "target_schema", "dbo");
-        assert_trace_field(event, "target_table", "target");
-        assert_trace_field(event, "planned_column_count", "1");
-        assert_trace_field(event, "direct_target_validation_required", "true");
-        assert_trace_field(event, "initialization_result", "success");
-        assert!(event.fields().contains_key("elapsed_us"));
-
-        Ok(())
-    }
-
-    #[test]
-    fn writer_initialization_trace_records_explicit_backend_resolution() -> Result<(), String> {
-        for backend in [
-            WriteBackend::BaselineTokenRow,
-            WriteBackend::DirectFramedBulk,
-            WriteBackend::DirectRawBulk,
-        ] {
-            let table = TableName::new("dbo", "target").unwrap();
-            let mappings = vec![mapping("id")];
-            let (_state, traces) = capture_traces(|| {
-                let mut trace = WriterInitializationTrace::new(&table, backend, mappings.len());
-                trace.emit_started();
-                let state = WriterState::new(
-                    backend,
-                    SchemaCheck::Strict,
-                    PlanOptions::default(),
-                    mappings,
-                )
-                .unwrap();
-                trace.record_resolved_backend(state.backend());
-                trace.record_direct_target_validation_required(matches!(
-                    state.backend(),
-                    WriteBackend::DirectFramedBulk | WriteBackend::DirectRawBulk
-                ));
-                trace.emit_completed();
-                state
-            });
-
-            let records = traces.records()?;
-            let event = trace_event(&records, WRITER_INITIALIZATION_COMPLETED_EVENT)?;
-            let backend_name = match backend {
-                WriteBackend::BaselineTokenRow => "BaselineTokenRow",
-                WriteBackend::DirectFramedBulk => "DirectFramedBulk",
-                WriteBackend::DirectRawBulk => "DirectRawBulk",
-                WriteBackend::Auto => "Auto",
-            };
-            assert_trace_field(event, "requested_backend", backend_name);
-            assert_trace_field(event, "resolved_backend", backend_name);
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn target_metadata_validation_trace_records_direct_success() -> Result<(), String> {
-        let table = TableName::new("dbo", "target").unwrap();
-        let mappings = vec![mapping("id")];
-        let columns = vec![bulk_target_column_with_type(
-            0,
-            "id",
-            false,
-            tiberius::ColumnType::Int4,
-        )];
-
-        let (_state, traces) = capture_traces(|| {
-            let mut trace =
-                WriterInitializationTrace::new(&table, WriteBackend::DirectRawBulk, mappings.len());
-            let state = WriterState::new(
-                WriteBackend::DirectRawBulk,
-                SchemaCheck::Strict,
-                PlanOptions::default(),
-                mappings,
-            )
-            .unwrap();
-            trace.record_resolved_backend(state.backend());
-            trace.record_direct_target_validation_required(true);
-            trace.emit_target_metadata_validation_started();
-            validate_bulk_target_columns(columns.iter(), state.mappings()).unwrap();
-            validate_direct_bulk_target_column_types(
-                columns.iter(),
-                state.direct_encoder().unwrap().plan(),
-            )
-            .unwrap();
-            trace.emit_target_metadata_validation_completed();
-            state
-        });
-
-        let records = traces.records()?;
-        let event = trace_event(&records, TARGET_METADATA_VALIDATION_COMPLETED_EVENT)?;
-        assert_trace_field(event, "phase", TARGET_METADATA_VALIDATION_PHASE);
-        assert_trace_field(event, "requested_backend", "DirectRawBulk");
-        assert_trace_field(event, "resolved_backend", "DirectRawBulk");
-        assert_trace_field(event, "direct_target_validation_required", "true");
-        assert_trace_field(event, "initialization_result", "success");
-
-        Ok(())
-    }
-
-    #[test]
-    fn target_metadata_validation_failure_trace_is_sanitized() -> Result<(), String> {
-        let table = TableName::new("dbo", "target").unwrap();
-        let mappings = vec![mapping("id")];
-        let columns = vec![bulk_target_column_with_type(
-            0,
-            "id",
-            false,
-            tiberius::ColumnType::Int8,
-        )];
-
-        let (_err, traces) = capture_traces(|| {
-            let mut trace =
-                WriterInitializationTrace::new(&table, WriteBackend::DirectRawBulk, mappings.len());
-            let state = WriterState::new(
-                WriteBackend::DirectRawBulk,
-                SchemaCheck::Strict,
-                PlanOptions::default(),
-                mappings,
-            )
-            .unwrap();
-            trace.record_resolved_backend(state.backend());
-            trace.record_direct_target_validation_required(true);
-            let err = validate_direct_bulk_target_column_types(
-                columns.iter(),
-                state.direct_encoder().unwrap().plan(),
-            )
-            .unwrap_err();
-            trace.emit_failed(TARGET_METADATA_VALIDATION_PHASE, &err);
-            err
-        });
-
-        let records = traces.records()?;
-        let event = trace_event(&records, TARGET_METADATA_VALIDATION_FAILED_EVENT)?;
-        assert_trace_field(event, "phase", TARGET_METADATA_VALIDATION_PHASE);
-        assert_trace_field(
-            event,
-            "error_summary",
-            "value conversion failed with diagnostics",
-        );
-        assert_trace_field(event, "diagnostic_codes", "SchemaMismatch");
-        traces.assert_no_forbidden_text(&[
-            "server=tcp:sql.example.com",
-            "password=secret",
-            "User ID=sa",
-        ])?;
-
-        let secret_error = Error::Tiberius {
-            source: tiberius::error::Error::BulkInput(Cow::Borrowed(
-                "server=tcp:sql.example.com;User ID=sa;password=secret",
-            )),
-        };
-        let (_result, tiberius_traces) = capture_traces(|| {
-            let trace = WriterInitializationTrace::new(&table, WriteBackend::DirectRawBulk, 1);
-            trace.emit_failed(TARGET_METADATA_VALIDATION_PHASE, &secret_error);
-        });
-        tiberius_traces.assert_no_forbidden_text(&[
-            "server=tcp:sql.example.com",
-            "password=secret",
-            "User ID=sa",
-        ])?;
-
-        Ok(())
     }
 
     #[test]
