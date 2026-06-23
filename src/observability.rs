@@ -98,6 +98,8 @@ pub(crate) mod test_support {
         registry::LookupSpan,
     };
 
+    static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+
     /// Kind of captured tracing record.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum CapturedTraceKind {
@@ -201,6 +203,10 @@ pub(crate) mod test_support {
 
     /// Runs a closure with a scoped tracing subscriber and returns captured records.
     pub(crate) fn capture_traces<R>(operation: impl FnOnce() -> R) -> (R, CapturedTraces) {
+        let _capture_guard = match CAPTURE_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let records = Arc::new(Mutex::new(Vec::new()));
         let subscriber = Registry::default().with(CaptureLayer {
             records: Arc::clone(&records),
