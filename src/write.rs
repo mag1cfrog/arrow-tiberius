@@ -1,5 +1,7 @@
 //! Write-path options and policies.
 
+pub use crate::error::WritePhase;
+
 pub(crate) mod direct;
 /// Write-path planning and conversion policies.
 pub mod policy;
