@@ -151,6 +151,23 @@ if let Error::Planning { diagnostics } = err {
 See [Arrow to SQL Server Type Mapping](docs/type-mapping.md) for the full
 supported and unsupported mapping surface.
 
+## Observability
+
+`arrow-tiberius` emits structured spans and events through `tracing` for schema
+planning, writer initialization, batch writes, direct raw backend summaries,
+and writer finish. It does not install a global subscriber; applications decide
+how tracing is filtered, formatted, exported, or attached to workflow-level
+spans.
+
+The tracing contract is intentionally sanitized. It includes backend names,
+validated identifiers, counts, phase names, diagnostic codes, and elapsed
+durations. It does not emit connection strings, passwords, row values, raw
+packet bytes, or arbitrary SQL text.
+
+See [Observability](docs/observability.md) for subscriber setup, span and event
+names, safe field categories, redaction guarantees, and downstream workflow
+integration guidance.
+
 ## Writer Backends
 
 `WriteBackend` controls how planned Arrow rows are sent to SQL Server:
