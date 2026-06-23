@@ -176,6 +176,7 @@ pub(crate) fn emit_test_capture_smoke_event() {
 
     tracing::info!(
         target: TRACE_TARGET,
+        telemetry_event = TEST_CAPTURE_EVENT,
         phase = "test_capture",
         smoke_count = 1_u64,
         smoke_label = "foundation",
@@ -306,23 +307,34 @@ pub(crate) mod test_support {
         }
     }
 
-    /// Runs a closure with a scoped tracing subscriber and returns captured records.
-    pub(crate) fn capture_traces<R>(operation: impl FnOnce() -> R) -> (R, CapturedTraces) {
+    /// Runs a closure while no other scoped tracing capture helper is active.
+    pub(crate) fn with_trace_capture_lock<R>(operation: impl FnOnce() -> R) -> R {
         let _capture_guard = match CAPTURE_LOCK.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let records = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = Registry::default().with(CaptureLayer {
-            records: Arc::clone(&records),
-        });
-        let result = tracing::subscriber::with_default(subscriber, || {
-            tracing::callsite::rebuild_interest_cache();
-            operation()
-        });
+        tracing::callsite::rebuild_interest_cache();
+        let result = operation();
         tracing::callsite::rebuild_interest_cache();
 
-        (result, CapturedTraces { records })
+        result
+    }
+
+    /// Runs a closure with a scoped tracing subscriber and returns captured records.
+    pub(crate) fn capture_traces<R>(operation: impl FnOnce() -> R) -> (R, CapturedTraces) {
+        with_trace_capture_lock(|| {
+            let records = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = Registry::default().with(CaptureLayer {
+                records: Arc::clone(&records),
+            });
+            let result = tracing::subscriber::with_default(subscriber, || {
+                tracing::callsite::rebuild_interest_cache();
+                operation()
+            });
+            tracing::callsite::rebuild_interest_cache();
+
+            (result, CapturedTraces { records })
+        })
     }
 
     pub(crate) fn trace_event<'a>(
@@ -441,7 +453,10 @@ mod tests {
 
     use super::{
         TEST_CAPTURE_EVENT, TEST_CAPTURE_SPAN, TRACE_TARGET, emit_test_capture_smoke_event,
-        test_support::{CapturedTraceKind, capture_traces},
+        test_support::{
+            CapturedTraceKind, assert_trace_field, capture_traces, trace_event,
+            with_trace_capture_lock,
+        },
     };
 
     #[test]
@@ -461,32 +476,24 @@ mod tests {
         });
         assert!(has_span, "captured records: {records:#?}");
 
-        let has_event = records.iter().any(|record| {
-            record.kind() == CapturedTraceKind::Event
-                && record.target() == TRACE_TARGET
-                && record.level() == Level::INFO
-                && record.span_name() == Some(TEST_CAPTURE_SPAN)
-                && record
-                    .fields()
-                    .get("message")
-                    .is_some_and(|value| value.contains(TEST_CAPTURE_EVENT))
-                && record
-                    .fields()
-                    .get("smoke_count")
-                    .is_some_and(|value| value == "1")
-                && record
-                    .fields()
-                    .get("smoke_label")
-                    .is_some_and(|value| value == "foundation")
-        });
-        assert!(has_event, "captured records: {records:#?}");
+        let event = trace_event(&records, TEST_CAPTURE_EVENT)?;
+        assert_eq!(event.target(), TRACE_TARGET, "trace record: {event:#?}");
+        assert_eq!(event.level(), Level::INFO, "trace record: {event:#?}");
+        assert_eq!(
+            event.span_name(),
+            Some(TEST_CAPTURE_SPAN),
+            "trace record: {event:#?}"
+        );
+        assert_trace_field(event, "message", TEST_CAPTURE_EVENT);
+        assert_trace_field(event, "smoke_count", "1");
+        assert_trace_field(event, "smoke_label", "foundation");
 
         Ok(())
     }
 
     #[test]
     fn smoke_event_runs_without_subscriber() {
-        emit_test_capture_smoke_event();
+        with_trace_capture_lock(emit_test_capture_smoke_event);
     }
 
     #[test]
