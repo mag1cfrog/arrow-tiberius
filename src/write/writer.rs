@@ -10,8 +10,11 @@ use arrow_array::RecordBatch;
 use futures_util::io::{AsyncRead, AsyncWrite};
 
 use crate::observability::{
-    TARGET_METADATA_VALIDATION_COMPLETED_EVENT, TARGET_METADATA_VALIDATION_FAILED_EVENT,
-    TARGET_METADATA_VALIDATION_PHASE, TARGET_METADATA_VALIDATION_STARTED_EVENT, TRACE_TARGET,
+    BATCH_SCHEMA_VALIDATION_PHASE, BATCH_WRITE_COMPLETED_EVENT, BATCH_WRITE_FAILED_EVENT,
+    BATCH_WRITE_PHASE, BATCH_WRITE_SPAN, BATCH_WRITE_STARTED_EVENT, DIRECT_ENCODING_PHASE,
+    PACKET_WRITE_PHASE, TARGET_METADATA_VALIDATION_COMPLETED_EVENT,
+    TARGET_METADATA_VALIDATION_FAILED_EVENT, TARGET_METADATA_VALIDATION_PHASE,
+    TARGET_METADATA_VALIDATION_STARTED_EVENT, TRACE_TARGET, VALUE_CONVERSION_PHASE,
     WRITER_INITIALIZATION_COMPLETED_EVENT, WRITER_INITIALIZATION_FAILED_EVENT,
     WRITER_INITIALIZATION_PHASE, WRITER_INITIALIZATION_SPAN, WRITER_INITIALIZATION_STARTED_EVENT,
 };
@@ -227,6 +230,111 @@ impl WriterInitializationTrace {
 
     fn direct_target_validation_required(&self) -> bool {
         self.direct_target_validation_required.unwrap_or(false)
+    }
+}
+
+#[derive(Debug)]
+struct BatchWriteTrace {
+    span: tracing::Span,
+    started: Instant,
+    backend: WriteBackend,
+    attempted_batch_ordinal: u64,
+    batch_row_count: u64,
+    batch_column_count: u64,
+    batch_is_empty: bool,
+    accepted_rows_before: u64,
+    accepted_batches_before: u64,
+}
+
+impl BatchWriteTrace {
+    fn new(state: &WriterState, batch: &RecordBatch) -> Self {
+        let stats = state.stats();
+        let attempted_batch_ordinal = stats.batches_written.saturating_add(1);
+        let batch_row_count = usize_to_u64_saturating(batch.num_rows());
+        let batch_column_count = usize_to_u64_saturating(batch.num_columns());
+        let batch_is_empty = batch.num_rows() == 0;
+        let span = tracing::info_span!(
+            target: TRACE_TARGET,
+            BATCH_WRITE_SPAN,
+            phase = BATCH_WRITE_PHASE,
+            backend = backend_trace_name(state.backend()),
+            attempted_batch_ordinal,
+            batch_row_count,
+            batch_column_count,
+            batch_is_empty,
+            accepted_rows_before = stats.rows_written,
+            accepted_batches_before = stats.batches_written,
+        );
+
+        Self {
+            span,
+            started: Instant::now(),
+            backend: state.backend(),
+            attempted_batch_ordinal,
+            batch_row_count,
+            batch_column_count,
+            batch_is_empty,
+            accepted_rows_before: stats.rows_written,
+            accepted_batches_before: stats.batches_written,
+        }
+    }
+
+    fn emit_started(&self) {
+        let _span_guard = self.span.enter();
+        tracing::info!(
+            target: TRACE_TARGET,
+            phase = BATCH_WRITE_PHASE,
+            telemetry_event = BATCH_WRITE_STARTED_EVENT,
+            backend = backend_trace_name(self.backend),
+            attempted_batch_ordinal = self.attempted_batch_ordinal,
+            batch_row_count = self.batch_row_count,
+            batch_column_count = self.batch_column_count,
+            batch_is_empty = self.batch_is_empty,
+            accepted_rows_before = self.accepted_rows_before,
+            accepted_batches_before = self.accepted_batches_before,
+            batch_write_result = "started"
+        );
+    }
+
+    fn emit_completed(&self, stats: WriteStats) {
+        let _span_guard = self.span.enter();
+        tracing::info!(
+            target: TRACE_TARGET,
+            phase = BATCH_WRITE_PHASE,
+            telemetry_event = BATCH_WRITE_COMPLETED_EVENT,
+            backend = backend_trace_name(self.backend),
+            attempted_batch_ordinal = self.attempted_batch_ordinal,
+            batch_row_count = self.batch_row_count,
+            batch_column_count = self.batch_column_count,
+            batch_is_empty = self.batch_is_empty,
+            accepted_rows_before = self.accepted_rows_before,
+            accepted_batches_before = self.accepted_batches_before,
+            accepted_rows_after = stats.rows_written,
+            accepted_batches_after = stats.batches_written,
+            batch_write_result = "success",
+            elapsed_us = duration_micros_u64(self.started.elapsed())
+        );
+    }
+
+    fn emit_failed(&self, phase: &'static str, error: &crate::Error) {
+        let diagnostic_codes = diagnostic_codes_for_error(error);
+        let _span_guard = self.span.enter();
+        tracing::error!(
+            target: TRACE_TARGET,
+            phase,
+            telemetry_event = BATCH_WRITE_FAILED_EVENT,
+            backend = backend_trace_name(self.backend),
+            attempted_batch_ordinal = self.attempted_batch_ordinal,
+            batch_row_count = self.batch_row_count,
+            batch_column_count = self.batch_column_count,
+            batch_is_empty = self.batch_is_empty,
+            accepted_rows_before = self.accepted_rows_before,
+            accepted_batches_before = self.accepted_batches_before,
+            batch_write_result = "failure",
+            error_summary = sanitized_error_summary(error),
+            diagnostic_codes = diagnostic_codes.as_str(),
+            elapsed_us = duration_micros_u64(self.started.elapsed())
+        );
     }
 }
 
@@ -822,21 +930,44 @@ async fn write_batch_to_sink<Sink>(
 where
     Sink: TokenRowSink,
 {
-    let view = record_batch_view(
+    let trace = BatchWriteTrace::new(state, batch);
+    trace.emit_started();
+
+    let view = match record_batch_view(
         batch,
         state.mappings(),
         state.schema_check(),
         state.plan_options(),
-    )?;
-    validate_batch_rows(&view)?;
+    ) {
+        Ok(view) => view,
+        Err(err) => {
+            trace.emit_failed(BATCH_SCHEMA_VALIDATION_PHASE, &err);
+            return Err(err);
+        }
+    };
+    if let Err(err) = validate_batch_rows(&view) {
+        trace.emit_failed(VALUE_CONVERSION_PHASE, &err);
+        return Err(err);
+    }
     let rows_written = usize_to_u64_saturating(view.row_count());
 
     for row_index in 0..view.row_count() {
-        let row = tiberius_row_owned(&view, row_index)?;
-        sink.send_token_row(row).await?;
+        let row = match tiberius_row_owned(&view, row_index) {
+            Ok(row) => row,
+            Err(err) => {
+                trace.emit_failed(VALUE_CONVERSION_PHASE, &err);
+                return Err(err);
+            }
+        };
+        if let Err(err) = sink.send_token_row(row).await {
+            trace.emit_failed(PACKET_WRITE_PHASE, &err);
+            return Err(err);
+        }
     }
 
-    Ok(state.record_accepted_batch(rows_written))
+    let stats = state.record_accepted_batch(rows_written);
+    trace.emit_completed(stats);
+    Ok(stats)
 }
 
 trait TokenRowSink {
@@ -862,28 +993,58 @@ async fn write_direct_batch_to_sink<Sink>(
 where
     Sink: RawRowsSink,
 {
-    let encoder = state
+    let trace = BatchWriteTrace::new(state, batch);
+    trace.emit_started();
+
+    let encoder = match state
         .direct_encoder()
         .ok_or_else(|| crate::Error::BackendUnavailable {
             backend: state.backend(),
             reason: "direct bulk encoder is not available for this writer".to_owned(),
-        })?;
+        }) {
+        Ok(encoder) => encoder,
+        Err(err) => {
+            trace.emit_failed(DIRECT_ENCODING_PHASE, &err);
+            return Err(err);
+        }
+    };
     let measure_start = std::time::Instant::now();
     let measured = encoder.measure_batch(batch);
-    let measured = profile::record_elapsed(measure_start, profile::record_measure_batch, measured)?;
+    let measured =
+        match profile::record_elapsed(measure_start, profile::record_measure_batch, measured) {
+            Ok(measured) => measured,
+            Err(err) => {
+                trace.emit_failed(batch_failure_phase(&err), &err);
+                return Err(err);
+            }
+        };
     let rows_written = usize_to_u64_saturating(measured.row_count());
 
     let split_start = std::time::Instant::now();
     let ranges = measured.row_ranges(DIRECT_RAW_MAX_PAYLOAD_BYTES);
-    let ranges = profile::record_elapsed(split_start, profile::record_row_range_split, ranges)?;
+    let ranges = match profile::record_elapsed(split_start, profile::record_row_range_split, ranges)
+    {
+        Ok(ranges) => ranges,
+        Err(err) => {
+            trace.emit_failed(DIRECT_ENCODING_PHASE, &err);
+            return Err(err);
+        }
+    };
 
     for range in ranges {
-        sink.send_measured_raw_rows(encoder, batch, &measured, range)
-            .await?;
+        if let Err(err) = sink
+            .send_measured_raw_rows(encoder, batch, &measured, range)
+            .await
+        {
+            trace.emit_failed(batch_failure_phase(&err), &err);
+            return Err(err);
+        }
     }
 
     profile::record_accepted_batch(measured.row_count());
-    Ok(state.record_accepted_batch(rows_written))
+    let stats = state.record_accepted_batch(rows_written);
+    trace.emit_completed(stats);
+    Ok(stats)
 }
 
 trait RawRowsSink {
@@ -1031,6 +1192,25 @@ fn diagnostic_codes(diagnostics: &DiagnosticSet) -> String {
     codes
 }
 
+fn batch_failure_phase(error: &crate::Error) -> &'static str {
+    match error {
+        crate::Error::ValueConversion { diagnostics }
+            if diagnostics
+                .all()
+                .iter()
+                .all(|diagnostic| diagnostic.code() == DiagnosticCode::SchemaMismatch) =>
+        {
+            BATCH_SCHEMA_VALIDATION_PHASE
+        }
+        crate::Error::ValueConversion { .. } => VALUE_CONVERSION_PHASE,
+        crate::Error::DirectEncoding { .. } | crate::Error::BackendUnavailable { .. } => {
+            DIRECT_ENCODING_PHASE
+        }
+        crate::Error::Tiberius { .. } => PACKET_WRITE_PHASE,
+        _ => BATCH_WRITE_PHASE,
+    }
+}
+
 fn duration_micros_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
@@ -1045,7 +1225,9 @@ mod tests {
         task::{Context, Poll, Waker},
     };
 
-    use arrow_array::{BinaryArray, Float64Array, Int32Array, RecordBatch, UInt64Array};
+    use arrow_array::{
+        BinaryArray, Float64Array, Int32Array, RecordBatch, StringArray, UInt64Array,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use futures_util::io::{AsyncRead, AsyncWrite};
 
@@ -1057,9 +1239,12 @@ mod tests {
         validate_direct_bulk_target_column_types, write_batch_to_sink, write_direct_batch_to_sink,
     };
     use crate::observability::{
+        BATCH_SCHEMA_VALIDATION_PHASE, BATCH_WRITE_COMPLETED_EVENT, BATCH_WRITE_FAILED_EVENT,
+        BATCH_WRITE_PHASE, BATCH_WRITE_SPAN, PACKET_WRITE_PHASE,
         TARGET_METADATA_VALIDATION_COMPLETED_EVENT, TARGET_METADATA_VALIDATION_FAILED_EVENT,
-        TARGET_METADATA_VALIDATION_PHASE, WRITER_INITIALIZATION_COMPLETED_EVENT,
-        WRITER_INITIALIZATION_PHASE, WRITER_INITIALIZATION_SPAN,
+        TARGET_METADATA_VALIDATION_PHASE, VALUE_CONVERSION_PHASE,
+        WRITER_INITIALIZATION_COMPLETED_EVENT, WRITER_INITIALIZATION_PHASE,
+        WRITER_INITIALIZATION_SPAN,
         test_support::{CapturedTrace, CapturedTraceKind, capture_traces},
     };
     use crate::{
@@ -2135,6 +2320,221 @@ mod tests {
     }
 
     #[test]
+    fn baseline_batch_write_success_emits_stats_trace() -> Result<(), String> {
+        let mappings = vec![mapping("id")];
+        let mut state = WriterState::new(
+            WriteBackend::BaselineTokenRow,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingSink::default();
+        let batch = int32_batch("id", &[10, 20]);
+
+        let (stats, traces) =
+            capture_traces(|| poll_ready(write_batch_to_sink(&mut state, &mut sink, &batch)));
+        let stats = stats.unwrap();
+
+        assert_eq!(
+            stats,
+            WriteStats {
+                rows_written: 2,
+                batches_written: 1
+            }
+        );
+        let records = traces.records()?;
+        let event = trace_event(&records, BATCH_WRITE_COMPLETED_EVENT)?;
+        assert_eq!(event.span_name(), Some(BATCH_WRITE_SPAN));
+        assert_trace_field(event, "phase", BATCH_WRITE_PHASE);
+        assert_trace_field(event, "backend", "BaselineTokenRow");
+        assert_trace_field(event, "attempted_batch_ordinal", "1");
+        assert_trace_field(event, "batch_row_count", "2");
+        assert_trace_field(event, "batch_column_count", "1");
+        assert_trace_field(event, "batch_is_empty", "false");
+        assert_trace_field(event, "accepted_rows_before", "0");
+        assert_trace_field(event, "accepted_batches_before", "0");
+        assert_trace_field(event, "accepted_rows_after", "2");
+        assert_trace_field(event, "accepted_batches_after", "1");
+        assert_trace_field(event, "batch_write_result", "success");
+        assert!(event.fields().contains_key("elapsed_us"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn empty_batch_write_success_trace_matches_stats() -> Result<(), String> {
+        let mappings = vec![mapping("id")];
+        let mut state = WriterState::new(
+            WriteBackend::BaselineTokenRow,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingSink::default();
+        let batch = int32_batch("id", &[]);
+
+        let (stats, traces) =
+            capture_traces(|| poll_ready(write_batch_to_sink(&mut state, &mut sink, &batch)));
+        let stats = stats.unwrap();
+
+        assert_eq!(
+            stats,
+            WriteStats {
+                rows_written: 0,
+                batches_written: 1
+            }
+        );
+        let records = traces.records()?;
+        let event = trace_event(&records, BATCH_WRITE_COMPLETED_EVENT)?;
+        assert_trace_field(event, "batch_row_count", "0");
+        assert_trace_field(event, "batch_is_empty", "true");
+        assert_trace_field(event, "accepted_rows_after", "0");
+        assert_trace_field(event, "accepted_batches_after", "1");
+
+        Ok(())
+    }
+
+    #[test]
+    fn batch_schema_validation_failure_emits_trace_without_accepting_batch() -> Result<(), String> {
+        let mappings = vec![mapping("id")];
+        let mut state = WriterState::new(
+            WriteBackend::BaselineTokenRow,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingSink::default();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "id",
+                DataType::Float64,
+                false,
+            )])),
+            vec![Arc::new(Float64Array::from(vec![1.0]))],
+        )
+        .unwrap();
+
+        let (err, traces) =
+            capture_traces(|| poll_ready(write_batch_to_sink(&mut state, &mut sink, &batch)));
+        let err = err.unwrap_err();
+
+        let Error::ValueConversion { diagnostics } = err else {
+            panic!("expected value conversion error");
+        };
+        assert_eq!(diagnostics.all()[0].code(), DiagnosticCode::SchemaMismatch);
+        assert_eq!(state.stats(), WriteStats::default());
+        assert!(sink.rows.is_empty());
+        let records = traces.records()?;
+        let event = trace_event(&records, BATCH_WRITE_FAILED_EVENT)?;
+        assert_eq!(event.span_name(), Some(BATCH_WRITE_SPAN));
+        assert_trace_field(event, "phase", BATCH_SCHEMA_VALIDATION_PHASE);
+        assert_trace_field(event, "backend", "BaselineTokenRow");
+        assert_trace_field(event, "batch_row_count", "1");
+        assert_trace_field(event, "batch_column_count", "1");
+        assert_trace_field(event, "accepted_rows_before", "0");
+        assert_trace_field(event, "accepted_batches_before", "0");
+        assert_trace_field(event, "batch_write_result", "failure");
+        assert_trace_field(event, "diagnostic_codes", "SchemaMismatch");
+
+        Ok(())
+    }
+
+    #[test]
+    fn value_conversion_failure_emits_trace_without_accepting_batch() -> Result<(), String> {
+        let mappings = vec![float_mapping("amount")];
+        let mut state = WriterState::new(
+            WriteBackend::BaselineTokenRow,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingSink::default();
+        let batch = float64_batch("amount", &[Some(1.0), Some(f64::NAN)]);
+
+        let (err, traces) =
+            capture_traces(|| poll_ready(write_batch_to_sink(&mut state, &mut sink, &batch)));
+        let err = err.unwrap_err();
+
+        let Error::ValueConversion { diagnostics } = err else {
+            panic!("expected value conversion error");
+        };
+        assert_eq!(diagnostics.all()[0].code(), DiagnosticCode::NonFiniteFloat);
+        assert_eq!(state.stats(), WriteStats::default());
+        assert!(sink.rows.is_empty());
+        let records = traces.records()?;
+        let event = trace_event(&records, BATCH_WRITE_FAILED_EVENT)?;
+        assert_trace_field(event, "phase", VALUE_CONVERSION_PHASE);
+        assert_trace_field(event, "diagnostic_codes", "NonFiniteFloat");
+        assert_trace_field(
+            event,
+            "error_summary",
+            "value conversion failed with diagnostics",
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn packet_write_failure_emits_trace_without_accepting_batch() -> Result<(), String> {
+        let mappings = vec![mapping("id")];
+        let mut state = WriterState::new(
+            WriteBackend::BaselineTokenRow,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingSink {
+            fail_on_send: Some(0),
+            rows: Vec::new(),
+        };
+        let batch = int32_batch("id", &[1, 2, 3]);
+
+        let (err, traces) =
+            capture_traces(|| poll_ready(write_batch_to_sink(&mut state, &mut sink, &batch)));
+        let err = err.unwrap_err();
+
+        let Error::Tiberius { .. } = err else {
+            panic!("expected tiberius error");
+        };
+        assert_eq!(state.stats(), WriteStats::default());
+        assert!(sink.rows.is_empty());
+        let records = traces.records()?;
+        let event = trace_event(&records, BATCH_WRITE_FAILED_EVENT)?;
+        assert_trace_field(event, "phase", PACKET_WRITE_PHASE);
+        assert_trace_field(event, "backend", "BaselineTokenRow");
+        assert_trace_field(event, "diagnostic_codes", "");
+        assert_trace_field(event, "error_summary", "tiberius operation failed");
+
+        Ok(())
+    }
+
+    #[test]
+    fn batch_write_trace_does_not_emit_row_values() -> Result<(), String> {
+        let mappings = vec![utf8_mapping_at(0, "secret_value")];
+        let mut state = WriterState::new(
+            WriteBackend::BaselineTokenRow,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingSink::default();
+        let batch = utf8_batch("secret_value", &["password=secret"]);
+
+        let (_stats, traces) =
+            capture_traces(|| poll_ready(write_batch_to_sink(&mut state, &mut sink, &batch)));
+
+        traces.assert_no_forbidden_text(&["password=secret"])?;
+
+        Ok(())
+    }
+
+    #[test]
     fn write_direct_batch_to_sink_sends_one_checked_payload_per_batch() {
         let mappings = vec![mapping("id")];
         let mut state = WriterState::new(
@@ -2162,6 +2562,50 @@ mod tests {
             sink.payloads[0].bytes,
             vec![0xD1, 10, 0, 0, 0, 0xD1, 20, 0, 0, 0]
         );
+    }
+
+    #[test]
+    fn direct_batch_write_success_emits_stats_trace() -> Result<(), String> {
+        for backend in [WriteBackend::DirectFramedBulk, WriteBackend::DirectRawBulk] {
+            let mappings = vec![mapping("id")];
+            let mut state = WriterState::new(
+                backend,
+                SchemaCheck::Strict,
+                PlanOptions::default(),
+                mappings,
+            )
+            .unwrap();
+            let mut sink = RecordingRawSink::default();
+            let batch = int32_batch("id", &[10, 20]);
+
+            let (stats, traces) = capture_traces(|| {
+                poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch))
+            });
+            let stats = stats.unwrap();
+
+            assert_eq!(
+                stats,
+                WriteStats {
+                    rows_written: 2,
+                    batches_written: 1
+                }
+            );
+            let records = traces.records()?;
+            let event = trace_event(&records, BATCH_WRITE_COMPLETED_EVENT)?;
+            let expected_backend = match backend {
+                WriteBackend::DirectFramedBulk => "DirectFramedBulk",
+                WriteBackend::DirectRawBulk => "DirectRawBulk",
+                WriteBackend::Auto => "Auto",
+                WriteBackend::BaselineTokenRow => "BaselineTokenRow",
+            };
+            assert_trace_field(event, "backend", expected_backend);
+            assert_trace_field(event, "batch_row_count", "2");
+            assert_trace_field(event, "batch_column_count", "1");
+            assert_trace_field(event, "accepted_rows_after", "2");
+            assert_trace_field(event, "accepted_batches_after", "1");
+        }
+
+        Ok(())
     }
 
     #[test]
@@ -2518,6 +2962,13 @@ mod tests {
     fn binary_batch(name: &str, values: &[&[u8]]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Binary, false)]));
         let array = Arc::new(BinaryArray::from_iter_values(values.iter().copied()));
+
+        RecordBatch::try_new(schema, vec![array]).unwrap()
+    }
+
+    fn utf8_batch(name: &str, values: &[&str]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Utf8, false)]));
+        let array = Arc::new(StringArray::from(values.to_vec()));
 
         RecordBatch::try_new(schema, vec![array]).unwrap()
     }
