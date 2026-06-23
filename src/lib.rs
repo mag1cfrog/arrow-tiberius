@@ -130,6 +130,7 @@ pub mod diagnostic;
 pub mod error;
 /// MSSQL-side schema metadata, identifiers, profile, and DDL helpers.
 pub mod mssql;
+mod observability;
 /// Bidirectional Arrow/MSSQL schema mapping.
 pub mod schema;
 /// Write-path options and conversion policies.
