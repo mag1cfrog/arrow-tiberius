@@ -1,5 +1,7 @@
 //! Crate-owned tracing names and test capture helpers.
 
+pub(crate) mod writer;
+
 /// Crate-level tracing target used by `arrow-tiberius` instrumentation.
 pub(crate) const TRACE_TARGET: &str = "arrow_tiberius";
 
