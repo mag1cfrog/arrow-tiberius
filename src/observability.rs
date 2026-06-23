@@ -1,8 +1,22 @@
 //! Crate-owned tracing names and test capture helpers.
 
 /// Crate-level tracing target used by `arrow-tiberius` instrumentation.
-#[allow(dead_code)]
 pub(crate) const TRACE_TARGET: &str = "arrow_tiberius";
+
+/// Stable phase name for Arrow-to-SQL Server schema planning telemetry.
+pub(crate) const SCHEMA_PLANNING_PHASE: &str = "schema_planning";
+
+/// Stable span name for Arrow-to-SQL Server schema planning telemetry.
+pub(crate) const SCHEMA_PLANNING_SPAN: &str = "arrow_tiberius.schema_planning";
+
+/// Stable event marker emitted when schema planning starts.
+pub(crate) const SCHEMA_PLANNING_STARTED_EVENT: &str = "arrow_tiberius.schema_planning.started";
+
+/// Stable event marker emitted when schema planning completes successfully.
+pub(crate) const SCHEMA_PLANNING_COMPLETED_EVENT: &str = "arrow_tiberius.schema_planning.completed";
+
+/// Stable event marker emitted when schema planning fails.
+pub(crate) const SCHEMA_PLANNING_FAILED_EVENT: &str = "arrow_tiberius.schema_planning.failed";
 
 /// Test-only span name used to prove tracing capture support.
 #[cfg(test)]
@@ -158,7 +172,11 @@ pub(crate) mod test_support {
         let subscriber = Registry::default().with(CaptureLayer {
             records: Arc::clone(&records),
         });
-        let result = tracing::subscriber::with_default(subscriber, operation);
+        let result = tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            operation()
+        });
+        tracing::callsite::rebuild_interest_cache();
 
         (result, CapturedTraces { records })
     }

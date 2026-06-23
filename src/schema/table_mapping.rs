@@ -6,22 +6,57 @@
 //! so future SQL Server-to-Arrow read planning can reuse the shared
 //! representation instead of inheriting a write-only column model.
 
-use arrow_schema::{Field, Schema};
+use std::{fmt::Write as _, time::Duration, time::Instant};
 
+use arrow_schema::{DataType, Field, Schema};
+
+use crate::diagnostic::DiagnosticSeverity;
+use crate::observability::{
+    SCHEMA_PLANNING_COMPLETED_EVENT, SCHEMA_PLANNING_FAILED_EVENT, SCHEMA_PLANNING_PHASE,
+    SCHEMA_PLANNING_SPAN, SCHEMA_PLANNING_STARTED_EVENT, TRACE_TARGET,
+};
 use crate::schema::type_conversion::plan_arrow_data_type_as_mssql_type;
 use crate::write::PlanOptions;
 use crate::{
     ArrowFieldRef, Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, Identifier, MssqlColumn,
-    MssqlProfile, PlanOutcome, Result, SchemaMapping, TableName, create_table_sql,
+    MssqlProfile, MssqlType, PlanOutcome, Result, SchemaMapping, TableName, create_table_sql,
 };
 
 /// Plans Arrow/MSSQL column mappings from an Arrow schema.
 pub fn plan_arrow_schema_to_mssql_mappings(
     schema: impl AsRef<Schema>,
-    _profile: MssqlProfile,
+    profile: MssqlProfile,
     options: PlanOptions,
 ) -> Result<PlanOutcome<Vec<SchemaMapping>>> {
     let schema = schema.as_ref();
+    let field_count = schema.fields().len();
+    let started = Instant::now();
+    let span = tracing::info_span!(
+        target: TRACE_TARGET,
+        SCHEMA_PLANNING_SPAN,
+        phase = SCHEMA_PLANNING_PHASE,
+        arrow_field_count = usize_to_u64(field_count),
+        mssql_version = ?profile.version(),
+        compatibility_level = u64::from(profile.compatibility_level().as_u16()),
+        string_policy = ?options.string_policy,
+        binary_policy = ?options.binary_policy,
+        timezone_policy = ?options.timezone_policy,
+        nanosecond_policy = ?options.nanosecond_policy,
+        uint64_policy = ?options.uint64_policy,
+        decimal_policy = ?options.decimal_policy,
+        decimal256_policy = ?options.decimal256_policy,
+        float_policy = ?options.float_policy,
+        date64_policy = ?options.date64_policy,
+    );
+    let _span_guard = span.enter();
+
+    tracing::info!(
+        target: TRACE_TARGET,
+        phase = SCHEMA_PLANNING_PHASE,
+        telemetry_event = SCHEMA_PLANNING_STARTED_EVENT,
+        arrow_field_count = usize_to_u64(field_count)
+    );
+
     let mut mappings = Vec::with_capacity(schema.fields().len());
     let mut diagnostics = DiagnosticSet::new();
 
@@ -33,8 +68,11 @@ pub fn plan_arrow_schema_to_mssql_mappings(
     }
 
     if diagnostics.has_errors() {
+        emit_schema_planning_failed(field_count, &diagnostics, started.elapsed());
         return Err(crate::Error::Planning { diagnostics });
     }
+
+    emit_schema_planning_completed(field_count, &mappings, &diagnostics, started.elapsed());
 
     Ok(PlanOutcome::new(mappings, diagnostics))
 }
@@ -79,16 +117,214 @@ fn plan_arrow_field_to_mssql_column_mapping(
     Ok(SchemaMapping::new(arrow, mssql))
 }
 
+fn emit_schema_planning_completed(
+    field_count: usize,
+    mappings: &[SchemaMapping],
+    diagnostics: &DiagnosticSet,
+    elapsed: Duration,
+) {
+    let summary = DiagnosticTraceSummary::from_diagnostics(diagnostics);
+    let shape = PlanningShapeTraceSummary::from_mappings(mappings);
+    tracing::info!(
+        target: TRACE_TARGET,
+        phase = SCHEMA_PLANNING_PHASE,
+        telemetry_event = SCHEMA_PLANNING_COMPLETED_EVENT,
+        arrow_field_count = usize_to_u64(field_count),
+        planned_mapping_count = usize_to_u64(mappings.len()),
+        arrow_data_type_families = %shape.arrow_data_type_families,
+        mssql_type_families = %shape.mssql_type_families,
+        diagnostic_count = usize_to_u64(summary.total_count),
+        error_diagnostic_count = usize_to_u64(summary.error_count),
+        warning_diagnostic_count = usize_to_u64(summary.warning_count),
+        diagnostic_codes = %summary.codes,
+        diagnostic_field_names = %summary.field_names,
+        elapsed_us = duration_micros_u64(elapsed)
+    );
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PlanningShapeTraceSummary {
+    arrow_data_type_families: String,
+    mssql_type_families: String,
+}
+
+impl PlanningShapeTraceSummary {
+    fn from_mappings(mappings: &[SchemaMapping]) -> Self {
+        let mut summary = Self::default();
+
+        for mapping in mappings {
+            append_unique_text(
+                &mut summary.arrow_data_type_families,
+                arrow_data_type_family(mapping.arrow().data_type()),
+            );
+            append_unique_text(
+                &mut summary.mssql_type_families,
+                mssql_type_family(mapping.mssql().ty()),
+            );
+        }
+
+        summary
+    }
+}
+
+fn emit_schema_planning_failed(field_count: usize, diagnostics: &DiagnosticSet, elapsed: Duration) {
+    let summary = DiagnosticTraceSummary::from_diagnostics(diagnostics);
+    tracing::error!(
+        target: TRACE_TARGET,
+        phase = SCHEMA_PLANNING_PHASE,
+        telemetry_event = SCHEMA_PLANNING_FAILED_EVENT,
+        arrow_field_count = usize_to_u64(field_count),
+        diagnostic_count = usize_to_u64(summary.total_count),
+        error_diagnostic_count = usize_to_u64(summary.error_count),
+        warning_diagnostic_count = usize_to_u64(summary.warning_count),
+        diagnostic_codes = %summary.codes,
+        diagnostic_field_names = %summary.field_names,
+        error_summary = "schema planning failed with diagnostics",
+        elapsed_us = duration_micros_u64(elapsed)
+    );
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DiagnosticTraceSummary {
+    total_count: usize,
+    error_count: usize,
+    warning_count: usize,
+    codes: String,
+    field_names: String,
+}
+
+impl DiagnosticTraceSummary {
+    fn from_diagnostics(diagnostics: &DiagnosticSet) -> Self {
+        let mut summary = Self::default();
+
+        for diagnostic in diagnostics.all() {
+            summary.total_count += 1;
+            match diagnostic.severity() {
+                DiagnosticSeverity::Warning => summary.warning_count += 1,
+                DiagnosticSeverity::Error => summary.error_count += 1,
+            }
+
+            append_debug_name(&mut summary.codes, diagnostic.code());
+            if let Some(field) = diagnostic.field() {
+                append_text(&mut summary.field_names, field.name());
+            }
+        }
+
+        summary
+    }
+}
+
+fn append_debug_name<T: std::fmt::Debug>(target: &mut String, value: T) {
+    if !target.is_empty() {
+        target.push(',');
+    }
+    let _ = write!(target, "{value:?}");
+}
+
+fn append_text(target: &mut String, value: &str) {
+    if !target.is_empty() {
+        target.push(',');
+    }
+    target.push_str(value);
+}
+
+fn append_unique_text(target: &mut String, value: &str) {
+    if target.split(',').any(|existing| existing == value) {
+        return;
+    }
+
+    append_text(target, value);
+}
+
+fn arrow_data_type_family(data_type: &DataType) -> &'static str {
+    match data_type {
+        DataType::Null => "null",
+        DataType::Boolean => "boolean",
+        DataType::Int8 => "int8",
+        DataType::Int16 => "int16",
+        DataType::Int32 => "int32",
+        DataType::Int64 => "int64",
+        DataType::UInt8 => "uint8",
+        DataType::UInt16 => "uint16",
+        DataType::UInt32 => "uint32",
+        DataType::UInt64 => "uint64",
+        DataType::Float16 => "float16",
+        DataType::Float32 => "float32",
+        DataType::Float64 => "float64",
+        DataType::Utf8 => "utf8",
+        DataType::LargeUtf8 => "large_utf8",
+        DataType::Binary => "binary",
+        DataType::LargeBinary => "large_binary",
+        DataType::FixedSizeBinary(_) => "fixed_size_binary",
+        DataType::Decimal32(_, _) => "decimal32",
+        DataType::Decimal64(_, _) => "decimal64",
+        DataType::Decimal128(_, _) => "decimal128",
+        DataType::Decimal256(_, _) => "decimal256",
+        DataType::Date32 => "date32",
+        DataType::Date64 => "date64",
+        DataType::Time32(_) => "time32",
+        DataType::Time64(_) => "time64",
+        DataType::Timestamp(_, _) => "timestamp",
+        DataType::Duration(_) => "duration",
+        DataType::Interval(_) => "interval",
+        DataType::List(_)
+        | DataType::ListView(_)
+        | DataType::FixedSizeList(_, _)
+        | DataType::LargeList(_)
+        | DataType::LargeListView(_)
+        | DataType::Struct(_)
+        | DataType::Map(_, _)
+        | DataType::Union(_, _) => "nested",
+        DataType::Dictionary(_, _) | DataType::RunEndEncoded(_, _) => "encoded",
+        DataType::BinaryView => "binary_view",
+        DataType::Utf8View => "utf8_view",
+    }
+}
+
+fn mssql_type_family(ty: &MssqlType) -> &'static str {
+    match ty {
+        MssqlType::Bit => "bit",
+        MssqlType::TinyInt => "tinyint",
+        MssqlType::SmallInt => "smallint",
+        MssqlType::Int => "int",
+        MssqlType::BigInt => "bigint",
+        MssqlType::Real => "real",
+        MssqlType::Float { .. } => "float",
+        MssqlType::NVarChar(_) => "nvarchar",
+        MssqlType::VarBinary(_) => "varbinary",
+        MssqlType::Binary(_) => "binary",
+        MssqlType::Decimal { .. } => "decimal",
+        MssqlType::Date => "date",
+        MssqlType::Time(_) => "time",
+        MssqlType::DateTime2 { .. } => "datetime2",
+        MssqlType::DateTimeOffset { .. } => "datetimeoffset",
+    }
+}
+
+fn duration_micros_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use arrow_schema::{DataType, Field, Schema, UnionFields, UnionMode};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit, UnionFields, UnionMode};
+    use tracing::Level;
 
+    use crate::observability::{
+        SCHEMA_PLANNING_COMPLETED_EVENT, SCHEMA_PLANNING_FAILED_EVENT, SCHEMA_PLANNING_PHASE,
+        SCHEMA_PLANNING_SPAN, SCHEMA_PLANNING_STARTED_EVENT, TRACE_TARGET,
+        test_support::{CapturedTraceKind, capture_traces},
+    };
     use crate::{
-        DiagnosticCode, Error, MssqlProfile, MssqlType, PlanOptions, TableName,
-        create_table_sql_from_mappings, mssql_columns_from_mappings,
-        plan_arrow_schema_to_mssql_mappings,
+        Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, MssqlProfile, MssqlType,
+        PlanOptions, TableName, TimezonePolicy, create_table_sql_from_mappings,
+        mssql_columns_from_mappings, plan_arrow_schema_to_mssql_mappings,
     };
 
     #[test]
@@ -274,5 +510,252 @@ mod tests {
         assert_eq!(diagnostic.code(), DiagnosticCode::IdentifierInvalid);
         assert_eq!(diagnostic.field().unwrap().index(), 0);
         assert_eq!(diagnostic.field().unwrap().name(), "");
+    }
+
+    #[test]
+    fn successful_schema_planning_emits_structured_trace() -> Result<(), String> {
+        let schema = Schema::new(vec![
+            Field::new("is_active", DataType::Boolean, false),
+            Field::new("quantity", DataType::Int32, true),
+        ]);
+
+        let (outcome, traces) = capture_traces(|| {
+            plan_arrow_schema_to_mssql_mappings(
+                Arc::new(schema),
+                MssqlProfile::sql_server_2016_compat_100(),
+                PlanOptions::default(),
+            )
+        });
+        let outcome = outcome.map_err(|err| err.to_string())?;
+        assert_eq!(outcome.value().len(), 2);
+
+        let records = traces.records()?;
+        assert!(
+            records.iter().any(|record| {
+                record.kind() == CapturedTraceKind::Span
+                    && record.name() == SCHEMA_PLANNING_SPAN
+                    && record.target() == TRACE_TARGET
+                    && record.level() == Level::INFO
+                    && record
+                        .fields()
+                        .get("phase")
+                        .is_some_and(|value| value == SCHEMA_PLANNING_PHASE)
+                    && record
+                        .fields()
+                        .get("arrow_field_count")
+                        .is_some_and(|value| value == "2")
+                    && record
+                        .fields()
+                        .get("mssql_version")
+                        .is_some_and(|value| value == "SqlServer2016")
+                    && record
+                        .fields()
+                        .get("compatibility_level")
+                        .is_some_and(|value| value == "100")
+                    && record
+                        .fields()
+                        .get("uint64_policy")
+                        .is_some_and(|value| value == "Reject")
+            }),
+            "captured records: {records:#?}"
+        );
+
+        assert!(
+            records.iter().any(|record| {
+                record.kind() == CapturedTraceKind::Event
+                    && record.target() == TRACE_TARGET
+                    && record.level() == Level::INFO
+                    && record.span_name() == Some(SCHEMA_PLANNING_SPAN)
+                    && record
+                        .fields()
+                        .get("telemetry_event")
+                        .is_some_and(|value| value == SCHEMA_PLANNING_STARTED_EVENT)
+                    && record
+                        .fields()
+                        .get("arrow_field_count")
+                        .is_some_and(|value| value == "2")
+            }),
+            "captured records: {records:#?}"
+        );
+
+        assert!(
+            records.iter().any(|record| {
+                record.kind() == CapturedTraceKind::Event
+                    && record.target() == TRACE_TARGET
+                    && record.level() == Level::INFO
+                    && record.span_name() == Some(SCHEMA_PLANNING_SPAN)
+                    && record
+                        .fields()
+                        .get("telemetry_event")
+                        .is_some_and(|value| value == SCHEMA_PLANNING_COMPLETED_EVENT)
+                    && record
+                        .fields()
+                        .get("planned_mapping_count")
+                        .is_some_and(|value| value == "2")
+                    && record
+                        .fields()
+                        .get("arrow_data_type_families")
+                        .is_some_and(|value| value == "boolean,int32")
+                    && record
+                        .fields()
+                        .get("mssql_type_families")
+                        .is_some_and(|value| value == "bit,int")
+                    && record
+                        .fields()
+                        .get("diagnostic_count")
+                        .is_some_and(|value| value == "0")
+                    && record
+                        .fields()
+                        .get("error_diagnostic_count")
+                        .is_some_and(|value| value == "0")
+                    && record
+                        .fields()
+                        .get("warning_diagnostic_count")
+                        .is_some_and(|value| value == "0")
+                    && record.fields().contains_key("elapsed_us")
+            }),
+            "captured records: {records:#?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn failed_schema_planning_emits_sanitized_diagnostic_trace() -> Result<(), String> {
+        let schema = Schema::new(vec![
+            Field::new("ok", DataType::Int32, false),
+            Field::new("unsigned_huge", DataType::UInt64, true),
+            Field::new("items", DataType::new_list(DataType::Int64, true), true),
+        ]);
+
+        let (outcome, traces) = capture_traces(|| {
+            plan_arrow_schema_to_mssql_mappings(
+                Arc::new(schema),
+                MssqlProfile::sql_server_2016_compat_100(),
+                PlanOptions::default(),
+            )
+        });
+        let err = outcome.expect_err("unsupported planning should fail");
+        let Error::Planning { diagnostics } = err else {
+            panic!("expected planning error");
+        };
+        assert_eq!(diagnostics.len(), 2);
+
+        let records = traces.records()?;
+        assert!(
+            records.iter().any(|record| {
+                record.kind() == CapturedTraceKind::Event
+                    && record.target() == TRACE_TARGET
+                    && record.level() == Level::ERROR
+                    && record.span_name() == Some(SCHEMA_PLANNING_SPAN)
+                    && record
+                        .fields()
+                        .get("telemetry_event")
+                        .is_some_and(|value| value == SCHEMA_PLANNING_FAILED_EVENT)
+                    && record
+                        .fields()
+                        .get("arrow_field_count")
+                        .is_some_and(|value| value == "3")
+                    && record
+                        .fields()
+                        .get("diagnostic_count")
+                        .is_some_and(|value| value == "2")
+                    && record
+                        .fields()
+                        .get("error_diagnostic_count")
+                        .is_some_and(|value| value == "2")
+                    && record
+                        .fields()
+                        .get("warning_diagnostic_count")
+                        .is_some_and(|value| value == "0")
+                    && record
+                        .fields()
+                        .get("diagnostic_codes")
+                        .is_some_and(|value| {
+                            value.contains("ProfileDependentConversion")
+                                && value.contains("UnsupportedArrowType")
+                        })
+                    && record
+                        .fields()
+                        .get("diagnostic_field_names")
+                        .is_some_and(|value| {
+                            value.contains("unsigned_huge") && value.contains("items")
+                        })
+                    && record
+                        .fields()
+                        .get("error_summary")
+                        .is_some_and(|value| value == "schema planning failed with diagnostics")
+                    && record.fields().contains_key("elapsed_us")
+            }),
+            "captured records: {records:#?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostic_trace_summary_counts_warning_codes() {
+        let diagnostics = DiagnosticSet::from(vec![
+            Diagnostic::warning(DiagnosticCode::PolicyApplied, "policy applied")
+                .with_field(FieldRef::new(0, "amount")),
+            Diagnostic::error(
+                DiagnosticCode::ProfileDependentConversion,
+                "policy required",
+            )
+            .with_field(FieldRef::new(1, "unsigned_huge")),
+        ]);
+
+        let summary = super::DiagnosticTraceSummary::from_diagnostics(&diagnostics);
+
+        assert_eq!(summary.total_count, 2);
+        assert_eq!(summary.warning_count, 1);
+        assert_eq!(summary.error_count, 1);
+        assert_eq!(summary.codes, "PolicyApplied,ProfileDependentConversion");
+        assert_eq!(summary.field_names, "amount,unsigned_huge");
+    }
+
+    #[test]
+    fn schema_planning_trace_does_not_emit_field_metadata_values() -> Result<(), String> {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(
+                [(
+                    "connection_hint".to_owned(),
+                    "server=tcp:sql.example.com;password=secret".to_owned(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            Field::new("label", DataType::Utf8, true).with_metadata(
+                [("token".to_owned(), "access_token=abc123".to_owned())]
+                    .into_iter()
+                    .collect(),
+            ),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Second, Some("password=timezone-secret".into())),
+                true,
+            ),
+        ]);
+
+        let (outcome, traces) = capture_traces(|| {
+            plan_arrow_schema_to_mssql_mappings(
+                Arc::new(schema),
+                MssqlProfile::sql_server_2016_compat_100(),
+                PlanOptions {
+                    timezone_policy: TimezonePolicy::DateTimeOffset,
+                    ..PlanOptions::default()
+                },
+            )
+        });
+        outcome.map_err(|err| err.to_string())?;
+
+        traces.assert_no_forbidden_text(&[
+            "server=tcp:sql.example.com",
+            "password=secret",
+            "access_token=abc123",
+            "password=timezone-secret",
+        ])?;
+
+        Ok(())
     }
 }
