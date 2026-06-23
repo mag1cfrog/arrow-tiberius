@@ -18,6 +18,39 @@ pub(crate) const SCHEMA_PLANNING_COMPLETED_EVENT: &str = "arrow_tiberius.schema_
 /// Stable event marker emitted when schema planning fails.
 pub(crate) const SCHEMA_PLANNING_FAILED_EVENT: &str = "arrow_tiberius.schema_planning.failed";
 
+/// Stable phase name for bulk writer initialization telemetry.
+pub(crate) const WRITER_INITIALIZATION_PHASE: &str = "writer_initialization";
+
+/// Stable phase name for target metadata validation telemetry.
+pub(crate) const TARGET_METADATA_VALIDATION_PHASE: &str = "target_metadata_validation";
+
+/// Stable span name for bulk writer initialization telemetry.
+pub(crate) const WRITER_INITIALIZATION_SPAN: &str = "arrow_tiberius.writer_initialization";
+
+/// Stable event marker emitted when writer initialization starts.
+pub(crate) const WRITER_INITIALIZATION_STARTED_EVENT: &str =
+    "arrow_tiberius.writer_initialization.started";
+
+/// Stable event marker emitted when writer initialization completes successfully.
+pub(crate) const WRITER_INITIALIZATION_COMPLETED_EVENT: &str =
+    "arrow_tiberius.writer_initialization.completed";
+
+/// Stable event marker emitted when writer initialization fails.
+pub(crate) const WRITER_INITIALIZATION_FAILED_EVENT: &str =
+    "arrow_tiberius.writer_initialization.failed";
+
+/// Stable event marker emitted when target metadata validation starts.
+pub(crate) const TARGET_METADATA_VALIDATION_STARTED_EVENT: &str =
+    "arrow_tiberius.target_metadata_validation.started";
+
+/// Stable event marker emitted when target metadata validation completes successfully.
+pub(crate) const TARGET_METADATA_VALIDATION_COMPLETED_EVENT: &str =
+    "arrow_tiberius.target_metadata_validation.completed";
+
+/// Stable event marker emitted when target metadata validation fails.
+pub(crate) const TARGET_METADATA_VALIDATION_FAILED_EVENT: &str =
+    "arrow_tiberius.target_metadata_validation.failed";
+
 /// Test-only span name used to prove tracing capture support.
 #[cfg(test)]
 pub(crate) const TEST_CAPTURE_SPAN: &str = "arrow_tiberius.test_capture";
@@ -64,6 +97,8 @@ pub(crate) mod test_support {
         layer::{Context, SubscriberExt},
         registry::LookupSpan,
     };
+
+    static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
 
     /// Kind of captured tracing record.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +203,10 @@ pub(crate) mod test_support {
 
     /// Runs a closure with a scoped tracing subscriber and returns captured records.
     pub(crate) fn capture_traces<R>(operation: impl FnOnce() -> R) -> (R, CapturedTraces) {
+        let _capture_guard = match CAPTURE_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let records = Arc::new(Mutex::new(Vec::new()));
         let subscriber = Registry::default().with(CaptureLayer {
             records: Arc::clone(&records),

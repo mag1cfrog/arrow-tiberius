@@ -1,10 +1,20 @@
 //! Baseline bulk writer public API skeleton.
 
-use std::borrow::Cow;
+use std::{
+    borrow::Cow,
+    fmt::Write as _,
+    time::{Duration, Instant},
+};
 
 use arrow_array::RecordBatch;
 use futures_util::io::{AsyncRead, AsyncWrite};
 
+use crate::observability::{
+    TARGET_METADATA_VALIDATION_COMPLETED_EVENT, TARGET_METADATA_VALIDATION_FAILED_EVENT,
+    TARGET_METADATA_VALIDATION_PHASE, TARGET_METADATA_VALIDATION_STARTED_EVENT, TRACE_TARGET,
+    WRITER_INITIALIZATION_COMPLETED_EVENT, WRITER_INITIALIZATION_FAILED_EVENT,
+    WRITER_INITIALIZATION_PHASE, WRITER_INITIALIZATION_SPAN, WRITER_INITIALIZATION_STARTED_EVENT,
+};
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, PlanOptions, Result, SchemaMapping,
     TableName,
@@ -59,6 +69,165 @@ pub struct WriteStats {
     pub rows_written: u64,
     /// Number of batches accepted by the writer.
     pub batches_written: u64,
+}
+
+#[derive(Debug)]
+struct WriterInitializationTrace {
+    span: tracing::Span,
+    started: Instant,
+    requested_backend: WriteBackend,
+    resolved_backend: Option<WriteBackend>,
+    target_schema: String,
+    target_table: String,
+    planned_column_count: usize,
+    direct_target_validation_required: Option<bool>,
+}
+
+impl WriterInitializationTrace {
+    fn new(
+        table: &TableName,
+        requested_backend: WriteBackend,
+        planned_column_count: usize,
+    ) -> Self {
+        let target_schema = table
+            .schema()
+            .map(|schema| schema.as_str().to_owned())
+            .unwrap_or_default();
+        let target_table = table.table().as_str().to_owned();
+        let span = tracing::info_span!(
+            target: TRACE_TARGET,
+            WRITER_INITIALIZATION_SPAN,
+            phase = WRITER_INITIALIZATION_PHASE,
+            requested_backend = backend_trace_name(requested_backend),
+            resolved_backend = tracing::field::Empty,
+            target_schema = target_schema.as_str(),
+            target_table = target_table.as_str(),
+            planned_column_count = usize_to_u64_saturating(planned_column_count),
+            direct_target_validation_required = tracing::field::Empty,
+        );
+
+        Self {
+            span,
+            started: Instant::now(),
+            requested_backend,
+            resolved_backend: None,
+            target_schema,
+            target_table,
+            planned_column_count,
+            direct_target_validation_required: None,
+        }
+    }
+
+    fn emit_started(&self) {
+        let _span_guard = self.span.enter();
+        tracing::info!(
+            target: TRACE_TARGET,
+            phase = WRITER_INITIALIZATION_PHASE,
+            telemetry_event = WRITER_INITIALIZATION_STARTED_EVENT,
+            requested_backend = backend_trace_name(self.requested_backend),
+            target_schema = self.target_schema.as_str(),
+            target_table = self.target_table.as_str(),
+            planned_column_count = usize_to_u64_saturating(self.planned_column_count),
+            initialization_result = "started"
+        );
+    }
+
+    fn record_resolved_backend(&mut self, resolved_backend: WriteBackend) {
+        self.span
+            .record("resolved_backend", backend_trace_name(resolved_backend));
+        self.resolved_backend = Some(resolved_backend);
+    }
+
+    fn record_direct_target_validation_required(&mut self, required: bool) {
+        self.span
+            .record("direct_target_validation_required", required);
+        self.direct_target_validation_required = Some(required);
+    }
+
+    fn emit_target_metadata_validation_started(&self) {
+        let _span_guard = self.span.enter();
+        tracing::info!(
+            target: TRACE_TARGET,
+            phase = TARGET_METADATA_VALIDATION_PHASE,
+            telemetry_event = TARGET_METADATA_VALIDATION_STARTED_EVENT,
+            requested_backend = backend_trace_name(self.requested_backend),
+            resolved_backend = self.resolved_backend_name(),
+            target_schema = self.target_schema.as_str(),
+            target_table = self.target_table.as_str(),
+            planned_column_count = usize_to_u64_saturating(self.planned_column_count),
+            direct_target_validation_required = self.direct_target_validation_required(),
+            initialization_result = "validating"
+        );
+    }
+
+    fn emit_target_metadata_validation_completed(&self) {
+        let _span_guard = self.span.enter();
+        tracing::info!(
+            target: TRACE_TARGET,
+            phase = TARGET_METADATA_VALIDATION_PHASE,
+            telemetry_event = TARGET_METADATA_VALIDATION_COMPLETED_EVENT,
+            requested_backend = backend_trace_name(self.requested_backend),
+            resolved_backend = self.resolved_backend_name(),
+            target_schema = self.target_schema.as_str(),
+            target_table = self.target_table.as_str(),
+            planned_column_count = usize_to_u64_saturating(self.planned_column_count),
+            direct_target_validation_required = self.direct_target_validation_required(),
+            initialization_result = "success",
+            elapsed_us = duration_micros_u64(self.started.elapsed())
+        );
+    }
+
+    fn emit_completed(&self) {
+        let _span_guard = self.span.enter();
+        tracing::info!(
+            target: TRACE_TARGET,
+            phase = WRITER_INITIALIZATION_PHASE,
+            telemetry_event = WRITER_INITIALIZATION_COMPLETED_EVENT,
+            requested_backend = backend_trace_name(self.requested_backend),
+            resolved_backend = self.resolved_backend_name(),
+            target_schema = self.target_schema.as_str(),
+            target_table = self.target_table.as_str(),
+            planned_column_count = usize_to_u64_saturating(self.planned_column_count),
+            direct_target_validation_required = self.direct_target_validation_required(),
+            initialization_result = "success",
+            elapsed_us = duration_micros_u64(self.started.elapsed())
+        );
+    }
+
+    fn emit_failed(&self, phase: &'static str, error: &crate::Error) {
+        let telemetry_event = if phase == TARGET_METADATA_VALIDATION_PHASE {
+            TARGET_METADATA_VALIDATION_FAILED_EVENT
+        } else {
+            WRITER_INITIALIZATION_FAILED_EVENT
+        };
+        let diagnostic_codes = diagnostic_codes_for_error(error);
+        let _span_guard = self.span.enter();
+        tracing::error!(
+            target: TRACE_TARGET,
+            phase,
+            telemetry_event,
+            requested_backend = backend_trace_name(self.requested_backend),
+            resolved_backend = self.resolved_backend_name(),
+            target_schema = self.target_schema.as_str(),
+            target_table = self.target_table.as_str(),
+            planned_column_count = usize_to_u64_saturating(self.planned_column_count),
+            direct_target_validation_required = self.direct_target_validation_required(),
+            initialization_result = "failure",
+            error_summary = sanitized_error_summary(error),
+            diagnostic_codes = diagnostic_codes.as_str(),
+            elapsed_us = duration_micros_u64(self.started.elapsed())
+        );
+    }
+
+    fn resolved_backend_name(&self) -> &'static str {
+        self.resolved_backend
+            .map(backend_trace_name)
+            .unwrap_or("unresolved")
+    }
+
+    fn direct_target_validation_required(&self) -> bool {
+        self.direct_target_validation_required.unwrap_or(false)
+    }
 }
 
 #[derive(Debug)]
@@ -148,49 +317,97 @@ where
         mappings: Vec<SchemaMapping>,
         options: WriteOptions,
     ) -> Result<Self> {
-        let state = WriterState::new(
+        let mut trace = WriterInitializationTrace::new(&table, options.backend, mappings.len());
+        trace.emit_started();
+
+        let state = match WriterState::new(
             options.backend,
             options.schema_check,
             options.plan_options,
             mappings,
-        )?;
+        ) {
+            Ok(state) => state,
+            Err(err) => {
+                trace.emit_failed(WRITER_INITIALIZATION_PHASE, &err);
+                return Err(err);
+            }
+        };
+        trace.record_resolved_backend(state.backend());
+        trace.record_direct_target_validation_required(matches!(
+            state.backend(),
+            WriteBackend::DirectFramedBulk | WriteBackend::DirectRawBulk
+        ));
+
         let mut request = match state.backend() {
             WriteBackend::BaselineTokenRow
             | WriteBackend::DirectFramedBulk
             | WriteBackend::DirectRawBulk => {
                 let table_sql = bulk_insert_table_sql(&table);
-                let columns = client
+                let columns = match client
                     .bulk_insert_columns(&table_sql)
                     .await
-                    .map_err(|source| crate::Error::Tiberius { source })?;
-                validate_bulk_target_columns(columns.iter(), state.mappings())?;
+                    .map_err(|source| crate::Error::Tiberius { source })
+                {
+                    Ok(columns) => columns,
+                    Err(err) => {
+                        trace.emit_failed(TARGET_METADATA_VALIDATION_PHASE, &err);
+                        return Err(err);
+                    }
+                };
+                trace.emit_target_metadata_validation_started();
+                if let Err(err) = validate_bulk_target_columns(columns.iter(), state.mappings()) {
+                    trace.emit_failed(TARGET_METADATA_VALIDATION_PHASE, &err);
+                    return Err(err);
+                }
                 if matches!(
                     state.backend(),
                     WriteBackend::DirectFramedBulk | WriteBackend::DirectRawBulk
                 ) {
-                    let encoder =
-                        state
-                            .direct_encoder()
-                            .ok_or_else(|| crate::Error::BackendUnavailable {
-                                backend: state.backend(),
-                                reason: "direct bulk encoder is not available for this writer"
-                                    .to_owned(),
-                            })?;
-                    validate_direct_bulk_target_column_types(columns.iter(), encoder.plan())?;
+                    let encoder = match state.direct_encoder().ok_or_else(|| {
+                        crate::Error::BackendUnavailable {
+                            backend: state.backend(),
+                            reason: "direct bulk encoder is not available for this writer"
+                                .to_owned(),
+                        }
+                    }) {
+                        Ok(encoder) => encoder,
+                        Err(err) => {
+                            trace.emit_failed(TARGET_METADATA_VALIDATION_PHASE, &err);
+                            return Err(err);
+                        }
+                    };
+                    if let Err(err) =
+                        validate_direct_bulk_target_column_types(columns.iter(), encoder.plan())
+                    {
+                        trace.emit_failed(TARGET_METADATA_VALIDATION_PHASE, &err);
+                        return Err(err);
+                    }
                 }
-                client
+                trace.emit_target_metadata_validation_completed();
+                match client
                     .bulk_insert_with_columns(&table_sql, columns)
                     .await
-                    .map_err(|source| crate::Error::Tiberius { source })?
+                    .map_err(|source| crate::Error::Tiberius { source })
+                {
+                    Ok(request) => request,
+                    Err(err) => {
+                        trace.emit_failed(WRITER_INITIALIZATION_PHASE, &err);
+                        return Err(err);
+                    }
+                }
             }
             WriteBackend::Auto => {
-                return Err(execution_unavailable(state.backend()));
+                let err = execution_unavailable(state.backend());
+                trace.emit_failed(WRITER_INITIALIZATION_PHASE, &err);
+                return Err(err);
             }
         };
 
         if state.backend() == WriteBackend::DirectRawBulk {
             request.enable_direct_packet_writes();
         }
+
+        trace.emit_completed();
 
         Ok(Self { state, request })
     }
@@ -542,6 +759,31 @@ trait BulkTargetColumnMetadata {
     }
 }
 
+impl<T> BulkTargetColumnMetadata for &T
+where
+    T: BulkTargetColumnMetadata + ?Sized,
+{
+    fn ordinal(&self) -> usize {
+        (*self).ordinal()
+    }
+
+    fn name(&self) -> &str {
+        (*self).name()
+    }
+
+    fn is_nullable(&self) -> bool {
+        (*self).is_nullable()
+    }
+
+    fn column_type(&self) -> tiberius::ColumnType {
+        (*self).column_type()
+    }
+
+    fn decimal_precision_scale(&self) -> Option<(u8, u8)> {
+        (*self).decimal_precision_scale()
+    }
+}
+
 impl BulkTargetColumnMetadata for tiberius::BulkLoadColumn<'_> {
     fn ordinal(&self) -> usize {
         self.ordinal()
@@ -737,6 +979,62 @@ fn execution_unavailable(backend: WriteBackend) -> crate::Error {
     }
 }
 
+fn backend_trace_name(backend: WriteBackend) -> &'static str {
+    match backend {
+        WriteBackend::Auto => "Auto",
+        WriteBackend::BaselineTokenRow => "BaselineTokenRow",
+        WriteBackend::DirectFramedBulk => "DirectFramedBulk",
+        WriteBackend::DirectRawBulk => "DirectRawBulk",
+    }
+}
+
+fn sanitized_error_summary(error: &crate::Error) -> &'static str {
+    match error {
+        crate::Error::InvalidCompatibilityLevel { .. } => "invalid compatibility level",
+        crate::Error::InvalidIdentifier { .. } => "invalid identifier",
+        crate::Error::Planning { .. } => "planning failed with diagnostics",
+        crate::Error::ValueConversion { .. } => "value conversion failed with diagnostics",
+        crate::Error::DirectEncoding { .. } => "direct encoding failed with diagnostics",
+        crate::Error::BackendUnavailable { .. } => "write backend unavailable",
+        crate::Error::InvalidConnectionString => "invalid connection string",
+        crate::Error::ConnectionTcpConnect { .. } => "TCP connection failed",
+        crate::Error::ConnectionClientSetup { .. } => "SQL Server client setup failed",
+        crate::Error::TableExistsQuery { .. } => "table existence query failed",
+        crate::Error::TableExistsUnexpectedResult { .. } => {
+            "table existence query returned unexpected result"
+        }
+        crate::Error::SqlExecution { .. } => "SQL statement execution failed",
+        crate::Error::Tiberius { .. } => "tiberius operation failed",
+    }
+}
+
+fn diagnostic_codes_for_error(error: &crate::Error) -> String {
+    match error {
+        crate::Error::Planning { diagnostics }
+        | crate::Error::ValueConversion { diagnostics }
+        | crate::Error::DirectEncoding { diagnostics } => diagnostic_codes(diagnostics),
+        crate::Error::BackendUnavailable { .. } => {
+            format!("{:?}", DiagnosticCode::BackendUnavailable)
+        }
+        _ => String::new(),
+    }
+}
+
+fn diagnostic_codes(diagnostics: &DiagnosticSet) -> String {
+    let mut codes = String::new();
+    for diagnostic in diagnostics.all() {
+        if !codes.is_empty() {
+            codes.push(',');
+        }
+        let _ = write!(codes, "{:?}", diagnostic.code());
+    }
+    codes
+}
+
+fn duration_micros_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -754,9 +1052,15 @@ mod tests {
     use super::{
         BulkTargetColumnMetadata, DIRECT_RAW_MAX_PAYLOAD_BYTES, DirectEncoder, MeasuredDirectBatch,
         MeasuredRowRange, RawRowsSink, TokenRowSink, WriteBackend, WriteOptions, WriteStats,
-        WriterState, bulk_insert_table_sql, record_batch_view, resolve_backend, tiberius_row_owned,
-        validate_batch_rows, validate_bulk_target_columns,
+        WriterInitializationTrace, WriterState, bulk_insert_table_sql, record_batch_view,
+        resolve_backend, tiberius_row_owned, validate_batch_rows, validate_bulk_target_columns,
         validate_direct_bulk_target_column_types, write_batch_to_sink, write_direct_batch_to_sink,
+    };
+    use crate::observability::{
+        TARGET_METADATA_VALIDATION_COMPLETED_EVENT, TARGET_METADATA_VALIDATION_FAILED_EVENT,
+        TARGET_METADATA_VALIDATION_PHASE, WRITER_INITIALIZATION_COMPLETED_EVENT,
+        WRITER_INITIALIZATION_PHASE, WRITER_INITIALIZATION_SPAN,
+        test_support::{CapturedTrace, CapturedTraceKind, capture_traces},
     };
     use crate::{
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, MssqlTypeLength,
@@ -826,6 +1130,198 @@ mod tests {
             resolve_backend(WriteBackend::DirectRawBulk).unwrap(),
             WriteBackend::DirectRawBulk
         );
+    }
+
+    #[test]
+    fn writer_initialization_trace_records_auto_backend_resolution() -> Result<(), String> {
+        let table = TableName::new("dbo", "target").unwrap();
+        let mappings = vec![mapping("id")];
+
+        let (state, traces) = capture_traces(|| {
+            let mut trace =
+                WriterInitializationTrace::new(&table, WriteBackend::Auto, mappings.len());
+            trace.emit_started();
+            let state = WriterState::new(
+                WriteBackend::Auto,
+                SchemaCheck::Strict,
+                PlanOptions::default(),
+                mappings,
+            )
+            .unwrap();
+            trace.record_resolved_backend(state.backend());
+            trace.record_direct_target_validation_required(true);
+            trace.emit_completed();
+            state
+        });
+
+        assert_eq!(state.backend(), WriteBackend::DirectRawBulk);
+        let records = traces.records()?;
+        let event = trace_event(&records, WRITER_INITIALIZATION_COMPLETED_EVENT)?;
+        assert_eq!(event.span_name(), Some(WRITER_INITIALIZATION_SPAN));
+        assert_trace_field(event, "phase", WRITER_INITIALIZATION_PHASE);
+        assert_trace_field(event, "requested_backend", "Auto");
+        assert_trace_field(event, "resolved_backend", "DirectRawBulk");
+        assert_trace_field(event, "target_schema", "dbo");
+        assert_trace_field(event, "target_table", "target");
+        assert_trace_field(event, "planned_column_count", "1");
+        assert_trace_field(event, "direct_target_validation_required", "true");
+        assert_trace_field(event, "initialization_result", "success");
+        assert!(event.fields().contains_key("elapsed_us"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn writer_initialization_trace_records_explicit_backend_resolution() -> Result<(), String> {
+        for backend in [
+            WriteBackend::BaselineTokenRow,
+            WriteBackend::DirectFramedBulk,
+            WriteBackend::DirectRawBulk,
+        ] {
+            let table = TableName::new("dbo", "target").unwrap();
+            let mappings = vec![mapping("id")];
+            let (_state, traces) = capture_traces(|| {
+                let mut trace = WriterInitializationTrace::new(&table, backend, mappings.len());
+                trace.emit_started();
+                let state = WriterState::new(
+                    backend,
+                    SchemaCheck::Strict,
+                    PlanOptions::default(),
+                    mappings,
+                )
+                .unwrap();
+                trace.record_resolved_backend(state.backend());
+                trace.record_direct_target_validation_required(matches!(
+                    state.backend(),
+                    WriteBackend::DirectFramedBulk | WriteBackend::DirectRawBulk
+                ));
+                trace.emit_completed();
+                state
+            });
+
+            let records = traces.records()?;
+            let event = trace_event(&records, WRITER_INITIALIZATION_COMPLETED_EVENT)?;
+            let backend_name = match backend {
+                WriteBackend::BaselineTokenRow => "BaselineTokenRow",
+                WriteBackend::DirectFramedBulk => "DirectFramedBulk",
+                WriteBackend::DirectRawBulk => "DirectRawBulk",
+                WriteBackend::Auto => "Auto",
+            };
+            assert_trace_field(event, "requested_backend", backend_name);
+            assert_trace_field(event, "resolved_backend", backend_name);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn target_metadata_validation_trace_records_direct_success() -> Result<(), String> {
+        let table = TableName::new("dbo", "target").unwrap();
+        let mappings = vec![mapping("id")];
+        let columns = vec![bulk_target_column_with_type(
+            0,
+            "id",
+            false,
+            tiberius::ColumnType::Int4,
+        )];
+
+        let (_state, traces) = capture_traces(|| {
+            let mut trace =
+                WriterInitializationTrace::new(&table, WriteBackend::DirectRawBulk, mappings.len());
+            let state = WriterState::new(
+                WriteBackend::DirectRawBulk,
+                SchemaCheck::Strict,
+                PlanOptions::default(),
+                mappings,
+            )
+            .unwrap();
+            trace.record_resolved_backend(state.backend());
+            trace.record_direct_target_validation_required(true);
+            trace.emit_target_metadata_validation_started();
+            validate_bulk_target_columns(columns.iter(), state.mappings()).unwrap();
+            validate_direct_bulk_target_column_types(
+                columns.iter(),
+                state.direct_encoder().unwrap().plan(),
+            )
+            .unwrap();
+            trace.emit_target_metadata_validation_completed();
+            state
+        });
+
+        let records = traces.records()?;
+        let event = trace_event(&records, TARGET_METADATA_VALIDATION_COMPLETED_EVENT)?;
+        assert_trace_field(event, "phase", TARGET_METADATA_VALIDATION_PHASE);
+        assert_trace_field(event, "requested_backend", "DirectRawBulk");
+        assert_trace_field(event, "resolved_backend", "DirectRawBulk");
+        assert_trace_field(event, "direct_target_validation_required", "true");
+        assert_trace_field(event, "initialization_result", "success");
+
+        Ok(())
+    }
+
+    #[test]
+    fn target_metadata_validation_failure_trace_is_sanitized() -> Result<(), String> {
+        let table = TableName::new("dbo", "target").unwrap();
+        let mappings = vec![mapping("id")];
+        let columns = vec![bulk_target_column_with_type(
+            0,
+            "id",
+            false,
+            tiberius::ColumnType::Int8,
+        )];
+
+        let (_err, traces) = capture_traces(|| {
+            let mut trace =
+                WriterInitializationTrace::new(&table, WriteBackend::DirectRawBulk, mappings.len());
+            let state = WriterState::new(
+                WriteBackend::DirectRawBulk,
+                SchemaCheck::Strict,
+                PlanOptions::default(),
+                mappings,
+            )
+            .unwrap();
+            trace.record_resolved_backend(state.backend());
+            trace.record_direct_target_validation_required(true);
+            let err = validate_direct_bulk_target_column_types(
+                columns.iter(),
+                state.direct_encoder().unwrap().plan(),
+            )
+            .unwrap_err();
+            trace.emit_failed(TARGET_METADATA_VALIDATION_PHASE, &err);
+            err
+        });
+
+        let records = traces.records()?;
+        let event = trace_event(&records, TARGET_METADATA_VALIDATION_FAILED_EVENT)?;
+        assert_trace_field(event, "phase", TARGET_METADATA_VALIDATION_PHASE);
+        assert_trace_field(
+            event,
+            "error_summary",
+            "value conversion failed with diagnostics",
+        );
+        assert_trace_field(event, "diagnostic_codes", "SchemaMismatch");
+        traces.assert_no_forbidden_text(&[
+            "server=tcp:sql.example.com",
+            "password=secret",
+            "User ID=sa",
+        ])?;
+
+        let secret_error = Error::Tiberius {
+            source: tiberius::error::Error::BulkInput(Cow::Borrowed(
+                "server=tcp:sql.example.com;User ID=sa;password=secret",
+            )),
+        };
+        let (_result, tiberius_traces) = capture_traces(|| {
+            let trace = WriterInitializationTrace::new(&table, WriteBackend::DirectRawBulk, 1);
+            trace.emit_failed(TARGET_METADATA_VALIDATION_PHASE, &secret_error);
+        });
+        tiberius_traces.assert_no_forbidden_text(&[
+            "server=tcp:sql.example.com",
+            "password=secret",
+            "User ID=sa",
+        ])?;
+
+        Ok(())
     }
 
     #[test]
@@ -1906,6 +2402,30 @@ mod tests {
         let name = std::any::type_name::<tiberius::Client<DummyStream>>();
 
         assert!(name.contains("tiberius"));
+    }
+
+    fn trace_event<'a>(
+        records: &'a [CapturedTrace],
+        telemetry_event: &str,
+    ) -> Result<&'a CapturedTrace, String> {
+        records
+            .iter()
+            .find(|record| {
+                record.kind() == CapturedTraceKind::Event
+                    && record
+                        .fields()
+                        .get("telemetry_event")
+                        .is_some_and(|value| value == telemetry_event)
+            })
+            .ok_or_else(|| format!("missing trace event {telemetry_event}: {records:#?}"))
+    }
+
+    fn assert_trace_field(record: &CapturedTrace, field: &str, expected: &str) {
+        assert_eq!(
+            record.fields().get(field).map(String::as_str),
+            Some(expected),
+            "trace record: {record:#?}"
+        );
     }
 
     fn mapping(name: &str) -> SchemaMapping {
