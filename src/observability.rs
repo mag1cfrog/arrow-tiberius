@@ -91,6 +91,24 @@ pub(crate) const DIRECT_RAW_PACKET_WRITE_COMPLETED_EVENT: &str =
 /// Stable event marker emitted when direct raw encoding or packet writing fails.
 pub(crate) const DIRECT_RAW_FAILED_EVENT: &str = "arrow_tiberius.direct_raw.failed";
 
+/// Stable phase name for bulk writer finish telemetry.
+pub(crate) const FINISH_PHASE: &str = "finish";
+
+/// Stable phase name for bulk writer finalize telemetry.
+pub(crate) const FINALIZE_PHASE: &str = "finalize";
+
+/// Stable span name for bulk writer finish telemetry.
+pub(crate) const FINISH_SPAN: &str = "arrow_tiberius.finish";
+
+/// Stable event marker emitted when writer finish starts.
+pub(crate) const FINISH_STARTED_EVENT: &str = "arrow_tiberius.finish.started";
+
+/// Stable event marker emitted when writer finish completes successfully.
+pub(crate) const FINISH_COMPLETED_EVENT: &str = "arrow_tiberius.finish.completed";
+
+/// Stable event marker emitted when writer finish fails during finalization.
+pub(crate) const FINISH_FAILED_EVENT: &str = "arrow_tiberius.finish.failed";
+
 /// Test-only span name used to prove tracing capture support.
 #[cfg(test)]
 pub(crate) const TEST_CAPTURE_SPAN: &str = "arrow_tiberius.test_capture";
