@@ -115,3 +115,261 @@ impl BatchWriteTrace {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{borrow::Cow, sync::Arc};
+
+    use arrow_array::{Int32Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+
+    use super::BatchWriteTrace;
+    use crate::{
+        Diagnostic, DiagnosticCode, DiagnosticSet, Error,
+        observability::{
+            BATCH_SCHEMA_VALIDATION_PHASE, BATCH_WRITE_COMPLETED_EVENT, BATCH_WRITE_FAILED_EVENT,
+            BATCH_WRITE_PHASE, BATCH_WRITE_SPAN, PACKET_WRITE_PHASE, VALUE_CONVERSION_PHASE,
+            test_support::{assert_trace_field, capture_traces, trace_event},
+        },
+        write::writer::{WriteBackend, WriteStats},
+    };
+
+    #[test]
+    fn baseline_batch_write_success_emits_stats_trace() -> Result<(), String> {
+        let batch = int32_batch("id", &[10, 20]);
+        let stats_before = WriteStats::default();
+        let stats_after = WriteStats {
+            rows_written: 2,
+            batches_written: 1,
+        };
+
+        let (_result, traces) = capture_traces(|| {
+            let trace = BatchWriteTrace::new(WriteBackend::BaselineTokenRow, stats_before, &batch);
+            trace.emit_started();
+            trace.emit_completed(stats_after);
+        });
+
+        let records = traces.records()?;
+        let event = trace_event(&records, BATCH_WRITE_COMPLETED_EVENT)?;
+        assert_eq!(event.span_name(), Some(BATCH_WRITE_SPAN));
+        assert_trace_field(event, "phase", BATCH_WRITE_PHASE);
+        assert_trace_field(event, "backend", "BaselineTokenRow");
+        assert_trace_field(event, "attempted_batch_ordinal", "1");
+        assert_trace_field(event, "batch_row_count", "2");
+        assert_trace_field(event, "batch_column_count", "1");
+        assert_trace_field(event, "batch_is_empty", "false");
+        assert_trace_field(event, "accepted_rows_before", "0");
+        assert_trace_field(event, "accepted_batches_before", "0");
+        assert_trace_field(event, "accepted_rows_after", "2");
+        assert_trace_field(event, "accepted_batches_after", "1");
+        assert_trace_field(event, "batch_write_result", "success");
+        assert!(event.fields().contains_key("elapsed_us"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn empty_batch_write_success_trace_matches_stats() -> Result<(), String> {
+        let batch = int32_batch("id", &[]);
+        let stats_after = WriteStats {
+            rows_written: 0,
+            batches_written: 1,
+        };
+
+        let (_result, traces) = capture_traces(|| {
+            let trace = BatchWriteTrace::new(
+                WriteBackend::BaselineTokenRow,
+                WriteStats::default(),
+                &batch,
+            );
+            trace.emit_completed(stats_after);
+        });
+
+        let records = traces.records()?;
+        let event = trace_event(&records, BATCH_WRITE_COMPLETED_EVENT)?;
+        assert_trace_field(event, "batch_row_count", "0");
+        assert_trace_field(event, "batch_is_empty", "true");
+        assert_trace_field(event, "accepted_rows_after", "0");
+        assert_trace_field(event, "accepted_batches_after", "1");
+
+        Ok(())
+    }
+
+    #[test]
+    fn batch_schema_validation_failure_emits_trace_without_accepting_batch() -> Result<(), String> {
+        let batch = int32_batch("id", &[1]);
+        let error = value_conversion_error(DiagnosticCode::SchemaMismatch);
+
+        let (_result, traces) = capture_traces(|| {
+            let trace = BatchWriteTrace::new(
+                WriteBackend::BaselineTokenRow,
+                WriteStats::default(),
+                &batch,
+            );
+            trace.emit_failed(BATCH_SCHEMA_VALIDATION_PHASE, &error);
+        });
+
+        let records = traces.records()?;
+        let event = trace_event(&records, BATCH_WRITE_FAILED_EVENT)?;
+        assert_eq!(event.span_name(), Some(BATCH_WRITE_SPAN));
+        assert_trace_field(event, "phase", BATCH_SCHEMA_VALIDATION_PHASE);
+        assert_trace_field(event, "backend", "BaselineTokenRow");
+        assert_trace_field(event, "batch_row_count", "1");
+        assert_trace_field(event, "batch_column_count", "1");
+        assert_trace_field(event, "accepted_rows_before", "0");
+        assert_trace_field(event, "accepted_batches_before", "0");
+        assert_trace_field(event, "batch_write_result", "failure");
+        assert_trace_field(event, "diagnostic_codes", "SchemaMismatch");
+
+        Ok(())
+    }
+
+    #[test]
+    fn value_conversion_failure_emits_trace_without_accepting_batch() -> Result<(), String> {
+        let batch = int32_batch("amount", &[1, 2]);
+        let error = value_conversion_error(DiagnosticCode::NonFiniteFloat);
+
+        let (_result, traces) = capture_traces(|| {
+            let trace = BatchWriteTrace::new(
+                WriteBackend::BaselineTokenRow,
+                WriteStats::default(),
+                &batch,
+            );
+            trace.emit_failed(VALUE_CONVERSION_PHASE, &error);
+        });
+
+        let records = traces.records()?;
+        let event = trace_event(&records, BATCH_WRITE_FAILED_EVENT)?;
+        assert_trace_field(event, "phase", VALUE_CONVERSION_PHASE);
+        assert_trace_field(event, "diagnostic_codes", "NonFiniteFloat");
+        assert_trace_field(
+            event,
+            "error_summary",
+            "value conversion failed with diagnostics",
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn packet_write_failure_emits_trace_without_accepting_batch() -> Result<(), String> {
+        let batch = int32_batch("id", &[1, 2, 3]);
+        let error = Error::Tiberius {
+            source: tiberius::error::Error::BulkInput(Cow::Borrowed("fake send failure")),
+        };
+
+        let (_result, traces) = capture_traces(|| {
+            let trace = BatchWriteTrace::new(
+                WriteBackend::BaselineTokenRow,
+                WriteStats::default(),
+                &batch,
+            );
+            trace.emit_failed(PACKET_WRITE_PHASE, &error);
+        });
+
+        let records = traces.records()?;
+        let event = trace_event(&records, BATCH_WRITE_FAILED_EVENT)?;
+        assert_trace_field(event, "phase", PACKET_WRITE_PHASE);
+        assert_trace_field(event, "backend", "BaselineTokenRow");
+        assert_trace_field(event, "diagnostic_codes", "");
+        assert_trace_field(event, "error_summary", "tiberius operation failed");
+
+        Ok(())
+    }
+
+    #[test]
+    fn batch_write_trace_does_not_emit_row_values() -> Result<(), String> {
+        let batch = utf8_batch("secret_value", &["password=secret"]);
+
+        let (_result, traces) = capture_traces(|| {
+            let trace = BatchWriteTrace::new(
+                WriteBackend::BaselineTokenRow,
+                WriteStats::default(),
+                &batch,
+            );
+            trace.emit_completed(WriteStats {
+                rows_written: 1,
+                batches_written: 1,
+            });
+        });
+
+        traces.assert_no_forbidden_text(&["password=secret"])?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn direct_batch_write_success_emits_stats_trace() -> Result<(), String> {
+        let batch = int32_batch("id", &[10, 20]);
+
+        for backend in [WriteBackend::DirectFramedBulk, WriteBackend::DirectRawBulk] {
+            let (_result, traces) = capture_traces(|| {
+                let trace = BatchWriteTrace::new(backend, WriteStats::default(), &batch);
+                trace.emit_completed(WriteStats {
+                    rows_written: 2,
+                    batches_written: 1,
+                });
+            });
+
+            let records = traces.records()?;
+            let event = trace_event(&records, BATCH_WRITE_COMPLETED_EVENT)?;
+            let expected_backend = match backend {
+                WriteBackend::DirectFramedBulk => "DirectFramedBulk",
+                WriteBackend::DirectRawBulk => "DirectRawBulk",
+                WriteBackend::Auto => "Auto",
+                WriteBackend::BaselineTokenRow => "BaselineTokenRow",
+            };
+            assert_trace_field(event, "backend", expected_backend);
+            assert_trace_field(event, "batch_row_count", "2");
+            assert_trace_field(event, "batch_column_count", "1");
+            assert_trace_field(event, "accepted_rows_after", "2");
+            assert_trace_field(event, "accepted_batches_after", "1");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn direct_raw_value_conversion_failure_trace_includes_diagnostic_codes() -> Result<(), String> {
+        let batch = int32_batch("u64_value", &[1]);
+        let error = value_conversion_error(DiagnosticCode::IntegerOutOfRange);
+
+        let (_result, traces) = capture_traces(|| {
+            let trace =
+                BatchWriteTrace::new(WriteBackend::DirectRawBulk, WriteStats::default(), &batch);
+            trace.emit_failed(VALUE_CONVERSION_PHASE, &error);
+        });
+
+        let records = traces.records()?;
+        let failure = trace_event(&records, BATCH_WRITE_FAILED_EVENT)?;
+        assert_eq!(failure.span_name(), Some(BATCH_WRITE_SPAN));
+        assert_trace_field(failure, "phase", VALUE_CONVERSION_PHASE);
+        assert_trace_field(failure, "backend", "DirectRawBulk");
+        assert_trace_field(failure, "batch_row_count", "1");
+        assert_trace_field(failure, "batch_column_count", "1");
+        assert_trace_field(failure, "diagnostic_codes", "IntegerOutOfRange");
+        assert_trace_field(
+            failure,
+            "error_summary",
+            "value conversion failed with diagnostics",
+        );
+
+        Ok(())
+    }
+
+    fn value_conversion_error(code: DiagnosticCode) -> Error {
+        Error::ValueConversion {
+            diagnostics: DiagnosticSet::from(vec![Diagnostic::error(code, "test diagnostic")]),
+        }
+    }
+
+    fn int32_batch(name: &str, values: &[i32]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values.to_vec()))]).unwrap()
+    }
+
+    fn utf8_batch(name: &str, values: &[&str]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Utf8, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values.to_vec()))]).unwrap()
+    }
+}
