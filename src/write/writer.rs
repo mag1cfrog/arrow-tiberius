@@ -13,7 +13,8 @@ use crate::observability::{
     BATCH_SCHEMA_VALIDATION_PHASE, BATCH_WRITE_COMPLETED_EVENT, BATCH_WRITE_FAILED_EVENT,
     BATCH_WRITE_PHASE, BATCH_WRITE_SPAN, BATCH_WRITE_STARTED_EVENT, DIRECT_ENCODING_PHASE,
     DIRECT_RAW_FAILED_EVENT, DIRECT_RAW_MEASURED_EVENT, DIRECT_RAW_PACKET_WRITE_COMPLETED_EVENT,
-    DIRECT_RAW_RANGES_PLANNED_EVENT, PACKET_WRITE_PHASE,
+    DIRECT_RAW_RANGES_PLANNED_EVENT, FINALIZE_PHASE, FINISH_COMPLETED_EVENT, FINISH_FAILED_EVENT,
+    FINISH_PHASE, FINISH_SPAN, FINISH_STARTED_EVENT, PACKET_WRITE_PHASE,
     TARGET_METADATA_VALIDATION_COMPLETED_EVENT, TARGET_METADATA_VALIDATION_FAILED_EVENT,
     TARGET_METADATA_VALIDATION_PHASE, TARGET_METADATA_VALIDATION_STARTED_EVENT, TRACE_TARGET,
     VALUE_CONVERSION_PHASE, WRITER_INITIALIZATION_COMPLETED_EVENT,
@@ -341,6 +342,79 @@ impl BatchWriteTrace {
 }
 
 #[derive(Debug)]
+struct FinishTrace {
+    span: tracing::Span,
+    started: Instant,
+    backend: WriteBackend,
+    stats: WriteStats,
+}
+
+impl FinishTrace {
+    fn new(state: &WriterState) -> Self {
+        let stats = state.stats();
+        let span = tracing::info_span!(
+            target: TRACE_TARGET,
+            FINISH_SPAN,
+            phase = FINISH_PHASE,
+            backend = backend_trace_name(state.backend()),
+            rows_written = stats.rows_written,
+            batches_written = stats.batches_written,
+        );
+
+        Self {
+            span,
+            started: Instant::now(),
+            backend: state.backend(),
+            stats,
+        }
+    }
+
+    fn emit_started(&self) {
+        let _span_guard = self.span.enter();
+        tracing::info!(
+            target: TRACE_TARGET,
+            phase = FINISH_PHASE,
+            telemetry_event = FINISH_STARTED_EVENT,
+            backend = backend_trace_name(self.backend),
+            rows_written = self.stats.rows_written,
+            batches_written = self.stats.batches_written,
+            finish_result = "started"
+        );
+    }
+
+    fn emit_completed(&self) {
+        let _span_guard = self.span.enter();
+        tracing::info!(
+            target: TRACE_TARGET,
+            phase = FINISH_PHASE,
+            telemetry_event = FINISH_COMPLETED_EVENT,
+            backend = backend_trace_name(self.backend),
+            rows_written = self.stats.rows_written,
+            batches_written = self.stats.batches_written,
+            finish_result = "success",
+            elapsed_us = duration_micros_u64(self.started.elapsed())
+        );
+    }
+
+    fn emit_failed(&self, error: &crate::Error) {
+        let diagnostic_codes = diagnostic_codes_for_error(error);
+        let _span_guard = self.span.enter();
+        tracing::error!(
+            target: TRACE_TARGET,
+            phase = FINALIZE_PHASE,
+            telemetry_event = FINISH_FAILED_EVENT,
+            backend = backend_trace_name(self.backend),
+            accepted_rows_before = self.stats.rows_written,
+            accepted_batches_before = self.stats.batches_written,
+            finish_result = "failure",
+            error_summary = sanitized_error_summary(error),
+            diagnostic_codes = diagnostic_codes.as_str(),
+            elapsed_us = duration_micros_u64(self.started.elapsed())
+        );
+    }
+}
+
+#[derive(Debug)]
 struct WriterState {
     backend: WriteBackend,
     direct_encoder: Option<DirectEncoder>,
@@ -538,11 +612,39 @@ where
     /// Finalizes the bulk writer and returns cumulative write statistics.
     pub async fn finish(self) -> Result<WriteStats> {
         let Self { state, request } = self;
-        let stats = state.stats();
+        finish_writer_to_sink(state, request).await
+    }
+}
 
+async fn finish_writer_to_sink<Sink>(state: WriterState, sink: Sink) -> Result<WriteStats>
+where
+    Sink: FinishSink,
+{
+    let trace = FinishTrace::new(&state);
+    trace.emit_started();
+    let stats = state.stats();
+
+    if let Err(err) = sink.finalize_bulk_load().await {
+        trace.emit_failed(&err);
+        return Err(err);
+    }
+
+    trace.emit_completed();
+    Ok(stats)
+}
+
+trait FinishSink {
+    async fn finalize_bulk_load(self) -> Result<()>;
+}
+
+impl<S> FinishSink for tiberius::BulkLoadRequest<'_, S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    async fn finalize_bulk_load(self) -> Result<()> {
         #[cfg(feature = "bench-profile")]
         {
-            let (_result, stats) = request
+            let (_result, stats) = self
                 .finalize_with_stats()
                 .await
                 .map_err(|source| crate::Error::Tiberius { source })?;
@@ -550,12 +652,11 @@ where
         }
 
         #[cfg(not(feature = "bench-profile"))]
-        request
-            .finalize()
+        self.finalize()
             .await
             .map_err(|source| crate::Error::Tiberius { source })?;
 
-        Ok(stats)
+        Ok(())
     }
 }
 
@@ -1369,18 +1470,19 @@ mod tests {
     use futures_util::io::{AsyncRead, AsyncWrite};
 
     use super::{
-        BulkTargetColumnMetadata, DIRECT_RAW_MAX_PAYLOAD_BYTES, DirectEncoder, MeasuredDirectBatch,
-        MeasuredRowRange, RawRowsSink, TokenRowSink, WriteBackend, WriteOptions, WriteStats,
-        WriterInitializationTrace, WriterState, bulk_insert_table_sql,
-        emit_direct_raw_packet_write_completed, record_batch_view, resolve_backend,
-        tiberius_row_owned, validate_batch_rows, validate_bulk_target_columns,
+        BulkTargetColumnMetadata, DIRECT_RAW_MAX_PAYLOAD_BYTES, DirectEncoder, FinishSink,
+        MeasuredDirectBatch, MeasuredRowRange, RawRowsSink, TokenRowSink, WriteBackend,
+        WriteOptions, WriteStats, WriterInitializationTrace, WriterState, bulk_insert_table_sql,
+        emit_direct_raw_packet_write_completed, finish_writer_to_sink, record_batch_view,
+        resolve_backend, tiberius_row_owned, validate_batch_rows, validate_bulk_target_columns,
         validate_direct_bulk_target_column_types, write_batch_to_sink, write_direct_batch_to_sink,
     };
     use crate::observability::{
         BATCH_SCHEMA_VALIDATION_PHASE, BATCH_WRITE_COMPLETED_EVENT, BATCH_WRITE_FAILED_EVENT,
         BATCH_WRITE_PHASE, BATCH_WRITE_SPAN, DIRECT_ENCODING_PHASE, DIRECT_RAW_FAILED_EVENT,
         DIRECT_RAW_MEASURED_EVENT, DIRECT_RAW_PACKET_WRITE_COMPLETED_EVENT,
-        DIRECT_RAW_RANGES_PLANNED_EVENT, PACKET_WRITE_PHASE,
+        DIRECT_RAW_RANGES_PLANNED_EVENT, FINALIZE_PHASE, FINISH_COMPLETED_EVENT,
+        FINISH_FAILED_EVENT, FINISH_PHASE, FINISH_SPAN, PACKET_WRITE_PHASE,
         TARGET_METADATA_VALIDATION_COMPLETED_EVENT, TARGET_METADATA_VALIDATION_FAILED_EVENT,
         TARGET_METADATA_VALIDATION_PHASE, VALUE_CONVERSION_PHASE,
         WRITER_INITIALIZATION_COMPLETED_EVENT, WRITER_INITIALIZATION_PHASE,
@@ -1766,6 +1868,108 @@ mod tests {
                 batches_written: 3
             }
         );
+    }
+
+    #[test]
+    fn finish_success_emits_final_stats_trace() -> Result<(), String> {
+        let mut state = WriterState::new(
+            WriteBackend::BaselineTokenRow,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            Vec::new(),
+        )
+        .unwrap();
+        state.record_accepted_batch(2);
+        state.record_accepted_batch(3);
+        let sink = RecordingFinishSink::default();
+
+        let (stats, traces) = capture_traces(|| poll_ready(finish_writer_to_sink(state, sink)));
+        let stats = stats.unwrap();
+
+        assert_eq!(
+            stats,
+            WriteStats {
+                rows_written: 5,
+                batches_written: 2
+            }
+        );
+        let records = traces.records()?;
+        let event = trace_event(&records, FINISH_COMPLETED_EVENT)?;
+        assert_eq!(event.span_name(), Some(FINISH_SPAN));
+        assert_trace_field(event, "phase", FINISH_PHASE);
+        assert_trace_field(event, "backend", "BaselineTokenRow");
+        assert_trace_field(event, "rows_written", "5");
+        assert_trace_field(event, "batches_written", "2");
+        assert_trace_field(event, "finish_result", "success");
+        assert!(event.fields().contains_key("elapsed_us"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn finish_failure_emits_finalize_trace_with_accepted_stats() -> Result<(), String> {
+        let mut state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            Vec::new(),
+        )
+        .unwrap();
+        state.record_accepted_batch(7);
+        let sink = RecordingFinishSink {
+            fail_message: Some("fake finalize failure"),
+        };
+
+        let (err, traces) = capture_traces(|| poll_ready(finish_writer_to_sink(state, sink)));
+        let err = err.unwrap_err();
+
+        let Error::Tiberius { source } = err else {
+            panic!("expected tiberius error");
+        };
+        assert_eq!(
+            source.to_string(),
+            "BULK UPLOAD input failure: fake finalize failure"
+        );
+        let records = traces.records()?;
+        let event = trace_event(&records, FINISH_FAILED_EVENT)?;
+        assert_eq!(event.span_name(), Some(FINISH_SPAN));
+        assert_trace_field(event, "phase", FINALIZE_PHASE);
+        assert_trace_field(event, "backend", "DirectRawBulk");
+        assert_trace_field(event, "accepted_rows_before", "7");
+        assert_trace_field(event, "accepted_batches_before", "1");
+        assert_trace_field(event, "finish_result", "failure");
+        assert_trace_field(event, "error_summary", "tiberius operation failed");
+        assert_trace_field(event, "diagnostic_codes", "");
+        assert!(event.fields().contains_key("elapsed_us"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn finish_failure_trace_is_sanitized() -> Result<(), String> {
+        let state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            Vec::new(),
+        )
+        .unwrap();
+        let sink = RecordingFinishSink {
+            fail_message: Some("server=tcp:sql.example.com;User ID=sa;password=secret"),
+        };
+
+        let (_err, traces) = capture_traces(|| poll_ready(finish_writer_to_sink(state, sink)));
+
+        let records = traces.records()?;
+        let event = trace_event(&records, FINISH_FAILED_EVENT)?;
+        assert_trace_field(event, "error_summary", "tiberius operation failed");
+        traces.assert_no_forbidden_text(&[
+            "server=tcp:sql.example.com",
+            "User ID=sa",
+            "password=secret",
+        ])?;
+
+        Ok(())
     }
 
     #[test]
@@ -3334,6 +3538,11 @@ mod tests {
         payloads: Vec<RecordedRawPayload>,
     }
 
+    #[derive(Debug, Default)]
+    struct RecordingFinishSink {
+        fail_message: Option<&'static str>,
+    }
+
     #[derive(Debug, PartialEq, Eq)]
     struct RecordedRawPayload {
         bytes: Vec<u8>,
@@ -3372,6 +3581,17 @@ mod tests {
                 std::time::Duration::ZERO,
             );
             Ok(())
+        }
+    }
+
+    impl FinishSink for RecordingFinishSink {
+        async fn finalize_bulk_load(self) -> crate::Result<()> {
+            match self.fail_message {
+                Some(message) => Err(Error::Tiberius {
+                    source: tiberius::error::Error::BulkInput(Cow::Borrowed(message)),
+                }),
+                None => Ok(()),
+            }
         }
     }
 
