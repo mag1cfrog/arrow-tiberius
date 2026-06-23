@@ -23,7 +23,7 @@ use crate::observability::{
 };
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, PlanOptions, Result, SchemaMapping,
-    TableName,
+    TableName, WritePhase,
 };
 
 use super::{
@@ -513,7 +513,7 @@ where
             Ok(state) => state,
             Err(err) => {
                 trace.emit_failed(WRITER_INITIALIZATION_PHASE, &err);
-                return Err(err);
+                return Err(err.with_write_phase(WritePhase::WriterInitialization));
             }
         };
         trace.record_resolved_backend(state.backend());
@@ -535,13 +535,13 @@ where
                     Ok(columns) => columns,
                     Err(err) => {
                         trace.emit_failed(TARGET_METADATA_VALIDATION_PHASE, &err);
-                        return Err(err);
+                        return Err(err.with_write_phase(WritePhase::TargetMetadataValidation));
                     }
                 };
                 trace.emit_target_metadata_validation_started();
                 if let Err(err) = validate_bulk_target_columns(columns.iter(), state.mappings()) {
                     trace.emit_failed(TARGET_METADATA_VALIDATION_PHASE, &err);
-                    return Err(err);
+                    return Err(err.with_write_phase(WritePhase::TargetMetadataValidation));
                 }
                 if matches!(
                     state.backend(),
@@ -557,14 +557,14 @@ where
                         Ok(encoder) => encoder,
                         Err(err) => {
                             trace.emit_failed(TARGET_METADATA_VALIDATION_PHASE, &err);
-                            return Err(err);
+                            return Err(err.with_write_phase(WritePhase::TargetMetadataValidation));
                         }
                     };
                     if let Err(err) =
                         validate_direct_bulk_target_column_types(columns.iter(), encoder.plan())
                     {
                         trace.emit_failed(TARGET_METADATA_VALIDATION_PHASE, &err);
-                        return Err(err);
+                        return Err(err.with_write_phase(WritePhase::TargetMetadataValidation));
                     }
                 }
                 trace.emit_target_metadata_validation_completed();
@@ -576,14 +576,14 @@ where
                     Ok(request) => request,
                     Err(err) => {
                         trace.emit_failed(WRITER_INITIALIZATION_PHASE, &err);
-                        return Err(err);
+                        return Err(err.with_write_phase(WritePhase::WriterInitialization));
                     }
                 }
             }
             WriteBackend::Auto => {
                 let err = execution_unavailable(state.backend());
                 trace.emit_failed(WRITER_INITIALIZATION_PHASE, &err);
-                return Err(err);
+                return Err(err.with_write_phase(WritePhase::WriterInitialization));
             }
         };
 
@@ -626,7 +626,7 @@ where
 
     if let Err(err) = sink.finalize_bulk_load().await {
         trace.emit_failed(&err);
-        return Err(err);
+        return Err(err.with_write_phase(WritePhase::Finalize));
     }
 
     trace.emit_completed();
@@ -1045,12 +1045,12 @@ where
         Ok(view) => view,
         Err(err) => {
             trace.emit_failed(BATCH_SCHEMA_VALIDATION_PHASE, &err);
-            return Err(err);
+            return Err(err.with_write_phase(WritePhase::BatchSchemaValidation));
         }
     };
     if let Err(err) = validate_batch_rows(&view) {
         trace.emit_failed(VALUE_CONVERSION_PHASE, &err);
-        return Err(err);
+        return Err(err.with_write_phase(WritePhase::ValueConversion));
     }
     let rows_written = usize_to_u64_saturating(view.row_count());
 
@@ -1059,12 +1059,12 @@ where
             Ok(row) => row,
             Err(err) => {
                 trace.emit_failed(VALUE_CONVERSION_PHASE, &err);
-                return Err(err);
+                return Err(err.with_write_phase(WritePhase::ValueConversion));
             }
         };
         if let Err(err) = sink.send_token_row(row).await {
             trace.emit_failed(PACKET_WRITE_PHASE, &err);
-            return Err(err);
+            return Err(err.with_write_phase(WritePhase::PacketWrite));
         }
     }
 
@@ -1108,7 +1108,7 @@ where
         Ok(encoder) => encoder,
         Err(err) => {
             trace.emit_failed(DIRECT_ENCODING_PHASE, &err);
-            return Err(err);
+            return Err(err.with_write_phase(WritePhase::DirectEncoding));
         }
     };
     let measure_start = std::time::Instant::now();
@@ -1117,15 +1117,10 @@ where
         match profile::record_elapsed(measure_start, profile::record_measure_batch, measured) {
             Ok(measured) => measured,
             Err(err) => {
-                trace.emit_failed(batch_failure_phase(&err), &err);
-                emit_direct_raw_failed(
-                    state.backend(),
-                    batch_failure_phase(&err),
-                    batch,
-                    None,
-                    &err,
-                );
-                return Err(err);
+                let phase = write_phase_for_batch_error(&err);
+                trace.emit_failed(phase.as_str(), &err);
+                emit_direct_raw_failed(state.backend(), phase.as_str(), batch, None, &err);
+                return Err(err.with_write_phase(phase));
             }
         };
     emit_direct_raw_measured(state.backend(), &measured, measure_start.elapsed());
@@ -1139,7 +1134,7 @@ where
         Err(err) => {
             trace.emit_failed(DIRECT_ENCODING_PHASE, &err);
             emit_direct_raw_failed(state.backend(), DIRECT_ENCODING_PHASE, batch, None, &err);
-            return Err(err);
+            return Err(err.with_write_phase(WritePhase::DirectEncoding));
         }
     };
     emit_direct_raw_ranges_planned(state.backend(), &measured, &ranges, split_start.elapsed());
@@ -1149,15 +1144,10 @@ where
             .send_measured_raw_rows(state.backend(), encoder, batch, &measured, range)
             .await
         {
-            trace.emit_failed(batch_failure_phase(&err), &err);
-            emit_direct_raw_failed(
-                state.backend(),
-                batch_failure_phase(&err),
-                batch,
-                Some(range),
-                &err,
-            );
-            return Err(err);
+            let phase = write_phase_for_batch_error(&err);
+            trace.emit_failed(phase.as_str(), &err);
+            emit_direct_raw_failed(state.backend(), phase.as_str(), batch, Some(range), &err);
+            return Err(err.with_write_phase(phase));
         }
     }
 
@@ -1389,6 +1379,7 @@ fn backend_trace_name(backend: WriteBackend) -> &'static str {
 
 fn sanitized_error_summary(error: &crate::Error) -> &'static str {
     match error {
+        crate::Error::WritePhaseContext { source, .. } => sanitized_error_summary(source),
         crate::Error::InvalidCompatibilityLevel { .. } => "invalid compatibility level",
         crate::Error::InvalidIdentifier { .. } => "invalid identifier",
         crate::Error::Planning { .. } => "planning failed with diagnostics",
@@ -1409,6 +1400,7 @@ fn sanitized_error_summary(error: &crate::Error) -> &'static str {
 
 fn diagnostic_codes_for_error(error: &crate::Error) -> String {
     match error {
+        crate::Error::WritePhaseContext { source, .. } => diagnostic_codes_for_error(source),
         crate::Error::Planning { diagnostics }
         | crate::Error::ValueConversion { diagnostics }
         | crate::Error::DirectEncoding { diagnostics } => diagnostic_codes(diagnostics),
@@ -1430,22 +1422,23 @@ fn diagnostic_codes(diagnostics: &DiagnosticSet) -> String {
     codes
 }
 
-fn batch_failure_phase(error: &crate::Error) -> &'static str {
+fn write_phase_for_batch_error(error: &crate::Error) -> WritePhase {
     match error {
+        crate::Error::WritePhaseContext { phase, .. } => *phase,
         crate::Error::ValueConversion { diagnostics }
             if diagnostics
                 .all()
                 .iter()
                 .all(|diagnostic| diagnostic.code() == DiagnosticCode::SchemaMismatch) =>
         {
-            BATCH_SCHEMA_VALIDATION_PHASE
+            WritePhase::BatchSchemaValidation
         }
-        crate::Error::ValueConversion { .. } => VALUE_CONVERSION_PHASE,
+        crate::Error::ValueConversion { .. } => WritePhase::ValueConversion,
         crate::Error::DirectEncoding { .. } | crate::Error::BackendUnavailable { .. } => {
-            DIRECT_ENCODING_PHASE
+            WritePhase::DirectEncoding
         }
-        crate::Error::Tiberius { .. } => PACKET_WRITE_PHASE,
-        _ => BATCH_WRITE_PHASE,
+        crate::Error::Tiberius { .. } => WritePhase::PacketWrite,
+        _ => WritePhase::BatchWrite,
     }
 }
 
@@ -1459,7 +1452,7 @@ mod tests {
         borrow::Cow,
         future::Future,
         pin::Pin,
-        sync::Arc,
+        sync::{Arc, Mutex, MutexGuard},
         task::{Context, Poll, Waker},
     };
 
@@ -1479,10 +1472,9 @@ mod tests {
     };
     use crate::observability::{
         BATCH_SCHEMA_VALIDATION_PHASE, BATCH_WRITE_COMPLETED_EVENT, BATCH_WRITE_FAILED_EVENT,
-        BATCH_WRITE_PHASE, BATCH_WRITE_SPAN, DIRECT_ENCODING_PHASE, DIRECT_RAW_FAILED_EVENT,
-        DIRECT_RAW_MEASURED_EVENT, DIRECT_RAW_PACKET_WRITE_COMPLETED_EVENT,
-        DIRECT_RAW_RANGES_PLANNED_EVENT, FINALIZE_PHASE, FINISH_COMPLETED_EVENT,
-        FINISH_FAILED_EVENT, FINISH_PHASE, FINISH_SPAN, PACKET_WRITE_PHASE,
+        BATCH_WRITE_PHASE, BATCH_WRITE_SPAN, DIRECT_ENCODING_PHASE, DIRECT_RAW_MEASURED_EVENT,
+        DIRECT_RAW_PACKET_WRITE_COMPLETED_EVENT, DIRECT_RAW_RANGES_PLANNED_EVENT, FINALIZE_PHASE,
+        FINISH_COMPLETED_EVENT, FINISH_FAILED_EVENT, FINISH_PHASE, FINISH_SPAN, PACKET_WRITE_PHASE,
         TARGET_METADATA_VALIDATION_COMPLETED_EVENT, TARGET_METADATA_VALIDATION_FAILED_EVENT,
         TARGET_METADATA_VALIDATION_PHASE, VALUE_CONVERSION_PHASE,
         WRITER_INITIALIZATION_COMPLETED_EVENT, WRITER_INITIALIZATION_PHASE,
@@ -1491,8 +1483,17 @@ mod tests {
     };
     use crate::{
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, MssqlTypeLength,
-        PlanOptions, SchemaCheck, SchemaMapping, TableName,
+        PlanOptions, SchemaCheck, SchemaMapping, TableName, WritePhase,
     };
+
+    static DIRECT_RAW_TRACE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn direct_raw_trace_test_guard() -> MutexGuard<'static, ()> {
+        match DIRECT_RAW_TRACE_TEST_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
 
     #[test]
     fn write_backend_defaults_to_auto() {
@@ -1923,7 +1924,8 @@ mod tests {
         let (err, traces) = capture_traces(|| poll_ready(finish_writer_to_sink(state, sink)));
         let err = err.unwrap_err();
 
-        let Error::Tiberius { source } = err else {
+        assert_write_phase(&err, WritePhase::Finalize);
+        let Error::Tiberius { source } = inner_error(&err) else {
             panic!("expected tiberius error");
         };
         assert_eq!(
@@ -2625,7 +2627,8 @@ mod tests {
 
         let err = poll_ready(write_batch_to_sink(&mut state, &mut sink, &batch)).unwrap_err();
 
-        let Error::ValueConversion { diagnostics } = err else {
+        assert_write_phase(&err, WritePhase::ValueConversion);
+        let Error::ValueConversion { diagnostics } = inner_error(&err) else {
             panic!("expected value conversion error");
         };
         assert_eq!(diagnostics.all()[0].code(), DiagnosticCode::NonFiniteFloat);
@@ -2652,7 +2655,8 @@ mod tests {
 
         let err = poll_ready(write_batch_to_sink(&mut state, &mut sink, &batch)).unwrap_err();
 
-        let Error::Tiberius { source } = err else {
+        assert_write_phase(&err, WritePhase::PacketWrite);
+        let Error::Tiberius { source } = inner_error(&err) else {
             panic!("expected tiberius error");
         };
         assert_eq!(
@@ -2765,7 +2769,8 @@ mod tests {
             capture_traces(|| poll_ready(write_batch_to_sink(&mut state, &mut sink, &batch)));
         let err = err.unwrap_err();
 
-        let Error::ValueConversion { diagnostics } = err else {
+        assert_write_phase(&err, WritePhase::BatchSchemaValidation);
+        let Error::ValueConversion { diagnostics } = inner_error(&err) else {
             panic!("expected value conversion error");
         };
         assert_eq!(diagnostics.all()[0].code(), DiagnosticCode::SchemaMismatch);
@@ -2803,7 +2808,8 @@ mod tests {
             capture_traces(|| poll_ready(write_batch_to_sink(&mut state, &mut sink, &batch)));
         let err = err.unwrap_err();
 
-        let Error::ValueConversion { diagnostics } = err else {
+        assert_write_phase(&err, WritePhase::ValueConversion);
+        let Error::ValueConversion { diagnostics } = inner_error(&err) else {
             panic!("expected value conversion error");
         };
         assert_eq!(diagnostics.all()[0].code(), DiagnosticCode::NonFiniteFloat);
@@ -2842,7 +2848,8 @@ mod tests {
             capture_traces(|| poll_ready(write_batch_to_sink(&mut state, &mut sink, &batch)));
         let err = err.unwrap_err();
 
-        let Error::Tiberius { .. } = err else {
+        assert_write_phase(&err, WritePhase::PacketWrite);
+        let Error::Tiberius { .. } = inner_error(&err) else {
             panic!("expected tiberius error");
         };
         assert_eq!(state.stats(), WriteStats::default());
@@ -2880,6 +2887,7 @@ mod tests {
 
     #[test]
     fn write_direct_batch_to_sink_sends_one_checked_payload_per_batch() {
+        let _trace_guard = direct_raw_trace_test_guard();
         let mappings = vec![mapping("id")];
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
@@ -2910,6 +2918,7 @@ mod tests {
 
     #[test]
     fn direct_batch_write_success_emits_stats_trace() -> Result<(), String> {
+        let _trace_guard = direct_raw_trace_test_guard();
         for backend in [WriteBackend::DirectFramedBulk, WriteBackend::DirectRawBulk] {
             let mappings = vec![mapping("id")];
             let mut state = WriterState::new(
@@ -2954,6 +2963,7 @@ mod tests {
 
     #[test]
     fn direct_raw_batch_write_emits_encoding_summary_trace() -> Result<(), String> {
+        let _trace_guard = direct_raw_trace_test_guard();
         let mappings = vec![mapping("id")];
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
@@ -2989,6 +2999,7 @@ mod tests {
 
     #[test]
     fn direct_raw_packet_write_emits_sanitized_summary_trace() -> Result<(), String> {
+        let _trace_guard = direct_raw_trace_test_guard();
         let mappings = vec![mapping("id")];
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
@@ -3018,7 +3029,8 @@ mod tests {
     }
 
     #[test]
-    fn direct_raw_failure_trace_includes_diagnostic_codes() -> Result<(), String> {
+    fn direct_raw_value_conversion_failure_trace_includes_diagnostic_codes() -> Result<(), String> {
+        let _trace_guard = direct_raw_trace_test_guard();
         let mappings = vec![schema_mapping_at(
             0,
             "u64_value",
@@ -3041,7 +3053,8 @@ mod tests {
         });
         let err = err.unwrap_err();
 
-        let Error::ValueConversion { diagnostics } = err else {
+        assert_write_phase(&err, WritePhase::ValueConversion);
+        let Error::ValueConversion { diagnostics } = inner_error(&err) else {
             panic!("expected value conversion error");
         };
         assert_eq!(
@@ -3049,7 +3062,8 @@ mod tests {
             DiagnosticCode::IntegerOutOfRange
         );
         let records = traces.records()?;
-        let failure = trace_event(&records, DIRECT_RAW_FAILED_EVENT)?;
+        let failure = trace_event(&records, BATCH_WRITE_FAILED_EVENT)?;
+        assert_eq!(failure.span_name(), Some(BATCH_WRITE_SPAN));
         assert_trace_field(failure, "phase", VALUE_CONVERSION_PHASE);
         assert_trace_field(failure, "backend", "DirectRawBulk");
         assert_trace_field(failure, "batch_row_count", "1");
@@ -3066,6 +3080,7 @@ mod tests {
 
     #[test]
     fn direct_raw_trace_does_not_emit_values_or_payload_bytes() -> Result<(), String> {
+        let _trace_guard = direct_raw_trace_test_guard();
         let mappings = vec![utf8_mapping_at(0, "secret_value")];
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
@@ -3104,6 +3119,7 @@ mod tests {
 
     #[test]
     fn write_direct_batch_to_sink_accumulates_multi_batch_stats() {
+        let _trace_guard = direct_raw_trace_test_guard();
         let mappings = vec![mapping("id")];
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
@@ -3147,6 +3163,7 @@ mod tests {
 
     #[test]
     fn write_direct_batch_to_sink_chunks_measured_payloads_by_byte_limit() {
+        let _trace_guard = direct_raw_trace_test_guard();
         let mappings = vec![binary_mapping_at(0, "payload")];
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
@@ -3175,6 +3192,7 @@ mod tests {
 
     #[test]
     fn write_direct_batch_to_sink_skips_send_for_empty_batch_but_records_stats() {
+        let _trace_guard = direct_raw_trace_test_guard();
         let mappings = vec![mapping("id")];
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
@@ -3200,6 +3218,7 @@ mod tests {
 
     #[test]
     fn write_direct_batch_to_sink_rejects_bad_later_row_before_send() {
+        let _trace_guard = direct_raw_trace_test_guard();
         let mappings = vec![float_mapping("amount")];
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
@@ -3214,7 +3233,8 @@ mod tests {
         let err =
             poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch)).unwrap_err();
 
-        let Error::ValueConversion { diagnostics } = err else {
+        assert_write_phase(&err, WritePhase::ValueConversion);
+        let Error::ValueConversion { diagnostics } = inner_error(&err) else {
             panic!("expected value conversion error");
         };
         assert_eq!(diagnostics.all()[0].code(), DiagnosticCode::NonFiniteFloat);
@@ -3225,6 +3245,7 @@ mod tests {
 
     #[test]
     fn write_direct_batch_to_sink_rejects_uint64_bigint_overflow_before_any_range_send() {
+        let _trace_guard = direct_raw_trace_test_guard();
         let mappings = vec![schema_mapping_at(
             0,
             "u64_value",
@@ -3248,7 +3269,8 @@ mod tests {
         let err =
             poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch)).unwrap_err();
 
-        let Error::ValueConversion { diagnostics } = err else {
+        assert_write_phase(&err, WritePhase::ValueConversion);
+        let Error::ValueConversion { diagnostics } = inner_error(&err) else {
             panic!("expected value conversion error");
         };
         assert_eq!(
@@ -3262,6 +3284,7 @@ mod tests {
 
     #[test]
     fn write_direct_batch_to_sink_rejects_runtime_type_mismatch_before_send() {
+        let _trace_guard = direct_raw_trace_test_guard();
         let mappings = vec![mapping("id")];
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
@@ -3284,7 +3307,8 @@ mod tests {
         let err =
             poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch)).unwrap_err();
 
-        let Error::ValueConversion { diagnostics } = err else {
+        assert_write_phase(&err, WritePhase::BatchSchemaValidation);
+        let Error::ValueConversion { diagnostics } = inner_error(&err) else {
             panic!("expected value conversion error");
         };
         assert_eq!(diagnostics.all()[0].code(), DiagnosticCode::SchemaMismatch);
@@ -3299,6 +3323,7 @@ mod tests {
 
     #[test]
     fn write_direct_batch_to_sink_send_failure_preserves_error_and_keeps_stats() {
+        let _trace_guard = direct_raw_trace_test_guard();
         let mappings = vec![mapping("id")];
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
@@ -3316,7 +3341,8 @@ mod tests {
         let err =
             poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch)).unwrap_err();
 
-        let Error::Tiberius { source } = err else {
+        assert_write_phase(&err, WritePhase::PacketWrite);
+        let Error::Tiberius { source } = inner_error(&err) else {
             panic!("expected tiberius error");
         };
         assert_eq!(
@@ -3332,6 +3358,7 @@ mod tests {
         assert_eq!(crate::WriteBackend::default(), WriteBackend::Auto);
         assert_eq!(crate::WriteOptions::default(), WriteOptions::default());
         assert_eq!(crate::WriteStats::default(), WriteStats::default());
+        assert_eq!(crate::WritePhase::PacketWrite.as_str(), "packet_write");
         let _ = std::any::type_name::<crate::BulkWriter<'static, DummyStream>>();
     }
 
@@ -3364,6 +3391,14 @@ mod tests {
             Some(expected),
             "trace record: {record:#?}"
         );
+    }
+
+    fn assert_write_phase(error: &Error, expected: WritePhase) {
+        assert_eq!(error.write_phase(), Some(expected));
+    }
+
+    fn inner_error(error: &Error) -> &Error {
+        error.without_write_phase()
     }
 
     fn mapping(name: &str) -> SchemaMapping {
