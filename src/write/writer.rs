@@ -1452,7 +1452,7 @@ mod tests {
         borrow::Cow,
         future::Future,
         pin::Pin,
-        sync::Arc,
+        sync::{Arc, Mutex, MutexGuard},
         task::{Context, Poll, Waker},
     };
 
@@ -1485,6 +1485,15 @@ mod tests {
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, MssqlTypeLength,
         PlanOptions, SchemaCheck, SchemaMapping, TableName, WritePhase,
     };
+
+    static DIRECT_RAW_TRACE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn direct_raw_trace_test_guard() -> MutexGuard<'static, ()> {
+        match DIRECT_RAW_TRACE_TEST_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
 
     #[test]
     fn write_backend_defaults_to_auto() {
@@ -2878,6 +2887,7 @@ mod tests {
 
     #[test]
     fn write_direct_batch_to_sink_sends_one_checked_payload_per_batch() {
+        let _trace_guard = direct_raw_trace_test_guard();
         let mappings = vec![mapping("id")];
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
@@ -2908,6 +2918,7 @@ mod tests {
 
     #[test]
     fn direct_batch_write_success_emits_stats_trace() -> Result<(), String> {
+        let _trace_guard = direct_raw_trace_test_guard();
         for backend in [WriteBackend::DirectFramedBulk, WriteBackend::DirectRawBulk] {
             let mappings = vec![mapping("id")];
             let mut state = WriterState::new(
@@ -2952,6 +2963,7 @@ mod tests {
 
     #[test]
     fn direct_raw_batch_write_emits_encoding_summary_trace() -> Result<(), String> {
+        let _trace_guard = direct_raw_trace_test_guard();
         let mappings = vec![mapping("id")];
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
@@ -2987,6 +2999,7 @@ mod tests {
 
     #[test]
     fn direct_raw_packet_write_emits_sanitized_summary_trace() -> Result<(), String> {
+        let _trace_guard = direct_raw_trace_test_guard();
         let mappings = vec![mapping("id")];
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
@@ -3017,6 +3030,7 @@ mod tests {
 
     #[test]
     fn direct_raw_value_conversion_failure_trace_includes_diagnostic_codes() -> Result<(), String> {
+        let _trace_guard = direct_raw_trace_test_guard();
         let mappings = vec![schema_mapping_at(
             0,
             "u64_value",
@@ -3066,6 +3080,7 @@ mod tests {
 
     #[test]
     fn direct_raw_trace_does_not_emit_values_or_payload_bytes() -> Result<(), String> {
+        let _trace_guard = direct_raw_trace_test_guard();
         let mappings = vec![utf8_mapping_at(0, "secret_value")];
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
@@ -3104,6 +3119,7 @@ mod tests {
 
     #[test]
     fn write_direct_batch_to_sink_accumulates_multi_batch_stats() {
+        let _trace_guard = direct_raw_trace_test_guard();
         let mappings = vec![mapping("id")];
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
@@ -3147,6 +3163,7 @@ mod tests {
 
     #[test]
     fn write_direct_batch_to_sink_chunks_measured_payloads_by_byte_limit() {
+        let _trace_guard = direct_raw_trace_test_guard();
         let mappings = vec![binary_mapping_at(0, "payload")];
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
@@ -3175,6 +3192,7 @@ mod tests {
 
     #[test]
     fn write_direct_batch_to_sink_skips_send_for_empty_batch_but_records_stats() {
+        let _trace_guard = direct_raw_trace_test_guard();
         let mappings = vec![mapping("id")];
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
@@ -3200,6 +3218,7 @@ mod tests {
 
     #[test]
     fn write_direct_batch_to_sink_rejects_bad_later_row_before_send() {
+        let _trace_guard = direct_raw_trace_test_guard();
         let mappings = vec![float_mapping("amount")];
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
@@ -3226,6 +3245,7 @@ mod tests {
 
     #[test]
     fn write_direct_batch_to_sink_rejects_uint64_bigint_overflow_before_any_range_send() {
+        let _trace_guard = direct_raw_trace_test_guard();
         let mappings = vec![schema_mapping_at(
             0,
             "u64_value",
@@ -3264,6 +3284,7 @@ mod tests {
 
     #[test]
     fn write_direct_batch_to_sink_rejects_runtime_type_mismatch_before_send() {
+        let _trace_guard = direct_raw_trace_test_guard();
         let mappings = vec![mapping("id")];
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
@@ -3302,6 +3323,7 @@ mod tests {
 
     #[test]
     fn write_direct_batch_to_sink_send_failure_preserves_error_and_keeps_stats() {
+        let _trace_guard = direct_raw_trace_test_guard();
         let mappings = vec![mapping("id")];
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,

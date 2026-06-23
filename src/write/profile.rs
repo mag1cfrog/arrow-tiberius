@@ -5,8 +5,7 @@ use std::time::Duration;
 #[cfg(feature = "bench-profile")]
 mod enabled {
     use std::{
-        cell::RefCell,
-        sync::atomic::{AtomicBool, Ordering},
+        cell::{Cell, RefCell},
         time::Duration,
     };
 
@@ -186,9 +185,9 @@ mod enabled {
 
     thread_local! {
         static DIRECT_PROFILE: RefCell<Option<DirectWriteProfile>> = const { RefCell::new(None) };
+        static DIRECT_DATE_FAST_PATH_DISABLED: Cell<bool> = const { Cell::new(false) };
+        static DIRECT_FIXED_WIDTH_FAST_PATH_DISABLED: Cell<bool> = const { Cell::new(false) };
     }
-    static DIRECT_DATE_FAST_PATH_DISABLED: AtomicBool = AtomicBool::new(false);
-    static DIRECT_FIXED_WIDTH_FAST_PATH_DISABLED: AtomicBool = AtomicBool::new(false);
 
     /// Scoped benchmark override that disables the direct date fast path.
     #[derive(Debug)]
@@ -204,36 +203,44 @@ mod enabled {
 
     impl Drop for DirectDateFastPathOverride {
         fn drop(&mut self) {
-            DIRECT_DATE_FAST_PATH_DISABLED.store(self.previous, Ordering::Relaxed);
+            DIRECT_DATE_FAST_PATH_DISABLED.with(|disabled| disabled.set(self.previous));
         }
     }
 
     impl Drop for DirectFixedWidthFastPathOverride {
         fn drop(&mut self) {
-            DIRECT_FIXED_WIDTH_FAST_PATH_DISABLED.store(self.previous, Ordering::Relaxed);
+            DIRECT_FIXED_WIDTH_FAST_PATH_DISABLED.with(|disabled| disabled.set(self.previous));
         }
     }
 
     /// Disables direct date fixed-width fast-path encoding for the current scope.
     pub fn disable_direct_date_fast_path_for_scope() -> DirectDateFastPathOverride {
-        DirectDateFastPathOverride {
-            previous: DIRECT_DATE_FAST_PATH_DISABLED.swap(true, Ordering::Relaxed),
-        }
+        let previous = DIRECT_DATE_FAST_PATH_DISABLED.with(|disabled| {
+            let previous = disabled.get();
+            disabled.set(true);
+            previous
+        });
+
+        DirectDateFastPathOverride { previous }
     }
 
     /// Disables direct fixed-width fast-path encoding for the current scope.
     pub fn disable_direct_fixed_width_fast_path_for_scope() -> DirectFixedWidthFastPathOverride {
-        DirectFixedWidthFastPathOverride {
-            previous: DIRECT_FIXED_WIDTH_FAST_PATH_DISABLED.swap(true, Ordering::Relaxed),
-        }
+        let previous = DIRECT_FIXED_WIDTH_FAST_PATH_DISABLED.with(|disabled| {
+            let previous = disabled.get();
+            disabled.set(true);
+            previous
+        });
+
+        DirectFixedWidthFastPathOverride { previous }
     }
 
     pub(crate) fn direct_date_fast_path_disabled() -> bool {
-        DIRECT_DATE_FAST_PATH_DISABLED.load(Ordering::Relaxed)
+        DIRECT_DATE_FAST_PATH_DISABLED.with(Cell::get)
     }
 
     pub(crate) fn direct_fixed_width_fast_path_disabled() -> bool {
-        DIRECT_FIXED_WIDTH_FAST_PATH_DISABLED.load(Ordering::Relaxed)
+        DIRECT_FIXED_WIDTH_FAST_PATH_DISABLED.with(Cell::get)
     }
 
     /// Starts direct writer profiling on the current thread.
@@ -555,7 +562,7 @@ pub(crate) fn record_elapsed<T>(start: std::time::Instant, record: fn(Duration),
 
 #[cfg(all(test, feature = "bench-profile"))]
 mod tests {
-    use std::time::Duration;
+    use std::{thread, time::Duration};
 
     #[test]
     fn direct_profile_accumulates_and_resets_current_thread_data() {
@@ -813,5 +820,47 @@ mod tests {
             Duration::from_millis(337)
         );
         assert!(super::finish_direct_write_profile().is_none());
+    }
+
+    #[test]
+    fn scoped_fast_path_overrides_do_not_cross_threads() -> Result<(), String> {
+        assert!(!super::direct_date_fast_path_disabled());
+        assert!(!super::direct_fixed_width_fast_path_disabled());
+
+        let _date_guard = super::disable_direct_date_fast_path_for_scope();
+        let _fixed_width_guard = super::disable_direct_fixed_width_fast_path_for_scope();
+
+        assert!(super::direct_date_fast_path_disabled());
+        assert!(super::direct_fixed_width_fast_path_disabled());
+
+        let handle = thread::spawn(|| {
+            (
+                super::direct_date_fast_path_disabled(),
+                super::direct_fixed_width_fast_path_disabled(),
+            )
+        });
+        let thread_state = handle
+            .join()
+            .map_err(|_| "fast path override thread panicked".to_owned())?;
+
+        assert_eq!(thread_state, (false, false));
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_fast_path_overrides_restore_previous_thread_state() {
+        assert!(!super::direct_date_fast_path_disabled());
+        assert!(!super::direct_fixed_width_fast_path_disabled());
+
+        {
+            let _date_guard = super::disable_direct_date_fast_path_for_scope();
+            let _fixed_width_guard = super::disable_direct_fixed_width_fast_path_for_scope();
+
+            assert!(super::direct_date_fast_path_disabled());
+            assert!(super::direct_fixed_width_fast_path_disabled());
+        }
+
+        assert!(!super::direct_date_fast_path_disabled());
+        assert!(!super::direct_fixed_width_fast_path_disabled());
     }
 }
