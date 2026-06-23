@@ -115,6 +115,7 @@
 //! # More Documentation
 //!
 //! - [Arrow to SQL Server Type Mapping](https://github.com/mag1cfrog/arrow-tiberius/blob/main/docs/type-mapping.md)
+//! - [Observability](https://github.com/mag1cfrog/arrow-tiberius/blob/main/docs/observability.md)
 //! - [Integration Tests](https://github.com/mag1cfrog/arrow-tiberius/blob/main/docs/integration-tests.md)
 //! - [Writer Benchmarks](https://github.com/mag1cfrog/arrow-tiberius/blob/main/docs/benchmarks.md)
 
