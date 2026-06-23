@@ -1,5 +1,9 @@
 //! Crate-owned tracing names and test capture helpers.
 
+use std::{fmt::Write as _, time::Duration};
+
+use crate::DiagnosticSet;
+
 pub(crate) mod schema;
 pub(crate) mod writer;
 
@@ -111,6 +115,44 @@ pub(crate) const FINISH_COMPLETED_EVENT: &str = "arrow_tiberius.finish.completed
 
 /// Stable event marker emitted when writer finish fails during finalization.
 pub(crate) const FINISH_FAILED_EVENT: &str = "arrow_tiberius.finish.failed";
+
+pub(crate) fn duration_micros_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+pub(crate) fn usize_to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+pub(crate) fn diagnostic_codes(diagnostics: &DiagnosticSet) -> String {
+    let mut codes = String::new();
+    for diagnostic in diagnostics.all() {
+        append_debug_name(&mut codes, diagnostic.code());
+    }
+    codes
+}
+
+pub(crate) fn append_debug_name<T: std::fmt::Debug>(target: &mut String, value: T) {
+    if !target.is_empty() {
+        target.push(',');
+    }
+    let _ = write!(target, "{value:?}");
+}
+
+pub(crate) fn append_text(target: &mut String, value: &str) {
+    if !target.is_empty() {
+        target.push(',');
+    }
+    target.push_str(value);
+}
+
+pub(crate) fn append_unique_text(target: &mut String, value: &str) {
+    if target.split(',').any(|existing| existing == value) {
+        return;
+    }
+
+    append_text(target, value);
+}
 
 /// Test-only span name used to prove tracing capture support.
 #[cfg(test)]

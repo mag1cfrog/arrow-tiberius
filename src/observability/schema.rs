@@ -1,14 +1,12 @@
-use std::{
-    fmt::Write as _,
-    time::{Duration, Instant},
-};
+use std::time::Instant;
 
 use crate::diagnostic::DiagnosticSeverity;
 use crate::{DiagnosticSet, MssqlProfile, MssqlType, PlanOptions, SchemaMapping};
 
 use super::{
     SCHEMA_PLANNING_COMPLETED_EVENT, SCHEMA_PLANNING_FAILED_EVENT, SCHEMA_PLANNING_PHASE,
-    SCHEMA_PLANNING_SPAN, SCHEMA_PLANNING_STARTED_EVENT, TRACE_TARGET,
+    SCHEMA_PLANNING_SPAN, SCHEMA_PLANNING_STARTED_EVENT, TRACE_TARGET, append_debug_name,
+    append_text, append_unique_text, duration_micros_u64, usize_to_u64_saturating,
 };
 
 pub(crate) struct SchemaPlanningTrace {
@@ -23,7 +21,7 @@ impl SchemaPlanningTrace {
             target: TRACE_TARGET,
             SCHEMA_PLANNING_SPAN,
             phase = SCHEMA_PLANNING_PHASE,
-            arrow_field_count = usize_to_u64(field_count),
+            arrow_field_count = usize_to_u64_saturating(field_count),
             mssql_version = ?profile.version(),
             compatibility_level = u64::from(profile.compatibility_level().as_u16()),
             string_policy = ?options.string_policy,
@@ -42,7 +40,7 @@ impl SchemaPlanningTrace {
                 target: TRACE_TARGET,
                 phase = SCHEMA_PLANNING_PHASE,
                 telemetry_event = SCHEMA_PLANNING_STARTED_EVENT,
-                arrow_field_count = usize_to_u64(field_count)
+                arrow_field_count = usize_to_u64_saturating(field_count)
             );
         });
 
@@ -65,13 +63,13 @@ impl SchemaPlanningTrace {
                 target: TRACE_TARGET,
                 phase = SCHEMA_PLANNING_PHASE,
                 telemetry_event = SCHEMA_PLANNING_COMPLETED_EVENT,
-                arrow_field_count = usize_to_u64(self.field_count),
-                planned_mapping_count = usize_to_u64(mappings.len()),
+                arrow_field_count = usize_to_u64_saturating(self.field_count),
+                planned_mapping_count = usize_to_u64_saturating(mappings.len()),
                 arrow_data_type_families = %shape.arrow_data_type_families,
                 mssql_type_families = %shape.mssql_type_families,
-                diagnostic_count = usize_to_u64(summary.total_count),
-                error_diagnostic_count = usize_to_u64(summary.error_count),
-                warning_diagnostic_count = usize_to_u64(summary.warning_count),
+                diagnostic_count = usize_to_u64_saturating(summary.total_count),
+                error_diagnostic_count = usize_to_u64_saturating(summary.error_count),
+                warning_diagnostic_count = usize_to_u64_saturating(summary.warning_count),
                 diagnostic_codes = %summary.codes,
                 diagnostic_field_names = %summary.field_names,
                 elapsed_us = duration_micros_u64(self.started.elapsed())
@@ -86,10 +84,10 @@ impl SchemaPlanningTrace {
                 target: TRACE_TARGET,
                 phase = SCHEMA_PLANNING_PHASE,
                 telemetry_event = SCHEMA_PLANNING_FAILED_EVENT,
-                arrow_field_count = usize_to_u64(self.field_count),
-                diagnostic_count = usize_to_u64(summary.total_count),
-                error_diagnostic_count = usize_to_u64(summary.error_count),
-                warning_diagnostic_count = usize_to_u64(summary.warning_count),
+                arrow_field_count = usize_to_u64_saturating(self.field_count),
+                diagnostic_count = usize_to_u64_saturating(summary.total_count),
+                error_diagnostic_count = usize_to_u64_saturating(summary.error_count),
+                warning_diagnostic_count = usize_to_u64_saturating(summary.warning_count),
                 diagnostic_codes = %summary.codes,
                 diagnostic_field_names = %summary.field_names,
                 error_summary = "schema planning failed with diagnostics",
@@ -152,28 +150,6 @@ impl DiagnosticTraceSummary {
 
         summary
     }
-}
-
-fn append_debug_name<T: std::fmt::Debug>(target: &mut String, value: T) {
-    if !target.is_empty() {
-        target.push(',');
-    }
-    let _ = write!(target, "{value:?}");
-}
-
-fn append_text(target: &mut String, value: &str) {
-    if !target.is_empty() {
-        target.push(',');
-    }
-    target.push_str(value);
-}
-
-fn append_unique_text(target: &mut String, value: &str) {
-    if target.split(',').any(|existing| existing == value) {
-        return;
-    }
-
-    append_text(target, value);
 }
 
 fn arrow_data_type_family(data_type: &arrow_schema::DataType) -> &'static str {
@@ -241,14 +217,6 @@ fn mssql_type_family(ty: &MssqlType) -> &'static str {
         MssqlType::DateTime2 { .. } => "datetime2",
         MssqlType::DateTimeOffset { .. } => "datetimeoffset",
     }
-}
-
-fn duration_micros_u64(duration: Duration) -> u64 {
-    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
-}
-
-fn usize_to_u64(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

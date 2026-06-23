@@ -1,14 +1,11 @@
 //! Writer tracing helpers.
 
-use std::{
-    fmt::Write as _,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
 
 use crate::{
-    DiagnosticCode, DiagnosticSet, TableName,
+    DiagnosticCode, TableName,
     write::{
         direct::{MeasuredDirectBatch, MeasuredRowRange},
         writer::{WriteBackend, WriteStats},
@@ -25,6 +22,7 @@ use super::{
     TARGET_METADATA_VALIDATION_PHASE, TARGET_METADATA_VALIDATION_STARTED_EVENT, TRACE_TARGET,
     WRITER_INITIALIZATION_COMPLETED_EVENT, WRITER_INITIALIZATION_FAILED_EVENT,
     WRITER_INITIALIZATION_PHASE, WRITER_INITIALIZATION_SPAN, WRITER_INITIALIZATION_STARTED_EVENT,
+    diagnostic_codes, duration_micros_u64, usize_to_u64_saturating,
 };
 
 #[derive(Debug)]
@@ -499,23 +497,4 @@ fn diagnostic_codes_for_error(error: &crate::Error) -> String {
         }
         _ => String::new(),
     }
-}
-
-fn diagnostic_codes(diagnostics: &DiagnosticSet) -> String {
-    let mut codes = String::new();
-    for diagnostic in diagnostics.all() {
-        if !codes.is_empty() {
-            codes.push(',');
-        }
-        let _ = write!(codes, "{:?}", diagnostic.code());
-    }
-    codes
-}
-
-fn duration_micros_u64(duration: Duration) -> u64 {
-    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
-}
-
-fn usize_to_u64_saturating(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
 }
