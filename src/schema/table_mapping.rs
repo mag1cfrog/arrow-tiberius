@@ -26,26 +26,28 @@ pub fn plan_arrow_schema_to_mssql_mappings(
     let field_count = schema.fields().len();
     let trace = SchemaPlanningTrace::start(field_count, profile, options);
 
-    trace.in_scope(|trace| {
-        let mut mappings = Vec::with_capacity(schema.fields().len());
-        let mut diagnostics = DiagnosticSet::new();
+    trace.trace_result(plan_arrow_schema_to_mssql_mappings_inner(schema, &options))
+}
 
-        for (index, field) in schema.fields().iter().enumerate() {
-            match plan_arrow_field_to_mssql_column_mapping(index, field, &options) {
-                Ok(mapping) => mappings.push(mapping),
-                Err(diagnostic) => diagnostics.push(diagnostic),
-            }
+fn plan_arrow_schema_to_mssql_mappings_inner(
+    schema: &Schema,
+    options: &PlanOptions,
+) -> Result<PlanOutcome<Vec<SchemaMapping>>> {
+    let mut mappings = Vec::with_capacity(schema.fields().len());
+    let mut diagnostics = DiagnosticSet::new();
+
+    for (index, field) in schema.fields().iter().enumerate() {
+        match plan_arrow_field_to_mssql_column_mapping(index, field, options) {
+            Ok(mapping) => mappings.push(mapping),
+            Err(diagnostic) => diagnostics.push(diagnostic),
         }
+    }
 
-        if diagnostics.has_errors() {
-            trace.failed(&diagnostics);
-            return Err(crate::Error::Planning { diagnostics });
-        }
+    if diagnostics.has_errors() {
+        return Err(crate::Error::Planning { diagnostics });
+    }
 
-        trace.completed(&mappings, &diagnostics);
-
-        Ok(PlanOutcome::new(mappings, diagnostics))
-    })
+    Ok(PlanOutcome::new(mappings, diagnostics))
 }
 
 /// Returns the planned MSSQL columns in mapping order.

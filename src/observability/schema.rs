@@ -1,7 +1,9 @@
 use std::time::Instant;
 
 use crate::diagnostic::DiagnosticSeverity;
-use crate::{DiagnosticSet, MssqlProfile, MssqlType, PlanOptions, SchemaMapping};
+use crate::{
+    DiagnosticSet, Error, MssqlProfile, MssqlType, PlanOptions, PlanOutcome, Result, SchemaMapping,
+};
 
 use super::{
     SCHEMA_PLANNING_COMPLETED_EVENT, SCHEMA_PLANNING_FAILED_EVENT, SCHEMA_PLANNING_PHASE,
@@ -51,8 +53,16 @@ impl SchemaPlanningTrace {
         }
     }
 
-    pub(crate) fn in_scope<R>(&self, operation: impl FnOnce(&Self) -> R) -> R {
-        self.span.in_scope(|| operation(self))
+    pub(crate) fn trace_result(
+        &self,
+        result: Result<PlanOutcome<Vec<SchemaMapping>>>,
+    ) -> Result<PlanOutcome<Vec<SchemaMapping>>> {
+        match &result {
+            Ok(outcome) => self.completed(outcome.value(), outcome.diagnostics()),
+            Err(Error::Planning { diagnostics }) => self.failed(diagnostics),
+            Err(_) => {}
+        }
+        result
     }
 
     pub(crate) fn completed(&self, mappings: &[SchemaMapping], diagnostics: &DiagnosticSet) {
