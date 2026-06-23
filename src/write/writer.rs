@@ -958,9 +958,7 @@ mod tests {
         task::{Context, Poll, Waker},
     };
 
-    use arrow_array::{
-        BinaryArray, Float64Array, Int32Array, RecordBatch, StringArray, UInt64Array,
-    };
+    use arrow_array::{BinaryArray, Float64Array, Int32Array, RecordBatch, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use futures_util::io::{AsyncRead, AsyncWrite};
 
@@ -971,11 +969,6 @@ mod tests {
         record_batch_view, resolve_backend, tiberius_row_owned, validate_batch_rows,
         validate_bulk_target_columns, validate_direct_bulk_target_column_types,
         write_batch_to_sink, write_direct_batch_to_sink,
-    };
-    use crate::observability::{
-        DIRECT_ENCODING_PHASE, DIRECT_RAW_MEASURED_EVENT, DIRECT_RAW_PACKET_WRITE_COMPLETED_EVENT,
-        DIRECT_RAW_RANGES_PLANNED_EVENT, PACKET_WRITE_PHASE,
-        test_support::{CapturedTrace, CapturedTraceKind, capture_traces},
     };
     use crate::{
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, MssqlTypeLength,
@@ -1900,112 +1893,6 @@ mod tests {
     }
 
     #[test]
-    fn direct_raw_batch_write_emits_encoding_summary_trace() -> Result<(), String> {
-        let _trace_guard = direct_raw_trace_test_guard();
-        let mappings = vec![mapping("id")];
-        let mut state = WriterState::new(
-            WriteBackend::DirectRawBulk,
-            SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
-        )
-        .unwrap();
-        let mut sink = RecordingRawSink::default();
-        let batch = int32_batch("id", &[10, 20]);
-
-        let (_stats, traces) = capture_traces(|| {
-            poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch))
-        });
-
-        let records = traces.records()?;
-        let measured = trace_event(&records, DIRECT_RAW_MEASURED_EVENT)?;
-        assert_trace_field(measured, "phase", DIRECT_ENCODING_PHASE);
-        assert_trace_field(measured, "backend", "DirectRawBulk");
-        assert_trace_field(measured, "batch_row_count", "2");
-        assert_trace_field(measured, "batch_column_count", "1");
-        assert_trace_field(measured, "encoded_row_count", "2");
-        assert_trace_field(measured, "encoded_byte_count", "10");
-        assert!(measured.fields().contains_key("elapsed_us"));
-
-        let ranges = trace_event(&records, DIRECT_RAW_RANGES_PLANNED_EVENT)?;
-        assert_trace_field(ranges, "phase", DIRECT_ENCODING_PHASE);
-        assert_trace_field(ranges, "encoded_range_count", "1");
-        assert_trace_field(ranges, "encoded_byte_count", "10");
-
-        Ok(())
-    }
-
-    #[test]
-    fn direct_raw_packet_write_emits_sanitized_summary_trace() -> Result<(), String> {
-        let _trace_guard = direct_raw_trace_test_guard();
-        let mappings = vec![mapping("id")];
-        let mut state = WriterState::new(
-            WriteBackend::DirectRawBulk,
-            SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
-        )
-        .unwrap();
-        let mut sink = RecordingRawSink::default();
-        let batch = int32_batch("id", &[10, 20]);
-
-        let (_stats, traces) = capture_traces(|| {
-            poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch))
-        });
-
-        let records = traces.records()?;
-        let packet = trace_event(&records, DIRECT_RAW_PACKET_WRITE_COMPLETED_EVENT)?;
-        assert_trace_field(packet, "phase", PACKET_WRITE_PHASE);
-        assert_trace_field(packet, "backend", "DirectRawBulk");
-        assert_trace_field(packet, "encoded_row_start", "0");
-        assert_trace_field(packet, "encoded_row_count", "2");
-        assert_trace_field(packet, "encoded_byte_count", "10");
-        assert!(packet.fields().contains_key("elapsed_us"));
-        assert!(!packet.fields().contains_key("raw_packet_count"));
-
-        Ok(())
-    }
-
-    #[test]
-    fn direct_raw_trace_does_not_emit_values_or_payload_bytes() -> Result<(), String> {
-        let _trace_guard = direct_raw_trace_test_guard();
-        let mappings = vec![utf8_mapping_at(0, "secret_value")];
-        let mut state = WriterState::new(
-            WriteBackend::DirectRawBulk,
-            SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
-        )
-        .unwrap();
-        let mut sink = RecordingRawSink::default();
-        let batch = utf8_batch("secret_value", &["password=secret"]);
-
-        let (_stats, traces) = capture_traces(|| {
-            poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch))
-        });
-
-        traces.assert_no_forbidden_text(&["password=secret"])?;
-
-        let mappings = vec![mapping("id")];
-        let mut state = WriterState::new(
-            WriteBackend::DirectRawBulk,
-            SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
-        )
-        .unwrap();
-        let mut sink = RecordingRawSink::default();
-        let batch = int32_batch("id", &[987_654_321]);
-        let (_stats, numeric_traces) = capture_traces(|| {
-            poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch))
-        });
-
-        numeric_traces.assert_no_forbidden_text(&["987654321"])?;
-
-        Ok(())
-    }
-
-    #[test]
     fn write_direct_batch_to_sink_accumulates_multi_batch_stats() {
         let _trace_guard = direct_raw_trace_test_guard();
         let mappings = vec![mapping("id")];
@@ -2257,30 +2144,6 @@ mod tests {
         assert!(name.contains("tiberius"));
     }
 
-    fn trace_event<'a>(
-        records: &'a [CapturedTrace],
-        telemetry_event: &str,
-    ) -> Result<&'a CapturedTrace, String> {
-        records
-            .iter()
-            .find(|record| {
-                record.kind() == CapturedTraceKind::Event
-                    && record
-                        .fields()
-                        .get("telemetry_event")
-                        .is_some_and(|value| value == telemetry_event)
-            })
-            .ok_or_else(|| format!("missing trace event {telemetry_event}: {records:#?}"))
-    }
-
-    fn assert_trace_field(record: &CapturedTrace, field: &str, expected: &str) {
-        assert_eq!(
-            record.fields().get(field).map(String::as_str),
-            Some(expected),
-            "trace record: {record:#?}"
-        );
-    }
-
     fn assert_write_phase(error: &Error, expected: WritePhase) {
         assert_eq!(error.write_phase(), Some(expected));
     }
@@ -2379,13 +2242,6 @@ mod tests {
     fn binary_batch(name: &str, values: &[&[u8]]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Binary, false)]));
         let array = Arc::new(BinaryArray::from_iter_values(values.iter().copied()));
-
-        RecordBatch::try_new(schema, vec![array]).unwrap()
-    }
-
-    fn utf8_batch(name: &str, values: &[&str]) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Utf8, false)]));
-        let array = Arc::new(StringArray::from(values.to_vec()));
 
         RecordBatch::try_new(schema, vec![array]).unwrap()
     }

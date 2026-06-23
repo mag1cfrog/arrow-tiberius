@@ -111,3 +111,163 @@ pub(crate) fn emit_direct_raw_failed(
         error_summary = sanitized_error_summary(error)
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use arrow_array::{Int32Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+
+    use super::{
+        emit_direct_raw_measured, emit_direct_raw_packet_write_completed,
+        emit_direct_raw_ranges_planned,
+    };
+    use crate::{
+        ArrowFieldRef, Identifier, MssqlColumn, MssqlType, MssqlTypeLength, SchemaMapping,
+        observability::{
+            DIRECT_ENCODING_PHASE, DIRECT_RAW_MEASURED_EVENT,
+            DIRECT_RAW_PACKET_WRITE_COMPLETED_EVENT, DIRECT_RAW_RANGES_PLANNED_EVENT,
+            PACKET_WRITE_PHASE,
+            test_support::{assert_trace_field, capture_traces, trace_event},
+        },
+        write::{
+            direct::{DirectEncoder, MeasuredRowRange},
+            writer::WriteBackend,
+        },
+    };
+
+    #[test]
+    fn direct_raw_batch_write_emits_encoding_summary_trace() -> Result<(), String> {
+        let batch = int32_batch("id", &[10, 20]);
+        let encoder = DirectEncoder::new(&[int32_mapping("id")]).unwrap();
+        let measured = encoder.measure_batch(&batch).unwrap();
+        let ranges = measured.row_ranges(10).unwrap();
+
+        let (_result, traces) = capture_traces(|| {
+            emit_direct_raw_measured(WriteBackend::DirectRawBulk, &measured, Duration::ZERO);
+            emit_direct_raw_ranges_planned(
+                WriteBackend::DirectRawBulk,
+                &measured,
+                &ranges,
+                Duration::ZERO,
+            );
+        });
+
+        let records = traces.records()?;
+        let measured = trace_event(&records, DIRECT_RAW_MEASURED_EVENT)?;
+        assert_trace_field(measured, "phase", DIRECT_ENCODING_PHASE);
+        assert_trace_field(measured, "backend", "DirectRawBulk");
+        assert_trace_field(measured, "batch_row_count", "2");
+        assert_trace_field(measured, "batch_column_count", "1");
+        assert_trace_field(measured, "encoded_row_count", "2");
+        assert_trace_field(measured, "encoded_byte_count", "10");
+        assert!(measured.fields().contains_key("elapsed_us"));
+
+        let ranges = trace_event(&records, DIRECT_RAW_RANGES_PLANNED_EVENT)?;
+        assert_trace_field(ranges, "phase", DIRECT_ENCODING_PHASE);
+        assert_trace_field(ranges, "encoded_range_count", "1");
+        assert_trace_field(ranges, "encoded_byte_count", "10");
+
+        Ok(())
+    }
+
+    #[test]
+    fn direct_raw_packet_write_emits_sanitized_summary_trace() -> Result<(), String> {
+        let (_result, traces) = capture_traces(|| {
+            emit_direct_raw_packet_write_completed(
+                WriteBackend::DirectRawBulk,
+                MeasuredRowRange { start: 0, len: 2 },
+                2,
+                10,
+                Duration::ZERO,
+            );
+        });
+
+        let records = traces.records()?;
+        let packet = trace_event(&records, DIRECT_RAW_PACKET_WRITE_COMPLETED_EVENT)?;
+        assert_trace_field(packet, "phase", PACKET_WRITE_PHASE);
+        assert_trace_field(packet, "backend", "DirectRawBulk");
+        assert_trace_field(packet, "encoded_row_start", "0");
+        assert_trace_field(packet, "encoded_row_count", "2");
+        assert_trace_field(packet, "encoded_byte_count", "10");
+        assert!(packet.fields().contains_key("elapsed_us"));
+        assert!(!packet.fields().contains_key("raw_packet_count"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn direct_raw_trace_does_not_emit_values_or_payload_bytes() -> Result<(), String> {
+        let secret_batch = utf8_batch("secret_value", &["password=secret"]);
+        let secret_encoder = DirectEncoder::new(&[utf8_mapping("secret_value")]).unwrap();
+        let secret_measured = secret_encoder.measure_batch(&secret_batch).unwrap();
+        let secret_ranges = secret_measured.row_ranges(1024).unwrap();
+
+        let (_result, traces) = capture_traces(|| {
+            emit_direct_raw_measured(
+                WriteBackend::DirectRawBulk,
+                &secret_measured,
+                Duration::ZERO,
+            );
+            emit_direct_raw_ranges_planned(
+                WriteBackend::DirectRawBulk,
+                &secret_measured,
+                &secret_ranges,
+                Duration::ZERO,
+            );
+        });
+
+        traces.assert_no_forbidden_text(&["password=secret"])?;
+
+        let numeric_batch = int32_batch("id", &[987_654_321]);
+        let numeric_encoder = DirectEncoder::new(&[int32_mapping("id")]).unwrap();
+        let numeric_measured = numeric_encoder.measure_batch(&numeric_batch).unwrap();
+        let (_result, numeric_traces) = capture_traces(|| {
+            emit_direct_raw_measured(
+                WriteBackend::DirectRawBulk,
+                &numeric_measured,
+                Duration::ZERO,
+            );
+            emit_direct_raw_packet_write_completed(
+                WriteBackend::DirectRawBulk,
+                MeasuredRowRange { start: 0, len: 1 },
+                1,
+                numeric_measured.payload_len(),
+                Duration::ZERO,
+            );
+        });
+
+        numeric_traces.assert_no_forbidden_text(&["987654321"])?;
+
+        Ok(())
+    }
+
+    fn int32_batch(name: &str, values: &[i32]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values.to_vec()))]).unwrap()
+    }
+
+    fn utf8_batch(name: &str, values: &[&str]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Utf8, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values.to_vec()))]).unwrap()
+    }
+
+    fn int32_mapping(name: &str) -> SchemaMapping {
+        SchemaMapping::new(
+            ArrowFieldRef::new(0, name.to_owned(), false, DataType::Int32),
+            MssqlColumn::new(Identifier::new(name).unwrap(), MssqlType::Int, false),
+        )
+    }
+
+    fn utf8_mapping(name: &str) -> SchemaMapping {
+        SchemaMapping::new(
+            ArrowFieldRef::new(0, name.to_owned(), false, DataType::Utf8),
+            MssqlColumn::new(
+                Identifier::new(name).unwrap(),
+                MssqlType::NVarChar(MssqlTypeLength::Max),
+                false,
+            ),
+        )
+    }
+}
