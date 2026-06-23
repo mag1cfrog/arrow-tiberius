@@ -1,5 +1,12 @@
 //! Crate-owned tracing names and test capture helpers.
 
+use std::{fmt::Write as _, time::Duration};
+
+use crate::DiagnosticSet;
+
+pub(crate) mod schema;
+pub(crate) mod writer;
+
 /// Crate-level tracing target used by `arrow-tiberius` instrumentation.
 pub(crate) const TRACE_TARGET: &str = "arrow_tiberius";
 
@@ -55,9 +62,11 @@ pub(crate) const TARGET_METADATA_VALIDATION_FAILED_EVENT: &str =
 pub(crate) const BATCH_WRITE_PHASE: &str = "batch_write";
 
 /// Stable phase name for batch schema validation telemetry.
+#[cfg(test)]
 pub(crate) const BATCH_SCHEMA_VALIDATION_PHASE: &str = "batch_schema_validation";
 
 /// Stable phase name for batch value conversion telemetry.
+#[cfg(test)]
 pub(crate) const VALUE_CONVERSION_PHASE: &str = "value_conversion";
 
 /// Stable phase name for direct encoding telemetry.
@@ -109,6 +118,44 @@ pub(crate) const FINISH_COMPLETED_EVENT: &str = "arrow_tiberius.finish.completed
 /// Stable event marker emitted when writer finish fails during finalization.
 pub(crate) const FINISH_FAILED_EVENT: &str = "arrow_tiberius.finish.failed";
 
+pub(crate) fn duration_micros_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+pub(crate) fn usize_to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+pub(crate) fn diagnostic_codes(diagnostics: &DiagnosticSet) -> String {
+    let mut codes = String::new();
+    for diagnostic in diagnostics.all() {
+        append_debug_name(&mut codes, diagnostic.code());
+    }
+    codes
+}
+
+pub(crate) fn append_debug_name<T: std::fmt::Debug>(target: &mut String, value: T) {
+    if !target.is_empty() {
+        target.push(',');
+    }
+    let _ = write!(target, "{value:?}");
+}
+
+pub(crate) fn append_text(target: &mut String, value: &str) {
+    if !target.is_empty() {
+        target.push(',');
+    }
+    target.push_str(value);
+}
+
+pub(crate) fn append_unique_text(target: &mut String, value: &str) {
+    if target.split(',').any(|existing| existing == value) {
+        return;
+    }
+
+    append_text(target, value);
+}
+
 /// Test-only span name used to prove tracing capture support.
 #[cfg(test)]
 pub(crate) const TEST_CAPTURE_SPAN: &str = "arrow_tiberius.test_capture";
@@ -129,6 +176,7 @@ pub(crate) fn emit_test_capture_smoke_event() {
 
     tracing::info!(
         target: TRACE_TARGET,
+        telemetry_event = TEST_CAPTURE_EVENT,
         phase = "test_capture",
         smoke_count = 1_u64,
         smoke_label = "foundation",
@@ -259,23 +307,58 @@ pub(crate) mod test_support {
         }
     }
 
-    /// Runs a closure with a scoped tracing subscriber and returns captured records.
-    pub(crate) fn capture_traces<R>(operation: impl FnOnce() -> R) -> (R, CapturedTraces) {
+    /// Runs a closure while no other scoped tracing capture helper is active.
+    pub(crate) fn with_trace_capture_lock<R>(operation: impl FnOnce() -> R) -> R {
         let _capture_guard = match CAPTURE_LOCK.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let records = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = Registry::default().with(CaptureLayer {
-            records: Arc::clone(&records),
-        });
-        let result = tracing::subscriber::with_default(subscriber, || {
-            tracing::callsite::rebuild_interest_cache();
-            operation()
-        });
+        tracing::callsite::rebuild_interest_cache();
+        let result = operation();
         tracing::callsite::rebuild_interest_cache();
 
-        (result, CapturedTraces { records })
+        result
+    }
+
+    /// Runs a closure with a scoped tracing subscriber and returns captured records.
+    pub(crate) fn capture_traces<R>(operation: impl FnOnce() -> R) -> (R, CapturedTraces) {
+        with_trace_capture_lock(|| {
+            let records = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = Registry::default().with(CaptureLayer {
+                records: Arc::clone(&records),
+            });
+            let result = tracing::subscriber::with_default(subscriber, || {
+                tracing::callsite::rebuild_interest_cache();
+                operation()
+            });
+            tracing::callsite::rebuild_interest_cache();
+
+            (result, CapturedTraces { records })
+        })
+    }
+
+    pub(crate) fn trace_event<'a>(
+        records: &'a [CapturedTrace],
+        telemetry_event: &str,
+    ) -> Result<&'a CapturedTrace, String> {
+        records
+            .iter()
+            .find(|record| {
+                record.kind() == CapturedTraceKind::Event
+                    && record
+                        .fields()
+                        .get("telemetry_event")
+                        .is_some_and(|value| value == telemetry_event)
+            })
+            .ok_or_else(|| format!("missing trace event {telemetry_event}: {records:#?}"))
+    }
+
+    pub(crate) fn assert_trace_field(record: &CapturedTrace, field: &str, expected: &str) {
+        assert_eq!(
+            record.fields().get(field).map(String::as_str),
+            Some(expected),
+            "trace record: {record:#?}"
+        );
     }
 
     struct CaptureLayer {
@@ -370,7 +453,10 @@ mod tests {
 
     use super::{
         TEST_CAPTURE_EVENT, TEST_CAPTURE_SPAN, TRACE_TARGET, emit_test_capture_smoke_event,
-        test_support::{CapturedTraceKind, capture_traces},
+        test_support::{
+            CapturedTraceKind, assert_trace_field, capture_traces, trace_event,
+            with_trace_capture_lock,
+        },
     };
 
     #[test]
@@ -390,32 +476,24 @@ mod tests {
         });
         assert!(has_span, "captured records: {records:#?}");
 
-        let has_event = records.iter().any(|record| {
-            record.kind() == CapturedTraceKind::Event
-                && record.target() == TRACE_TARGET
-                && record.level() == Level::INFO
-                && record.span_name() == Some(TEST_CAPTURE_SPAN)
-                && record
-                    .fields()
-                    .get("message")
-                    .is_some_and(|value| value.contains(TEST_CAPTURE_EVENT))
-                && record
-                    .fields()
-                    .get("smoke_count")
-                    .is_some_and(|value| value == "1")
-                && record
-                    .fields()
-                    .get("smoke_label")
-                    .is_some_and(|value| value == "foundation")
-        });
-        assert!(has_event, "captured records: {records:#?}");
+        let event = trace_event(&records, TEST_CAPTURE_EVENT)?;
+        assert_eq!(event.target(), TRACE_TARGET, "trace record: {event:#?}");
+        assert_eq!(event.level(), Level::INFO, "trace record: {event:#?}");
+        assert_eq!(
+            event.span_name(),
+            Some(TEST_CAPTURE_SPAN),
+            "trace record: {event:#?}"
+        );
+        assert_trace_field(event, "message", TEST_CAPTURE_EVENT);
+        assert_trace_field(event, "smoke_count", "1");
+        assert_trace_field(event, "smoke_label", "foundation");
 
         Ok(())
     }
 
     #[test]
     fn smoke_event_runs_without_subscriber() {
-        emit_test_capture_smoke_event();
+        with_trace_capture_lock(emit_test_capture_smoke_event);
     }
 
     #[test]

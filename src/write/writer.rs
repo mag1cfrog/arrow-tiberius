@@ -1,25 +1,13 @@
 //! Baseline bulk writer public API skeleton.
 
-use std::{
-    borrow::Cow,
-    fmt::Write as _,
-    time::{Duration, Instant},
-};
+use std::borrow::Cow;
 
 use arrow_array::RecordBatch;
 use futures_util::io::{AsyncRead, AsyncWrite};
 
 use crate::observability::{
-    BATCH_SCHEMA_VALIDATION_PHASE, BATCH_WRITE_COMPLETED_EVENT, BATCH_WRITE_FAILED_EVENT,
-    BATCH_WRITE_PHASE, BATCH_WRITE_SPAN, BATCH_WRITE_STARTED_EVENT, DIRECT_ENCODING_PHASE,
-    DIRECT_RAW_FAILED_EVENT, DIRECT_RAW_MEASURED_EVENT, DIRECT_RAW_PACKET_WRITE_COMPLETED_EVENT,
-    DIRECT_RAW_RANGES_PLANNED_EVENT, FINALIZE_PHASE, FINISH_COMPLETED_EVENT, FINISH_FAILED_EVENT,
-    FINISH_PHASE, FINISH_SPAN, FINISH_STARTED_EVENT, PACKET_WRITE_PHASE,
-    TARGET_METADATA_VALIDATION_COMPLETED_EVENT, TARGET_METADATA_VALIDATION_FAILED_EVENT,
-    TARGET_METADATA_VALIDATION_PHASE, TARGET_METADATA_VALIDATION_STARTED_EVENT, TRACE_TARGET,
-    VALUE_CONVERSION_PHASE, WRITER_INITIALIZATION_COMPLETED_EVENT,
-    WRITER_INITIALIZATION_FAILED_EVENT, WRITER_INITIALIZATION_PHASE, WRITER_INITIALIZATION_SPAN,
-    WRITER_INITIALIZATION_STARTED_EVENT,
+    DIRECT_ENCODING_PHASE, TARGET_METADATA_VALIDATION_PHASE, WRITER_INITIALIZATION_PHASE,
+    writer::{BatchWriteTrace, DirectRawBatchObserver, FinishTrace, WriterInitializationTrace},
 };
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, PlanOptions, Result, SchemaMapping,
@@ -75,343 +63,6 @@ pub struct WriteStats {
     pub rows_written: u64,
     /// Number of batches accepted by the writer.
     pub batches_written: u64,
-}
-
-#[derive(Debug)]
-struct WriterInitializationTrace {
-    span: tracing::Span,
-    started: Instant,
-    requested_backend: WriteBackend,
-    resolved_backend: Option<WriteBackend>,
-    target_schema: String,
-    target_table: String,
-    planned_column_count: usize,
-    direct_target_validation_required: Option<bool>,
-}
-
-impl WriterInitializationTrace {
-    fn new(
-        table: &TableName,
-        requested_backend: WriteBackend,
-        planned_column_count: usize,
-    ) -> Self {
-        let target_schema = table
-            .schema()
-            .map(|schema| schema.as_str().to_owned())
-            .unwrap_or_default();
-        let target_table = table.table().as_str().to_owned();
-        let span = tracing::info_span!(
-            target: TRACE_TARGET,
-            WRITER_INITIALIZATION_SPAN,
-            phase = WRITER_INITIALIZATION_PHASE,
-            requested_backend = backend_trace_name(requested_backend),
-            resolved_backend = tracing::field::Empty,
-            target_schema = target_schema.as_str(),
-            target_table = target_table.as_str(),
-            planned_column_count = usize_to_u64_saturating(planned_column_count),
-            direct_target_validation_required = tracing::field::Empty,
-        );
-
-        Self {
-            span,
-            started: Instant::now(),
-            requested_backend,
-            resolved_backend: None,
-            target_schema,
-            target_table,
-            planned_column_count,
-            direct_target_validation_required: None,
-        }
-    }
-
-    fn emit_started(&self) {
-        let _span_guard = self.span.enter();
-        tracing::info!(
-            target: TRACE_TARGET,
-            phase = WRITER_INITIALIZATION_PHASE,
-            telemetry_event = WRITER_INITIALIZATION_STARTED_EVENT,
-            requested_backend = backend_trace_name(self.requested_backend),
-            target_schema = self.target_schema.as_str(),
-            target_table = self.target_table.as_str(),
-            planned_column_count = usize_to_u64_saturating(self.planned_column_count),
-            initialization_result = "started"
-        );
-    }
-
-    fn record_resolved_backend(&mut self, resolved_backend: WriteBackend) {
-        self.span
-            .record("resolved_backend", backend_trace_name(resolved_backend));
-        self.resolved_backend = Some(resolved_backend);
-    }
-
-    fn record_direct_target_validation_required(&mut self, required: bool) {
-        self.span
-            .record("direct_target_validation_required", required);
-        self.direct_target_validation_required = Some(required);
-    }
-
-    fn emit_target_metadata_validation_started(&self) {
-        let _span_guard = self.span.enter();
-        tracing::info!(
-            target: TRACE_TARGET,
-            phase = TARGET_METADATA_VALIDATION_PHASE,
-            telemetry_event = TARGET_METADATA_VALIDATION_STARTED_EVENT,
-            requested_backend = backend_trace_name(self.requested_backend),
-            resolved_backend = self.resolved_backend_name(),
-            target_schema = self.target_schema.as_str(),
-            target_table = self.target_table.as_str(),
-            planned_column_count = usize_to_u64_saturating(self.planned_column_count),
-            direct_target_validation_required = self.direct_target_validation_required(),
-            initialization_result = "validating"
-        );
-    }
-
-    fn emit_target_metadata_validation_completed(&self) {
-        let _span_guard = self.span.enter();
-        tracing::info!(
-            target: TRACE_TARGET,
-            phase = TARGET_METADATA_VALIDATION_PHASE,
-            telemetry_event = TARGET_METADATA_VALIDATION_COMPLETED_EVENT,
-            requested_backend = backend_trace_name(self.requested_backend),
-            resolved_backend = self.resolved_backend_name(),
-            target_schema = self.target_schema.as_str(),
-            target_table = self.target_table.as_str(),
-            planned_column_count = usize_to_u64_saturating(self.planned_column_count),
-            direct_target_validation_required = self.direct_target_validation_required(),
-            initialization_result = "success",
-            elapsed_us = duration_micros_u64(self.started.elapsed())
-        );
-    }
-
-    fn emit_completed(&self) {
-        let _span_guard = self.span.enter();
-        tracing::info!(
-            target: TRACE_TARGET,
-            phase = WRITER_INITIALIZATION_PHASE,
-            telemetry_event = WRITER_INITIALIZATION_COMPLETED_EVENT,
-            requested_backend = backend_trace_name(self.requested_backend),
-            resolved_backend = self.resolved_backend_name(),
-            target_schema = self.target_schema.as_str(),
-            target_table = self.target_table.as_str(),
-            planned_column_count = usize_to_u64_saturating(self.planned_column_count),
-            direct_target_validation_required = self.direct_target_validation_required(),
-            initialization_result = "success",
-            elapsed_us = duration_micros_u64(self.started.elapsed())
-        );
-    }
-
-    fn emit_failed(&self, phase: &'static str, error: &crate::Error) {
-        let telemetry_event = if phase == TARGET_METADATA_VALIDATION_PHASE {
-            TARGET_METADATA_VALIDATION_FAILED_EVENT
-        } else {
-            WRITER_INITIALIZATION_FAILED_EVENT
-        };
-        let diagnostic_codes = diagnostic_codes_for_error(error);
-        let _span_guard = self.span.enter();
-        tracing::error!(
-            target: TRACE_TARGET,
-            phase,
-            telemetry_event,
-            requested_backend = backend_trace_name(self.requested_backend),
-            resolved_backend = self.resolved_backend_name(),
-            target_schema = self.target_schema.as_str(),
-            target_table = self.target_table.as_str(),
-            planned_column_count = usize_to_u64_saturating(self.planned_column_count),
-            direct_target_validation_required = self.direct_target_validation_required(),
-            initialization_result = "failure",
-            error_summary = sanitized_error_summary(error),
-            diagnostic_codes = diagnostic_codes.as_str(),
-            elapsed_us = duration_micros_u64(self.started.elapsed())
-        );
-    }
-
-    fn resolved_backend_name(&self) -> &'static str {
-        self.resolved_backend
-            .map(backend_trace_name)
-            .unwrap_or("unresolved")
-    }
-
-    fn direct_target_validation_required(&self) -> bool {
-        self.direct_target_validation_required.unwrap_or(false)
-    }
-}
-
-#[derive(Debug)]
-struct BatchWriteTrace {
-    span: tracing::Span,
-    started: Instant,
-    backend: WriteBackend,
-    attempted_batch_ordinal: u64,
-    batch_row_count: u64,
-    batch_column_count: u64,
-    batch_is_empty: bool,
-    accepted_rows_before: u64,
-    accepted_batches_before: u64,
-}
-
-impl BatchWriteTrace {
-    fn new(state: &WriterState, batch: &RecordBatch) -> Self {
-        let stats = state.stats();
-        let attempted_batch_ordinal = stats.batches_written.saturating_add(1);
-        let batch_row_count = usize_to_u64_saturating(batch.num_rows());
-        let batch_column_count = usize_to_u64_saturating(batch.num_columns());
-        let batch_is_empty = batch.num_rows() == 0;
-        let span = tracing::info_span!(
-            target: TRACE_TARGET,
-            BATCH_WRITE_SPAN,
-            phase = BATCH_WRITE_PHASE,
-            backend = backend_trace_name(state.backend()),
-            attempted_batch_ordinal,
-            batch_row_count,
-            batch_column_count,
-            batch_is_empty,
-            accepted_rows_before = stats.rows_written,
-            accepted_batches_before = stats.batches_written,
-        );
-
-        Self {
-            span,
-            started: Instant::now(),
-            backend: state.backend(),
-            attempted_batch_ordinal,
-            batch_row_count,
-            batch_column_count,
-            batch_is_empty,
-            accepted_rows_before: stats.rows_written,
-            accepted_batches_before: stats.batches_written,
-        }
-    }
-
-    fn emit_started(&self) {
-        let _span_guard = self.span.enter();
-        tracing::info!(
-            target: TRACE_TARGET,
-            phase = BATCH_WRITE_PHASE,
-            telemetry_event = BATCH_WRITE_STARTED_EVENT,
-            backend = backend_trace_name(self.backend),
-            attempted_batch_ordinal = self.attempted_batch_ordinal,
-            batch_row_count = self.batch_row_count,
-            batch_column_count = self.batch_column_count,
-            batch_is_empty = self.batch_is_empty,
-            accepted_rows_before = self.accepted_rows_before,
-            accepted_batches_before = self.accepted_batches_before,
-            batch_write_result = "started"
-        );
-    }
-
-    fn emit_completed(&self, stats: WriteStats) {
-        let _span_guard = self.span.enter();
-        tracing::info!(
-            target: TRACE_TARGET,
-            phase = BATCH_WRITE_PHASE,
-            telemetry_event = BATCH_WRITE_COMPLETED_EVENT,
-            backend = backend_trace_name(self.backend),
-            attempted_batch_ordinal = self.attempted_batch_ordinal,
-            batch_row_count = self.batch_row_count,
-            batch_column_count = self.batch_column_count,
-            batch_is_empty = self.batch_is_empty,
-            accepted_rows_before = self.accepted_rows_before,
-            accepted_batches_before = self.accepted_batches_before,
-            accepted_rows_after = stats.rows_written,
-            accepted_batches_after = stats.batches_written,
-            batch_write_result = "success",
-            elapsed_us = duration_micros_u64(self.started.elapsed())
-        );
-    }
-
-    fn emit_failed(&self, phase: &'static str, error: &crate::Error) {
-        let diagnostic_codes = diagnostic_codes_for_error(error);
-        let _span_guard = self.span.enter();
-        tracing::error!(
-            target: TRACE_TARGET,
-            phase,
-            telemetry_event = BATCH_WRITE_FAILED_EVENT,
-            backend = backend_trace_name(self.backend),
-            attempted_batch_ordinal = self.attempted_batch_ordinal,
-            batch_row_count = self.batch_row_count,
-            batch_column_count = self.batch_column_count,
-            batch_is_empty = self.batch_is_empty,
-            accepted_rows_before = self.accepted_rows_before,
-            accepted_batches_before = self.accepted_batches_before,
-            batch_write_result = "failure",
-            error_summary = sanitized_error_summary(error),
-            diagnostic_codes = diagnostic_codes.as_str(),
-            elapsed_us = duration_micros_u64(self.started.elapsed())
-        );
-    }
-}
-
-#[derive(Debug)]
-struct FinishTrace {
-    span: tracing::Span,
-    started: Instant,
-    backend: WriteBackend,
-    stats: WriteStats,
-}
-
-impl FinishTrace {
-    fn new(state: &WriterState) -> Self {
-        let stats = state.stats();
-        let span = tracing::info_span!(
-            target: TRACE_TARGET,
-            FINISH_SPAN,
-            phase = FINISH_PHASE,
-            backend = backend_trace_name(state.backend()),
-            rows_written = stats.rows_written,
-            batches_written = stats.batches_written,
-        );
-
-        Self {
-            span,
-            started: Instant::now(),
-            backend: state.backend(),
-            stats,
-        }
-    }
-
-    fn emit_started(&self) {
-        let _span_guard = self.span.enter();
-        tracing::info!(
-            target: TRACE_TARGET,
-            phase = FINISH_PHASE,
-            telemetry_event = FINISH_STARTED_EVENT,
-            backend = backend_trace_name(self.backend),
-            rows_written = self.stats.rows_written,
-            batches_written = self.stats.batches_written,
-            finish_result = "started"
-        );
-    }
-
-    fn emit_completed(&self) {
-        let _span_guard = self.span.enter();
-        tracing::info!(
-            target: TRACE_TARGET,
-            phase = FINISH_PHASE,
-            telemetry_event = FINISH_COMPLETED_EVENT,
-            backend = backend_trace_name(self.backend),
-            rows_written = self.stats.rows_written,
-            batches_written = self.stats.batches_written,
-            finish_result = "success",
-            elapsed_us = duration_micros_u64(self.started.elapsed())
-        );
-    }
-
-    fn emit_failed(&self, error: &crate::Error) {
-        let diagnostic_codes = diagnostic_codes_for_error(error);
-        let _span_guard = self.span.enter();
-        tracing::error!(
-            target: TRACE_TARGET,
-            phase = FINALIZE_PHASE,
-            telemetry_event = FINISH_FAILED_EVENT,
-            backend = backend_trace_name(self.backend),
-            accepted_rows_before = self.stats.rows_written,
-            accepted_batches_before = self.stats.batches_written,
-            finish_result = "failure",
-            error_summary = sanitized_error_summary(error),
-            diagnostic_codes = diagnostic_codes.as_str(),
-            elapsed_us = duration_micros_u64(self.started.elapsed())
-        );
-    }
 }
 
 #[derive(Debug)]
@@ -600,10 +251,10 @@ where
     pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteStats> {
         match self.state.backend() {
             WriteBackend::BaselineTokenRow => {
-                write_batch_to_sink(&mut self.state, &mut self.request, batch).await
+                write_traced_batch_to_sink(&mut self.state, &mut self.request, batch).await
             }
             WriteBackend::DirectFramedBulk | WriteBackend::DirectRawBulk => {
-                write_direct_batch_to_sink(&mut self.state, &mut self.request, batch).await
+                write_traced_direct_batch_to_sink(&mut self.state, &mut self.request, batch).await
             }
             WriteBackend::Auto => Err(execution_unavailable(WriteBackend::Auto)),
         }
@@ -620,7 +271,7 @@ async fn finish_writer_to_sink<Sink>(state: WriterState, sink: Sink) -> Result<W
 where
     Sink: FinishSink,
 {
-    let trace = FinishTrace::new(&state);
+    let trace = FinishTrace::new(state.backend(), state.stats());
     trace.emit_started();
     let stats = state.stats();
 
@@ -1025,6 +676,7 @@ impl BulkTargetColumnMetadata for tiberius::BulkLoadColumn<'_> {
     }
 }
 
+/// Writes one baseline token-row batch without crate-owned batch lifecycle traces.
 async fn write_batch_to_sink<Sink>(
     state: &mut WriterState,
     sink: &mut Sink,
@@ -1033,9 +685,6 @@ async fn write_batch_to_sink<Sink>(
 where
     Sink: TokenRowSink,
 {
-    let trace = BatchWriteTrace::new(state, batch);
-    trace.emit_started();
-
     let view = match record_batch_view(
         batch,
         state.mappings(),
@@ -1043,13 +692,9 @@ where
         state.plan_options(),
     ) {
         Ok(view) => view,
-        Err(err) => {
-            trace.emit_failed(BATCH_SCHEMA_VALIDATION_PHASE, &err);
-            return Err(err.with_write_phase(WritePhase::BatchSchemaValidation));
-        }
+        Err(err) => return Err(err.with_write_phase(WritePhase::BatchSchemaValidation)),
     };
     if let Err(err) = validate_batch_rows(&view) {
-        trace.emit_failed(VALUE_CONVERSION_PHASE, &err);
         return Err(err.with_write_phase(WritePhase::ValueConversion));
     }
     let rows_written = usize_to_u64_saturating(view.row_count());
@@ -1057,20 +702,30 @@ where
     for row_index in 0..view.row_count() {
         let row = match tiberius_row_owned(&view, row_index) {
             Ok(row) => row,
-            Err(err) => {
-                trace.emit_failed(VALUE_CONVERSION_PHASE, &err);
-                return Err(err.with_write_phase(WritePhase::ValueConversion));
-            }
+            Err(err) => return Err(err.with_write_phase(WritePhase::ValueConversion)),
         };
         if let Err(err) = sink.send_token_row(row).await {
-            trace.emit_failed(PACKET_WRITE_PHASE, &err);
             return Err(err.with_write_phase(WritePhase::PacketWrite));
         }
     }
 
     let stats = state.record_accepted_batch(rows_written);
-    trace.emit_completed(stats);
     Ok(stats)
+}
+
+/// Adds the crate-owned batch lifecycle span around the baseline token-row write path.
+async fn write_traced_batch_to_sink<Sink>(
+    state: &mut WriterState,
+    sink: &mut Sink,
+    batch: &RecordBatch,
+) -> Result<WriteStats>
+where
+    Sink: TokenRowSink,
+{
+    let trace = BatchWriteTrace::new(state.backend(), state.stats(), batch);
+    trace
+        .trace_result(write_batch_to_sink(state, sink, batch))
+        .await
 }
 
 trait TokenRowSink {
@@ -1088,6 +743,8 @@ where
     }
 }
 
+/// Test-only direct write entry point with direct raw detail telemetry disabled.
+#[cfg(test)]
 async fn write_direct_batch_to_sink<Sink>(
     state: &mut WriterState,
     sink: &mut Sink,
@@ -1096,21 +753,52 @@ async fn write_direct_batch_to_sink<Sink>(
 where
     Sink: RawRowsSink,
 {
-    let trace = BatchWriteTrace::new(state, batch);
-    trace.emit_started();
+    write_direct_batch_to_sink_with_observer(state, sink, batch, DirectRawBatchObserver::disabled())
+        .await
+}
 
-    let encoder = match state
+/// Adds the crate-owned batch lifecycle span and direct raw detail telemetry.
+async fn write_traced_direct_batch_to_sink<Sink>(
+    state: &mut WriterState,
+    sink: &mut Sink,
+    batch: &RecordBatch,
+) -> Result<WriteStats>
+where
+    Sink: RawRowsSink,
+{
+    let trace = BatchWriteTrace::new(state.backend(), state.stats(), batch);
+    let direct_observer = DirectRawBatchObserver::enabled(state.backend());
+    trace
+        .trace_result(write_direct_batch_to_sink_with_observer(
+            state,
+            sink,
+            batch,
+            direct_observer,
+        ))
+        .await
+}
+
+/// Shared direct write implementation.
+///
+/// The `direct_observer` records direct raw detail events when enabled. Batch
+/// lifecycle tracing is owned by `write_traced_direct_batch_to_sink`.
+async fn write_direct_batch_to_sink_with_observer<Sink>(
+    state: &mut WriterState,
+    sink: &mut Sink,
+    batch: &RecordBatch,
+    direct_observer: DirectRawBatchObserver,
+) -> Result<WriteStats>
+where
+    Sink: RawRowsSink,
+{
+    let encoder = state
         .direct_encoder()
         .ok_or_else(|| crate::Error::BackendUnavailable {
             backend: state.backend(),
             reason: "direct bulk encoder is not available for this writer".to_owned(),
-        }) {
-        Ok(encoder) => encoder,
-        Err(err) => {
-            trace.emit_failed(DIRECT_ENCODING_PHASE, &err);
-            return Err(err.with_write_phase(WritePhase::DirectEncoding));
-        }
-    };
+        })
+        .map_err(|err| err.with_write_phase(WritePhase::DirectEncoding))?;
+
     let measure_start = std::time::Instant::now();
     let measured = encoder.measure_batch(batch);
     let measured =
@@ -1118,12 +806,11 @@ where
             Ok(measured) => measured,
             Err(err) => {
                 let phase = write_phase_for_batch_error(&err);
-                trace.emit_failed(phase.as_str(), &err);
-                emit_direct_raw_failed(state.backend(), phase.as_str(), batch, None, &err);
+                direct_observer.record_failed(phase.as_str(), batch, None, &err);
                 return Err(err.with_write_phase(phase));
             }
         };
-    emit_direct_raw_measured(state.backend(), &measured, measure_start.elapsed());
+    direct_observer.record_measured(&measured, measure_start.elapsed());
     let rows_written = usize_to_u64_saturating(measured.row_count());
 
     let split_start = std::time::Instant::now();
@@ -1132,39 +819,36 @@ where
     {
         Ok(ranges) => ranges,
         Err(err) => {
-            trace.emit_failed(DIRECT_ENCODING_PHASE, &err);
-            emit_direct_raw_failed(state.backend(), DIRECT_ENCODING_PHASE, batch, None, &err);
+            direct_observer.record_failed(DIRECT_ENCODING_PHASE, batch, None, &err);
             return Err(err.with_write_phase(WritePhase::DirectEncoding));
         }
     };
-    emit_direct_raw_ranges_planned(state.backend(), &measured, &ranges, split_start.elapsed());
+    direct_observer.record_ranges_planned(&measured, &ranges, split_start.elapsed());
 
     for range in ranges {
         if let Err(err) = sink
-            .send_measured_raw_rows(state.backend(), encoder, batch, &measured, range)
+            .send_measured_raw_rows(encoder, batch, &measured, range, direct_observer)
             .await
         {
             let phase = write_phase_for_batch_error(&err);
-            trace.emit_failed(phase.as_str(), &err);
-            emit_direct_raw_failed(state.backend(), phase.as_str(), batch, Some(range), &err);
+            direct_observer.record_failed(phase.as_str(), batch, Some(range), &err);
             return Err(err.with_write_phase(phase));
         }
     }
 
     profile::record_accepted_batch(measured.row_count());
     let stats = state.record_accepted_batch(rows_written);
-    trace.emit_completed(stats);
     Ok(stats)
 }
 
 trait RawRowsSink {
     async fn send_measured_raw_rows(
         &mut self,
-        backend: WriteBackend,
         encoder: &DirectEncoder,
         batch: &RecordBatch,
         measured: &MeasuredDirectBatch,
         range: MeasuredRowRange,
+        direct_observer: DirectRawBatchObserver,
     ) -> Result<()>;
 }
 
@@ -1174,11 +858,11 @@ where
 {
     async fn send_measured_raw_rows(
         &mut self,
-        backend: WriteBackend,
         encoder: &DirectEncoder,
         batch: &RecordBatch,
         measured: &MeasuredDirectBatch,
         range: MeasuredRowRange,
+        direct_observer: DirectRawBatchObserver,
     ) -> Result<()> {
         let encoded_bytes = measured.range_payload_len(range.start, range.len)?;
         profile::record_row_range(encoded_bytes);
@@ -1196,8 +880,7 @@ where
                 .map_err(|source| crate::Error::Tiberius { source });
             profile::record_send_total(send_start.elapsed());
             if send_result.is_ok() {
-                emit_direct_raw_packet_write_completed(
-                    backend,
+                direct_observer.record_packet_write_completed(
                     range,
                     payload.row_count(),
                     payload.bytes().len(),
@@ -1240,8 +923,7 @@ where
 
         let send_result = send_result.map_err(|source| crate::Error::Tiberius { source });
         if send_result.is_ok() {
-            emit_direct_raw_packet_write_completed(
-                backend,
+            direct_observer.record_packet_write_completed(
                 range,
                 range.len,
                 encoded_bytes,
@@ -1251,106 +933,6 @@ where
 
         send_result
     }
-}
-
-fn emit_direct_raw_measured(
-    backend: WriteBackend,
-    measured: &MeasuredDirectBatch,
-    elapsed: Duration,
-) {
-    if backend != WriteBackend::DirectRawBulk {
-        return;
-    }
-
-    tracing::debug!(
-        target: TRACE_TARGET,
-        phase = DIRECT_ENCODING_PHASE,
-        telemetry_event = DIRECT_RAW_MEASURED_EVENT,
-        backend = backend_trace_name(backend),
-        batch_row_count = usize_to_u64_saturating(measured.row_count()),
-        batch_column_count = usize_to_u64_saturating(measured.column_count()),
-        encoded_row_count = usize_to_u64_saturating(measured.row_count()),
-        encoded_byte_count = usize_to_u64_saturating(measured.payload_len()),
-        elapsed_us = duration_micros_u64(elapsed)
-    );
-}
-
-fn emit_direct_raw_ranges_planned(
-    backend: WriteBackend,
-    measured: &MeasuredDirectBatch,
-    ranges: &[MeasuredRowRange],
-    elapsed: Duration,
-) {
-    if backend != WriteBackend::DirectRawBulk {
-        return;
-    }
-
-    tracing::debug!(
-        target: TRACE_TARGET,
-        phase = DIRECT_ENCODING_PHASE,
-        telemetry_event = DIRECT_RAW_RANGES_PLANNED_EVENT,
-        backend = backend_trace_name(backend),
-        batch_row_count = usize_to_u64_saturating(measured.row_count()),
-        batch_column_count = usize_to_u64_saturating(measured.column_count()),
-        encoded_byte_count = usize_to_u64_saturating(measured.payload_len()),
-        encoded_range_count = usize_to_u64_saturating(ranges.len()),
-        elapsed_us = duration_micros_u64(elapsed)
-    );
-}
-
-fn emit_direct_raw_packet_write_completed(
-    backend: WriteBackend,
-    range: MeasuredRowRange,
-    encoded_row_count: usize,
-    encoded_byte_count: usize,
-    elapsed: Duration,
-) {
-    if backend != WriteBackend::DirectRawBulk {
-        return;
-    }
-
-    // `tiberius-raw-bulk` does not expose raw packet counts on the normal
-    // write path. Emit safe range and byte summaries instead of guessing.
-    tracing::debug!(
-        target: TRACE_TARGET,
-        phase = PACKET_WRITE_PHASE,
-        telemetry_event = DIRECT_RAW_PACKET_WRITE_COMPLETED_EVENT,
-        backend = backend_trace_name(backend),
-        encoded_row_start = usize_to_u64_saturating(range.start),
-        encoded_row_count = usize_to_u64_saturating(encoded_row_count),
-        encoded_byte_count = usize_to_u64_saturating(encoded_byte_count),
-        elapsed_us = duration_micros_u64(elapsed)
-    );
-}
-
-fn emit_direct_raw_failed(
-    backend: WriteBackend,
-    phase: &'static str,
-    batch: &RecordBatch,
-    range: Option<MeasuredRowRange>,
-    error: &crate::Error,
-) {
-    if backend != WriteBackend::DirectRawBulk {
-        return;
-    }
-
-    let diagnostic_codes = diagnostic_codes_for_error(error);
-    tracing::error!(
-        target: TRACE_TARGET,
-        phase,
-        telemetry_event = DIRECT_RAW_FAILED_EVENT,
-        backend = backend_trace_name(backend),
-        batch_row_count = usize_to_u64_saturating(batch.num_rows()),
-        batch_column_count = usize_to_u64_saturating(batch.num_columns()),
-        encoded_row_start = range.map(|range| usize_to_u64_saturating(range.start)),
-        encoded_row_count = range.map(|range| usize_to_u64_saturating(range.len)),
-        diagnostic_codes = diagnostic_codes.as_str(),
-        error_summary = sanitized_error_summary(error)
-    );
-}
-
-fn usize_to_u64_saturating(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn resolve_backend(requested_backend: WriteBackend) -> Result<WriteBackend> {
@@ -1366,60 +948,6 @@ fn execution_unavailable(backend: WriteBackend) -> crate::Error {
         backend,
         reason: "bulk writer execution is not implemented yet".to_owned(),
     }
-}
-
-fn backend_trace_name(backend: WriteBackend) -> &'static str {
-    match backend {
-        WriteBackend::Auto => "Auto",
-        WriteBackend::BaselineTokenRow => "BaselineTokenRow",
-        WriteBackend::DirectFramedBulk => "DirectFramedBulk",
-        WriteBackend::DirectRawBulk => "DirectRawBulk",
-    }
-}
-
-fn sanitized_error_summary(error: &crate::Error) -> &'static str {
-    match error {
-        crate::Error::WritePhaseContext { source, .. } => sanitized_error_summary(source),
-        crate::Error::InvalidCompatibilityLevel { .. } => "invalid compatibility level",
-        crate::Error::InvalidIdentifier { .. } => "invalid identifier",
-        crate::Error::Planning { .. } => "planning failed with diagnostics",
-        crate::Error::ValueConversion { .. } => "value conversion failed with diagnostics",
-        crate::Error::DirectEncoding { .. } => "direct encoding failed with diagnostics",
-        crate::Error::BackendUnavailable { .. } => "write backend unavailable",
-        crate::Error::InvalidConnectionString => "invalid connection string",
-        crate::Error::ConnectionTcpConnect { .. } => "TCP connection failed",
-        crate::Error::ConnectionClientSetup { .. } => "SQL Server client setup failed",
-        crate::Error::TableExistsQuery { .. } => "table existence query failed",
-        crate::Error::TableExistsUnexpectedResult { .. } => {
-            "table existence query returned unexpected result"
-        }
-        crate::Error::SqlExecution { .. } => "SQL statement execution failed",
-        crate::Error::Tiberius { .. } => "tiberius operation failed",
-    }
-}
-
-fn diagnostic_codes_for_error(error: &crate::Error) -> String {
-    match error {
-        crate::Error::WritePhaseContext { source, .. } => diagnostic_codes_for_error(source),
-        crate::Error::Planning { diagnostics }
-        | crate::Error::ValueConversion { diagnostics }
-        | crate::Error::DirectEncoding { diagnostics } => diagnostic_codes(diagnostics),
-        crate::Error::BackendUnavailable { .. } => {
-            format!("{:?}", DiagnosticCode::BackendUnavailable)
-        }
-        _ => String::new(),
-    }
-}
-
-fn diagnostic_codes(diagnostics: &DiagnosticSet) -> String {
-    let mut codes = String::new();
-    for diagnostic in diagnostics.all() {
-        if !codes.is_empty() {
-            codes.push(',');
-        }
-        let _ = write!(codes, "{:?}", diagnostic.code());
-    }
-    codes
 }
 
 fn write_phase_for_batch_error(error: &crate::Error) -> WritePhase {
@@ -1442,8 +970,8 @@ fn write_phase_for_batch_error(error: &crate::Error) -> WritePhase {
     }
 }
 
-fn duration_micros_u64(duration: Duration) -> u64 {
-    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+fn usize_to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -1456,31 +984,18 @@ mod tests {
         task::{Context, Poll, Waker},
     };
 
-    use arrow_array::{
-        BinaryArray, Float64Array, Int32Array, RecordBatch, StringArray, UInt64Array,
-    };
+    use arrow_array::{BinaryArray, Float64Array, Int32Array, RecordBatch, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use futures_util::io::{AsyncRead, AsyncWrite};
 
     use super::{
-        BulkTargetColumnMetadata, DIRECT_RAW_MAX_PAYLOAD_BYTES, DirectEncoder, FinishSink,
-        MeasuredDirectBatch, MeasuredRowRange, RawRowsSink, TokenRowSink, WriteBackend,
-        WriteOptions, WriteStats, WriterInitializationTrace, WriterState, bulk_insert_table_sql,
-        emit_direct_raw_packet_write_completed, finish_writer_to_sink, record_batch_view,
-        resolve_backend, tiberius_row_owned, validate_batch_rows, validate_bulk_target_columns,
+        BulkTargetColumnMetadata, DIRECT_RAW_MAX_PAYLOAD_BYTES, DirectEncoder, MeasuredDirectBatch,
+        MeasuredRowRange, RawRowsSink, TokenRowSink, WriteBackend, WriteOptions, WriteStats,
+        WriterState, bulk_insert_table_sql, record_batch_view, resolve_backend, tiberius_row_owned,
+        validate_batch_rows, validate_bulk_target_columns,
         validate_direct_bulk_target_column_types, write_batch_to_sink, write_direct_batch_to_sink,
     };
-    use crate::observability::{
-        BATCH_SCHEMA_VALIDATION_PHASE, BATCH_WRITE_COMPLETED_EVENT, BATCH_WRITE_FAILED_EVENT,
-        BATCH_WRITE_PHASE, BATCH_WRITE_SPAN, DIRECT_ENCODING_PHASE, DIRECT_RAW_MEASURED_EVENT,
-        DIRECT_RAW_PACKET_WRITE_COMPLETED_EVENT, DIRECT_RAW_RANGES_PLANNED_EVENT, FINALIZE_PHASE,
-        FINISH_COMPLETED_EVENT, FINISH_FAILED_EVENT, FINISH_PHASE, FINISH_SPAN, PACKET_WRITE_PHASE,
-        TARGET_METADATA_VALIDATION_COMPLETED_EVENT, TARGET_METADATA_VALIDATION_FAILED_EVENT,
-        TARGET_METADATA_VALIDATION_PHASE, VALUE_CONVERSION_PHASE,
-        WRITER_INITIALIZATION_COMPLETED_EVENT, WRITER_INITIALIZATION_PHASE,
-        WRITER_INITIALIZATION_SPAN,
-        test_support::{CapturedTrace, CapturedTraceKind, capture_traces},
-    };
+    use crate::observability::writer::DirectRawBatchObserver;
     use crate::{
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, MssqlTypeLength,
         PlanOptions, SchemaCheck, SchemaMapping, TableName, WritePhase,
@@ -1558,198 +1073,6 @@ mod tests {
             resolve_backend(WriteBackend::DirectRawBulk).unwrap(),
             WriteBackend::DirectRawBulk
         );
-    }
-
-    #[test]
-    fn writer_initialization_trace_records_auto_backend_resolution() -> Result<(), String> {
-        let table = TableName::new("dbo", "target").unwrap();
-        let mappings = vec![mapping("id")];
-
-        let (state, traces) = capture_traces(|| {
-            let mut trace =
-                WriterInitializationTrace::new(&table, WriteBackend::Auto, mappings.len());
-            trace.emit_started();
-            let state = WriterState::new(
-                WriteBackend::Auto,
-                SchemaCheck::Strict,
-                PlanOptions::default(),
-                mappings,
-            )
-            .unwrap();
-            trace.record_resolved_backend(state.backend());
-            trace.record_direct_target_validation_required(true);
-            trace.emit_completed();
-            state
-        });
-
-        assert_eq!(state.backend(), WriteBackend::DirectRawBulk);
-        let records = traces.records()?;
-        let event = trace_event(&records, WRITER_INITIALIZATION_COMPLETED_EVENT)?;
-        assert_eq!(event.span_name(), Some(WRITER_INITIALIZATION_SPAN));
-        assert_trace_field(event, "phase", WRITER_INITIALIZATION_PHASE);
-        assert_trace_field(event, "requested_backend", "Auto");
-        assert_trace_field(event, "resolved_backend", "DirectRawBulk");
-        assert_trace_field(event, "target_schema", "dbo");
-        assert_trace_field(event, "target_table", "target");
-        assert_trace_field(event, "planned_column_count", "1");
-        assert_trace_field(event, "direct_target_validation_required", "true");
-        assert_trace_field(event, "initialization_result", "success");
-        assert!(event.fields().contains_key("elapsed_us"));
-
-        Ok(())
-    }
-
-    #[test]
-    fn writer_initialization_trace_records_explicit_backend_resolution() -> Result<(), String> {
-        for backend in [
-            WriteBackend::BaselineTokenRow,
-            WriteBackend::DirectFramedBulk,
-            WriteBackend::DirectRawBulk,
-        ] {
-            let table = TableName::new("dbo", "target").unwrap();
-            let mappings = vec![mapping("id")];
-            let (_state, traces) = capture_traces(|| {
-                let mut trace = WriterInitializationTrace::new(&table, backend, mappings.len());
-                trace.emit_started();
-                let state = WriterState::new(
-                    backend,
-                    SchemaCheck::Strict,
-                    PlanOptions::default(),
-                    mappings,
-                )
-                .unwrap();
-                trace.record_resolved_backend(state.backend());
-                trace.record_direct_target_validation_required(matches!(
-                    state.backend(),
-                    WriteBackend::DirectFramedBulk | WriteBackend::DirectRawBulk
-                ));
-                trace.emit_completed();
-                state
-            });
-
-            let records = traces.records()?;
-            let event = trace_event(&records, WRITER_INITIALIZATION_COMPLETED_EVENT)?;
-            let backend_name = match backend {
-                WriteBackend::BaselineTokenRow => "BaselineTokenRow",
-                WriteBackend::DirectFramedBulk => "DirectFramedBulk",
-                WriteBackend::DirectRawBulk => "DirectRawBulk",
-                WriteBackend::Auto => "Auto",
-            };
-            assert_trace_field(event, "requested_backend", backend_name);
-            assert_trace_field(event, "resolved_backend", backend_name);
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn target_metadata_validation_trace_records_direct_success() -> Result<(), String> {
-        let table = TableName::new("dbo", "target").unwrap();
-        let mappings = vec![mapping("id")];
-        let columns = vec![bulk_target_column_with_type(
-            0,
-            "id",
-            false,
-            tiberius::ColumnType::Int4,
-        )];
-
-        let (_state, traces) = capture_traces(|| {
-            let mut trace =
-                WriterInitializationTrace::new(&table, WriteBackend::DirectRawBulk, mappings.len());
-            let state = WriterState::new(
-                WriteBackend::DirectRawBulk,
-                SchemaCheck::Strict,
-                PlanOptions::default(),
-                mappings,
-            )
-            .unwrap();
-            trace.record_resolved_backend(state.backend());
-            trace.record_direct_target_validation_required(true);
-            trace.emit_target_metadata_validation_started();
-            validate_bulk_target_columns(columns.iter(), state.mappings()).unwrap();
-            validate_direct_bulk_target_column_types(
-                columns.iter(),
-                state.direct_encoder().unwrap().plan(),
-            )
-            .unwrap();
-            trace.emit_target_metadata_validation_completed();
-            state
-        });
-
-        let records = traces.records()?;
-        let event = trace_event(&records, TARGET_METADATA_VALIDATION_COMPLETED_EVENT)?;
-        assert_trace_field(event, "phase", TARGET_METADATA_VALIDATION_PHASE);
-        assert_trace_field(event, "requested_backend", "DirectRawBulk");
-        assert_trace_field(event, "resolved_backend", "DirectRawBulk");
-        assert_trace_field(event, "direct_target_validation_required", "true");
-        assert_trace_field(event, "initialization_result", "success");
-
-        Ok(())
-    }
-
-    #[test]
-    fn target_metadata_validation_failure_trace_is_sanitized() -> Result<(), String> {
-        let table = TableName::new("dbo", "target").unwrap();
-        let mappings = vec![mapping("id")];
-        let columns = vec![bulk_target_column_with_type(
-            0,
-            "id",
-            false,
-            tiberius::ColumnType::Int8,
-        )];
-
-        let (_err, traces) = capture_traces(|| {
-            let mut trace =
-                WriterInitializationTrace::new(&table, WriteBackend::DirectRawBulk, mappings.len());
-            let state = WriterState::new(
-                WriteBackend::DirectRawBulk,
-                SchemaCheck::Strict,
-                PlanOptions::default(),
-                mappings,
-            )
-            .unwrap();
-            trace.record_resolved_backend(state.backend());
-            trace.record_direct_target_validation_required(true);
-            let err = validate_direct_bulk_target_column_types(
-                columns.iter(),
-                state.direct_encoder().unwrap().plan(),
-            )
-            .unwrap_err();
-            trace.emit_failed(TARGET_METADATA_VALIDATION_PHASE, &err);
-            err
-        });
-
-        let records = traces.records()?;
-        let event = trace_event(&records, TARGET_METADATA_VALIDATION_FAILED_EVENT)?;
-        assert_trace_field(event, "phase", TARGET_METADATA_VALIDATION_PHASE);
-        assert_trace_field(
-            event,
-            "error_summary",
-            "value conversion failed with diagnostics",
-        );
-        assert_trace_field(event, "diagnostic_codes", "SchemaMismatch");
-        traces.assert_no_forbidden_text(&[
-            "server=tcp:sql.example.com",
-            "password=secret",
-            "User ID=sa",
-        ])?;
-
-        let secret_error = Error::Tiberius {
-            source: tiberius::error::Error::BulkInput(Cow::Borrowed(
-                "server=tcp:sql.example.com;User ID=sa;password=secret",
-            )),
-        };
-        let (_result, tiberius_traces) = capture_traces(|| {
-            let trace = WriterInitializationTrace::new(&table, WriteBackend::DirectRawBulk, 1);
-            trace.emit_failed(TARGET_METADATA_VALIDATION_PHASE, &secret_error);
-        });
-        tiberius_traces.assert_no_forbidden_text(&[
-            "server=tcp:sql.example.com",
-            "password=secret",
-            "User ID=sa",
-        ])?;
-
-        Ok(())
     }
 
     #[test]
@@ -1869,109 +1192,6 @@ mod tests {
                 batches_written: 3
             }
         );
-    }
-
-    #[test]
-    fn finish_success_emits_final_stats_trace() -> Result<(), String> {
-        let mut state = WriterState::new(
-            WriteBackend::BaselineTokenRow,
-            SchemaCheck::Strict,
-            PlanOptions::default(),
-            Vec::new(),
-        )
-        .unwrap();
-        state.record_accepted_batch(2);
-        state.record_accepted_batch(3);
-        let sink = RecordingFinishSink::default();
-
-        let (stats, traces) = capture_traces(|| poll_ready(finish_writer_to_sink(state, sink)));
-        let stats = stats.unwrap();
-
-        assert_eq!(
-            stats,
-            WriteStats {
-                rows_written: 5,
-                batches_written: 2
-            }
-        );
-        let records = traces.records()?;
-        let event = trace_event(&records, FINISH_COMPLETED_EVENT)?;
-        assert_eq!(event.span_name(), Some(FINISH_SPAN));
-        assert_trace_field(event, "phase", FINISH_PHASE);
-        assert_trace_field(event, "backend", "BaselineTokenRow");
-        assert_trace_field(event, "rows_written", "5");
-        assert_trace_field(event, "batches_written", "2");
-        assert_trace_field(event, "finish_result", "success");
-        assert!(event.fields().contains_key("elapsed_us"));
-
-        Ok(())
-    }
-
-    #[test]
-    fn finish_failure_emits_finalize_trace_with_accepted_stats() -> Result<(), String> {
-        let mut state = WriterState::new(
-            WriteBackend::DirectRawBulk,
-            SchemaCheck::Strict,
-            PlanOptions::default(),
-            Vec::new(),
-        )
-        .unwrap();
-        state.record_accepted_batch(7);
-        let sink = RecordingFinishSink {
-            fail_message: Some("fake finalize failure"),
-        };
-
-        let (err, traces) = capture_traces(|| poll_ready(finish_writer_to_sink(state, sink)));
-        let err = err.unwrap_err();
-
-        assert_write_phase(&err, WritePhase::Finalize);
-        let Error::Tiberius { source } = inner_error(&err) else {
-            panic!("expected tiberius error");
-        };
-        assert_eq!(
-            source.to_string(),
-            "BULK UPLOAD input failure: fake finalize failure"
-        );
-        let records = traces.records()?;
-        let event = trace_event(&records, FINISH_FAILED_EVENT)?;
-        assert_eq!(event.span_name(), Some(FINISH_SPAN));
-        assert_trace_field(event, "phase", FINALIZE_PHASE);
-        assert_trace_field(event, "backend", "DirectRawBulk");
-        assert_trace_field(event, "accepted_rows_before", "7");
-        assert_trace_field(event, "accepted_batches_before", "1");
-        assert_trace_field(event, "finish_result", "failure");
-        assert_trace_field(event, "error_summary", "tiberius operation failed");
-        assert_trace_field(event, "diagnostic_codes", "");
-        assert!(event.fields().contains_key("elapsed_us"));
-
-        Ok(())
-    }
-
-    #[test]
-    fn finish_failure_trace_is_sanitized() -> Result<(), String> {
-        let state = WriterState::new(
-            WriteBackend::DirectRawBulk,
-            SchemaCheck::Strict,
-            PlanOptions::default(),
-            Vec::new(),
-        )
-        .unwrap();
-        let sink = RecordingFinishSink {
-            fail_message: Some("server=tcp:sql.example.com;User ID=sa;password=secret"),
-        };
-
-        let (_err, traces) = capture_traces(|| poll_ready(finish_writer_to_sink(state, sink)));
-
-        let records = traces.records()?;
-        let event = trace_event(&records, FINISH_FAILED_EVENT)?;
-        assert_trace_field(event, "error_summary", "tiberius operation failed");
-        traces.assert_no_forbidden_text(&[
-            "server=tcp:sql.example.com",
-            "User ID=sa",
-            "password=secret",
-        ])?;
-
-        Ok(())
     }
 
     #[test]
@@ -2668,224 +1888,6 @@ mod tests {
     }
 
     #[test]
-    fn baseline_batch_write_success_emits_stats_trace() -> Result<(), String> {
-        let mappings = vec![mapping("id")];
-        let mut state = WriterState::new(
-            WriteBackend::BaselineTokenRow,
-            SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
-        )
-        .unwrap();
-        let mut sink = RecordingSink::default();
-        let batch = int32_batch("id", &[10, 20]);
-
-        let (stats, traces) =
-            capture_traces(|| poll_ready(write_batch_to_sink(&mut state, &mut sink, &batch)));
-        let stats = stats.unwrap();
-
-        assert_eq!(
-            stats,
-            WriteStats {
-                rows_written: 2,
-                batches_written: 1
-            }
-        );
-        let records = traces.records()?;
-        let event = trace_event(&records, BATCH_WRITE_COMPLETED_EVENT)?;
-        assert_eq!(event.span_name(), Some(BATCH_WRITE_SPAN));
-        assert_trace_field(event, "phase", BATCH_WRITE_PHASE);
-        assert_trace_field(event, "backend", "BaselineTokenRow");
-        assert_trace_field(event, "attempted_batch_ordinal", "1");
-        assert_trace_field(event, "batch_row_count", "2");
-        assert_trace_field(event, "batch_column_count", "1");
-        assert_trace_field(event, "batch_is_empty", "false");
-        assert_trace_field(event, "accepted_rows_before", "0");
-        assert_trace_field(event, "accepted_batches_before", "0");
-        assert_trace_field(event, "accepted_rows_after", "2");
-        assert_trace_field(event, "accepted_batches_after", "1");
-        assert_trace_field(event, "batch_write_result", "success");
-        assert!(event.fields().contains_key("elapsed_us"));
-
-        Ok(())
-    }
-
-    #[test]
-    fn empty_batch_write_success_trace_matches_stats() -> Result<(), String> {
-        let mappings = vec![mapping("id")];
-        let mut state = WriterState::new(
-            WriteBackend::BaselineTokenRow,
-            SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
-        )
-        .unwrap();
-        let mut sink = RecordingSink::default();
-        let batch = int32_batch("id", &[]);
-
-        let (stats, traces) =
-            capture_traces(|| poll_ready(write_batch_to_sink(&mut state, &mut sink, &batch)));
-        let stats = stats.unwrap();
-
-        assert_eq!(
-            stats,
-            WriteStats {
-                rows_written: 0,
-                batches_written: 1
-            }
-        );
-        let records = traces.records()?;
-        let event = trace_event(&records, BATCH_WRITE_COMPLETED_EVENT)?;
-        assert_trace_field(event, "batch_row_count", "0");
-        assert_trace_field(event, "batch_is_empty", "true");
-        assert_trace_field(event, "accepted_rows_after", "0");
-        assert_trace_field(event, "accepted_batches_after", "1");
-
-        Ok(())
-    }
-
-    #[test]
-    fn batch_schema_validation_failure_emits_trace_without_accepting_batch() -> Result<(), String> {
-        let mappings = vec![mapping("id")];
-        let mut state = WriterState::new(
-            WriteBackend::BaselineTokenRow,
-            SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
-        )
-        .unwrap();
-        let mut sink = RecordingSink::default();
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new(
-                "id",
-                DataType::Float64,
-                false,
-            )])),
-            vec![Arc::new(Float64Array::from(vec![1.0]))],
-        )
-        .unwrap();
-
-        let (err, traces) =
-            capture_traces(|| poll_ready(write_batch_to_sink(&mut state, &mut sink, &batch)));
-        let err = err.unwrap_err();
-
-        assert_write_phase(&err, WritePhase::BatchSchemaValidation);
-        let Error::ValueConversion { diagnostics } = inner_error(&err) else {
-            panic!("expected value conversion error");
-        };
-        assert_eq!(diagnostics.all()[0].code(), DiagnosticCode::SchemaMismatch);
-        assert_eq!(state.stats(), WriteStats::default());
-        assert!(sink.rows.is_empty());
-        let records = traces.records()?;
-        let event = trace_event(&records, BATCH_WRITE_FAILED_EVENT)?;
-        assert_eq!(event.span_name(), Some(BATCH_WRITE_SPAN));
-        assert_trace_field(event, "phase", BATCH_SCHEMA_VALIDATION_PHASE);
-        assert_trace_field(event, "backend", "BaselineTokenRow");
-        assert_trace_field(event, "batch_row_count", "1");
-        assert_trace_field(event, "batch_column_count", "1");
-        assert_trace_field(event, "accepted_rows_before", "0");
-        assert_trace_field(event, "accepted_batches_before", "0");
-        assert_trace_field(event, "batch_write_result", "failure");
-        assert_trace_field(event, "diagnostic_codes", "SchemaMismatch");
-
-        Ok(())
-    }
-
-    #[test]
-    fn value_conversion_failure_emits_trace_without_accepting_batch() -> Result<(), String> {
-        let mappings = vec![float_mapping("amount")];
-        let mut state = WriterState::new(
-            WriteBackend::BaselineTokenRow,
-            SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
-        )
-        .unwrap();
-        let mut sink = RecordingSink::default();
-        let batch = float64_batch("amount", &[Some(1.0), Some(f64::NAN)]);
-
-        let (err, traces) =
-            capture_traces(|| poll_ready(write_batch_to_sink(&mut state, &mut sink, &batch)));
-        let err = err.unwrap_err();
-
-        assert_write_phase(&err, WritePhase::ValueConversion);
-        let Error::ValueConversion { diagnostics } = inner_error(&err) else {
-            panic!("expected value conversion error");
-        };
-        assert_eq!(diagnostics.all()[0].code(), DiagnosticCode::NonFiniteFloat);
-        assert_eq!(state.stats(), WriteStats::default());
-        assert!(sink.rows.is_empty());
-        let records = traces.records()?;
-        let event = trace_event(&records, BATCH_WRITE_FAILED_EVENT)?;
-        assert_trace_field(event, "phase", VALUE_CONVERSION_PHASE);
-        assert_trace_field(event, "diagnostic_codes", "NonFiniteFloat");
-        assert_trace_field(
-            event,
-            "error_summary",
-            "value conversion failed with diagnostics",
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn packet_write_failure_emits_trace_without_accepting_batch() -> Result<(), String> {
-        let mappings = vec![mapping("id")];
-        let mut state = WriterState::new(
-            WriteBackend::BaselineTokenRow,
-            SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
-        )
-        .unwrap();
-        let mut sink = RecordingSink {
-            fail_on_send: Some(0),
-            rows: Vec::new(),
-        };
-        let batch = int32_batch("id", &[1, 2, 3]);
-
-        let (err, traces) =
-            capture_traces(|| poll_ready(write_batch_to_sink(&mut state, &mut sink, &batch)));
-        let err = err.unwrap_err();
-
-        assert_write_phase(&err, WritePhase::PacketWrite);
-        let Error::Tiberius { .. } = inner_error(&err) else {
-            panic!("expected tiberius error");
-        };
-        assert_eq!(state.stats(), WriteStats::default());
-        assert!(sink.rows.is_empty());
-        let records = traces.records()?;
-        let event = trace_event(&records, BATCH_WRITE_FAILED_EVENT)?;
-        assert_trace_field(event, "phase", PACKET_WRITE_PHASE);
-        assert_trace_field(event, "backend", "BaselineTokenRow");
-        assert_trace_field(event, "diagnostic_codes", "");
-        assert_trace_field(event, "error_summary", "tiberius operation failed");
-
-        Ok(())
-    }
-
-    #[test]
-    fn batch_write_trace_does_not_emit_row_values() -> Result<(), String> {
-        let mappings = vec![utf8_mapping_at(0, "secret_value")];
-        let mut state = WriterState::new(
-            WriteBackend::BaselineTokenRow,
-            SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
-        )
-        .unwrap();
-        let mut sink = RecordingSink::default();
-        let batch = utf8_batch("secret_value", &["password=secret"]);
-
-        let (_stats, traces) =
-            capture_traces(|| poll_ready(write_batch_to_sink(&mut state, &mut sink, &batch)));
-
-        traces.assert_no_forbidden_text(&["password=secret"])?;
-
-        Ok(())
-    }
-
-    #[test]
     fn write_direct_batch_to_sink_sends_one_checked_payload_per_batch() {
         let _trace_guard = direct_raw_trace_test_guard();
         let mappings = vec![mapping("id")];
@@ -2914,207 +1916,6 @@ mod tests {
             sink.payloads[0].bytes,
             vec![0xD1, 10, 0, 0, 0, 0xD1, 20, 0, 0, 0]
         );
-    }
-
-    #[test]
-    fn direct_batch_write_success_emits_stats_trace() -> Result<(), String> {
-        let _trace_guard = direct_raw_trace_test_guard();
-        for backend in [WriteBackend::DirectFramedBulk, WriteBackend::DirectRawBulk] {
-            let mappings = vec![mapping("id")];
-            let mut state = WriterState::new(
-                backend,
-                SchemaCheck::Strict,
-                PlanOptions::default(),
-                mappings,
-            )
-            .unwrap();
-            let mut sink = RecordingRawSink::default();
-            let batch = int32_batch("id", &[10, 20]);
-
-            let (stats, traces) = capture_traces(|| {
-                poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch))
-            });
-            let stats = stats.unwrap();
-
-            assert_eq!(
-                stats,
-                WriteStats {
-                    rows_written: 2,
-                    batches_written: 1
-                }
-            );
-            let records = traces.records()?;
-            let event = trace_event(&records, BATCH_WRITE_COMPLETED_EVENT)?;
-            let expected_backend = match backend {
-                WriteBackend::DirectFramedBulk => "DirectFramedBulk",
-                WriteBackend::DirectRawBulk => "DirectRawBulk",
-                WriteBackend::Auto => "Auto",
-                WriteBackend::BaselineTokenRow => "BaselineTokenRow",
-            };
-            assert_trace_field(event, "backend", expected_backend);
-            assert_trace_field(event, "batch_row_count", "2");
-            assert_trace_field(event, "batch_column_count", "1");
-            assert_trace_field(event, "accepted_rows_after", "2");
-            assert_trace_field(event, "accepted_batches_after", "1");
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn direct_raw_batch_write_emits_encoding_summary_trace() -> Result<(), String> {
-        let _trace_guard = direct_raw_trace_test_guard();
-        let mappings = vec![mapping("id")];
-        let mut state = WriterState::new(
-            WriteBackend::DirectRawBulk,
-            SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
-        )
-        .unwrap();
-        let mut sink = RecordingRawSink::default();
-        let batch = int32_batch("id", &[10, 20]);
-
-        let (_stats, traces) = capture_traces(|| {
-            poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch))
-        });
-
-        let records = traces.records()?;
-        let measured = trace_event(&records, DIRECT_RAW_MEASURED_EVENT)?;
-        assert_trace_field(measured, "phase", DIRECT_ENCODING_PHASE);
-        assert_trace_field(measured, "backend", "DirectRawBulk");
-        assert_trace_field(measured, "batch_row_count", "2");
-        assert_trace_field(measured, "batch_column_count", "1");
-        assert_trace_field(measured, "encoded_row_count", "2");
-        assert_trace_field(measured, "encoded_byte_count", "10");
-        assert!(measured.fields().contains_key("elapsed_us"));
-
-        let ranges = trace_event(&records, DIRECT_RAW_RANGES_PLANNED_EVENT)?;
-        assert_trace_field(ranges, "phase", DIRECT_ENCODING_PHASE);
-        assert_trace_field(ranges, "encoded_range_count", "1");
-        assert_trace_field(ranges, "encoded_byte_count", "10");
-
-        Ok(())
-    }
-
-    #[test]
-    fn direct_raw_packet_write_emits_sanitized_summary_trace() -> Result<(), String> {
-        let _trace_guard = direct_raw_trace_test_guard();
-        let mappings = vec![mapping("id")];
-        let mut state = WriterState::new(
-            WriteBackend::DirectRawBulk,
-            SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
-        )
-        .unwrap();
-        let mut sink = RecordingRawSink::default();
-        let batch = int32_batch("id", &[10, 20]);
-
-        let (_stats, traces) = capture_traces(|| {
-            poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch))
-        });
-
-        let records = traces.records()?;
-        let packet = trace_event(&records, DIRECT_RAW_PACKET_WRITE_COMPLETED_EVENT)?;
-        assert_trace_field(packet, "phase", PACKET_WRITE_PHASE);
-        assert_trace_field(packet, "backend", "DirectRawBulk");
-        assert_trace_field(packet, "encoded_row_start", "0");
-        assert_trace_field(packet, "encoded_row_count", "2");
-        assert_trace_field(packet, "encoded_byte_count", "10");
-        assert!(packet.fields().contains_key("elapsed_us"));
-        assert!(!packet.fields().contains_key("raw_packet_count"));
-
-        Ok(())
-    }
-
-    #[test]
-    fn direct_raw_value_conversion_failure_trace_includes_diagnostic_codes() -> Result<(), String> {
-        let _trace_guard = direct_raw_trace_test_guard();
-        let mappings = vec![schema_mapping_at(
-            0,
-            "u64_value",
-            DataType::UInt64,
-            MssqlType::BigInt,
-            false,
-        )];
-        let mut state = WriterState::new(
-            WriteBackend::DirectRawBulk,
-            SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
-        )
-        .unwrap();
-        let mut sink = RecordingRawSink::default();
-        let batch = uint64_batch("u64_value", &[i64::MAX as u64 + 1]);
-
-        let (err, traces) = capture_traces(|| {
-            poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch))
-        });
-        let err = err.unwrap_err();
-
-        assert_write_phase(&err, WritePhase::ValueConversion);
-        let Error::ValueConversion { diagnostics } = inner_error(&err) else {
-            panic!("expected value conversion error");
-        };
-        assert_eq!(
-            diagnostics.all()[0].code(),
-            DiagnosticCode::IntegerOutOfRange
-        );
-        let records = traces.records()?;
-        let failure = trace_event(&records, BATCH_WRITE_FAILED_EVENT)?;
-        assert_eq!(failure.span_name(), Some(BATCH_WRITE_SPAN));
-        assert_trace_field(failure, "phase", VALUE_CONVERSION_PHASE);
-        assert_trace_field(failure, "backend", "DirectRawBulk");
-        assert_trace_field(failure, "batch_row_count", "1");
-        assert_trace_field(failure, "batch_column_count", "1");
-        assert_trace_field(failure, "diagnostic_codes", "IntegerOutOfRange");
-        assert_trace_field(
-            failure,
-            "error_summary",
-            "value conversion failed with diagnostics",
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn direct_raw_trace_does_not_emit_values_or_payload_bytes() -> Result<(), String> {
-        let _trace_guard = direct_raw_trace_test_guard();
-        let mappings = vec![utf8_mapping_at(0, "secret_value")];
-        let mut state = WriterState::new(
-            WriteBackend::DirectRawBulk,
-            SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
-        )
-        .unwrap();
-        let mut sink = RecordingRawSink::default();
-        let batch = utf8_batch("secret_value", &["password=secret"]);
-
-        let (_stats, traces) = capture_traces(|| {
-            poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch))
-        });
-
-        traces.assert_no_forbidden_text(&["password=secret"])?;
-
-        let mappings = vec![mapping("id")];
-        let mut state = WriterState::new(
-            WriteBackend::DirectRawBulk,
-            SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
-        )
-        .unwrap();
-        let mut sink = RecordingRawSink::default();
-        let batch = int32_batch("id", &[987_654_321]);
-        let (_stats, numeric_traces) = capture_traces(|| {
-            poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch))
-        });
-
-        numeric_traces.assert_no_forbidden_text(&["987654321"])?;
-
-        Ok(())
     }
 
     #[test]
@@ -3369,30 +2170,6 @@ mod tests {
         assert!(name.contains("tiberius"));
     }
 
-    fn trace_event<'a>(
-        records: &'a [CapturedTrace],
-        telemetry_event: &str,
-    ) -> Result<&'a CapturedTrace, String> {
-        records
-            .iter()
-            .find(|record| {
-                record.kind() == CapturedTraceKind::Event
-                    && record
-                        .fields()
-                        .get("telemetry_event")
-                        .is_some_and(|value| value == telemetry_event)
-            })
-            .ok_or_else(|| format!("missing trace event {telemetry_event}: {records:#?}"))
-    }
-
-    fn assert_trace_field(record: &CapturedTrace, field: &str, expected: &str) {
-        assert_eq!(
-            record.fields().get(field).map(String::as_str),
-            Some(expected),
-            "trace record: {record:#?}"
-        );
-    }
-
     fn assert_write_phase(error: &Error, expected: WritePhase) {
         assert_eq!(error.write_phase(), Some(expected));
     }
@@ -3495,13 +2272,6 @@ mod tests {
         RecordBatch::try_new(schema, vec![array]).unwrap()
     }
 
-    fn utf8_batch(name: &str, values: &[&str]) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Utf8, false)]));
-        let array = Arc::new(StringArray::from(values.to_vec()));
-
-        RecordBatch::try_new(schema, vec![array]).unwrap()
-    }
-
     fn bulk_target_column(ordinal: usize, name: &str, nullable: bool) -> FakeBulkTargetColumn {
         bulk_target_column_with_type(ordinal, name, nullable, tiberius::ColumnType::Int4)
     }
@@ -3573,11 +2343,6 @@ mod tests {
         payloads: Vec<RecordedRawPayload>,
     }
 
-    #[derive(Debug, Default)]
-    struct RecordingFinishSink {
-        fail_message: Option<&'static str>,
-    }
-
     #[derive(Debug, PartialEq, Eq)]
     struct RecordedRawPayload {
         bytes: Vec<u8>,
@@ -3587,11 +2352,11 @@ mod tests {
     impl RawRowsSink for RecordingRawSink {
         async fn send_measured_raw_rows(
             &mut self,
-            backend: WriteBackend,
             encoder: &DirectEncoder,
             batch: &RecordBatch,
             measured: &MeasuredDirectBatch,
             range: MeasuredRowRange,
+            direct_observer: DirectRawBatchObserver,
         ) -> crate::Result<()> {
             let payload =
                 encoder.encode_measured_batch_range(batch, measured, range.start, range.len)?;
@@ -3608,25 +2373,13 @@ mod tests {
                 bytes: payload.bytes().to_vec(),
                 row_token_offsets: payload.row_token_offsets().to_vec(),
             });
-            emit_direct_raw_packet_write_completed(
-                backend,
+            direct_observer.record_packet_write_completed(
                 range,
                 payload.row_count(),
                 payload.bytes().len(),
                 std::time::Duration::ZERO,
             );
             Ok(())
-        }
-    }
-
-    impl FinishSink for RecordingFinishSink {
-        async fn finalize_bulk_load(self) -> crate::Result<()> {
-            match self.fail_message {
-                Some(message) => Err(Error::Tiberius {
-                    source: tiberius::error::Error::BulkInput(Cow::Borrowed(message)),
-                }),
-                None => Ok(()),
-            }
         }
     }
 
