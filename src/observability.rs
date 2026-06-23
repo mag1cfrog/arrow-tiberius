@@ -78,6 +78,19 @@ pub(crate) const BATCH_WRITE_COMPLETED_EVENT: &str = "arrow_tiberius.batch_write
 /// Stable event marker emitted when batch writing fails.
 pub(crate) const BATCH_WRITE_FAILED_EVENT: &str = "arrow_tiberius.batch_write.failed";
 
+/// Stable event marker emitted when direct raw measurement completes.
+pub(crate) const DIRECT_RAW_MEASURED_EVENT: &str = "arrow_tiberius.direct_raw.measured";
+
+/// Stable event marker emitted when direct raw row ranges are planned.
+pub(crate) const DIRECT_RAW_RANGES_PLANNED_EVENT: &str = "arrow_tiberius.direct_raw.ranges_planned";
+
+/// Stable event marker emitted when a direct raw range packet write completes.
+pub(crate) const DIRECT_RAW_PACKET_WRITE_COMPLETED_EVENT: &str =
+    "arrow_tiberius.direct_raw.packet_write.completed";
+
+/// Stable event marker emitted when direct raw encoding or packet writing fails.
+pub(crate) const DIRECT_RAW_FAILED_EVENT: &str = "arrow_tiberius.direct_raw.failed";
+
 /// Test-only span name used to prove tracing capture support.
 #[cfg(test)]
 pub(crate) const TEST_CAPTURE_SPAN: &str = "arrow_tiberius.test_capture";
