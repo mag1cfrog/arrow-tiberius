@@ -1,5 +1,6 @@
 //! Crate-owned tracing names and test capture helpers.
 
+pub(crate) mod schema;
 pub(crate) mod writer;
 
 /// Crate-level tracing target used by `arrow-tiberius` instrumentation.
