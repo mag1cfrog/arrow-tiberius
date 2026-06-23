@@ -1,8 +1,10 @@
-use std::time::Instant;
+use std::{future::Future, time::Instant};
 
 use arrow_array::RecordBatch;
+use tracing::Instrument as _;
 
 use crate::{
+    Result, WritePhase,
     observability::{
         BATCH_WRITE_COMPLETED_EVENT, BATCH_WRITE_FAILED_EVENT, BATCH_WRITE_PHASE, BATCH_WRITE_SPAN,
         BATCH_WRITE_STARTED_EVENT, TRACE_TARGET, duration_micros_u64, usize_to_u64_saturating,
@@ -72,6 +74,23 @@ impl BatchWriteTrace {
             accepted_batches_before = self.accepted_batches_before,
             batch_write_result = "started"
         );
+    }
+
+    /// Emits batch lifecycle events while polling the write future inside this span.
+    pub(crate) async fn trace_result<F>(&self, future: F) -> Result<WriteStats>
+    where
+        F: Future<Output = Result<WriteStats>>,
+    {
+        self.emit_started();
+        let result = future.instrument(self.span.clone()).await;
+        match &result {
+            Ok(stats) => self.emit_completed(*stats),
+            Err(err) => {
+                let phase = err.write_phase().unwrap_or(WritePhase::BatchWrite);
+                self.emit_failed(phase.as_str(), err);
+            }
+        }
+        result
     }
 
     pub(crate) fn emit_completed(&self, stats: WriteStats) {

@@ -8,10 +8,7 @@ mod finish;
 mod initialization;
 
 pub(crate) use batch::BatchWriteTrace;
-pub(crate) use direct_raw::{
-    emit_direct_raw_failed, emit_direct_raw_measured, emit_direct_raw_packet_write_completed,
-    emit_direct_raw_ranges_planned,
-};
+pub(crate) use direct_raw::DirectRawBatchObserver;
 pub(crate) use finish::FinishTrace;
 pub(crate) use initialization::WriterInitializationTrace;
 

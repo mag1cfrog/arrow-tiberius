@@ -6,13 +6,8 @@ use arrow_array::RecordBatch;
 use futures_util::io::{AsyncRead, AsyncWrite};
 
 use crate::observability::{
-    BATCH_SCHEMA_VALIDATION_PHASE, DIRECT_ENCODING_PHASE, PACKET_WRITE_PHASE,
-    TARGET_METADATA_VALIDATION_PHASE, VALUE_CONVERSION_PHASE, WRITER_INITIALIZATION_PHASE,
-    writer::{
-        BatchWriteTrace, FinishTrace, WriterInitializationTrace, emit_direct_raw_failed,
-        emit_direct_raw_measured, emit_direct_raw_packet_write_completed,
-        emit_direct_raw_ranges_planned,
-    },
+    DIRECT_ENCODING_PHASE, TARGET_METADATA_VALIDATION_PHASE, WRITER_INITIALIZATION_PHASE,
+    writer::{BatchWriteTrace, DirectRawBatchObserver, FinishTrace, WriterInitializationTrace},
 };
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, PlanOptions, Result, SchemaMapping,
@@ -256,10 +251,10 @@ where
     pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteStats> {
         match self.state.backend() {
             WriteBackend::BaselineTokenRow => {
-                write_batch_to_sink(&mut self.state, &mut self.request, batch).await
+                write_traced_batch_to_sink(&mut self.state, &mut self.request, batch).await
             }
             WriteBackend::DirectFramedBulk | WriteBackend::DirectRawBulk => {
-                write_direct_batch_to_sink(&mut self.state, &mut self.request, batch).await
+                write_traced_direct_batch_to_sink(&mut self.state, &mut self.request, batch).await
             }
             WriteBackend::Auto => Err(execution_unavailable(WriteBackend::Auto)),
         }
@@ -681,6 +676,7 @@ impl BulkTargetColumnMetadata for tiberius::BulkLoadColumn<'_> {
     }
 }
 
+/// Writes one baseline token-row batch without crate-owned batch lifecycle traces.
 async fn write_batch_to_sink<Sink>(
     state: &mut WriterState,
     sink: &mut Sink,
@@ -689,9 +685,6 @@ async fn write_batch_to_sink<Sink>(
 where
     Sink: TokenRowSink,
 {
-    let trace = BatchWriteTrace::new(state.backend(), state.stats(), batch);
-    trace.emit_started();
-
     let view = match record_batch_view(
         batch,
         state.mappings(),
@@ -699,13 +692,9 @@ where
         state.plan_options(),
     ) {
         Ok(view) => view,
-        Err(err) => {
-            trace.emit_failed(BATCH_SCHEMA_VALIDATION_PHASE, &err);
-            return Err(err.with_write_phase(WritePhase::BatchSchemaValidation));
-        }
+        Err(err) => return Err(err.with_write_phase(WritePhase::BatchSchemaValidation)),
     };
     if let Err(err) = validate_batch_rows(&view) {
-        trace.emit_failed(VALUE_CONVERSION_PHASE, &err);
         return Err(err.with_write_phase(WritePhase::ValueConversion));
     }
     let rows_written = usize_to_u64_saturating(view.row_count());
@@ -713,20 +702,30 @@ where
     for row_index in 0..view.row_count() {
         let row = match tiberius_row_owned(&view, row_index) {
             Ok(row) => row,
-            Err(err) => {
-                trace.emit_failed(VALUE_CONVERSION_PHASE, &err);
-                return Err(err.with_write_phase(WritePhase::ValueConversion));
-            }
+            Err(err) => return Err(err.with_write_phase(WritePhase::ValueConversion)),
         };
         if let Err(err) = sink.send_token_row(row).await {
-            trace.emit_failed(PACKET_WRITE_PHASE, &err);
             return Err(err.with_write_phase(WritePhase::PacketWrite));
         }
     }
 
     let stats = state.record_accepted_batch(rows_written);
-    trace.emit_completed(stats);
     Ok(stats)
+}
+
+/// Adds the crate-owned batch lifecycle span around the baseline token-row write path.
+async fn write_traced_batch_to_sink<Sink>(
+    state: &mut WriterState,
+    sink: &mut Sink,
+    batch: &RecordBatch,
+) -> Result<WriteStats>
+where
+    Sink: TokenRowSink,
+{
+    let trace = BatchWriteTrace::new(state.backend(), state.stats(), batch);
+    trace
+        .trace_result(write_batch_to_sink(state, sink, batch))
+        .await
 }
 
 trait TokenRowSink {
@@ -744,6 +743,8 @@ where
     }
 }
 
+/// Test-only direct write entry point with direct raw detail telemetry disabled.
+#[cfg(test)]
 async fn write_direct_batch_to_sink<Sink>(
     state: &mut WriterState,
     sink: &mut Sink,
@@ -752,21 +753,52 @@ async fn write_direct_batch_to_sink<Sink>(
 where
     Sink: RawRowsSink,
 {
-    let trace = BatchWriteTrace::new(state.backend(), state.stats(), batch);
-    trace.emit_started();
+    write_direct_batch_to_sink_with_observer(state, sink, batch, DirectRawBatchObserver::disabled())
+        .await
+}
 
-    let encoder = match state
+/// Adds the crate-owned batch lifecycle span and direct raw detail telemetry.
+async fn write_traced_direct_batch_to_sink<Sink>(
+    state: &mut WriterState,
+    sink: &mut Sink,
+    batch: &RecordBatch,
+) -> Result<WriteStats>
+where
+    Sink: RawRowsSink,
+{
+    let trace = BatchWriteTrace::new(state.backend(), state.stats(), batch);
+    let direct_observer = DirectRawBatchObserver::enabled(state.backend());
+    trace
+        .trace_result(write_direct_batch_to_sink_with_observer(
+            state,
+            sink,
+            batch,
+            direct_observer,
+        ))
+        .await
+}
+
+/// Shared direct write implementation.
+///
+/// The `direct_observer` records direct raw detail events when enabled. Batch
+/// lifecycle tracing is owned by `write_traced_direct_batch_to_sink`.
+async fn write_direct_batch_to_sink_with_observer<Sink>(
+    state: &mut WriterState,
+    sink: &mut Sink,
+    batch: &RecordBatch,
+    direct_observer: DirectRawBatchObserver,
+) -> Result<WriteStats>
+where
+    Sink: RawRowsSink,
+{
+    let encoder = state
         .direct_encoder()
         .ok_or_else(|| crate::Error::BackendUnavailable {
             backend: state.backend(),
             reason: "direct bulk encoder is not available for this writer".to_owned(),
-        }) {
-        Ok(encoder) => encoder,
-        Err(err) => {
-            trace.emit_failed(DIRECT_ENCODING_PHASE, &err);
-            return Err(err.with_write_phase(WritePhase::DirectEncoding));
-        }
-    };
+        })
+        .map_err(|err| err.with_write_phase(WritePhase::DirectEncoding))?;
+
     let measure_start = std::time::Instant::now();
     let measured = encoder.measure_batch(batch);
     let measured =
@@ -774,12 +806,11 @@ where
             Ok(measured) => measured,
             Err(err) => {
                 let phase = write_phase_for_batch_error(&err);
-                trace.emit_failed(phase.as_str(), &err);
-                emit_direct_raw_failed(state.backend(), phase.as_str(), batch, None, &err);
+                direct_observer.record_failed(phase.as_str(), batch, None, &err);
                 return Err(err.with_write_phase(phase));
             }
         };
-    emit_direct_raw_measured(state.backend(), &measured, measure_start.elapsed());
+    direct_observer.record_measured(&measured, measure_start.elapsed());
     let rows_written = usize_to_u64_saturating(measured.row_count());
 
     let split_start = std::time::Instant::now();
@@ -788,39 +819,36 @@ where
     {
         Ok(ranges) => ranges,
         Err(err) => {
-            trace.emit_failed(DIRECT_ENCODING_PHASE, &err);
-            emit_direct_raw_failed(state.backend(), DIRECT_ENCODING_PHASE, batch, None, &err);
+            direct_observer.record_failed(DIRECT_ENCODING_PHASE, batch, None, &err);
             return Err(err.with_write_phase(WritePhase::DirectEncoding));
         }
     };
-    emit_direct_raw_ranges_planned(state.backend(), &measured, &ranges, split_start.elapsed());
+    direct_observer.record_ranges_planned(&measured, &ranges, split_start.elapsed());
 
     for range in ranges {
         if let Err(err) = sink
-            .send_measured_raw_rows(state.backend(), encoder, batch, &measured, range)
+            .send_measured_raw_rows(encoder, batch, &measured, range, direct_observer)
             .await
         {
             let phase = write_phase_for_batch_error(&err);
-            trace.emit_failed(phase.as_str(), &err);
-            emit_direct_raw_failed(state.backend(), phase.as_str(), batch, Some(range), &err);
+            direct_observer.record_failed(phase.as_str(), batch, Some(range), &err);
             return Err(err.with_write_phase(phase));
         }
     }
 
     profile::record_accepted_batch(measured.row_count());
     let stats = state.record_accepted_batch(rows_written);
-    trace.emit_completed(stats);
     Ok(stats)
 }
 
 trait RawRowsSink {
     async fn send_measured_raw_rows(
         &mut self,
-        backend: WriteBackend,
         encoder: &DirectEncoder,
         batch: &RecordBatch,
         measured: &MeasuredDirectBatch,
         range: MeasuredRowRange,
+        direct_observer: DirectRawBatchObserver,
     ) -> Result<()>;
 }
 
@@ -830,11 +858,11 @@ where
 {
     async fn send_measured_raw_rows(
         &mut self,
-        backend: WriteBackend,
         encoder: &DirectEncoder,
         batch: &RecordBatch,
         measured: &MeasuredDirectBatch,
         range: MeasuredRowRange,
+        direct_observer: DirectRawBatchObserver,
     ) -> Result<()> {
         let encoded_bytes = measured.range_payload_len(range.start, range.len)?;
         profile::record_row_range(encoded_bytes);
@@ -852,8 +880,7 @@ where
                 .map_err(|source| crate::Error::Tiberius { source });
             profile::record_send_total(send_start.elapsed());
             if send_result.is_ok() {
-                emit_direct_raw_packet_write_completed(
-                    backend,
+                direct_observer.record_packet_write_completed(
                     range,
                     payload.row_count(),
                     payload.bytes().len(),
@@ -896,8 +923,7 @@ where
 
         let send_result = send_result.map_err(|source| crate::Error::Tiberius { source });
         if send_result.is_ok() {
-            emit_direct_raw_packet_write_completed(
-                backend,
+            direct_observer.record_packet_write_completed(
                 range,
                 range.len,
                 encoded_bytes,
@@ -965,11 +991,11 @@ mod tests {
     use super::{
         BulkTargetColumnMetadata, DIRECT_RAW_MAX_PAYLOAD_BYTES, DirectEncoder, MeasuredDirectBatch,
         MeasuredRowRange, RawRowsSink, TokenRowSink, WriteBackend, WriteOptions, WriteStats,
-        WriterState, bulk_insert_table_sql, emit_direct_raw_packet_write_completed,
-        record_batch_view, resolve_backend, tiberius_row_owned, validate_batch_rows,
-        validate_bulk_target_columns, validate_direct_bulk_target_column_types,
-        write_batch_to_sink, write_direct_batch_to_sink,
+        WriterState, bulk_insert_table_sql, record_batch_view, resolve_backend, tiberius_row_owned,
+        validate_batch_rows, validate_bulk_target_columns,
+        validate_direct_bulk_target_column_types, write_batch_to_sink, write_direct_batch_to_sink,
     };
+    use crate::observability::writer::DirectRawBatchObserver;
     use crate::{
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, MssqlTypeLength,
         PlanOptions, SchemaCheck, SchemaMapping, TableName, WritePhase,
@@ -2326,11 +2352,11 @@ mod tests {
     impl RawRowsSink for RecordingRawSink {
         async fn send_measured_raw_rows(
             &mut self,
-            backend: WriteBackend,
             encoder: &DirectEncoder,
             batch: &RecordBatch,
             measured: &MeasuredDirectBatch,
             range: MeasuredRowRange,
+            direct_observer: DirectRawBatchObserver,
         ) -> crate::Result<()> {
             let payload =
                 encoder.encode_measured_batch_range(batch, measured, range.start, range.len)?;
@@ -2347,8 +2373,7 @@ mod tests {
                 bytes: payload.bytes().to_vec(),
                 row_token_offsets: payload.row_token_offsets().to_vec(),
             });
-            emit_direct_raw_packet_write_completed(
-                backend,
+            direct_observer.record_packet_write_completed(
                 range,
                 payload.row_count(),
                 payload.bytes().len(),

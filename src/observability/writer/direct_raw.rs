@@ -16,6 +16,76 @@ use crate::{
 
 use super::{backend_trace_name, diagnostic_codes_for_error, sanitized_error_summary};
 
+/// Records optional direct raw detail events from the direct writer path.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DirectRawBatchObserver {
+    backend: Option<WriteBackend>,
+}
+
+impl DirectRawBatchObserver {
+    #[cfg(test)]
+    pub(crate) const fn disabled() -> Self {
+        Self { backend: None }
+    }
+
+    pub(crate) const fn enabled(backend: WriteBackend) -> Self {
+        Self {
+            backend: Some(backend),
+        }
+    }
+
+    pub(crate) fn record_measured(&self, measured: &MeasuredDirectBatch, elapsed: Duration) {
+        let Some(backend) = self.backend else {
+            return;
+        };
+        emit_direct_raw_measured(backend, measured, elapsed);
+    }
+
+    pub(crate) fn record_ranges_planned(
+        &self,
+        measured: &MeasuredDirectBatch,
+        ranges: &[MeasuredRowRange],
+        elapsed: Duration,
+    ) {
+        let Some(backend) = self.backend else {
+            return;
+        };
+        emit_direct_raw_ranges_planned(backend, measured, ranges, elapsed);
+    }
+
+    pub(crate) fn record_packet_write_completed(
+        &self,
+        range: MeasuredRowRange,
+        encoded_row_count: usize,
+        encoded_byte_count: usize,
+        elapsed: Duration,
+    ) {
+        let Some(backend) = self.backend else {
+            return;
+        };
+        emit_direct_raw_packet_write_completed(
+            backend,
+            range,
+            encoded_row_count,
+            encoded_byte_count,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_failed(
+        &self,
+        phase: &'static str,
+        batch: &RecordBatch,
+        range: Option<MeasuredRowRange>,
+        error: &crate::Error,
+    ) {
+        let Some(backend) = self.backend else {
+            return;
+        };
+        emit_direct_raw_failed(backend, phase, batch, range, error);
+    }
+}
+
 pub(crate) fn emit_direct_raw_measured(
     backend: WriteBackend,
     measured: &MeasuredDirectBatch,
@@ -114,7 +184,14 @@ pub(crate) fn emit_direct_raw_failed(
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        future::Future,
+        sync::Arc,
+        task::{Context, Poll, Waker},
+        time::Duration,
+    };
+
+    use super::super::BatchWriteTrace;
 
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
@@ -126,14 +203,14 @@ mod tests {
     use crate::{
         ArrowFieldRef, Identifier, MssqlColumn, MssqlType, MssqlTypeLength, SchemaMapping,
         observability::{
-            DIRECT_ENCODING_PHASE, DIRECT_RAW_MEASURED_EVENT,
+            BATCH_WRITE_SPAN, DIRECT_ENCODING_PHASE, DIRECT_RAW_MEASURED_EVENT,
             DIRECT_RAW_PACKET_WRITE_COMPLETED_EVENT, DIRECT_RAW_RANGES_PLANNED_EVENT,
             PACKET_WRITE_PHASE,
             test_support::{assert_trace_field, capture_traces, trace_event},
         },
         write::{
             direct::{DirectEncoder, MeasuredRowRange},
-            writer::WriteBackend,
+            writer::{WriteBackend, WriteStats},
         },
     };
 
@@ -193,6 +270,47 @@ mod tests {
         assert_trace_field(packet, "encoded_byte_count", "10");
         assert!(packet.fields().contains_key("elapsed_us"));
         assert!(!packet.fields().contains_key("raw_packet_count"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn direct_raw_events_can_be_parented_to_batch_write_span() -> Result<(), String> {
+        let batch = int32_batch("id", &[10, 20]);
+        let encoder = DirectEncoder::new(&[int32_mapping("id")]).unwrap();
+        let measured = encoder.measure_batch(&batch).unwrap();
+        let ranges = measured.row_ranges(10).unwrap();
+
+        let (_result, traces) = capture_traces(|| {
+            let trace =
+                BatchWriteTrace::new(WriteBackend::DirectRawBulk, WriteStats::default(), &batch);
+            poll_ready(trace.trace_result(async {
+                emit_direct_raw_measured(WriteBackend::DirectRawBulk, &measured, Duration::ZERO);
+                emit_direct_raw_ranges_planned(
+                    WriteBackend::DirectRawBulk,
+                    &measured,
+                    &ranges,
+                    Duration::ZERO,
+                );
+                emit_direct_raw_packet_write_completed(
+                    WriteBackend::DirectRawBulk,
+                    MeasuredRowRange { start: 0, len: 2 },
+                    2,
+                    10,
+                    Duration::ZERO,
+                );
+                Ok(WriteStats::default())
+            }))
+            .unwrap();
+        });
+
+        let records = traces.records()?;
+        let measured = trace_event(&records, DIRECT_RAW_MEASURED_EVENT)?;
+        assert_eq!(measured.span_name(), Some(BATCH_WRITE_SPAN));
+        let ranges = trace_event(&records, DIRECT_RAW_RANGES_PLANNED_EVENT)?;
+        assert_eq!(ranges.span_name(), Some(BATCH_WRITE_SPAN));
+        let packet = trace_event(&records, DIRECT_RAW_PACKET_WRITE_COMPLETED_EVENT)?;
+        assert_eq!(packet.span_name(), Some(BATCH_WRITE_SPAN));
 
         Ok(())
     }
@@ -269,5 +387,17 @@ mod tests {
                 false,
             ),
         )
+    }
+
+    fn poll_ready<F>(future: F) -> F::Output
+    where
+        F: Future,
+    {
+        let mut future = Box::pin(future);
+        let mut context = Context::from_waker(Waker::noop());
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("test future unexpectedly pending"),
+        }
     }
 }

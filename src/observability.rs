@@ -62,9 +62,11 @@ pub(crate) const TARGET_METADATA_VALIDATION_FAILED_EVENT: &str =
 pub(crate) const BATCH_WRITE_PHASE: &str = "batch_write";
 
 /// Stable phase name for batch schema validation telemetry.
+#[cfg(test)]
 pub(crate) const BATCH_SCHEMA_VALIDATION_PHASE: &str = "batch_schema_validation";
 
 /// Stable phase name for batch value conversion telemetry.
+#[cfg(test)]
 pub(crate) const VALUE_CONVERSION_PHASE: &str = "value_conversion";
 
 /// Stable phase name for direct encoding telemetry.
