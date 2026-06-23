@@ -12,11 +12,13 @@ use futures_util::io::{AsyncRead, AsyncWrite};
 use crate::observability::{
     BATCH_SCHEMA_VALIDATION_PHASE, BATCH_WRITE_COMPLETED_EVENT, BATCH_WRITE_FAILED_EVENT,
     BATCH_WRITE_PHASE, BATCH_WRITE_SPAN, BATCH_WRITE_STARTED_EVENT, DIRECT_ENCODING_PHASE,
-    PACKET_WRITE_PHASE, TARGET_METADATA_VALIDATION_COMPLETED_EVENT,
-    TARGET_METADATA_VALIDATION_FAILED_EVENT, TARGET_METADATA_VALIDATION_PHASE,
-    TARGET_METADATA_VALIDATION_STARTED_EVENT, TRACE_TARGET, VALUE_CONVERSION_PHASE,
-    WRITER_INITIALIZATION_COMPLETED_EVENT, WRITER_INITIALIZATION_FAILED_EVENT,
-    WRITER_INITIALIZATION_PHASE, WRITER_INITIALIZATION_SPAN, WRITER_INITIALIZATION_STARTED_EVENT,
+    DIRECT_RAW_FAILED_EVENT, DIRECT_RAW_MEASURED_EVENT, DIRECT_RAW_PACKET_WRITE_COMPLETED_EVENT,
+    DIRECT_RAW_RANGES_PLANNED_EVENT, PACKET_WRITE_PHASE,
+    TARGET_METADATA_VALIDATION_COMPLETED_EVENT, TARGET_METADATA_VALIDATION_FAILED_EVENT,
+    TARGET_METADATA_VALIDATION_PHASE, TARGET_METADATA_VALIDATION_STARTED_EVENT, TRACE_TARGET,
+    VALUE_CONVERSION_PHASE, WRITER_INITIALIZATION_COMPLETED_EVENT,
+    WRITER_INITIALIZATION_FAILED_EVENT, WRITER_INITIALIZATION_PHASE, WRITER_INITIALIZATION_SPAN,
+    WRITER_INITIALIZATION_STARTED_EVENT,
 };
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, PlanOptions, Result, SchemaMapping,
@@ -1015,9 +1017,17 @@ where
             Ok(measured) => measured,
             Err(err) => {
                 trace.emit_failed(batch_failure_phase(&err), &err);
+                emit_direct_raw_failed(
+                    state.backend(),
+                    batch_failure_phase(&err),
+                    batch,
+                    None,
+                    &err,
+                );
                 return Err(err);
             }
         };
+    emit_direct_raw_measured(state.backend(), &measured, measure_start.elapsed());
     let rows_written = usize_to_u64_saturating(measured.row_count());
 
     let split_start = std::time::Instant::now();
@@ -1027,16 +1037,25 @@ where
         Ok(ranges) => ranges,
         Err(err) => {
             trace.emit_failed(DIRECT_ENCODING_PHASE, &err);
+            emit_direct_raw_failed(state.backend(), DIRECT_ENCODING_PHASE, batch, None, &err);
             return Err(err);
         }
     };
+    emit_direct_raw_ranges_planned(state.backend(), &measured, &ranges, split_start.elapsed());
 
     for range in ranges {
         if let Err(err) = sink
-            .send_measured_raw_rows(encoder, batch, &measured, range)
+            .send_measured_raw_rows(state.backend(), encoder, batch, &measured, range)
             .await
         {
             trace.emit_failed(batch_failure_phase(&err), &err);
+            emit_direct_raw_failed(
+                state.backend(),
+                batch_failure_phase(&err),
+                batch,
+                Some(range),
+                &err,
+            );
             return Err(err);
         }
     }
@@ -1050,6 +1069,7 @@ where
 trait RawRowsSink {
     async fn send_measured_raw_rows(
         &mut self,
+        backend: WriteBackend,
         encoder: &DirectEncoder,
         batch: &RecordBatch,
         measured: &MeasuredDirectBatch,
@@ -1063,6 +1083,7 @@ where
 {
     async fn send_measured_raw_rows(
         &mut self,
+        backend: WriteBackend,
         encoder: &DirectEncoder,
         batch: &RecordBatch,
         measured: &MeasuredDirectBatch,
@@ -1083,6 +1104,15 @@ where
                 .await
                 .map_err(|source| crate::Error::Tiberius { source });
             profile::record_send_total(send_start.elapsed());
+            if send_result.is_ok() {
+                emit_direct_raw_packet_write_completed(
+                    backend,
+                    range,
+                    payload.row_count(),
+                    payload.bytes().len(),
+                    send_start.elapsed(),
+                );
+            }
             return send_result;
         }
 
@@ -1117,8 +1147,115 @@ where
             return Err(err);
         }
 
-        send_result.map_err(|source| crate::Error::Tiberius { source })
+        let send_result = send_result.map_err(|source| crate::Error::Tiberius { source });
+        if send_result.is_ok() {
+            emit_direct_raw_packet_write_completed(
+                backend,
+                range,
+                range.len,
+                encoded_bytes,
+                send_start.elapsed(),
+            );
+        }
+
+        send_result
     }
+}
+
+fn emit_direct_raw_measured(
+    backend: WriteBackend,
+    measured: &MeasuredDirectBatch,
+    elapsed: Duration,
+) {
+    if backend != WriteBackend::DirectRawBulk {
+        return;
+    }
+
+    tracing::debug!(
+        target: TRACE_TARGET,
+        phase = DIRECT_ENCODING_PHASE,
+        telemetry_event = DIRECT_RAW_MEASURED_EVENT,
+        backend = backend_trace_name(backend),
+        batch_row_count = usize_to_u64_saturating(measured.row_count()),
+        batch_column_count = usize_to_u64_saturating(measured.column_count()),
+        encoded_row_count = usize_to_u64_saturating(measured.row_count()),
+        encoded_byte_count = usize_to_u64_saturating(measured.payload_len()),
+        elapsed_us = duration_micros_u64(elapsed)
+    );
+}
+
+fn emit_direct_raw_ranges_planned(
+    backend: WriteBackend,
+    measured: &MeasuredDirectBatch,
+    ranges: &[MeasuredRowRange],
+    elapsed: Duration,
+) {
+    if backend != WriteBackend::DirectRawBulk {
+        return;
+    }
+
+    tracing::debug!(
+        target: TRACE_TARGET,
+        phase = DIRECT_ENCODING_PHASE,
+        telemetry_event = DIRECT_RAW_RANGES_PLANNED_EVENT,
+        backend = backend_trace_name(backend),
+        batch_row_count = usize_to_u64_saturating(measured.row_count()),
+        batch_column_count = usize_to_u64_saturating(measured.column_count()),
+        encoded_byte_count = usize_to_u64_saturating(measured.payload_len()),
+        encoded_range_count = usize_to_u64_saturating(ranges.len()),
+        elapsed_us = duration_micros_u64(elapsed)
+    );
+}
+
+fn emit_direct_raw_packet_write_completed(
+    backend: WriteBackend,
+    range: MeasuredRowRange,
+    encoded_row_count: usize,
+    encoded_byte_count: usize,
+    elapsed: Duration,
+) {
+    if backend != WriteBackend::DirectRawBulk {
+        return;
+    }
+
+    // `tiberius-raw-bulk` does not expose raw packet counts on the normal
+    // write path. Emit safe range and byte summaries instead of guessing.
+    tracing::debug!(
+        target: TRACE_TARGET,
+        phase = PACKET_WRITE_PHASE,
+        telemetry_event = DIRECT_RAW_PACKET_WRITE_COMPLETED_EVENT,
+        backend = backend_trace_name(backend),
+        encoded_row_start = usize_to_u64_saturating(range.start),
+        encoded_row_count = usize_to_u64_saturating(encoded_row_count),
+        encoded_byte_count = usize_to_u64_saturating(encoded_byte_count),
+        elapsed_us = duration_micros_u64(elapsed)
+    );
+}
+
+fn emit_direct_raw_failed(
+    backend: WriteBackend,
+    phase: &'static str,
+    batch: &RecordBatch,
+    range: Option<MeasuredRowRange>,
+    error: &crate::Error,
+) {
+    if backend != WriteBackend::DirectRawBulk {
+        return;
+    }
+
+    let diagnostic_codes = diagnostic_codes_for_error(error);
+    tracing::error!(
+        target: TRACE_TARGET,
+        phase,
+        telemetry_event = DIRECT_RAW_FAILED_EVENT,
+        backend = backend_trace_name(backend),
+        batch_row_count = usize_to_u64_saturating(batch.num_rows()),
+        batch_column_count = usize_to_u64_saturating(batch.num_columns()),
+        encoded_row_start = range.map(|range| usize_to_u64_saturating(range.start)),
+        encoded_row_count = range.map(|range| usize_to_u64_saturating(range.len)),
+        diagnostic_codes = diagnostic_codes.as_str(),
+        error_summary = sanitized_error_summary(error)
+    );
 }
 
 fn usize_to_u64_saturating(value: usize) -> u64 {
@@ -1234,13 +1371,16 @@ mod tests {
     use super::{
         BulkTargetColumnMetadata, DIRECT_RAW_MAX_PAYLOAD_BYTES, DirectEncoder, MeasuredDirectBatch,
         MeasuredRowRange, RawRowsSink, TokenRowSink, WriteBackend, WriteOptions, WriteStats,
-        WriterInitializationTrace, WriterState, bulk_insert_table_sql, record_batch_view,
-        resolve_backend, tiberius_row_owned, validate_batch_rows, validate_bulk_target_columns,
+        WriterInitializationTrace, WriterState, bulk_insert_table_sql,
+        emit_direct_raw_packet_write_completed, record_batch_view, resolve_backend,
+        tiberius_row_owned, validate_batch_rows, validate_bulk_target_columns,
         validate_direct_bulk_target_column_types, write_batch_to_sink, write_direct_batch_to_sink,
     };
     use crate::observability::{
         BATCH_SCHEMA_VALIDATION_PHASE, BATCH_WRITE_COMPLETED_EVENT, BATCH_WRITE_FAILED_EVENT,
-        BATCH_WRITE_PHASE, BATCH_WRITE_SPAN, PACKET_WRITE_PHASE,
+        BATCH_WRITE_PHASE, BATCH_WRITE_SPAN, DIRECT_ENCODING_PHASE, DIRECT_RAW_FAILED_EVENT,
+        DIRECT_RAW_MEASURED_EVENT, DIRECT_RAW_PACKET_WRITE_COMPLETED_EVENT,
+        DIRECT_RAW_RANGES_PLANNED_EVENT, PACKET_WRITE_PHASE,
         TARGET_METADATA_VALIDATION_COMPLETED_EVENT, TARGET_METADATA_VALIDATION_FAILED_EVENT,
         TARGET_METADATA_VALIDATION_PHASE, VALUE_CONVERSION_PHASE,
         WRITER_INITIALIZATION_COMPLETED_EVENT, WRITER_INITIALIZATION_PHASE,
@@ -2609,6 +2749,156 @@ mod tests {
     }
 
     #[test]
+    fn direct_raw_batch_write_emits_encoding_summary_trace() -> Result<(), String> {
+        let mappings = vec![mapping("id")];
+        let mut state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingRawSink::default();
+        let batch = int32_batch("id", &[10, 20]);
+
+        let (_stats, traces) = capture_traces(|| {
+            poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch))
+        });
+
+        let records = traces.records()?;
+        let measured = trace_event(&records, DIRECT_RAW_MEASURED_EVENT)?;
+        assert_trace_field(measured, "phase", DIRECT_ENCODING_PHASE);
+        assert_trace_field(measured, "backend", "DirectRawBulk");
+        assert_trace_field(measured, "batch_row_count", "2");
+        assert_trace_field(measured, "batch_column_count", "1");
+        assert_trace_field(measured, "encoded_row_count", "2");
+        assert_trace_field(measured, "encoded_byte_count", "10");
+        assert!(measured.fields().contains_key("elapsed_us"));
+
+        let ranges = trace_event(&records, DIRECT_RAW_RANGES_PLANNED_EVENT)?;
+        assert_trace_field(ranges, "phase", DIRECT_ENCODING_PHASE);
+        assert_trace_field(ranges, "encoded_range_count", "1");
+        assert_trace_field(ranges, "encoded_byte_count", "10");
+
+        Ok(())
+    }
+
+    #[test]
+    fn direct_raw_packet_write_emits_sanitized_summary_trace() -> Result<(), String> {
+        let mappings = vec![mapping("id")];
+        let mut state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingRawSink::default();
+        let batch = int32_batch("id", &[10, 20]);
+
+        let (_stats, traces) = capture_traces(|| {
+            poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch))
+        });
+
+        let records = traces.records()?;
+        let packet = trace_event(&records, DIRECT_RAW_PACKET_WRITE_COMPLETED_EVENT)?;
+        assert_trace_field(packet, "phase", PACKET_WRITE_PHASE);
+        assert_trace_field(packet, "backend", "DirectRawBulk");
+        assert_trace_field(packet, "encoded_row_start", "0");
+        assert_trace_field(packet, "encoded_row_count", "2");
+        assert_trace_field(packet, "encoded_byte_count", "10");
+        assert!(packet.fields().contains_key("elapsed_us"));
+        assert!(!packet.fields().contains_key("raw_packet_count"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn direct_raw_failure_trace_includes_diagnostic_codes() -> Result<(), String> {
+        let mappings = vec![schema_mapping_at(
+            0,
+            "u64_value",
+            DataType::UInt64,
+            MssqlType::BigInt,
+            false,
+        )];
+        let mut state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingRawSink::default();
+        let batch = uint64_batch("u64_value", &[i64::MAX as u64 + 1]);
+
+        let (err, traces) = capture_traces(|| {
+            poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch))
+        });
+        let err = err.unwrap_err();
+
+        let Error::ValueConversion { diagnostics } = err else {
+            panic!("expected value conversion error");
+        };
+        assert_eq!(
+            diagnostics.all()[0].code(),
+            DiagnosticCode::IntegerOutOfRange
+        );
+        let records = traces.records()?;
+        let failure = trace_event(&records, DIRECT_RAW_FAILED_EVENT)?;
+        assert_trace_field(failure, "phase", VALUE_CONVERSION_PHASE);
+        assert_trace_field(failure, "backend", "DirectRawBulk");
+        assert_trace_field(failure, "batch_row_count", "1");
+        assert_trace_field(failure, "batch_column_count", "1");
+        assert_trace_field(failure, "diagnostic_codes", "IntegerOutOfRange");
+        assert_trace_field(
+            failure,
+            "error_summary",
+            "value conversion failed with diagnostics",
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn direct_raw_trace_does_not_emit_values_or_payload_bytes() -> Result<(), String> {
+        let mappings = vec![utf8_mapping_at(0, "secret_value")];
+        let mut state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingRawSink::default();
+        let batch = utf8_batch("secret_value", &["password=secret"]);
+
+        let (_stats, traces) = capture_traces(|| {
+            poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch))
+        });
+
+        traces.assert_no_forbidden_text(&["password=secret"])?;
+
+        let mappings = vec![mapping("id")];
+        let mut state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingRawSink::default();
+        let batch = int32_batch("id", &[987_654_321]);
+        let (_stats, numeric_traces) = capture_traces(|| {
+            poll_ready(write_direct_batch_to_sink(&mut state, &mut sink, &batch))
+        });
+
+        numeric_traces.assert_no_forbidden_text(&["987654321"])?;
+
+        Ok(())
+    }
+
+    #[test]
     fn write_direct_batch_to_sink_accumulates_multi_batch_stats() {
         let mappings = vec![mapping("id")];
         let mut state = WriterState::new(
@@ -3053,6 +3343,7 @@ mod tests {
     impl RawRowsSink for RecordingRawSink {
         async fn send_measured_raw_rows(
             &mut self,
+            backend: WriteBackend,
             encoder: &DirectEncoder,
             batch: &RecordBatch,
             measured: &MeasuredDirectBatch,
@@ -3073,6 +3364,13 @@ mod tests {
                 bytes: payload.bytes().to_vec(),
                 row_token_offsets: payload.row_token_offsets().to_vec(),
             });
+            emit_direct_raw_packet_write_completed(
+                backend,
+                range,
+                payload.row_count(),
+                payload.bytes().len(),
+                std::time::Duration::ZERO,
+            );
             Ok(())
         }
     }
