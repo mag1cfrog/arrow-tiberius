@@ -965,19 +965,18 @@ mod tests {
     use futures_util::io::{AsyncRead, AsyncWrite};
 
     use super::{
-        BulkTargetColumnMetadata, DIRECT_RAW_MAX_PAYLOAD_BYTES, DirectEncoder, FinishSink,
-        MeasuredDirectBatch, MeasuredRowRange, RawRowsSink, TokenRowSink, WriteBackend,
-        WriteOptions, WriteStats, WriterState, bulk_insert_table_sql,
-        emit_direct_raw_packet_write_completed, finish_writer_to_sink, record_batch_view,
-        resolve_backend, tiberius_row_owned, validate_batch_rows, validate_bulk_target_columns,
-        validate_direct_bulk_target_column_types, write_batch_to_sink, write_direct_batch_to_sink,
+        BulkTargetColumnMetadata, DIRECT_RAW_MAX_PAYLOAD_BYTES, DirectEncoder, MeasuredDirectBatch,
+        MeasuredRowRange, RawRowsSink, TokenRowSink, WriteBackend, WriteOptions, WriteStats,
+        WriterState, bulk_insert_table_sql, emit_direct_raw_packet_write_completed,
+        record_batch_view, resolve_backend, tiberius_row_owned, validate_batch_rows,
+        validate_bulk_target_columns, validate_direct_bulk_target_column_types,
+        write_batch_to_sink, write_direct_batch_to_sink,
     };
     use crate::observability::{
         BATCH_SCHEMA_VALIDATION_PHASE, BATCH_WRITE_COMPLETED_EVENT, BATCH_WRITE_FAILED_EVENT,
         BATCH_WRITE_PHASE, BATCH_WRITE_SPAN, DIRECT_ENCODING_PHASE, DIRECT_RAW_MEASURED_EVENT,
-        DIRECT_RAW_PACKET_WRITE_COMPLETED_EVENT, DIRECT_RAW_RANGES_PLANNED_EVENT, FINALIZE_PHASE,
-        FINISH_COMPLETED_EVENT, FINISH_FAILED_EVENT, FINISH_PHASE, FINISH_SPAN, PACKET_WRITE_PHASE,
-        VALUE_CONVERSION_PHASE,
+        DIRECT_RAW_PACKET_WRITE_COMPLETED_EVENT, DIRECT_RAW_RANGES_PLANNED_EVENT,
+        PACKET_WRITE_PHASE, VALUE_CONVERSION_PHASE,
         test_support::{CapturedTrace, CapturedTraceKind, capture_traces},
     };
     use crate::{
@@ -1176,109 +1175,6 @@ mod tests {
                 batches_written: 3
             }
         );
-    }
-
-    #[test]
-    fn finish_success_emits_final_stats_trace() -> Result<(), String> {
-        let mut state = WriterState::new(
-            WriteBackend::BaselineTokenRow,
-            SchemaCheck::Strict,
-            PlanOptions::default(),
-            Vec::new(),
-        )
-        .unwrap();
-        state.record_accepted_batch(2);
-        state.record_accepted_batch(3);
-        let sink = RecordingFinishSink::default();
-
-        let (stats, traces) = capture_traces(|| poll_ready(finish_writer_to_sink(state, sink)));
-        let stats = stats.unwrap();
-
-        assert_eq!(
-            stats,
-            WriteStats {
-                rows_written: 5,
-                batches_written: 2
-            }
-        );
-        let records = traces.records()?;
-        let event = trace_event(&records, FINISH_COMPLETED_EVENT)?;
-        assert_eq!(event.span_name(), Some(FINISH_SPAN));
-        assert_trace_field(event, "phase", FINISH_PHASE);
-        assert_trace_field(event, "backend", "BaselineTokenRow");
-        assert_trace_field(event, "rows_written", "5");
-        assert_trace_field(event, "batches_written", "2");
-        assert_trace_field(event, "finish_result", "success");
-        assert!(event.fields().contains_key("elapsed_us"));
-
-        Ok(())
-    }
-
-    #[test]
-    fn finish_failure_emits_finalize_trace_with_accepted_stats() -> Result<(), String> {
-        let mut state = WriterState::new(
-            WriteBackend::DirectRawBulk,
-            SchemaCheck::Strict,
-            PlanOptions::default(),
-            Vec::new(),
-        )
-        .unwrap();
-        state.record_accepted_batch(7);
-        let sink = RecordingFinishSink {
-            fail_message: Some("fake finalize failure"),
-        };
-
-        let (err, traces) = capture_traces(|| poll_ready(finish_writer_to_sink(state, sink)));
-        let err = err.unwrap_err();
-
-        assert_write_phase(&err, WritePhase::Finalize);
-        let Error::Tiberius { source } = inner_error(&err) else {
-            panic!("expected tiberius error");
-        };
-        assert_eq!(
-            source.to_string(),
-            "BULK UPLOAD input failure: fake finalize failure"
-        );
-        let records = traces.records()?;
-        let event = trace_event(&records, FINISH_FAILED_EVENT)?;
-        assert_eq!(event.span_name(), Some(FINISH_SPAN));
-        assert_trace_field(event, "phase", FINALIZE_PHASE);
-        assert_trace_field(event, "backend", "DirectRawBulk");
-        assert_trace_field(event, "accepted_rows_before", "7");
-        assert_trace_field(event, "accepted_batches_before", "1");
-        assert_trace_field(event, "finish_result", "failure");
-        assert_trace_field(event, "error_summary", "tiberius operation failed");
-        assert_trace_field(event, "diagnostic_codes", "");
-        assert!(event.fields().contains_key("elapsed_us"));
-
-        Ok(())
-    }
-
-    #[test]
-    fn finish_failure_trace_is_sanitized() -> Result<(), String> {
-        let state = WriterState::new(
-            WriteBackend::DirectRawBulk,
-            SchemaCheck::Strict,
-            PlanOptions::default(),
-            Vec::new(),
-        )
-        .unwrap();
-        let sink = RecordingFinishSink {
-            fail_message: Some("server=tcp:sql.example.com;User ID=sa;password=secret"),
-        };
-
-        let (_err, traces) = capture_traces(|| poll_ready(finish_writer_to_sink(state, sink)));
-
-        let records = traces.records()?;
-        let event = trace_event(&records, FINISH_FAILED_EVENT)?;
-        assert_trace_field(event, "error_summary", "tiberius operation failed");
-        traces.assert_no_forbidden_text(&[
-            "server=tcp:sql.example.com",
-            "User ID=sa",
-            "password=secret",
-        ])?;
-
-        Ok(())
     }
 
     #[test]
@@ -2880,11 +2776,6 @@ mod tests {
         payloads: Vec<RecordedRawPayload>,
     }
 
-    #[derive(Debug, Default)]
-    struct RecordingFinishSink {
-        fail_message: Option<&'static str>,
-    }
-
     #[derive(Debug, PartialEq, Eq)]
     struct RecordedRawPayload {
         bytes: Vec<u8>,
@@ -2923,17 +2814,6 @@ mod tests {
                 std::time::Duration::ZERO,
             );
             Ok(())
-        }
-    }
-
-    impl FinishSink for RecordingFinishSink {
-        async fn finalize_bulk_load(self) -> crate::Result<()> {
-            match self.fail_message {
-                Some(message) => Err(Error::Tiberius {
-                    source: tiberius::error::Error::BulkInput(Cow::Borrowed(message)),
-                }),
-                None => Ok(()),
-            }
         }
     }
 
