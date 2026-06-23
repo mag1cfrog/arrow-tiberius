@@ -1,0 +1,327 @@
+//! Crate-owned tracing names and test capture helpers.
+
+/// Crate-level tracing target used by `arrow-tiberius` instrumentation.
+#[allow(dead_code)]
+pub(crate) const TRACE_TARGET: &str = "arrow_tiberius";
+
+/// Test-only span name used to prove tracing capture support.
+#[cfg(test)]
+pub(crate) const TEST_CAPTURE_SPAN: &str = "arrow_tiberius.test_capture";
+
+/// Test-only event message used to prove tracing capture support.
+#[cfg(test)]
+pub(crate) const TEST_CAPTURE_EVENT: &str = "arrow_tiberius.test_capture_smoke";
+
+/// Emits a test-only event through the same tracing path production code uses.
+#[cfg(test)]
+pub(crate) fn emit_test_capture_smoke_event() {
+    let span = tracing::info_span!(
+        target: TRACE_TARGET,
+        TEST_CAPTURE_SPAN,
+        phase = "test_capture"
+    );
+    let _span_guard = span.enter();
+
+    tracing::info!(
+        target: TRACE_TARGET,
+        phase = "test_capture",
+        smoke_count = 1_u64,
+        smoke_label = "foundation",
+        message = TEST_CAPTURE_EVENT
+    );
+}
+
+/// Test-only helpers for scoped tracing capture.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::{
+        collections::BTreeMap,
+        fmt,
+        sync::{Arc, Mutex},
+    };
+
+    use tracing::{
+        Event, Level, Subscriber,
+        field::{Field, Visit},
+        span::{Attributes, Id},
+    };
+    use tracing_subscriber::{
+        Layer, Registry,
+        layer::{Context, SubscriberExt},
+        registry::LookupSpan,
+    };
+
+    /// Kind of captured tracing record.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum CapturedTraceKind {
+        /// A span was created.
+        Span,
+        /// An event was emitted.
+        Event,
+    }
+
+    /// One captured tracing span or event.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct CapturedTrace {
+        kind: CapturedTraceKind,
+        name: String,
+        target: String,
+        level: Level,
+        span_name: Option<String>,
+        fields: BTreeMap<String, String>,
+    }
+
+    impl CapturedTrace {
+        /// Returns whether this record is a span or event.
+        pub(crate) const fn kind(&self) -> CapturedTraceKind {
+            self.kind
+        }
+
+        /// Returns the tracing metadata name.
+        pub(crate) fn name(&self) -> &str {
+            &self.name
+        }
+
+        /// Returns the tracing target.
+        pub(crate) fn target(&self) -> &str {
+            &self.target
+        }
+
+        /// Returns the tracing level.
+        pub(crate) fn level(&self) -> Level {
+            self.level
+        }
+
+        /// Returns the active span name captured for this event.
+        pub(crate) fn span_name(&self) -> Option<&str> {
+            self.span_name.as_deref()
+        }
+
+        /// Returns captured structured fields.
+        pub(crate) const fn fields(&self) -> &BTreeMap<String, String> {
+            &self.fields
+        }
+
+        fn contains_text(&self, text: &str) -> bool {
+            self.name.contains(text)
+                || self.target.contains(text)
+                || self
+                    .span_name
+                    .as_ref()
+                    .is_some_and(|span_name| span_name.contains(text))
+                || self
+                    .fields
+                    .iter()
+                    .any(|(key, value)| key.contains(text) || value.contains(text))
+        }
+    }
+
+    /// Records captured inside one scoped subscriber.
+    #[derive(Debug, Clone)]
+    pub(crate) struct CapturedTraces {
+        records: Arc<Mutex<Vec<CapturedTrace>>>,
+    }
+
+    impl CapturedTraces {
+        /// Returns a cloned snapshot of captured records.
+        pub(crate) fn records(&self) -> Result<Vec<CapturedTrace>, String> {
+            self.records
+                .lock()
+                .map_err(|_| "captured traces lock poisoned".to_owned())
+                .map(|records| records.clone())
+        }
+
+        /// Returns whether any captured record contains the supplied text.
+        pub(crate) fn contains_text(&self, text: &str) -> Result<bool, String> {
+            Ok(self
+                .records()?
+                .into_iter()
+                .any(|record| record.contains_text(text)))
+        }
+
+        /// Fails if any captured record contains one of the supplied texts.
+        pub(crate) fn assert_no_forbidden_text(&self, forbidden: &[&str]) -> Result<(), String> {
+            let records = self.records()?;
+            for text in forbidden {
+                if records.iter().any(|record| record.contains_text(text)) {
+                    return Err(format!("captured trace contained forbidden text `{text}`"));
+                }
+            }
+
+            Ok(())
+        }
+    }
+
+    /// Runs a closure with a scoped tracing subscriber and returns captured records.
+    pub(crate) fn capture_traces<R>(operation: impl FnOnce() -> R) -> (R, CapturedTraces) {
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = Registry::default().with(CaptureLayer {
+            records: Arc::clone(&records),
+        });
+        let result = tracing::subscriber::with_default(subscriber, operation);
+
+        (result, CapturedTraces { records })
+    }
+
+    struct CaptureLayer {
+        records: Arc<Mutex<Vec<CapturedTrace>>>,
+    }
+
+    impl<S> Layer<S> for CaptureLayer
+    where
+        S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    {
+        fn on_new_span(&self, attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {
+            let metadata = attrs.metadata();
+            let mut visitor = FieldVisitor::default();
+            attrs.record(&mut visitor);
+            self.push(CapturedTrace {
+                kind: CapturedTraceKind::Span,
+                name: metadata.name().to_owned(),
+                target: metadata.target().to_owned(),
+                level: *metadata.level(),
+                span_name: None,
+                fields: visitor.fields,
+            });
+        }
+
+        fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+            let metadata = event.metadata();
+            let mut visitor = FieldVisitor::default();
+            event.record(&mut visitor);
+            let span_name = ctx.event_scope(event).and_then(|scope| {
+                scope
+                    .from_root()
+                    .last()
+                    .map(|span| span.metadata().name().to_owned())
+            });
+
+            self.push(CapturedTrace {
+                kind: CapturedTraceKind::Event,
+                name: metadata.name().to_owned(),
+                target: metadata.target().to_owned(),
+                level: *metadata.level(),
+                span_name,
+                fields: visitor.fields,
+            });
+        }
+    }
+
+    impl CaptureLayer {
+        fn push(&self, record: CapturedTrace) {
+            if let Ok(mut records) = self.records.lock() {
+                records.push(record);
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct FieldVisitor {
+        fields: BTreeMap<String, String>,
+    }
+
+    impl FieldVisitor {
+        fn insert(&mut self, field: &Field, value: impl Into<String>) {
+            self.fields.insert(field.name().to_owned(), value.into());
+        }
+    }
+
+    impl Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            self.insert(field, format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.insert(field, value);
+        }
+
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            self.insert(field, value.to_string());
+        }
+
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.insert(field, value.to_string());
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.insert(field, value.to_string());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tracing::Level;
+
+    use super::{
+        TEST_CAPTURE_EVENT, TEST_CAPTURE_SPAN, TRACE_TARGET, emit_test_capture_smoke_event,
+        test_support::{CapturedTraceKind, capture_traces},
+    };
+
+    #[test]
+    fn scoped_capture_records_event_and_fields() -> Result<(), String> {
+        let (_result, traces) = capture_traces(emit_test_capture_smoke_event);
+        let records = traces.records()?;
+
+        let has_span = records.iter().any(|record| {
+            record.kind() == CapturedTraceKind::Span
+                && record.name() == TEST_CAPTURE_SPAN
+                && record.target() == TRACE_TARGET
+                && record.level() == Level::INFO
+                && record
+                    .fields()
+                    .get("phase")
+                    .is_some_and(|value| value == "test_capture")
+        });
+        assert!(has_span, "captured records: {records:#?}");
+
+        let has_event = records.iter().any(|record| {
+            record.kind() == CapturedTraceKind::Event
+                && record.target() == TRACE_TARGET
+                && record.level() == Level::INFO
+                && record.span_name() == Some(TEST_CAPTURE_SPAN)
+                && record
+                    .fields()
+                    .get("message")
+                    .is_some_and(|value| value.contains(TEST_CAPTURE_EVENT))
+                && record
+                    .fields()
+                    .get("smoke_count")
+                    .is_some_and(|value| value == "1")
+                && record
+                    .fields()
+                    .get("smoke_label")
+                    .is_some_and(|value| value == "foundation")
+        });
+        assert!(has_event, "captured records: {records:#?}");
+
+        Ok(())
+    }
+
+    #[test]
+    fn smoke_event_runs_without_subscriber() {
+        emit_test_capture_smoke_event();
+    }
+
+    #[test]
+    fn capture_helper_detects_forbidden_text() -> Result<(), String> {
+        let (_result, traces) = capture_traces(|| {
+            tracing::info!(
+                target: TRACE_TARGET,
+                safe_field = "credential-free",
+                secret_like = "password=secret",
+                "test forbidden scan"
+            );
+        });
+
+        assert!(traces.contains_text("password=secret")?);
+        traces.assert_no_forbidden_text(&["server=tcp:sql.example.com"])?;
+        assert!(
+            traces
+                .assert_no_forbidden_text(&["password=secret"])
+                .is_err()
+        );
+
+        Ok(())
+    }
+}
