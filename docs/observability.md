@@ -29,7 +29,9 @@ use tracing_subscriber::EnvFilter;
 
 fn init_tracing_for_example() {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new("info,arrow_tiberius=debug"))
+        .with_env_filter(EnvFilter::new(
+            "info,arrow_tiberius=debug,tiberius_raw_bulk::protocol=info",
+        ))
         .init();
 }
 ```
@@ -46,6 +48,18 @@ All crate-owned instrumentation uses the tracing target:
 ```text
 arrow_tiberius
 ```
+
+The `tiberius-raw-bulk` dependency emits sanitized SQL Server client and TDS
+protocol telemetry under:
+
+```text
+tiberius_raw_bulk::protocol
+```
+
+That protocol target covers lower-level phases such as connection setup, TLS
+negotiation, login, bulk-load protocol operations, packet write summaries,
+server token summaries, and SQL Browser named-instance resolution. It is emitted
+by `tiberius-raw-bulk`, not re-wrapped by `arrow-tiberius`.
 
 Recommended filters:
 
@@ -149,6 +163,28 @@ application span. This lets downstream systems group crate-owned writer details
 under the application's workflow or output context without duplicating writer
 internals.
 
+During writer operations, `tiberius-raw-bulk` protocol events are emitted under
+the active `arrow-tiberius` writer spans. A typical write trace can therefore
+look like:
+
+```text
+my_app.output_write
+  -> arrow_tiberius.writer_initialization
+    -> protocol.connection.connect
+    -> protocol.tls.negotiation
+    -> protocol.login.flow
+  -> arrow_tiberius.batch_write
+    -> protocol.bulk_load.request
+    -> protocol.bulk_load.packet.written
+  -> arrow_tiberius.finish
+    -> protocol.token.done
+```
+
+Collectors should keep the targets distinct: `arrow_tiberius` describes Arrow
+schema planning and writer lifecycle semantics, while
+`tiberius_raw_bulk::protocol` describes SQL Server client and TDS protocol
+semantics.
+
 When a workflow writes multiple outputs, create one parent span per output or
 per logical workflow step. Keep source-specific context in the application span
 or its fields rather than expecting `arrow-tiberius` to infer it.
@@ -159,10 +195,11 @@ or its fields rather than expecting `arrow-tiberius` to infer it.
 - `arrow-tiberius` does not emit row-level telemetry.
 - `arrow-tiberius` does not emit raw packet bytes, raw row payload bytes, or
   arbitrary SQL text.
-- Direct raw packet events report safe row and byte summaries, not internal
-  packet counts for the normal write path.
-- Tiberius internal connection, TLS, socket, and SQL Server engine behavior is
-  not fully covered by crate-owned tracing.
+- Direct raw writer events report safe row and byte summaries. Lower-level
+  packet summaries are emitted by `tiberius-raw-bulk` protocol tracing.
+- SQL Server engine behavior is outside both client libraries. Server-side
+  execution, waits, locks, IO, and query plans require SQL Server DMVs,
+  Extended Events, Query Store, or separate profiling queries.
 - Workflow ids, output names, source aliases, retries, transactions, and
   orchestration status must be supplied by downstream applications.
 - The `bench-profile` feature exposes benchmark-only profiling hooks. It is

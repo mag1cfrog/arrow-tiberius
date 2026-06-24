@@ -137,7 +137,12 @@ impl BatchWriteTrace {
 
 #[cfg(test)]
 mod tests {
-    use std::{borrow::Cow, sync::Arc};
+    use std::{
+        borrow::Cow,
+        future::Future,
+        sync::Arc,
+        task::{Context, Poll, Waker},
+    };
 
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
@@ -318,6 +323,46 @@ mod tests {
     }
 
     #[test]
+    fn tiberius_protocol_events_are_parented_to_batch_write_span() -> Result<(), String> {
+        const TIBERIUS_PROTOCOL_TARGET: &str = "tiberius_raw_bulk::protocol";
+        const TIBERIUS_PACKET_EVENT: &str = "protocol.bulk_load.packet.written";
+
+        let batch = int32_batch("id", &[10, 20]);
+        let (result, traces) = capture_traces(|| {
+            let trace =
+                BatchWriteTrace::new(WriteBackend::DirectRawBulk, WriteStats::default(), &batch);
+            let write_result = poll_ready(trace.trace_result(async {
+                tracing::info!(
+                    target: TIBERIUS_PROTOCOL_TARGET,
+                    telemetry_event = TIBERIUS_PACKET_EVENT,
+                    phase = PACKET_WRITE_PHASE,
+                    operation = "bulk_load",
+                    status = "success",
+                    packet_count = 1_u64
+                );
+                Ok(WriteStats {
+                    rows_written: 2,
+                    batches_written: 1,
+                })
+            }))?;
+            write_result.map_err(|err| err.to_string())?;
+            Ok::<(), String>(())
+        });
+        result?;
+
+        let records = traces.records()?;
+        let event = trace_event(&records, TIBERIUS_PACKET_EVENT)?;
+        assert_eq!(event.target(), TIBERIUS_PROTOCOL_TARGET);
+        assert_eq!(event.span_name(), Some(BATCH_WRITE_SPAN));
+        assert_trace_field(event, "phase", PACKET_WRITE_PHASE);
+        assert_trace_field(event, "operation", "bulk_load");
+        assert_trace_field(event, "status", "success");
+        assert_trace_field(event, "packet_count", "1");
+
+        Ok(())
+    }
+
+    #[test]
     fn direct_batch_write_success_emits_stats_trace() -> Result<(), String> {
         let batch = int32_batch("id", &[10, 20]);
 
@@ -390,5 +435,17 @@ mod tests {
     fn utf8_batch(name: &str, values: &[&str]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Utf8, false)]));
         RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values.to_vec()))]).unwrap()
+    }
+
+    fn poll_ready<F>(future: F) -> Result<F::Output, String>
+    where
+        F: Future,
+    {
+        let mut future = Box::pin(future);
+        let mut context = Context::from_waker(Waker::noop());
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => Ok(output),
+            Poll::Pending => Err("test future unexpectedly pending".to_owned()),
+        }
     }
 }
