@@ -159,6 +159,12 @@ and writer finish. It does not install a global subscriber; applications decide
 how tracing is filtered, formatted, exported, or attached to workflow-level
 spans.
 
+Its `tiberius-raw-bulk` dependency also emits sanitized protocol tracing under
+the `tiberius_raw_bulk::protocol` target. Those protocol events are emitted
+inside the active `arrow-tiberius` writer spans during connect, bulk-load, and
+finish operations, so applications can see writer lifecycle telemetry and
+low-level SQL Server client/TDS telemetry with one subscriber.
+
 The tracing contract is intentionally sanitized. It includes backend names,
 validated identifiers, counts, phase names, diagnostic codes, and elapsed
 durations. It does not emit connection strings, passwords, row values, raw
@@ -232,7 +238,7 @@ path used by this repository.
 crate name `tiberius` and owns that compatibility boundary internally:
 
 ```toml
-tiberius = { package = "tiberius-raw-bulk", version = "=0.12.3-raw-bulk.13", default-features = false, features = [
+tiberius = { package = "tiberius-raw-bulk", version = "=0.12.3-raw-bulk.14", default-features = false, features = [
     "tds73",
     "winauth",
     "native-tls",

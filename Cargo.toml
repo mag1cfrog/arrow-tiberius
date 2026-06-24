@@ -42,6 +42,7 @@ include = [
     "docs/dependency-audit.md",
     "docs/direct-raw-benchmark-comparison.md",
     "docs/integration-tests.md",
+    "docs/observability.md",
     "docs/release-v0.1.md",
     "docs/type-mapping.md",
 ]
@@ -69,7 +70,7 @@ arrow-schema = "58.3.0"
 chrono = { version = "0.4.40", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["io"] }
 snafu = "0.9.1"
-tiberius = { package = "tiberius-raw-bulk", version = "=0.12.3-raw-bulk.13", default-features = false, features = [
+tiberius = { package = "tiberius-raw-bulk", version = "=0.12.3-raw-bulk.14", default-features = false, features = [
     "tds73",
     "winauth",
     "native-tls",

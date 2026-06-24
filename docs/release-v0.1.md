@@ -74,7 +74,7 @@ The public profile constructor for this target is
 `arrow-tiberius` depends on a forked Tiberius package:
 
 ```toml
-tiberius = { package = "tiberius-raw-bulk", version = "=0.12.3-raw-bulk.13", default-features = false, features = [
+tiberius = { package = "tiberius-raw-bulk", version = "=0.12.3-raw-bulk.14", default-features = false, features = [
     "tds73",
     "winauth",
     "native-tls",
