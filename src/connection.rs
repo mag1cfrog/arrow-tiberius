@@ -91,6 +91,34 @@ impl ConnectedMssqlClient {
             })
     }
 
+    /// Returns `COUNT_BIG(*)` for a target table.
+    ///
+    /// The query uses this crate's bracket-quoted [`TableName`] rendering and
+    /// returns only a checked `u64` count. It does not expose raw SQL text,
+    /// result rows, or the underlying Tiberius client type.
+    pub async fn target_row_count(&mut self, table: &TableName) -> Result<u64> {
+        let query = target_row_count_query(table);
+        let row = self
+            .client
+            .simple_query(query)
+            .await
+            .map_err(|source| Error::TargetRowCountQuery { source })?
+            .into_row()
+            .await
+            .map_err(|source| Error::TargetRowCountQuery { source })?
+            .ok_or_else(|| Error::TargetRowCountUnexpectedResult {
+                reason: "target row count query returned no rows".to_owned(),
+            })?;
+        let count = row
+            .try_get::<i64, _>("row_count")
+            .map_err(|source| Error::TargetRowCountQuery { source })?
+            .ok_or_else(|| Error::TargetRowCountUnexpectedResult {
+                reason: "target row count query returned NULL".to_owned(),
+            })?;
+
+        count_big_i64_to_u64(count)
+    }
+
     /// Executes a prepared lifecycle SQL statement.
     ///
     /// This method accepts statement text but intentionally returns only
@@ -179,6 +207,19 @@ fn table_exists_query(table: &TableName) -> String {
     )
 }
 
+fn target_row_count_query(table: &TableName) -> String {
+    format!(
+        "SELECT COUNT_BIG(*) AS [row_count] FROM {}",
+        table.quoted_sql()
+    )
+}
+
+fn count_big_i64_to_u64(count: i64) -> Result<u64> {
+    u64::try_from(count).map_err(|_| Error::TargetRowCountUnexpectedResult {
+        reason: "target row count was outside the supported range".to_owned(),
+    })
+}
+
 fn sql_string_literal(value: &str) -> String {
     format!("N'{}'", value.replace('\'', "''"))
 }
@@ -227,6 +268,32 @@ mod tests {
         assert!(query.contains("t.name = N'people'"));
         assert!(!query.contains("s.name ="));
         Ok(())
+    }
+
+    #[test]
+    fn target_row_count_query_uses_quoted_table_name() -> crate::Result<()> {
+        let table = crate::TableName::new("tenant.schema", "people]2026")?;
+        let query = super::target_row_count_query(&table);
+
+        assert_eq!(
+            query,
+            "SELECT COUNT_BIG(*) AS [row_count] FROM [tenant.schema].[people]]2026]"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn count_big_conversion_rejects_negative_values_without_panicking() {
+        let error = super::count_big_i64_to_u64(-1).err().unwrap_or_else(|| {
+            Error::TargetRowCountUnexpectedResult {
+                reason: "expected negative count to fail".to_owned(),
+            }
+        });
+
+        assert!(matches!(
+            error,
+            Error::TargetRowCountUnexpectedResult { .. }
+        ));
     }
 
     #[test]
