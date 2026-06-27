@@ -158,6 +158,20 @@ pub enum Error {
         reason: String,
     },
 
+    /// SQL Server target row-count query failed.
+    #[snafu(display("SQL Server target row count query failed: {source}"))]
+    TargetRowCountQuery {
+        /// Source error returned by Tiberius.
+        source: tiberius::error::Error,
+    },
+
+    /// SQL Server target row-count query returned an unexpected shape.
+    #[snafu(display("SQL Server target row count query returned an unexpected result: {reason}"))]
+    TargetRowCountUnexpectedResult {
+        /// Human-readable reason the target row-count result could not be interpreted.
+        reason: String,
+    },
+
     /// SQL Server lifecycle statement execution failed.
     #[snafu(display("SQL Server statement execution failed: {source}"))]
     SqlExecution {

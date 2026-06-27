@@ -39,6 +39,10 @@ pub(super) fn sanitized_error_summary(error: &crate::Error) -> &'static str {
         crate::Error::TableExistsUnexpectedResult { .. } => {
             "table existence query returned unexpected result"
         }
+        crate::Error::TargetRowCountQuery { .. } => "target row count query failed",
+        crate::Error::TargetRowCountUnexpectedResult { .. } => {
+            "target row count query returned unexpected result"
+        }
         crate::Error::SqlExecution { .. } => "SQL statement execution failed",
         crate::Error::Tiberius { .. } => "tiberius operation failed",
     }
