@@ -4,7 +4,8 @@ use arrow_schema::DataType;
 
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, MssqlType, MssqlTypeLength, Result,
-    SchemaMapping, arrow::field::is_arrow_string_family,
+    SchemaMapping,
+    arrow::field::{is_arrow_binary_family, is_arrow_string_family},
 };
 
 /// Shared semantic conversion class for variable-width Arrow-to-MSSQL values.
@@ -48,6 +49,12 @@ impl VariableWidthArrowToMssql {
 pub(crate) fn is_string_family_to_nvarchar(mapping: &SchemaMapping) -> bool {
     is_arrow_string_family(mapping.arrow().data_type())
         && matches!(mapping.mssql().ty(), MssqlType::NVarChar(_))
+}
+
+/// Returns true when a planned mapping writes Arrow binary-family values to `varbinary`.
+pub(crate) fn is_binary_family_to_varbinary(mapping: &SchemaMapping) -> bool {
+    is_arrow_binary_family(mapping.arrow().data_type())
+        && matches!(mapping.mssql().ty(), MssqlType::VarBinary(_))
 }
 
 /// Returns true when a runtime Arrow type is compatible with the planned mapping.

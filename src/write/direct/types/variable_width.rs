@@ -1,6 +1,6 @@
 //! Variable-width direct TDS row layout measurement.
 
-use arrow_array::{Array, GenericBinaryArray, OffsetSizeTrait, StringArrayType};
+use arrow_array::{BinaryArrayType, StringArrayType};
 
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, MssqlTypeLength, Result,
@@ -48,9 +48,9 @@ pub(crate) fn measure_nvarchar_column_cell_lengths<'a>(
     )
 }
 
-/// Measures one Binary-to-varbinary column into a row-major cell length matrix.
-pub(crate) fn measure_varbinary_column_cell_lengths(
-    array: &GenericBinaryArray<impl OffsetSizeTrait>,
+/// Measures one binary-family-to-varbinary column into a row-major cell length matrix.
+pub(crate) fn measure_varbinary_column_cell_lengths<'a>(
+    array: impl BinaryArrayType<'a>,
     column: &DirectColumnPlan,
     column_index: usize,
     column_count: usize,
@@ -117,9 +117,9 @@ pub(crate) fn fill_nvarchar_column<'a>(
     Ok(())
 }
 
-/// Fills one Binary-to-varbinary column into an already allocated rows payload.
-pub(crate) fn fill_varbinary_column(
-    array: &GenericBinaryArray<impl OffsetSizeTrait>,
+/// Fills one binary-family-to-varbinary column into an already allocated rows payload.
+pub(crate) fn fill_varbinary_column<'a>(
+    array: impl BinaryArrayType<'a>,
     column: &DirectColumnPlan,
     column_index: usize,
     column_count: usize,
@@ -217,10 +217,10 @@ pub(crate) fn append_nvarchar_cell<'a>(
     }
 }
 
-/// Appends one Binary-to-varbinary cell to a raw bulk append buffer.
-pub(crate) fn append_varbinary_cell(
+/// Appends one binary-family-to-varbinary cell to a raw bulk append buffer.
+pub(crate) fn append_varbinary_cell<'a>(
     buf: &mut tiberius::RawRowsAppendBuffer<'_>,
-    array: &GenericBinaryArray<impl OffsetSizeTrait>,
+    array: impl BinaryArrayType<'a>,
     column: &DirectColumnPlan,
     row_index: usize,
     measured_len: usize,
@@ -305,8 +305,8 @@ fn measure_nvarchar_cell_lengths<'a>(
     Ok(())
 }
 
-fn measure_varbinary_cell_lengths(
-    array: &GenericBinaryArray<impl OffsetSizeTrait>,
+fn measure_varbinary_cell_lengths<'a>(
+    array: impl BinaryArrayType<'a>,
     column: &DirectColumnPlan,
     column_index: usize,
     column_count: usize,
@@ -886,7 +886,8 @@ fn unsupported_batch(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use arrow_array::{
-        Array, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
+        Array, BinaryArray, BinaryViewArray, LargeBinaryArray, LargeStringArray, StringArray,
+        StringViewArray,
     };
     use arrow_schema::DataType;
 
@@ -1391,6 +1392,74 @@ mod tests {
                 0, 0, 0, 0, 0xd1, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0xd1,
                 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
             ]
+        );
+    }
+
+    #[test]
+    fn measures_binary_view_varbinary_cells_by_byte_count() {
+        let array = BinaryViewArray::from(vec![Some(&b"abc"[..]), Some(&b""[..]), None]);
+        let plan = plan(&[mapping(
+            0,
+            "view_bytes",
+            DataType::Binary,
+            MssqlType::VarBinary(MssqlTypeLength::Bounded(3)),
+            true,
+        )]);
+        let mut cell_lengths = vec![0; array.len()];
+
+        measure_varbinary_column_cell_lengths(&array, &plan.columns()[0], 0, 1, &mut cell_lengths)
+            .unwrap();
+
+        assert_eq!(cell_lengths, [5, 2, 2]);
+    }
+
+    #[test]
+    fn rejects_binary_view_bounded_varbinary_values_over_planned_bytes() {
+        let array = BinaryViewArray::from(vec![Some(&b"abcd"[..])]);
+        let plan = plan(&[mapping(
+            0,
+            "view_bytes",
+            DataType::Binary,
+            MssqlType::VarBinary(MssqlTypeLength::Bounded(3)),
+            true,
+        )]);
+        let mut cell_lengths = vec![0; array.len()];
+
+        let err = measure_varbinary_column_cell_lengths(
+            &array,
+            &plan.columns()[0],
+            0,
+            1,
+            &mut cell_lengths,
+        )
+        .unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::ValueTooLong,
+            Some(0),
+            Some((0, "view_bytes")),
+        );
+    }
+
+    #[test]
+    fn fills_binary_view_bounded_varbinary_cells_with_null_sentinel() {
+        let array = BinaryViewArray::from(vec![Some(&b"abc"[..]), Some(&b""[..]), None]);
+        let plan = plan(&[mapping(
+            0,
+            "view_bytes",
+            DataType::Binary,
+            MssqlType::VarBinary(MssqlTypeLength::Bounded(3)),
+            true,
+        )]);
+        let layout = build_fixed_width_row_layout(3, 1, &[5, 2, 2]).unwrap();
+        let mut bytes = allocate_rows_payload_with_tokens(&layout);
+
+        fill_varbinary_column(&array, &plan.columns()[0], 0, 1, &layout, &mut bytes).unwrap();
+
+        assert_eq!(
+            bytes,
+            [0xd1, 3, 0, b'a', b'b', b'c', 0xd1, 0, 0, 0xd1, 0xff, 0xff,]
         );
     }
 

@@ -110,10 +110,13 @@ impl BoundDirectColumn<'_> {
                 append_nvarchar_cell(buf, *array, column, row_index, measured_len)
             }
             Self::Binary { column, array } => {
-                append_varbinary_cell(buf, array, column, row_index, measured_len)
+                append_varbinary_cell(buf, *array, column, row_index, measured_len)
             }
             Self::LargeBinary { column, array } => {
-                append_varbinary_cell(buf, array, column, row_index, measured_len)
+                append_varbinary_cell(buf, *array, column, row_index, measured_len)
+            }
+            Self::BinaryView { column, array } => {
+                append_varbinary_cell(buf, *array, column, row_index, measured_len)
             }
             Self::FixedSizeBinary {
                 column,

@@ -5,9 +5,9 @@ mod fill;
 mod measure;
 
 use arrow_array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
-    Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float16Array, Float32Array,
-    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
+    Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Decimal32Array,
+    Decimal64Array, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float16Array,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
     LargeStringArray, RecordBatch, StringArray, StringViewArray, Time32MillisecondArray,
     Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
@@ -29,7 +29,9 @@ use crate::{
         fixed_size_binary::FixedSizeBinaryArrowToMssql,
         primitive::PrimitiveArrowToMssql,
         temporal::TemporalArrowToMssql,
-        variable_width::{VariableWidthArrowToMssql, is_string_family_to_nvarchar},
+        variable_width::{
+            VariableWidthArrowToMssql, is_binary_family_to_varbinary, is_string_family_to_nvarchar,
+        },
     },
 };
 
@@ -383,7 +385,15 @@ fn bind_direct_varbinary_array<'a>(
     column: &'a plan::DirectColumnPlan,
     mapping: &SchemaMapping,
 ) -> Result<BoundDirectColumn<'a>> {
-    match mapping.arrow().data_type() {
+    if !is_binary_family_to_varbinary(mapping) {
+        return Err(unsupported_planned_direct_type(
+            column,
+            "varbinary",
+            mapping.arrow().data_type(),
+        ));
+    }
+
+    match array.data_type() {
         DataType::Binary => Ok(BoundDirectColumn::Binary {
             column,
             array: downcast_direct_array::<BinaryArray>(array, column)?,
@@ -391,6 +401,10 @@ fn bind_direct_varbinary_array<'a>(
         DataType::LargeBinary => Ok(BoundDirectColumn::LargeBinary {
             column,
             array: downcast_direct_array::<LargeBinaryArray>(array, column)?,
+        }),
+        DataType::BinaryView => Ok(BoundDirectColumn::BinaryView {
+            column,
+            array: downcast_direct_array::<BinaryViewArray>(array, column)?,
         }),
         other => Err(unsupported_planned_direct_type(column, "varbinary", other)),
     }
@@ -488,6 +502,10 @@ pub(crate) enum BoundDirectColumn<'a> {
     LargeBinary {
         column: &'a plan::DirectColumnPlan,
         array: &'a LargeBinaryArray,
+    },
+    BinaryView {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a BinaryViewArray,
     },
     FixedSizeBinary {
         column: &'a plan::DirectColumnPlan,
@@ -605,7 +623,9 @@ fn unsupported_planned_direct_type(
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, FixedSizeBinaryArray, Int32Array, StringViewArray};
+    use arrow_array::{
+        ArrayRef, BinaryViewArray, FixedSizeBinaryArray, Int32Array, StringViewArray,
+    };
     use arrow_schema::{DataType, Field, Schema};
 
     use super::*;
@@ -694,6 +714,39 @@ mod tests {
             panic!("string-family mapping should bind to StringViewArray");
         };
         assert_eq!(array.value(0), "view");
+    }
+
+    #[test]
+    fn binds_binary_view_arrays_to_binary_runtime_variant() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "bytes",
+                DataType::Binary,
+                MssqlType::VarBinary(MssqlTypeLength::Max),
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("bytes", DataType::BinaryView, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![7])) as ArrayRef,
+                Arc::new(BinaryViewArray::from(vec![Some(&b"view"[..])])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+
+        let BoundDirectColumn::BinaryView { array, .. } = bound.columns()[1] else {
+            panic!("binary-family mapping should bind to BinaryViewArray");
+        };
+        assert_eq!(array.value(0), b"view");
     }
 
     #[test]

@@ -750,7 +750,8 @@ fn fixed_width_column_parts<'a>(
         | BoundDirectColumn::LargeUtf8 { .. }
         | BoundDirectColumn::Utf8View { .. }
         | BoundDirectColumn::Binary { .. }
-        | BoundDirectColumn::LargeBinary { .. } => None,
+        | BoundDirectColumn::LargeBinary { .. }
+        | BoundDirectColumn::BinaryView { .. } => None,
     }
 }
 
@@ -792,7 +793,8 @@ fn fixed_width_column_array<'a>(column: &'a BoundDirectColumn<'a>) -> &'a dyn Ar
         | BoundDirectColumn::LargeUtf8 { .. }
         | BoundDirectColumn::Utf8View { .. }
         | BoundDirectColumn::Binary { .. }
-        | BoundDirectColumn::LargeBinary { .. } => {
+        | BoundDirectColumn::LargeBinary { .. }
+        | BoundDirectColumn::BinaryView { .. } => {
             unreachable!("only fixed-width columns are measured")
         }
     }

@@ -152,10 +152,13 @@ impl BoundDirectColumn<'_> {
                 fill_nvarchar_column(*array, column, column_index, column_count, layout, bytes)
             }
             Self::Binary { column, array } => {
-                fill_varbinary_column(array, column, column_index, column_count, layout, bytes)
+                fill_varbinary_column(*array, column, column_index, column_count, layout, bytes)
             }
             Self::LargeBinary { column, array } => {
-                fill_varbinary_column(array, column, column_index, column_count, layout, bytes)
+                fill_varbinary_column(*array, column, column_index, column_count, layout, bytes)
+            }
+            Self::BinaryView { column, array } => {
+                fill_varbinary_column(*array, column, column_index, column_count, layout, bytes)
             }
             Self::FixedSizeBinary {
                 column,
