@@ -3,4 +3,5 @@ release_always = false
 
 [[package]]
 name = "xtask"
+publish = false
 release = false
