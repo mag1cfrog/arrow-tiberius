@@ -203,65 +203,87 @@ mod tests {
 
     #[test]
     fn accepts_string_family_runtime_types_for_nvarchar_mappings() {
-        let mapping = mapping(
-            0,
-            "text",
-            DataType::Utf8,
-            MssqlType::NVarChar(MssqlTypeLength::Max),
-        );
+        for planned in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
+            let mapping = mapping(
+                0,
+                "text",
+                planned,
+                MssqlType::NVarChar(MssqlTypeLength::Max),
+            );
 
-        for runtime in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
-            assert!(arrow_type_compatible_with_mapping(&runtime, &mapping));
+            for runtime in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
+                assert!(arrow_type_compatible_with_mapping(&runtime, &mapping));
+            }
         }
     }
 
     #[test]
     fn rejects_cross_family_runtime_types_for_string_mappings() {
-        let mapping = mapping(
-            0,
-            "text",
-            DataType::Utf8,
-            MssqlType::NVarChar(MssqlTypeLength::Max),
-        );
+        for planned in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
+            let mapping = mapping(
+                0,
+                "text",
+                planned,
+                MssqlType::NVarChar(MssqlTypeLength::Max),
+            );
 
-        for runtime in [
-            DataType::Binary,
-            DataType::LargeBinary,
-            DataType::BinaryView,
-        ] {
-            assert!(!arrow_type_compatible_with_mapping(&runtime, &mapping));
+            for runtime in [
+                DataType::Binary,
+                DataType::LargeBinary,
+                DataType::BinaryView,
+                DataType::FixedSizeBinary(3),
+            ] {
+                assert!(!arrow_type_compatible_with_mapping(&runtime, &mapping));
+            }
         }
     }
 
     #[test]
     fn accepts_binary_family_runtime_types_for_varbinary_mappings() {
-        let mapping = mapping(
-            0,
-            "bytes",
-            DataType::Binary,
-            MssqlType::VarBinary(MssqlTypeLength::Max),
-        );
-
-        for runtime in [
+        for planned in [
             DataType::Binary,
             DataType::LargeBinary,
             DataType::BinaryView,
         ] {
-            assert!(arrow_type_compatible_with_mapping(&runtime, &mapping));
+            let mapping = mapping(
+                0,
+                "bytes",
+                planned,
+                MssqlType::VarBinary(MssqlTypeLength::Max),
+            );
+
+            for runtime in [
+                DataType::Binary,
+                DataType::LargeBinary,
+                DataType::BinaryView,
+            ] {
+                assert!(arrow_type_compatible_with_mapping(&runtime, &mapping));
+            }
         }
     }
 
     #[test]
     fn rejects_cross_family_runtime_types_for_binary_mappings() {
-        let mapping = mapping(
-            0,
-            "bytes",
+        for planned in [
             DataType::Binary,
-            MssqlType::VarBinary(MssqlTypeLength::Max),
-        );
+            DataType::LargeBinary,
+            DataType::BinaryView,
+        ] {
+            let mapping = mapping(
+                0,
+                "bytes",
+                planned,
+                MssqlType::VarBinary(MssqlTypeLength::Max),
+            );
 
-        for runtime in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
-            assert!(!arrow_type_compatible_with_mapping(&runtime, &mapping));
+            for runtime in [
+                DataType::Utf8,
+                DataType::LargeUtf8,
+                DataType::Utf8View,
+                DataType::FixedSizeBinary(3),
+            ] {
+                assert!(!arrow_type_compatible_with_mapping(&runtime, &mapping));
+            }
         }
     }
 

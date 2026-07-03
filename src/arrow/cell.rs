@@ -358,7 +358,9 @@ mod tests {
     use arrow_schema::{DataType, TimeUnit};
 
     use super::{ArrowCell, extract_arrow_cell};
-    use crate::{ArrowFieldRef, Identifier, MssqlColumn, MssqlType, SchemaMapping};
+    use crate::{
+        ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, SchemaMapping,
+    };
 
     type F16 = <Float16Type as ArrowPrimitiveType>::Native;
 
@@ -480,6 +482,21 @@ mod tests {
         let cases: Vec<(SchemaMapping, ArrayRef, ArrowCell<'_>)> = vec![
             (
                 mapping("text", DataType::Utf8),
+                Arc::new(LargeStringArray::from(vec![Some("large"), None])),
+                ArrowCell::Utf8("large"),
+            ),
+            (
+                mapping("text", DataType::Utf8),
+                Arc::new(StringViewArray::from(vec![Some("view"), None])),
+                ArrowCell::Utf8("view"),
+            ),
+            (
+                mapping("text", DataType::LargeUtf8),
+                Arc::new(StringArray::from(vec![Some("small"), None])),
+                ArrowCell::Utf8("small"),
+            ),
+            (
+                mapping("text", DataType::LargeUtf8),
                 Arc::new(StringViewArray::from(vec![Some("view"), None])),
                 ArrowCell::Utf8("view"),
             ),
@@ -512,6 +529,21 @@ mod tests {
         let cases: Vec<(SchemaMapping, ArrayRef, ArrowCell<'_>)> = vec![
             (
                 mapping("bytes", DataType::Binary),
+                Arc::new(LargeBinaryArray::from(vec![Some(&b"large"[..]), None])),
+                ArrowCell::Binary(b"large"),
+            ),
+            (
+                mapping("bytes", DataType::Binary),
+                Arc::new(BinaryViewArray::from(vec![Some(&b"view"[..]), None])),
+                ArrowCell::Binary(b"view"),
+            ),
+            (
+                mapping("bytes", DataType::LargeBinary),
+                Arc::new(BinaryArray::from(vec![Some(&b"small"[..]), None])),
+                ArrowCell::Binary(b"small"),
+            ),
+            (
+                mapping("bytes", DataType::LargeBinary),
                 Arc::new(BinaryViewArray::from(vec![Some(&b"view"[..]), None])),
                 ArrowCell::Binary(b"view"),
             ),
@@ -535,6 +567,48 @@ mod tests {
             assert_eq!(
                 extract_arrow_cell(array.as_ref(), &mapping, 1).unwrap(),
                 ArrowCell::Null
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_cross_family_cells_from_runtime_representations() {
+        let fixed_size_binary = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            [Some(&b"abc"[..])].into_iter(),
+            3,
+        )
+        .unwrap();
+        let cases: Vec<(SchemaMapping, ArrayRef)> = vec![
+            (
+                mapping("text", DataType::Utf8),
+                Arc::new(BinaryViewArray::from(vec![Some(&b"bytes"[..])])),
+            ),
+            (
+                mapping("text", DataType::Utf8View),
+                Arc::new(BinaryArray::from(vec![Some(&b"bytes"[..])])),
+            ),
+            (
+                mapping("bytes", DataType::Binary),
+                Arc::new(StringViewArray::from(vec![Some("text")])),
+            ),
+            (
+                mapping("bytes", DataType::BinaryView),
+                Arc::new(LargeStringArray::from(vec![Some("text")])),
+            ),
+            (
+                mapping("bytes", DataType::Binary),
+                Arc::new(fixed_size_binary),
+            ),
+        ];
+
+        for (mapping, array) in cases {
+            let err = extract_arrow_cell(array.as_ref(), &mapping, 0).unwrap_err();
+
+            assert_single_diagnostic(
+                err,
+                DiagnosticCode::ValueTypeMismatch,
+                Some(0),
+                Some((0, mapping.arrow().name())),
             );
         }
     }
@@ -840,5 +914,27 @@ mod tests {
             ArrowFieldRef::new(0, name.to_owned(), true, data_type),
             MssqlColumn::new(Identifier::new(name).unwrap(), MssqlType::Int, true),
         )
+    }
+
+    fn assert_single_diagnostic(
+        err: Error,
+        expected_code: DiagnosticCode,
+        expected_row: Option<usize>,
+        expected_field: Option<(usize, &str)>,
+    ) {
+        let Error::ValueConversion { diagnostics } = err else {
+            panic!("expected value conversion error");
+        };
+
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics.all()[0];
+        assert_eq!(diagnostic.code(), expected_code);
+        assert_eq!(diagnostic.row(), expected_row);
+        assert_eq!(
+            diagnostic
+                .field()
+                .map(|field| (field.index(), field.name())),
+            expected_field
+        );
     }
 }
