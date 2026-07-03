@@ -19,6 +19,50 @@ const PLP_TERMINATOR_LEN: usize = 4;
 const MAX_BOUNDED_TDS_VALUE_LEN: usize = 0xfffe;
 const MAX_PLP_CHUNK_LEN: usize = u32::MAX as usize;
 
+pub(crate) trait RawRowsAppendTarget {
+    fn extend_from_slice(&mut self, slice: &[u8]);
+    fn put_u16_le(&mut self, value: u16);
+    fn put_u32_le(&mut self, value: u32);
+    fn put_u64_le(&mut self, value: u64);
+}
+
+impl RawRowsAppendTarget for tiberius::RawRowsAppendBuffer<'_> {
+    fn extend_from_slice(&mut self, slice: &[u8]) {
+        tiberius::RawRowsAppendBuffer::extend_from_slice(self, slice);
+    }
+
+    fn put_u16_le(&mut self, value: u16) {
+        tiberius::RawRowsAppendBuffer::put_u16_le(self, value);
+    }
+
+    fn put_u32_le(&mut self, value: u32) {
+        tiberius::RawRowsAppendBuffer::put_u32_le(self, value);
+    }
+
+    fn put_u64_le(&mut self, value: u64) {
+        tiberius::RawRowsAppendBuffer::put_u64_le(self, value);
+    }
+}
+
+#[cfg(test)]
+impl RawRowsAppendTarget for Vec<u8> {
+    fn extend_from_slice(&mut self, slice: &[u8]) {
+        Vec::extend_from_slice(self, slice);
+    }
+
+    fn put_u16_le(&mut self, value: u16) {
+        self.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u32_le(&mut self, value: u32) {
+        self.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u64_le(&mut self, value: u64) {
+        self.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
 /// Measures one string-family-to-nvarchar column into a row-major cell length matrix.
 pub(crate) fn measure_nvarchar_column_cell_lengths<'a>(
     array: impl StringArrayType<'a>,
@@ -159,7 +203,7 @@ pub(crate) fn fill_varbinary_column<'a>(
 
 /// Appends one string-family-to-nvarchar cell to a raw bulk append buffer.
 pub(crate) fn append_nvarchar_cell<'a>(
-    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    buf: &mut impl RawRowsAppendTarget,
     array: impl StringArrayType<'a>,
     column: &DirectColumnPlan,
     row_index: usize,
@@ -219,7 +263,7 @@ pub(crate) fn append_nvarchar_cell<'a>(
 
 /// Appends one binary-family-to-varbinary cell to a raw bulk append buffer.
 pub(crate) fn append_varbinary_cell<'a>(
-    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    buf: &mut impl RawRowsAppendTarget,
     array: impl BinaryArrayType<'a>,
     column: &DirectColumnPlan,
     row_index: usize,
@@ -345,7 +389,7 @@ fn measure_varbinary_cell_lengths<'a>(
 }
 
 fn append_null_cell(
-    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    buf: &mut impl RawRowsAppendTarget,
     column: &DirectColumnPlan,
     row_index: usize,
     measured_len: usize,
@@ -371,7 +415,7 @@ fn append_null_cell(
 }
 
 fn append_bounded_nvarchar_cell(
-    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    buf: &mut impl RawRowsAppendTarget,
     value: &str,
     encoded_bytes: usize,
 ) -> Result<()> {
@@ -383,7 +427,7 @@ fn append_bounded_nvarchar_cell(
 }
 
 fn append_bounded_payload_cell(
-    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    buf: &mut impl RawRowsAppendTarget,
     column: &DirectColumnPlan,
     row_index: usize,
     measured_len: usize,
@@ -406,7 +450,7 @@ fn append_bounded_payload_cell(
 }
 
 fn append_plp_nvarchar_cell(
-    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    buf: &mut impl RawRowsAppendTarget,
     value: &str,
     encoded_bytes: usize,
 ) -> Result<()> {
@@ -417,7 +461,7 @@ fn append_plp_nvarchar_cell(
 }
 
 fn append_plp_payload_cell(
-    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    buf: &mut impl RawRowsAppendTarget,
     column: &DirectColumnPlan,
     row_index: usize,
     measured_len: usize,
@@ -475,13 +519,13 @@ fn validate_utf16_byte_len_for_append(
     )))
 }
 
-fn append_utf16le(buf: &mut tiberius::RawRowsAppendBuffer<'_>, value: &str) {
+fn append_utf16le(buf: &mut impl RawRowsAppendTarget, value: &str) {
     for code_unit in value.encode_utf16() {
         buf.put_u16_le(code_unit);
     }
 }
 
-fn append_plp_header(buf: &mut tiberius::RawRowsAppendBuffer<'_>, len: usize) -> Result<()> {
+fn append_plp_header(buf: &mut impl RawRowsAppendTarget, len: usize) -> Result<()> {
     if len > MAX_PLP_CHUNK_LEN {
         return Err(invalid_payload(format!(
             "direct variable-width PLP chunk length {len} exceeds u32::MAX"
@@ -493,7 +537,7 @@ fn append_plp_header(buf: &mut tiberius::RawRowsAppendBuffer<'_>, len: usize) ->
     Ok(())
 }
 
-fn append_plp_terminator(buf: &mut tiberius::RawRowsAppendBuffer<'_>, len: usize) {
+fn append_plp_terminator(buf: &mut impl RawRowsAppendTarget, len: usize) {
     if len != 0 {
         buf.put_u32_le(0);
     }

@@ -250,6 +250,29 @@ mod tests {
     }
 
     #[test]
+    fn regression_161_accepts_utf8_view_runtime_for_planned_utf8_nvarchar() {
+        let mappings =
+            mappings_for_schema(Schema::new(vec![Field::new("level", DataType::Utf8, true)]));
+        let batch = record_batch_for_field(
+            "level",
+            DataType::Utf8View,
+            Arc::new(StringViewArray::from(vec![Some("info"), None])),
+            true,
+        );
+
+        validate_arrow_schema_against_mappings(batch.schema().as_ref(), &mappings).unwrap();
+        validate_record_batch_schema_against_mappings(&batch, &mappings).unwrap();
+        validate_record_batch_encoding_shape(&batch, &mappings).unwrap();
+
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+        assert_eq!(
+            view.mssql_row(0).unwrap(),
+            vec![MssqlCell::NVarChar(Some("info"))]
+        );
+        assert_eq!(view.mssql_row(1).unwrap(), vec![MssqlCell::NVarChar(None)]);
+    }
+
+    #[test]
     fn public_schema_validation_accepts_binary_family_runtime_representations() {
         for planned in binary_family_types() {
             let mappings = mappings_for_schema(Schema::new(vec![Field::new(

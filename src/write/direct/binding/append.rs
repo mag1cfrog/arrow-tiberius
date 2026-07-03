@@ -268,4 +268,34 @@ impl BoundDirectColumn<'_> {
             ),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn append_variable_width_cell_for_test(
+        &self,
+        buf: &mut Vec<u8>,
+        row_index: usize,
+        measured_len: usize,
+    ) -> Result<()> {
+        match self {
+            Self::Utf8 { column, array } => {
+                append_nvarchar_cell(buf, *array, column, row_index, measured_len)
+            }
+            Self::LargeUtf8 { column, array } => {
+                append_nvarchar_cell(buf, *array, column, row_index, measured_len)
+            }
+            Self::Utf8View { column, array } => {
+                append_nvarchar_cell(buf, *array, column, row_index, measured_len)
+            }
+            Self::Binary { column, array } => {
+                append_varbinary_cell(buf, *array, column, row_index, measured_len)
+            }
+            Self::LargeBinary { column, array } => {
+                append_varbinary_cell(buf, *array, column, row_index, measured_len)
+            }
+            Self::BinaryView { column, array } => {
+                append_varbinary_cell(buf, *array, column, row_index, measured_len)
+            }
+            _ => panic!("test helper only supports direct variable-width columns"),
+        }
+    }
 }

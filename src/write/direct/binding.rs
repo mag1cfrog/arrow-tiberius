@@ -750,6 +750,79 @@ mod tests {
     }
 
     #[test]
+    fn appends_string_view_cells_through_bound_direct_dispatch() {
+        let mappings = vec![mapping(
+            0,
+            "text",
+            DataType::Utf8,
+            MssqlType::NVarChar(MssqlTypeLength::Bounded(2)),
+            true,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "text",
+                DataType::Utf8View,
+                true,
+            )])),
+            vec![Arc::new(StringViewArray::from(vec![Some("az"), Some("🙂"), None])) as ArrayRef],
+        )
+        .unwrap();
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+        let measured = bound.measure_cell_lengths().unwrap();
+
+        let mut bytes = Vec::new();
+        for (row_index, measured_len) in measured.into_iter().enumerate() {
+            bound.columns()[0]
+                .append_variable_width_cell_for_test(&mut bytes, row_index, measured_len)
+                .unwrap();
+        }
+
+        assert_eq!(
+            bytes,
+            [
+                4, 0, b'a', 0, b'z', 0, 4, 0, 0x3d, 0xd8, 0x42, 0xde, 0xff, 0xff,
+            ]
+        );
+    }
+
+    #[test]
+    fn appends_binary_view_cells_through_bound_direct_dispatch() {
+        let mappings = vec![mapping(
+            0,
+            "bytes",
+            DataType::Binary,
+            MssqlType::VarBinary(MssqlTypeLength::Bounded(3)),
+            true,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "bytes",
+                DataType::BinaryView,
+                true,
+            )])),
+            vec![Arc::new(BinaryViewArray::from(vec![
+                Some(&b"abc"[..]),
+                Some(&b""[..]),
+                None,
+            ])) as ArrayRef],
+        )
+        .unwrap();
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+        let measured = bound.measure_cell_lengths().unwrap();
+
+        let mut bytes = Vec::new();
+        for (row_index, measured_len) in measured.into_iter().enumerate() {
+            bound.columns()[0]
+                .append_variable_width_cell_for_test(&mut bytes, row_index, measured_len)
+                .unwrap();
+        }
+
+        assert_eq!(bytes, [3, 0, b'a', b'b', b'c', 0, 0, 0xff, 0xff,]);
+    }
+
+    #[test]
     fn binds_fixed_size_binary_arrays_to_runtime_variant() {
         let mappings = vec![
             mapping(0, "id", DataType::Int32, MssqlType::Int, false),
