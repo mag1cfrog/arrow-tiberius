@@ -8,8 +8,8 @@ use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
     Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float16Array, Float32Array,
     Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
-    LargeStringArray, RecordBatch, StringArray, Time32MillisecondArray, Time32SecondArray,
-    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    LargeStringArray, RecordBatch, StringArray, StringViewArray, Time32MillisecondArray,
+    Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
     UInt16Array, UInt32Array, UInt64Array,
 };
@@ -25,9 +25,11 @@ use super::{
 use crate::{
     DiagnosticCode, NanosecondPolicy, Result, SchemaMapping,
     conversion::arrow_to_mssql::{
-        decimal::DecimalArrowToMssql, fixed_size_binary::FixedSizeBinaryArrowToMssql,
-        primitive::PrimitiveArrowToMssql, temporal::TemporalArrowToMssql,
-        variable_width::VariableWidthArrowToMssql,
+        decimal::DecimalArrowToMssql,
+        fixed_size_binary::FixedSizeBinaryArrowToMssql,
+        primitive::PrimitiveArrowToMssql,
+        temporal::TemporalArrowToMssql,
+        variable_width::{VariableWidthArrowToMssql, is_string_family_to_nvarchar},
     },
 };
 
@@ -351,7 +353,15 @@ fn bind_direct_nvarchar_array<'a>(
     column: &'a plan::DirectColumnPlan,
     mapping: &SchemaMapping,
 ) -> Result<BoundDirectColumn<'a>> {
-    match mapping.arrow().data_type() {
+    if !is_string_family_to_nvarchar(mapping) {
+        return Err(unsupported_planned_direct_type(
+            column,
+            "nvarchar",
+            mapping.arrow().data_type(),
+        ));
+    }
+
+    match array.data_type() {
         DataType::Utf8 => Ok(BoundDirectColumn::Utf8 {
             column,
             array: downcast_direct_array::<StringArray>(array, column)?,
@@ -359,6 +369,10 @@ fn bind_direct_nvarchar_array<'a>(
         DataType::LargeUtf8 => Ok(BoundDirectColumn::LargeUtf8 {
             column,
             array: downcast_direct_array::<LargeStringArray>(array, column)?,
+        }),
+        DataType::Utf8View => Ok(BoundDirectColumn::Utf8View {
+            column,
+            array: downcast_direct_array::<StringViewArray>(array, column)?,
         }),
         other => Err(unsupported_planned_direct_type(column, "nvarchar", other)),
     }
@@ -462,6 +476,10 @@ pub(crate) enum BoundDirectColumn<'a> {
     LargeUtf8 {
         column: &'a plan::DirectColumnPlan,
         array: &'a LargeStringArray,
+    },
+    Utf8View {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a StringViewArray,
     },
     Binary {
         column: &'a plan::DirectColumnPlan,
@@ -587,7 +605,7 @@ fn unsupported_planned_direct_type(
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, FixedSizeBinaryArray, Int32Array};
+    use arrow_array::{ArrayRef, FixedSizeBinaryArray, Int32Array, StringViewArray};
     use arrow_schema::{DataType, Field, Schema};
 
     use super::*;
@@ -643,6 +661,39 @@ mod tests {
             panic!("LargeBinary mapping should bind to LargeBinaryArray");
         };
         assert_eq!(array.value(0), b"bytes");
+    }
+
+    #[test]
+    fn binds_string_view_arrays_to_string_runtime_variant() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "text",
+                DataType::Utf8,
+                MssqlType::NVarChar(MssqlTypeLength::Max),
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("text", DataType::Utf8View, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![7])) as ArrayRef,
+                Arc::new(StringViewArray::from(vec![Some("view")])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+
+        let BoundDirectColumn::Utf8View { array, .. } = bound.columns()[1] else {
+            panic!("string-family mapping should bind to StringViewArray");
+        };
+        assert_eq!(array.value(0), "view");
     }
 
     #[test]

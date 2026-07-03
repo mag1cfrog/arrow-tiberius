@@ -23,7 +23,7 @@ mod tests {
         ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array,
         Decimal64Array, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float16Array,
         Float32Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
-        RecordBatch, StringArray, Time32MillisecondArray, Time32SecondArray,
+        RecordBatch, StringArray, StringViewArray, Time32MillisecondArray, Time32SecondArray,
         Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
         TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
         types::{ArrowPrimitiveType, Float16Type},
@@ -1876,6 +1876,48 @@ mod tests {
     }
 
     #[test]
+    fn direct_encoder_encodes_string_view_rows_like_utf8_rows() {
+        let mappings = vec![mapping(
+            0,
+            "name",
+            DataType::Utf8,
+            MssqlType::NVarChar(MssqlTypeLength::Bounded(2)),
+            true,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let utf8_batch = record_batch(
+            vec![Field::new("name", DataType::Utf8, true)],
+            vec![Arc::new(StringArray::from(vec![
+                Some("ab"),
+                Some("🙂"),
+                None,
+            ]))],
+        );
+        let string_view_batch = record_batch(
+            vec![Field::new("name", DataType::Utf8View, true)],
+            vec![Arc::new(StringViewArray::from(vec![
+                Some("ab"),
+                Some("🙂"),
+                None,
+            ]))],
+        );
+
+        let expected = encoder.encode_batch(&utf8_batch).unwrap();
+        let actual = encoder.encode_batch(&string_view_batch).unwrap();
+
+        assert_eq!(actual.row_token_offsets(), expected.row_token_offsets());
+        assert_eq!(actual.bytes(), expected.bytes());
+        assert_eq!(
+            actual.bytes(),
+            expected_rows([
+                [bounded_nvarchar_cell("ab")],
+                [bounded_nvarchar_cell("🙂")],
+                [bounded_nvarchar_null_cell()]
+            ])
+        );
+    }
+
+    #[test]
     fn direct_encoder_large_variable_width_measured_ranges_match_full_payload() {
         let mappings = vec![
             mapping(0, "id", DataType::Int32, MssqlType::Int, false),
@@ -2028,7 +2070,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_encoder_rejects_large_variable_width_runtime_type_drift() {
+    fn direct_encoder_rejects_binary_runtime_type_drift_until_binary_family_slice() {
         let mappings = vec![
             mapping(
                 0,
@@ -2046,24 +2088,6 @@ mod tests {
             ),
         ];
         let encoder = DirectEncoder::new(&mappings).unwrap();
-        let text_drift = record_batch(
-            vec![
-                Field::new("large_text", DataType::Utf8, true),
-                Field::new("large_bytes", DataType::LargeBinary, true),
-            ],
-            vec![
-                Arc::new(StringArray::from(vec![Some("not-large")])) as ArrayRef,
-                Arc::new(LargeBinaryArray::from_iter(vec![Some(&b"abc"[..])])),
-            ],
-        );
-
-        assert_value_conversion_diagnostic(
-            encoder.encode_batch(&text_drift).unwrap_err(),
-            DiagnosticCode::SchemaMismatch,
-            None,
-            Some((0, "large_text")),
-        );
-
         let binary_drift = record_batch(
             vec![
                 Field::new("large_text", DataType::LargeUtf8, true),

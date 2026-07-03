@@ -146,11 +146,11 @@ mod tests {
 
     use arrow_array::{
         ArrayRef, BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch,
-        StringArray,
+        StringArray, StringViewArray,
     };
     use arrow_schema::{DataType, Field, Schema};
 
-    use super::RecordBatchView;
+    use super::{RecordBatchView, validate_record_batch_encoding_shape};
     use crate::mssql::cell::MssqlCell;
     use crate::{
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlProfile, MssqlType,
@@ -213,6 +213,66 @@ mod tests {
         .unwrap();
 
         validate_record_batch_schema_against_mappings(&batch, &mappings).unwrap();
+    }
+
+    #[test]
+    fn public_schema_validation_accepts_string_family_runtime_representations() {
+        let mappings =
+            mappings_for_schema(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+        let schema = Schema::new(vec![Field::new("name", DataType::Utf8View, true)]);
+
+        validate_arrow_schema_against_mappings(&schema, &mappings).unwrap();
+    }
+
+    #[test]
+    fn public_record_batch_validation_accepts_string_view_runtime_batch() {
+        let mappings =
+            mappings_for_schema(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "name",
+                DataType::Utf8View,
+                true,
+            )])),
+            vec![Arc::new(StringViewArray::from(vec![Some("view"), None]))],
+        )
+        .unwrap();
+
+        validate_record_batch_schema_against_mappings(&batch, &mappings).unwrap();
+        validate_record_batch_encoding_shape(&batch, &mappings).unwrap();
+    }
+
+    #[test]
+    fn converts_string_view_runtime_batch_for_planned_utf8_mapping() {
+        let mappings =
+            mappings_for_schema(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "name",
+                DataType::Utf8View,
+                true,
+            )])),
+            vec![Arc::new(StringViewArray::from(vec![Some("view"), None]))],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        assert_eq!(
+            view.mssql_row(0).unwrap(),
+            vec![MssqlCell::NVarChar(Some("view"))]
+        );
+        assert_eq!(view.mssql_row(1).unwrap(), vec![MssqlCell::NVarChar(None)]);
+    }
+
+    #[test]
+    fn public_schema_validation_rejects_cross_family_view_mismatch() {
+        let mappings =
+            mappings_for_schema(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+        let schema = Schema::new(vec![Field::new("name", DataType::BinaryView, true)]);
+
+        let err = validate_arrow_schema_against_mappings(&schema, &mappings).unwrap_err();
+
+        assert_single_diagnostic(err, DiagnosticCode::SchemaMismatch, None, Some((0, "name")));
     }
 
     #[test]

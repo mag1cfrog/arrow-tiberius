@@ -4,7 +4,7 @@ use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
     Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float16Array, Float32Array,
     Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
-    LargeStringArray, StringArray, Time32MillisecondArray, Time32SecondArray,
+    LargeStringArray, StringArray, StringViewArray, Time32MillisecondArray, Time32SecondArray,
     Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
     UInt16Array, UInt32Array, UInt64Array,
@@ -12,7 +12,10 @@ use arrow_array::{
 use arrow_buffer::i256;
 use arrow_schema::{DataType, TimeUnit};
 
-use crate::{Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, Result, SchemaMapping};
+use crate::{
+    Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, Result, SchemaMapping,
+    arrow::field::is_arrow_string_family,
+};
 
 /// Borrowed value extracted from one Arrow array cell.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -207,14 +210,7 @@ pub(crate) fn extract_arrow_cell<'a>(
             let array = downcast_array::<Float64Array>(array, mapping, row_index)?;
             Ok(ArrowCell::Float64(array.value(row_index)))
         }
-        DataType::Utf8 => {
-            let array = downcast_array::<StringArray>(array, mapping, row_index)?;
-            Ok(ArrowCell::Utf8(array.value(row_index)))
-        }
-        DataType::LargeUtf8 => {
-            let array = downcast_array::<LargeStringArray>(array, mapping, row_index)?;
-            Ok(ArrowCell::Utf8(array.value(row_index)))
-        }
+        planned if is_arrow_string_family(planned) => extract_utf8_cell(array, mapping, row_index),
         DataType::Binary => {
             let array = downcast_array::<BinaryArray>(array, mapping, row_index)?;
             Ok(ArrowCell::Binary(array.value(row_index)))
@@ -232,6 +228,37 @@ pub(crate) fn extract_arrow_cell<'a>(
             row_index,
             format!("Arrow value extraction for {other} is not supported yet"),
         )),
+    }
+}
+
+fn extract_utf8_cell<'a>(
+    array: &'a dyn Array,
+    mapping: &SchemaMapping,
+    row_index: usize,
+) -> Result<ArrowCell<'a>> {
+    match array.data_type() {
+        DataType::Utf8 => {
+            let array = downcast_array::<StringArray>(array, mapping, row_index)?;
+            Ok(ArrowCell::Utf8(array.value(row_index)))
+        }
+        DataType::LargeUtf8 => {
+            let array = downcast_array::<LargeStringArray>(array, mapping, row_index)?;
+            Ok(ArrowCell::Utf8(array.value(row_index)))
+        }
+        DataType::Utf8View => {
+            let array = downcast_array::<StringViewArray>(array, mapping, row_index)?;
+            Ok(ArrowCell::Utf8(array.value(row_index)))
+        }
+        _ => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!(
+                "runtime Arrow type {} does not match planned Arrow type {}",
+                array.data_type(),
+                mapping.arrow().data_type()
+            ),
+        ))),
     }
 }
 
@@ -295,10 +322,10 @@ mod tests {
         ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array,
         Decimal64Array, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float16Array,
         Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-        LargeBinaryArray, LargeStringArray, StringArray, Time32MillisecondArray, Time32SecondArray,
-        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
-        UInt16Array, UInt32Array, UInt64Array,
+        LargeBinaryArray, LargeStringArray, StringArray, StringViewArray, Time32MillisecondArray,
+        Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
         types::{ArrowPrimitiveType, Float16Type},
     };
     use arrow_buffer::i256;
@@ -378,6 +405,11 @@ mod tests {
                 ArrowCell::Utf8("Tokyo"),
             ),
             (
+                mapping("view_text", DataType::Utf8View),
+                Arc::new(StringViewArray::from(vec![Some("view"), None])),
+                ArrowCell::Utf8("view"),
+            ),
+            (
                 mapping("bytes", DataType::Binary),
                 Arc::new(BinaryArray::from(vec![Some(&b"abc"[..]), None])),
                 ArrowCell::Binary(b"abc"),
@@ -397,6 +429,38 @@ mod tests {
                     .unwrap(),
                 ),
                 ArrowCell::Binary(b"abc"),
+            ),
+        ];
+
+        for (mapping, array, expected) in cases {
+            assert_eq!(
+                extract_arrow_cell(array.as_ref(), &mapping, 0).unwrap(),
+                expected
+            );
+            assert_eq!(
+                extract_arrow_cell(array.as_ref(), &mapping, 1).unwrap(),
+                ArrowCell::Null
+            );
+        }
+    }
+
+    #[test]
+    fn extracts_string_family_cells_from_runtime_representations() {
+        let cases: Vec<(SchemaMapping, ArrayRef, ArrowCell<'_>)> = vec![
+            (
+                mapping("text", DataType::Utf8),
+                Arc::new(StringViewArray::from(vec![Some("view"), None])),
+                ArrowCell::Utf8("view"),
+            ),
+            (
+                mapping("text", DataType::Utf8View),
+                Arc::new(StringArray::from(vec![Some("small"), None])),
+                ArrowCell::Utf8("small"),
+            ),
+            (
+                mapping("text", DataType::Utf8View),
+                Arc::new(LargeStringArray::from(vec![Some("large"), None])),
+                ArrowCell::Utf8("large"),
             ),
         ];
 

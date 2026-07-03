@@ -191,14 +191,21 @@ impl BoundDirectColumn<'_> {
                 cell_lengths,
             ),
             Self::Utf8 { column, array } => measure_nvarchar_column_cell_lengths(
-                array,
+                *array,
                 column,
                 column_index,
                 column_count,
                 cell_lengths,
             ),
             Self::LargeUtf8 { column, array } => measure_nvarchar_column_cell_lengths(
-                array,
+                *array,
+                column,
+                column_index,
+                column_count,
+                cell_lengths,
+            ),
+            Self::Utf8View { column, array } => measure_nvarchar_column_cell_lengths(
+                *array,
                 column,
                 column_index,
                 column_count,

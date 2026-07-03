@@ -4,7 +4,7 @@ use arrow_schema::DataType;
 
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, MssqlType, MssqlTypeLength, Result,
-    SchemaMapping,
+    SchemaMapping, arrow::field::is_arrow_string_family,
 };
 
 /// Shared semantic conversion class for variable-width Arrow-to-MSSQL values.
@@ -20,7 +20,7 @@ impl VariableWidthArrowToMssql {
     /// Classifies a planned variable-width mapping.
     pub(crate) fn classify(mapping: &SchemaMapping, row_index: usize) -> Result<Self> {
         let classification = match (mapping.arrow().data_type(), mapping.mssql().ty()) {
-            (DataType::Utf8 | DataType::LargeUtf8, MssqlType::NVarChar(length)) => {
+            (data_type, MssqlType::NVarChar(length)) if is_arrow_string_family(data_type) => {
                 Self::StringToNVarChar { length: *length }
             }
             (DataType::Binary | DataType::LargeBinary, MssqlType::VarBinary(length)) => {
@@ -42,6 +42,21 @@ impl VariableWidthArrowToMssql {
 
         Ok(classification)
     }
+}
+
+/// Returns true when a planned mapping writes Arrow string-family values to `nvarchar`.
+pub(crate) fn is_string_family_to_nvarchar(mapping: &SchemaMapping) -> bool {
+    is_arrow_string_family(mapping.arrow().data_type())
+        && matches!(mapping.mssql().ty(), MssqlType::NVarChar(_))
+}
+
+/// Returns true when a runtime Arrow type is compatible with the planned mapping.
+pub(crate) fn arrow_type_compatible_with_mapping(
+    runtime: &DataType,
+    mapping: &SchemaMapping,
+) -> bool {
+    runtime == mapping.arrow().data_type()
+        || (is_arrow_string_family(runtime) && is_string_family_to_nvarchar(mapping))
 }
 
 fn row_mapping_diagnostic(
@@ -73,7 +88,7 @@ mod tests {
         SchemaMapping,
     };
 
-    use super::VariableWidthArrowToMssql;
+    use super::{VariableWidthArrowToMssql, arrow_type_compatible_with_mapping};
 
     #[test]
     fn classifies_variable_width_mappings() {
@@ -94,6 +109,13 @@ mod tests {
             ),
             (
                 DataType::LargeUtf8,
+                MssqlType::NVarChar(MssqlTypeLength::Max),
+                VariableWidthArrowToMssql::StringToNVarChar {
+                    length: MssqlTypeLength::Max,
+                },
+            ),
+            (
+                DataType::Utf8View,
                 MssqlType::NVarChar(MssqlTypeLength::Max),
                 VariableWidthArrowToMssql::StringToNVarChar {
                     length: MssqlTypeLength::Max,
@@ -161,6 +183,38 @@ mod tests {
             let classification = VariableWidthArrowToMssql::classify(&mapping, 7).unwrap();
 
             assert_eq!(classification, expected);
+        }
+    }
+
+    #[test]
+    fn accepts_string_family_runtime_types_for_nvarchar_mappings() {
+        let mapping = mapping(
+            0,
+            "text",
+            DataType::Utf8,
+            MssqlType::NVarChar(MssqlTypeLength::Max),
+        );
+
+        for runtime in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
+            assert!(arrow_type_compatible_with_mapping(&runtime, &mapping));
+        }
+    }
+
+    #[test]
+    fn rejects_cross_family_runtime_types_for_string_mappings() {
+        let mapping = mapping(
+            0,
+            "text",
+            DataType::Utf8,
+            MssqlType::NVarChar(MssqlTypeLength::Max),
+        );
+
+        for runtime in [
+            DataType::Binary,
+            DataType::LargeBinary,
+            DataType::BinaryView,
+        ] {
+            assert!(!arrow_type_compatible_with_mapping(&runtime, &mapping));
         }
     }
 

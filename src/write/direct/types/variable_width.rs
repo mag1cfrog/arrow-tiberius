@@ -1,6 +1,6 @@
 //! Variable-width direct TDS row layout measurement.
 
-use arrow_array::{Array, GenericBinaryArray, GenericStringArray, OffsetSizeTrait};
+use arrow_array::{Array, GenericBinaryArray, OffsetSizeTrait, StringArrayType};
 
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, MssqlTypeLength, Result,
@@ -19,9 +19,9 @@ const PLP_TERMINATOR_LEN: usize = 4;
 const MAX_BOUNDED_TDS_VALUE_LEN: usize = 0xfffe;
 const MAX_PLP_CHUNK_LEN: usize = u32::MAX as usize;
 
-/// Measures one Utf8-to-nvarchar column into a row-major cell length matrix.
-pub(crate) fn measure_nvarchar_column_cell_lengths(
-    array: &GenericStringArray<impl OffsetSizeTrait>,
+/// Measures one string-family-to-nvarchar column into a row-major cell length matrix.
+pub(crate) fn measure_nvarchar_column_cell_lengths<'a>(
+    array: impl StringArrayType<'a>,
     column: &DirectColumnPlan,
     column_index: usize,
     column_count: usize,
@@ -77,9 +77,9 @@ pub(crate) fn measure_varbinary_column_cell_lengths(
     )
 }
 
-/// Fills one Utf8-to-nvarchar column into an already allocated rows payload.
-pub(crate) fn fill_nvarchar_column(
-    array: &GenericStringArray<impl OffsetSizeTrait>,
+/// Fills one string-family-to-nvarchar column into an already allocated rows payload.
+pub(crate) fn fill_nvarchar_column<'a>(
+    array: impl StringArrayType<'a>,
     column: &DirectColumnPlan,
     column_index: usize,
     column_count: usize,
@@ -157,10 +157,10 @@ pub(crate) fn fill_varbinary_column(
     Ok(())
 }
 
-/// Appends one Utf8-to-nvarchar cell to a raw bulk append buffer.
-pub(crate) fn append_nvarchar_cell(
+/// Appends one string-family-to-nvarchar cell to a raw bulk append buffer.
+pub(crate) fn append_nvarchar_cell<'a>(
     buf: &mut tiberius::RawRowsAppendBuffer<'_>,
-    array: &GenericStringArray<impl OffsetSizeTrait>,
+    array: impl StringArrayType<'a>,
     column: &DirectColumnPlan,
     row_index: usize,
     measured_len: usize,
@@ -264,8 +264,8 @@ pub(crate) fn append_varbinary_cell(
     }
 }
 
-fn measure_nvarchar_cell_lengths(
-    array: &GenericStringArray<impl OffsetSizeTrait>,
+fn measure_nvarchar_cell_lengths<'a>(
+    array: impl StringArrayType<'a>,
     column: &DirectColumnPlan,
     column_index: usize,
     column_count: usize,
@@ -885,7 +885,9 @@ fn unsupported_batch(message: impl Into<String>) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{Array, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
+    use arrow_array::{
+        Array, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
+    };
     use arrow_schema::DataType;
 
     use crate::{
@@ -1317,6 +1319,53 @@ mod tests {
                 0xd1, 4, 0, b'a', 0, b'z', 0, 0xd1, 4, 0, 0x3d, 0xd8, 0x42, 0xde, 0xd1, 0, 0, 0xd1,
                 0xff, 0xff,
             ]
+        );
+    }
+
+    #[test]
+    fn measures_string_view_nvarchar_cells_by_encoded_utf16_bytes() {
+        let array = StringViewArray::from(vec![Some("az"), Some("🙂"), None]);
+        let plan = plan(&[mapping(
+            0,
+            "view_text",
+            DataType::Utf8View,
+            MssqlType::NVarChar(MssqlTypeLength::Bounded(2)),
+            true,
+        )]);
+        let mut cell_lengths = vec![0; array.len()];
+
+        measure_nvarchar_column_cell_lengths(&array, &plan.columns()[0], 0, 1, &mut cell_lengths)
+            .unwrap();
+
+        assert_eq!(cell_lengths, [6, 6, 2]);
+    }
+
+    #[test]
+    fn rejects_string_view_bounded_nvarchar_values_over_planned_code_units() {
+        let array = StringViewArray::from(vec![Some("a🙂")]);
+        let plan = plan(&[mapping(
+            0,
+            "view_text",
+            DataType::Utf8View,
+            MssqlType::NVarChar(MssqlTypeLength::Bounded(2)),
+            true,
+        )]);
+        let mut cell_lengths = vec![0; array.len()];
+
+        let err = measure_nvarchar_column_cell_lengths(
+            &array,
+            &plan.columns()[0],
+            0,
+            1,
+            &mut cell_lengths,
+        )
+        .unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::ValueTooLong,
+            Some(0),
+            Some((0, "view_text")),
         );
     }
 
