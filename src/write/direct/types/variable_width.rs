@@ -1,6 +1,6 @@
 //! Variable-width direct TDS row layout measurement.
 
-use arrow_array::{Array, GenericBinaryArray, GenericStringArray, OffsetSizeTrait};
+use arrow_array::{BinaryArrayType, StringArrayType};
 
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, MssqlTypeLength, Result,
@@ -19,19 +19,62 @@ const PLP_TERMINATOR_LEN: usize = 4;
 const MAX_BOUNDED_TDS_VALUE_LEN: usize = 0xfffe;
 const MAX_PLP_CHUNK_LEN: usize = u32::MAX as usize;
 
-/// Measures one Utf8-to-nvarchar column into a row-major cell length matrix.
-pub(crate) fn measure_nvarchar_column_cell_lengths(
-    array: &GenericStringArray<impl OffsetSizeTrait>,
+pub(crate) trait RawRowsAppendTarget {
+    fn extend_from_slice(&mut self, slice: &[u8]);
+    fn put_u16_le(&mut self, value: u16);
+    fn put_u32_le(&mut self, value: u32);
+    fn put_u64_le(&mut self, value: u64);
+}
+
+impl RawRowsAppendTarget for tiberius::RawRowsAppendBuffer<'_> {
+    fn extend_from_slice(&mut self, slice: &[u8]) {
+        tiberius::RawRowsAppendBuffer::extend_from_slice(self, slice);
+    }
+
+    fn put_u16_le(&mut self, value: u16) {
+        tiberius::RawRowsAppendBuffer::put_u16_le(self, value);
+    }
+
+    fn put_u32_le(&mut self, value: u32) {
+        tiberius::RawRowsAppendBuffer::put_u32_le(self, value);
+    }
+
+    fn put_u64_le(&mut self, value: u64) {
+        tiberius::RawRowsAppendBuffer::put_u64_le(self, value);
+    }
+}
+
+#[cfg(test)]
+impl RawRowsAppendTarget for Vec<u8> {
+    fn extend_from_slice(&mut self, slice: &[u8]) {
+        Vec::extend_from_slice(self, slice);
+    }
+
+    fn put_u16_le(&mut self, value: u16) {
+        self.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u32_le(&mut self, value: u32) {
+        self.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u64_le(&mut self, value: u64) {
+        self.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+/// Measures one string-family-to-nvarchar column into a row-major cell length matrix.
+pub(crate) fn measure_nvarchar_column_cell_lengths<'a>(
+    array: impl StringArrayType<'a>,
     column: &DirectColumnPlan,
     column_index: usize,
     column_count: usize,
     cell_lengths: &mut [usize],
 ) -> Result<()> {
     let length = match column.encoding() {
-        DirectColumnEncoding::VariableWidth(
-            VariableWidthArrowToMssql::Utf8ToNVarChar { length }
-            | VariableWidthArrowToMssql::LargeUtf8ToNVarChar { length },
-        ) => length,
+        DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::StringToNVarChar {
+            length,
+        }) => length,
         other => {
             return Err(unsupported_batch(format!(
                 "direct nvarchar layout cannot measure mapping {other:?}"
@@ -49,19 +92,18 @@ pub(crate) fn measure_nvarchar_column_cell_lengths(
     )
 }
 
-/// Measures one Binary-to-varbinary column into a row-major cell length matrix.
-pub(crate) fn measure_varbinary_column_cell_lengths(
-    array: &GenericBinaryArray<impl OffsetSizeTrait>,
+/// Measures one binary-family-to-varbinary column into a row-major cell length matrix.
+pub(crate) fn measure_varbinary_column_cell_lengths<'a>(
+    array: impl BinaryArrayType<'a>,
     column: &DirectColumnPlan,
     column_index: usize,
     column_count: usize,
     cell_lengths: &mut [usize],
 ) -> Result<()> {
     let length = match column.encoding() {
-        DirectColumnEncoding::VariableWidth(
-            VariableWidthArrowToMssql::BinaryToVarBinary { length }
-            | VariableWidthArrowToMssql::LargeBinaryToVarBinary { length },
-        ) => length,
+        DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::BytesToVarBinary {
+            length,
+        }) => length,
         other => {
             return Err(unsupported_batch(format!(
                 "direct varbinary layout cannot measure mapping {other:?}"
@@ -79,9 +121,9 @@ pub(crate) fn measure_varbinary_column_cell_lengths(
     )
 }
 
-/// Fills one Utf8-to-nvarchar column into an already allocated rows payload.
-pub(crate) fn fill_nvarchar_column(
-    array: &GenericStringArray<impl OffsetSizeTrait>,
+/// Fills one string-family-to-nvarchar column into an already allocated rows payload.
+pub(crate) fn fill_nvarchar_column<'a>(
+    array: impl StringArrayType<'a>,
     column: &DirectColumnPlan,
     column_index: usize,
     column_count: usize,
@@ -89,10 +131,9 @@ pub(crate) fn fill_nvarchar_column(
     bytes: &mut [u8],
 ) -> Result<()> {
     let length = match column.encoding() {
-        DirectColumnEncoding::VariableWidth(
-            VariableWidthArrowToMssql::Utf8ToNVarChar { length }
-            | VariableWidthArrowToMssql::LargeUtf8ToNVarChar { length },
-        ) => length,
+        DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::StringToNVarChar {
+            length,
+        }) => length,
         other => {
             return Err(unsupported_batch(format!(
                 "direct nvarchar fill cannot encode mapping {other:?}"
@@ -120,9 +161,9 @@ pub(crate) fn fill_nvarchar_column(
     Ok(())
 }
 
-/// Fills one Binary-to-varbinary column into an already allocated rows payload.
-pub(crate) fn fill_varbinary_column(
-    array: &GenericBinaryArray<impl OffsetSizeTrait>,
+/// Fills one binary-family-to-varbinary column into an already allocated rows payload.
+pub(crate) fn fill_varbinary_column<'a>(
+    array: impl BinaryArrayType<'a>,
     column: &DirectColumnPlan,
     column_index: usize,
     column_count: usize,
@@ -130,10 +171,9 @@ pub(crate) fn fill_varbinary_column(
     bytes: &mut [u8],
 ) -> Result<()> {
     let length = match column.encoding() {
-        DirectColumnEncoding::VariableWidth(
-            VariableWidthArrowToMssql::BinaryToVarBinary { length }
-            | VariableWidthArrowToMssql::LargeBinaryToVarBinary { length },
-        ) => length,
+        DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::BytesToVarBinary {
+            length,
+        }) => length,
         other => {
             return Err(unsupported_batch(format!(
                 "direct varbinary fill cannot encode mapping {other:?}"
@@ -161,19 +201,18 @@ pub(crate) fn fill_varbinary_column(
     Ok(())
 }
 
-/// Appends one Utf8-to-nvarchar cell to a raw bulk append buffer.
-pub(crate) fn append_nvarchar_cell(
-    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
-    array: &GenericStringArray<impl OffsetSizeTrait>,
+/// Appends one string-family-to-nvarchar cell to a raw bulk append buffer.
+pub(crate) fn append_nvarchar_cell<'a>(
+    buf: &mut impl RawRowsAppendTarget,
+    array: impl StringArrayType<'a>,
     column: &DirectColumnPlan,
     row_index: usize,
     measured_len: usize,
 ) -> Result<()> {
     let length = match column.encoding() {
-        DirectColumnEncoding::VariableWidth(
-            VariableWidthArrowToMssql::Utf8ToNVarChar { length }
-            | VariableWidthArrowToMssql::LargeUtf8ToNVarChar { length },
-        ) => length,
+        DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::StringToNVarChar {
+            length,
+        }) => length,
         other => {
             return Err(unsupported_batch(format!(
                 "direct nvarchar append cannot encode mapping {other:?}"
@@ -222,19 +261,18 @@ pub(crate) fn append_nvarchar_cell(
     }
 }
 
-/// Appends one Binary-to-varbinary cell to a raw bulk append buffer.
-pub(crate) fn append_varbinary_cell(
-    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
-    array: &GenericBinaryArray<impl OffsetSizeTrait>,
+/// Appends one binary-family-to-varbinary cell to a raw bulk append buffer.
+pub(crate) fn append_varbinary_cell<'a>(
+    buf: &mut impl RawRowsAppendTarget,
+    array: impl BinaryArrayType<'a>,
     column: &DirectColumnPlan,
     row_index: usize,
     measured_len: usize,
 ) -> Result<()> {
     let length = match column.encoding() {
-        DirectColumnEncoding::VariableWidth(
-            VariableWidthArrowToMssql::BinaryToVarBinary { length }
-            | VariableWidthArrowToMssql::LargeBinaryToVarBinary { length },
-        ) => length,
+        DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::BytesToVarBinary {
+            length,
+        }) => length,
         other => {
             return Err(unsupported_batch(format!(
                 "direct varbinary append cannot encode mapping {other:?}"
@@ -270,8 +308,8 @@ pub(crate) fn append_varbinary_cell(
     }
 }
 
-fn measure_nvarchar_cell_lengths(
-    array: &GenericStringArray<impl OffsetSizeTrait>,
+fn measure_nvarchar_cell_lengths<'a>(
+    array: impl StringArrayType<'a>,
     column: &DirectColumnPlan,
     column_index: usize,
     column_count: usize,
@@ -311,8 +349,8 @@ fn measure_nvarchar_cell_lengths(
     Ok(())
 }
 
-fn measure_varbinary_cell_lengths(
-    array: &GenericBinaryArray<impl OffsetSizeTrait>,
+fn measure_varbinary_cell_lengths<'a>(
+    array: impl BinaryArrayType<'a>,
     column: &DirectColumnPlan,
     column_index: usize,
     column_count: usize,
@@ -351,7 +389,7 @@ fn measure_varbinary_cell_lengths(
 }
 
 fn append_null_cell(
-    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    buf: &mut impl RawRowsAppendTarget,
     column: &DirectColumnPlan,
     row_index: usize,
     measured_len: usize,
@@ -377,7 +415,7 @@ fn append_null_cell(
 }
 
 fn append_bounded_nvarchar_cell(
-    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    buf: &mut impl RawRowsAppendTarget,
     value: &str,
     encoded_bytes: usize,
 ) -> Result<()> {
@@ -389,7 +427,7 @@ fn append_bounded_nvarchar_cell(
 }
 
 fn append_bounded_payload_cell(
-    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    buf: &mut impl RawRowsAppendTarget,
     column: &DirectColumnPlan,
     row_index: usize,
     measured_len: usize,
@@ -412,7 +450,7 @@ fn append_bounded_payload_cell(
 }
 
 fn append_plp_nvarchar_cell(
-    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    buf: &mut impl RawRowsAppendTarget,
     value: &str,
     encoded_bytes: usize,
 ) -> Result<()> {
@@ -423,7 +461,7 @@ fn append_plp_nvarchar_cell(
 }
 
 fn append_plp_payload_cell(
-    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    buf: &mut impl RawRowsAppendTarget,
     column: &DirectColumnPlan,
     row_index: usize,
     measured_len: usize,
@@ -481,13 +519,13 @@ fn validate_utf16_byte_len_for_append(
     )))
 }
 
-fn append_utf16le(buf: &mut tiberius::RawRowsAppendBuffer<'_>, value: &str) {
+fn append_utf16le(buf: &mut impl RawRowsAppendTarget, value: &str) {
     for code_unit in value.encode_utf16() {
         buf.put_u16_le(code_unit);
     }
 }
 
-fn append_plp_header(buf: &mut tiberius::RawRowsAppendBuffer<'_>, len: usize) -> Result<()> {
+fn append_plp_header(buf: &mut impl RawRowsAppendTarget, len: usize) -> Result<()> {
     if len > MAX_PLP_CHUNK_LEN {
         return Err(invalid_payload(format!(
             "direct variable-width PLP chunk length {len} exceeds u32::MAX"
@@ -499,7 +537,7 @@ fn append_plp_header(buf: &mut tiberius::RawRowsAppendBuffer<'_>, len: usize) ->
     Ok(())
 }
 
-fn append_plp_terminator(buf: &mut tiberius::RawRowsAppendBuffer<'_>, len: usize) {
+fn append_plp_terminator(buf: &mut impl RawRowsAppendTarget, len: usize) {
     if len != 0 {
         buf.put_u32_le(0);
     }
@@ -891,7 +929,10 @@ fn unsupported_batch(message: impl Into<String>) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{Array, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
+    use arrow_array::{
+        Array, BinaryArray, BinaryViewArray, LargeBinaryArray, LargeStringArray, StringArray,
+        StringViewArray,
+    };
     use arrow_schema::DataType;
 
     use crate::{
@@ -1327,6 +1368,53 @@ mod tests {
     }
 
     #[test]
+    fn measures_string_view_nvarchar_cells_by_encoded_utf16_bytes() {
+        let array = StringViewArray::from(vec![Some("az"), Some("🙂"), None]);
+        let plan = plan(&[mapping(
+            0,
+            "view_text",
+            DataType::Utf8View,
+            MssqlType::NVarChar(MssqlTypeLength::Bounded(2)),
+            true,
+        )]);
+        let mut cell_lengths = vec![0; array.len()];
+
+        measure_nvarchar_column_cell_lengths(&array, &plan.columns()[0], 0, 1, &mut cell_lengths)
+            .unwrap();
+
+        assert_eq!(cell_lengths, [6, 6, 2]);
+    }
+
+    #[test]
+    fn rejects_string_view_bounded_nvarchar_values_over_planned_code_units() {
+        let array = StringViewArray::from(vec![Some("a🙂")]);
+        let plan = plan(&[mapping(
+            0,
+            "view_text",
+            DataType::Utf8View,
+            MssqlType::NVarChar(MssqlTypeLength::Bounded(2)),
+            true,
+        )]);
+        let mut cell_lengths = vec![0; array.len()];
+
+        let err = measure_nvarchar_column_cell_lengths(
+            &array,
+            &plan.columns()[0],
+            0,
+            1,
+            &mut cell_lengths,
+        )
+        .unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::ValueTooLong,
+            Some(0),
+            Some((0, "view_text")),
+        );
+    }
+
+    #[test]
     fn fills_large_max_varbinary_cells_as_single_chunk_plp() {
         let array = LargeBinaryArray::from_iter(vec![Some(&b"abc"[..]), Some(&b""[..]), None]);
         let plan = plan(&[mapping(
@@ -1348,6 +1436,74 @@ mod tests {
                 0, 0, 0, 0, 0xd1, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0xd1,
                 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
             ]
+        );
+    }
+
+    #[test]
+    fn measures_binary_view_varbinary_cells_by_byte_count() {
+        let array = BinaryViewArray::from(vec![Some(&b"abc"[..]), Some(&b""[..]), None]);
+        let plan = plan(&[mapping(
+            0,
+            "view_bytes",
+            DataType::Binary,
+            MssqlType::VarBinary(MssqlTypeLength::Bounded(3)),
+            true,
+        )]);
+        let mut cell_lengths = vec![0; array.len()];
+
+        measure_varbinary_column_cell_lengths(&array, &plan.columns()[0], 0, 1, &mut cell_lengths)
+            .unwrap();
+
+        assert_eq!(cell_lengths, [5, 2, 2]);
+    }
+
+    #[test]
+    fn rejects_binary_view_bounded_varbinary_values_over_planned_bytes() {
+        let array = BinaryViewArray::from(vec![Some(&b"abcd"[..])]);
+        let plan = plan(&[mapping(
+            0,
+            "view_bytes",
+            DataType::Binary,
+            MssqlType::VarBinary(MssqlTypeLength::Bounded(3)),
+            true,
+        )]);
+        let mut cell_lengths = vec![0; array.len()];
+
+        let err = measure_varbinary_column_cell_lengths(
+            &array,
+            &plan.columns()[0],
+            0,
+            1,
+            &mut cell_lengths,
+        )
+        .unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::ValueTooLong,
+            Some(0),
+            Some((0, "view_bytes")),
+        );
+    }
+
+    #[test]
+    fn fills_binary_view_bounded_varbinary_cells_with_null_sentinel() {
+        let array = BinaryViewArray::from(vec![Some(&b"abc"[..]), Some(&b""[..]), None]);
+        let plan = plan(&[mapping(
+            0,
+            "view_bytes",
+            DataType::Binary,
+            MssqlType::VarBinary(MssqlTypeLength::Bounded(3)),
+            true,
+        )]);
+        let layout = build_fixed_width_row_layout(3, 1, &[5, 2, 2]).unwrap();
+        let mut bytes = allocate_rows_payload_with_tokens(&layout);
+
+        fill_varbinary_column(&array, &plan.columns()[0], 0, 1, &layout, &mut bytes).unwrap();
+
+        assert_eq!(
+            bytes,
+            [0xd1, 3, 0, b'a', b'b', b'c', 0xd1, 0, 0, 0xd1, 0xff, 0xff,]
         );
     }
 

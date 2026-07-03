@@ -5,14 +5,15 @@ mod fill;
 mod measure;
 
 use arrow_array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
-    Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float16Array, Float32Array,
-    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
-    LargeStringArray, RecordBatch, StringArray, Time32MillisecondArray, Time32SecondArray,
-    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Decimal32Array,
+    Decimal64Array, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float16Array,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
+    LargeStringArray, RecordBatch, StringArray, StringViewArray, Time32MillisecondArray,
+    Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
     UInt16Array, UInt32Array, UInt64Array,
 };
+use arrow_schema::DataType;
 
 use super::{
     DirectEncoder,
@@ -24,9 +25,13 @@ use super::{
 use crate::{
     DiagnosticCode, NanosecondPolicy, Result, SchemaMapping,
     conversion::arrow_to_mssql::{
-        decimal::DecimalArrowToMssql, fixed_size_binary::FixedSizeBinaryArrowToMssql,
-        primitive::PrimitiveArrowToMssql, temporal::TemporalArrowToMssql,
-        variable_width::VariableWidthArrowToMssql,
+        decimal::DecimalArrowToMssql,
+        fixed_size_binary::FixedSizeBinaryArrowToMssql,
+        primitive::PrimitiveArrowToMssql,
+        temporal::TemporalArrowToMssql,
+        variable_width::{
+            VariableWidthArrowToMssql, is_binary_family_to_varbinary, is_string_family_to_nvarchar,
+        },
     },
 };
 
@@ -211,30 +216,20 @@ fn bind_direct_columns<'a>(
                 classification,
                 array: downcast_direct_array::<Decimal256Array>(array, column)?,
             },
-            DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::Utf8ToNVarChar {
+            DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::StringToNVarChar {
                 ..
-            }) => BoundDirectColumn::Utf8 {
+            }) => bind_direct_nvarchar_array(
+                array,
                 column,
-                array: downcast_direct_array::<StringArray>(array, column)?,
-            },
-            DirectColumnEncoding::VariableWidth(
-                VariableWidthArrowToMssql::LargeUtf8ToNVarChar { .. },
-            ) => BoundDirectColumn::LargeUtf8 {
-                column,
-                array: downcast_direct_array::<LargeStringArray>(array, column)?,
-            },
-            DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::BinaryToVarBinary {
+                encoder.mapping_for_column_index(column_index)?,
+            )?,
+            DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::BytesToVarBinary {
                 ..
-            }) => BoundDirectColumn::Binary {
+            }) => bind_direct_varbinary_array(
+                array,
                 column,
-                array: downcast_direct_array::<BinaryArray>(array, column)?,
-            },
-            DirectColumnEncoding::VariableWidth(
-                VariableWidthArrowToMssql::LargeBinaryToVarBinary { .. },
-            ) => BoundDirectColumn::LargeBinary {
-                column,
-                array: downcast_direct_array::<LargeBinaryArray>(array, column)?,
-            },
+                encoder.mapping_for_column_index(column_index)?,
+            )?,
             DirectColumnEncoding::FixedSizeBinary(classification) => {
                 BoundDirectColumn::FixedSizeBinary {
                     column,
@@ -355,6 +350,66 @@ fn bind_direct_columns<'a>(
     Ok(columns)
 }
 
+fn bind_direct_nvarchar_array<'a>(
+    array: &'a dyn Array,
+    column: &'a plan::DirectColumnPlan,
+    mapping: &SchemaMapping,
+) -> Result<BoundDirectColumn<'a>> {
+    if !is_string_family_to_nvarchar(mapping) {
+        return Err(unsupported_planned_direct_type(
+            column,
+            "nvarchar",
+            mapping.arrow().data_type(),
+        ));
+    }
+
+    match array.data_type() {
+        DataType::Utf8 => Ok(BoundDirectColumn::Utf8 {
+            column,
+            array: downcast_direct_array::<StringArray>(array, column)?,
+        }),
+        DataType::LargeUtf8 => Ok(BoundDirectColumn::LargeUtf8 {
+            column,
+            array: downcast_direct_array::<LargeStringArray>(array, column)?,
+        }),
+        DataType::Utf8View => Ok(BoundDirectColumn::Utf8View {
+            column,
+            array: downcast_direct_array::<StringViewArray>(array, column)?,
+        }),
+        other => Err(unsupported_planned_direct_type(column, "nvarchar", other)),
+    }
+}
+
+fn bind_direct_varbinary_array<'a>(
+    array: &'a dyn Array,
+    column: &'a plan::DirectColumnPlan,
+    mapping: &SchemaMapping,
+) -> Result<BoundDirectColumn<'a>> {
+    if !is_binary_family_to_varbinary(mapping) {
+        return Err(unsupported_planned_direct_type(
+            column,
+            "varbinary",
+            mapping.arrow().data_type(),
+        ));
+    }
+
+    match array.data_type() {
+        DataType::Binary => Ok(BoundDirectColumn::Binary {
+            column,
+            array: downcast_direct_array::<BinaryArray>(array, column)?,
+        }),
+        DataType::LargeBinary => Ok(BoundDirectColumn::LargeBinary {
+            column,
+            array: downcast_direct_array::<LargeBinaryArray>(array, column)?,
+        }),
+        DataType::BinaryView => Ok(BoundDirectColumn::BinaryView {
+            column,
+            array: downcast_direct_array::<BinaryViewArray>(array, column)?,
+        }),
+        other => Err(unsupported_planned_direct_type(column, "varbinary", other)),
+    }
+}
+
 pub(crate) enum BoundDirectColumn<'a> {
     Boolean {
         column: &'a plan::DirectColumnPlan,
@@ -436,6 +491,10 @@ pub(crate) enum BoundDirectColumn<'a> {
         column: &'a plan::DirectColumnPlan,
         array: &'a LargeStringArray,
     },
+    Utf8View {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a StringViewArray,
+    },
     Binary {
         column: &'a plan::DirectColumnPlan,
         array: &'a BinaryArray,
@@ -443,6 +502,10 @@ pub(crate) enum BoundDirectColumn<'a> {
     LargeBinary {
         column: &'a plan::DirectColumnPlan,
         array: &'a LargeBinaryArray,
+    },
+    BinaryView {
+        column: &'a plan::DirectColumnPlan,
+        array: &'a BinaryViewArray,
     },
     FixedSizeBinary {
         column: &'a plan::DirectColumnPlan,
@@ -541,11 +604,28 @@ fn downcast_direct_array<'a, T: Array + 'static>(
     })
 }
 
+fn unsupported_planned_direct_type(
+    column: &plan::DirectColumnPlan,
+    target_family: &str,
+    data_type: &DataType,
+) -> crate::Error {
+    value_conversion_error(row_column_diagnostic(
+        column,
+        0,
+        DiagnosticCode::ValueConversionUnsupported,
+        format!(
+            "planned Arrow type {data_type} is not supported by direct {target_family} binding"
+        ),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, FixedSizeBinaryArray, Int32Array};
+    use arrow_array::{
+        ArrayRef, BinaryViewArray, FixedSizeBinaryArray, Int32Array, StringViewArray,
+    };
     use arrow_schema::{DataType, Field, Schema};
 
     use super::*;
@@ -601,6 +681,145 @@ mod tests {
             panic!("LargeBinary mapping should bind to LargeBinaryArray");
         };
         assert_eq!(array.value(0), b"bytes");
+    }
+
+    #[test]
+    fn binds_string_view_arrays_to_string_runtime_variant() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "text",
+                DataType::Utf8,
+                MssqlType::NVarChar(MssqlTypeLength::Max),
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("text", DataType::Utf8View, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![7])) as ArrayRef,
+                Arc::new(StringViewArray::from(vec![Some("view")])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+
+        let BoundDirectColumn::Utf8View { array, .. } = bound.columns()[1] else {
+            panic!("string-family mapping should bind to StringViewArray");
+        };
+        assert_eq!(array.value(0), "view");
+    }
+
+    #[test]
+    fn binds_binary_view_arrays_to_binary_runtime_variant() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "bytes",
+                DataType::Binary,
+                MssqlType::VarBinary(MssqlTypeLength::Max),
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("bytes", DataType::BinaryView, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![7])) as ArrayRef,
+                Arc::new(BinaryViewArray::from(vec![Some(&b"view"[..])])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+
+        let BoundDirectColumn::BinaryView { array, .. } = bound.columns()[1] else {
+            panic!("binary-family mapping should bind to BinaryViewArray");
+        };
+        assert_eq!(array.value(0), b"view");
+    }
+
+    #[test]
+    fn appends_string_view_cells_through_bound_direct_dispatch() {
+        let mappings = vec![mapping(
+            0,
+            "text",
+            DataType::Utf8,
+            MssqlType::NVarChar(MssqlTypeLength::Bounded(2)),
+            true,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "text",
+                DataType::Utf8View,
+                true,
+            )])),
+            vec![Arc::new(StringViewArray::from(vec![Some("az"), Some("🙂"), None])) as ArrayRef],
+        )
+        .unwrap();
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+        let measured = bound.measure_cell_lengths().unwrap();
+
+        let mut bytes = Vec::new();
+        for (row_index, measured_len) in measured.into_iter().enumerate() {
+            bound.columns()[0]
+                .append_variable_width_cell_for_test(&mut bytes, row_index, measured_len)
+                .unwrap();
+        }
+
+        assert_eq!(
+            bytes,
+            [
+                4, 0, b'a', 0, b'z', 0, 4, 0, 0x3d, 0xd8, 0x42, 0xde, 0xff, 0xff,
+            ]
+        );
+    }
+
+    #[test]
+    fn appends_binary_view_cells_through_bound_direct_dispatch() {
+        let mappings = vec![mapping(
+            0,
+            "bytes",
+            DataType::Binary,
+            MssqlType::VarBinary(MssqlTypeLength::Bounded(3)),
+            true,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "bytes",
+                DataType::BinaryView,
+                true,
+            )])),
+            vec![Arc::new(BinaryViewArray::from(vec![
+                Some(&b"abc"[..]),
+                Some(&b""[..]),
+                None,
+            ])) as ArrayRef],
+        )
+        .unwrap();
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+        let measured = bound.measure_cell_lengths().unwrap();
+
+        let mut bytes = Vec::new();
+        for (row_index, measured_len) in measured.into_iter().enumerate() {
+            bound.columns()[0]
+                .append_variable_width_cell_for_test(&mut bytes, row_index, measured_len)
+                .unwrap();
+        }
+
+        assert_eq!(bytes, [3, 0, b'a', b'b', b'c', 0, 0, 0xff, 0xff,]);
     }
 
     #[test]

@@ -45,3 +45,48 @@ impl ArrowFieldRef {
         &self.data_type
     }
 }
+
+/// Returns true for Arrow string representations that carry UTF-8 text values.
+pub(crate) fn is_arrow_string_family(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    )
+}
+
+/// Returns true for Arrow binary representations that carry variable-width bytes.
+pub(crate) fn is_arrow_binary_family(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_schema::DataType;
+
+    use super::{is_arrow_binary_family, is_arrow_string_family};
+
+    #[test]
+    fn identifies_arrow_variable_width_representation_families() {
+        for data_type in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
+            assert!(is_arrow_string_family(&data_type));
+            assert!(!is_arrow_binary_family(&data_type));
+        }
+
+        for data_type in [
+            DataType::Binary,
+            DataType::LargeBinary,
+            DataType::BinaryView,
+        ] {
+            assert!(is_arrow_binary_family(&data_type));
+            assert!(!is_arrow_string_family(&data_type));
+        }
+
+        for data_type in [DataType::Int32, DataType::FixedSizeBinary(4)] {
+            assert!(!is_arrow_string_family(&data_type));
+            assert!(!is_arrow_binary_family(&data_type));
+        }
+    }
+}

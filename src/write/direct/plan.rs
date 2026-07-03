@@ -99,12 +99,7 @@ fn uint64_support(mapping: &SchemaMapping) -> DirectMappingSupport {
 
 fn variable_width_support(mapping: &SchemaMapping) -> DirectMappingSupport {
     match VariableWidthArrowToMssql::classify(mapping, 0) {
-        Ok(
-            classification @ (VariableWidthArrowToMssql::Utf8ToNVarChar { .. }
-            | VariableWidthArrowToMssql::LargeUtf8ToNVarChar { .. }
-            | VariableWidthArrowToMssql::BinaryToVarBinary { .. }
-            | VariableWidthArrowToMssql::LargeBinaryToVarBinary { .. }),
-        ) => DirectMappingSupport::Supported {
+        Ok(classification) => DirectMappingSupport::Supported {
             encoding: DirectColumnEncoding::VariableWidth(classification),
         },
         Err(_) => fixed_size_binary_support(mapping),
@@ -634,13 +629,13 @@ mod tests {
         assert_eq!(plan.column_count(), 2);
         assert_eq!(
             plan.columns()[0].encoding(),
-            DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::Utf8ToNVarChar {
+            DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::StringToNVarChar {
                 length: MssqlTypeLength::Max,
             })
         );
         assert_eq!(
             plan.columns()[1].encoding(),
-            DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::BinaryToVarBinary {
+            DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::BytesToVarBinary {
                 length: MssqlTypeLength::Bounded(100),
             })
         );
@@ -668,17 +663,15 @@ mod tests {
 
         assert_eq!(
             err.columns()[0].encoding(),
-            DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::LargeUtf8ToNVarChar {
+            DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::StringToNVarChar {
                 length: MssqlTypeLength::Max,
             })
         );
         assert_eq!(
             err.columns()[1].encoding(),
-            DirectColumnEncoding::VariableWidth(
-                VariableWidthArrowToMssql::LargeBinaryToVarBinary {
-                    length: MssqlTypeLength::Max,
-                }
-            )
+            DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::BytesToVarBinary {
+                length: MssqlTypeLength::Max,
+            })
         );
     }
 

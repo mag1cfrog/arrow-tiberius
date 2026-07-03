@@ -24,10 +24,10 @@ pub(crate) fn plan_arrow_data_type_as_mssql_type(
         DataType::UInt64 => plan_arrow_uint64_as_mssql_type(options.uint64_policy, index, field),
         DataType::Float16 | DataType::Float32 => Ok(MssqlType::Real),
         DataType::Float64 => Ok(MssqlType::Float { precision: 53 }),
-        DataType::Utf8 | DataType::LargeUtf8 => {
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
             plan_arrow_string_as_mssql_type(options.string_policy, index, field)
         }
-        DataType::Binary | DataType::LargeBinary => {
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
             plan_arrow_binary_as_mssql_type(options.binary_policy, index, field)
         }
         DataType::FixedSizeBinary(length) => {
@@ -342,7 +342,6 @@ fn unsupported_arrow_type_family(data_type: &DataType) -> &'static str {
         DataType::Duration(_) => "duration",
         DataType::Interval(_) => "interval",
         DataType::FixedSizeBinary(_) => "fixed-size binary",
-        DataType::BinaryView | DataType::Utf8View => "view",
         DataType::List(_)
         | DataType::ListView(_)
         | DataType::FixedSizeList(_, _)
@@ -389,9 +388,17 @@ mod tests {
                 DataType::LargeUtf8,
                 MssqlType::NVarChar(MssqlTypeLength::Max),
             ),
+            (
+                DataType::Utf8View,
+                MssqlType::NVarChar(MssqlTypeLength::Max),
+            ),
             (DataType::Binary, MssqlType::VarBinary(MssqlTypeLength::Max)),
             (
                 DataType::LargeBinary,
+                MssqlType::VarBinary(MssqlTypeLength::Max),
+            ),
+            (
+                DataType::BinaryView,
                 MssqlType::VarBinary(MssqlTypeLength::Max),
             ),
             (DataType::FixedSizeBinary(1), MssqlType::Binary(1)),
@@ -422,7 +429,29 @@ mod tests {
         );
         assert_eq!(
             plan_type(
+                DataType::Utf8View,
+                PlanOptions {
+                    string_policy: StringPolicy::NVarChar(128),
+                    ..PlanOptions::default()
+                },
+            )
+            .unwrap(),
+            MssqlType::NVarChar(MssqlTypeLength::Bounded(128))
+        );
+        assert_eq!(
+            plan_type(
                 DataType::Binary,
+                PlanOptions {
+                    binary_policy: crate::BinaryPolicy::VarBinary(256),
+                    ..PlanOptions::default()
+                },
+            )
+            .unwrap(),
+            MssqlType::VarBinary(MssqlTypeLength::Bounded(256))
+        );
+        assert_eq!(
+            plan_type(
+                DataType::BinaryView,
                 PlanOptions {
                     binary_policy: crate::BinaryPolicy::VarBinary(256),
                     ..PlanOptions::default()
@@ -744,8 +773,6 @@ mod tests {
             (DataType::Null, "null"),
             (DataType::Time32(TimeUnit::Microsecond), "time-only"),
             (DataType::Duration(TimeUnit::Microsecond), "duration"),
-            (DataType::BinaryView, "view"),
-            (DataType::Utf8View, "view"),
             (
                 DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
                 "encoded",

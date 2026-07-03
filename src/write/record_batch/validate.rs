@@ -3,14 +3,17 @@
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{Field, Schema};
 
-use crate::{Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, Result, SchemaMapping};
+use crate::{
+    Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, Result, SchemaMapping,
+    conversion::arrow_to_mssql::variable_width::arrow_type_compatible_with_mapping,
+};
 
 /// Validates a runtime Arrow schema against planned Arrow-side schema mappings.
 ///
 /// This is a strict schema-contract check for callers that plan once and later
 /// want to confirm a runtime schema still matches that plan before writing. It
 /// verifies field count, field order, planned Arrow index, field name, Arrow
-/// data type, and Arrow nullability.
+/// data type compatibility, and Arrow nullability.
 ///
 /// This function does not inspect row values. A nullable runtime value in a
 /// non-nullable SQL Server target column is still a value-conversion error and
@@ -129,7 +132,7 @@ fn validate_schema_field_shape_against_mapping(
         )));
     }
 
-    if field.data_type() != mapping.arrow().data_type() {
+    if !arrow_type_compatible_with_mapping(field.data_type(), mapping) {
         return Err(value_conversion_error(mapping_diagnostic(
             mapping,
             DiagnosticCode::SchemaMismatch,
@@ -167,7 +170,7 @@ fn validate_unchecked_column_array_against_mapping(
     array: &dyn Array,
     mapping: &SchemaMapping,
 ) -> Result<()> {
-    if array.data_type() != mapping.arrow().data_type() {
+    if !arrow_type_compatible_with_mapping(array.data_type(), mapping) {
         return Err(value_conversion_error(mapping_diagnostic(
             mapping,
             DiagnosticCode::SchemaMismatch,

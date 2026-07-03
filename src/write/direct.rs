@@ -20,12 +20,13 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array,
-        Decimal64Array, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float16Array,
-        Float32Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
-        RecordBatch, StringArray, Time32MillisecondArray, Time32SecondArray,
-        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
+        ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
+        Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array, FixedSizeBinaryArray,
+        Float16Array, Float32Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray,
+        LargeStringArray, RecordBatch, StringArray, StringViewArray, Time32MillisecondArray,
+        Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray, UInt64Array,
         types::{ArrowPrimitiveType, Float16Type},
     };
     use arrow_buffer::{NullBuffer, ScalarBuffer, i256};
@@ -1876,6 +1877,280 @@ mod tests {
     }
 
     #[test]
+    fn direct_encoder_encodes_string_view_rows_like_utf8_rows() {
+        let mappings = vec![mapping(
+            0,
+            "name",
+            DataType::Utf8,
+            MssqlType::NVarChar(MssqlTypeLength::Bounded(2)),
+            true,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let utf8_batch = record_batch(
+            vec![Field::new("name", DataType::Utf8, true)],
+            vec![Arc::new(StringArray::from(vec![
+                Some("ab"),
+                Some("🙂"),
+                None,
+            ]))],
+        );
+        let string_view_batch = record_batch(
+            vec![Field::new("name", DataType::Utf8View, true)],
+            vec![Arc::new(StringViewArray::from(vec![
+                Some("ab"),
+                Some("🙂"),
+                None,
+            ]))],
+        );
+
+        let expected = encoder.encode_batch(&utf8_batch).unwrap();
+        let actual = encoder.encode_batch(&string_view_batch).unwrap();
+
+        assert_eq!(actual.row_token_offsets(), expected.row_token_offsets());
+        assert_eq!(actual.bytes(), expected.bytes());
+        assert_eq!(
+            actual.bytes(),
+            expected_rows([
+                [bounded_nvarchar_cell("ab")],
+                [bounded_nvarchar_cell("🙂")],
+                [bounded_nvarchar_null_cell()]
+            ])
+        );
+    }
+
+    #[test]
+    fn direct_encoder_encodes_binary_view_rows_like_binary_rows() {
+        let mappings = vec![mapping(
+            0,
+            "payload",
+            DataType::Binary,
+            MssqlType::VarBinary(MssqlTypeLength::Max),
+            true,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let binary_batch = record_batch(
+            vec![Field::new("payload", DataType::Binary, true)],
+            vec![Arc::new(BinaryArray::from_iter(vec![
+                Some(&b"abc"[..]),
+                Some(&b""[..]),
+                None,
+            ]))],
+        );
+        let binary_view_batch = record_batch(
+            vec![Field::new("payload", DataType::BinaryView, true)],
+            vec![Arc::new(BinaryViewArray::from(vec![
+                Some(&b"abc"[..]),
+                Some(&b""[..]),
+                None,
+            ]))],
+        );
+
+        let expected = encoder.encode_batch(&binary_batch).unwrap();
+        let actual = encoder.encode_batch(&binary_view_batch).unwrap();
+
+        assert_eq!(actual.row_token_offsets(), expected.row_token_offsets());
+        assert_eq!(actual.bytes(), expected.bytes());
+        assert_eq!(
+            actual.bytes(),
+            expected_rows([
+                [max_varbinary_cell(b"abc")],
+                [max_varbinary_cell(b"")],
+                [max_varbinary_null_cell()]
+            ])
+        );
+    }
+
+    #[test]
+    fn direct_encoder_encodes_string_family_runtime_matrix() {
+        for planned in string_family_types() {
+            let mappings = vec![mapping(
+                0,
+                "name",
+                planned.clone(),
+                MssqlType::NVarChar(MssqlTypeLength::Bounded(8)),
+                true,
+            )];
+            let encoder = DirectEncoder::new(&mappings).unwrap();
+
+            for runtime in string_family_types() {
+                let batch = record_batch(
+                    vec![Field::new("name", runtime.clone(), true)],
+                    vec![string_family_array(
+                        runtime,
+                        vec![Some("alpha"), Some("🙂"), None],
+                    )],
+                );
+
+                let measured = encoder.measure_batch(&batch).unwrap();
+                let full = encoder.encode_batch(&batch).unwrap();
+                let range = encoder
+                    .encode_measured_batch_range(&batch, &measured, 0, 3)
+                    .unwrap();
+
+                assert_eq!(measured.row_count(), 3);
+                assert_eq!(range.bytes(), full.bytes());
+                assert_eq!(
+                    full.bytes(),
+                    expected_rows([
+                        [bounded_nvarchar_cell("alpha")],
+                        [bounded_nvarchar_cell("🙂")],
+                        [bounded_nvarchar_null_cell()]
+                    ])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn direct_encoder_encodes_binary_family_runtime_matrix() {
+        for planned in binary_family_types() {
+            let mappings = vec![mapping(
+                0,
+                "payload",
+                planned.clone(),
+                MssqlType::VarBinary(MssqlTypeLength::Max),
+                true,
+            )];
+            let encoder = DirectEncoder::new(&mappings).unwrap();
+
+            for runtime in binary_family_types() {
+                let batch = record_batch(
+                    vec![Field::new("payload", runtime.clone(), true)],
+                    vec![binary_family_array(
+                        runtime,
+                        vec![Some(&b"alpha"[..]), Some(&b""[..]), None],
+                    )],
+                );
+
+                let measured = encoder.measure_batch(&batch).unwrap();
+                let full = encoder.encode_batch(&batch).unwrap();
+                let range = encoder
+                    .encode_measured_batch_range(&batch, &measured, 0, 3)
+                    .unwrap();
+
+                assert_eq!(measured.row_count(), 3);
+                assert_eq!(range.bytes(), full.bytes());
+                assert_eq!(
+                    full.bytes(),
+                    expected_rows([
+                        [max_varbinary_cell(b"alpha")],
+                        [max_varbinary_cell(b"")],
+                        [max_varbinary_null_cell()]
+                    ])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn direct_encoder_rejects_cross_family_runtime_representations() {
+        let cases: Vec<(SchemaMapping, ArrayRef)> = vec![
+            (
+                mapping(
+                    0,
+                    "name",
+                    DataType::Utf8View,
+                    MssqlType::NVarChar(MssqlTypeLength::Max),
+                    true,
+                ),
+                Arc::new(BinaryViewArray::from(vec![Some(&b"bytes"[..])])) as ArrayRef,
+            ),
+            (
+                mapping(
+                    0,
+                    "payload",
+                    DataType::BinaryView,
+                    MssqlType::VarBinary(MssqlTypeLength::Max),
+                    true,
+                ),
+                Arc::new(StringViewArray::from(vec![Some("text")])) as ArrayRef,
+            ),
+        ];
+
+        for (mapping, array) in cases {
+            let field_name = mapping.arrow().name().to_owned();
+            let field = Field::new(
+                mapping.arrow().name(),
+                mapping.arrow().data_type().clone(),
+                mapping.arrow().nullable(),
+            );
+            let mappings = vec![mapping];
+            let encoder = DirectEncoder::new(&mappings).unwrap();
+            let batch = unsafe_record_batch(vec![field], vec![array], 1);
+
+            let err = encoder
+                .encode_batch(&batch)
+                .expect_err("direct encoder must reject cross-family physical arrays");
+
+            assert_value_conversion_diagnostic(
+                err,
+                DiagnosticCode::SchemaMismatch,
+                None,
+                Some((0, field_name.as_str())),
+            );
+        }
+    }
+
+    #[test]
+    fn direct_encoder_rejects_fixed_size_binary_variable_binary_mismatches() {
+        let planned_varbinary = vec![mapping(
+            0,
+            "payload",
+            DataType::BinaryView,
+            MssqlType::VarBinary(MssqlTypeLength::Max),
+            true,
+        )];
+        let encoder = DirectEncoder::new(&planned_varbinary).unwrap();
+        let batch = unsafe_record_batch(
+            vec![Field::new("payload", DataType::BinaryView, true)],
+            vec![Arc::new(
+                FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    [Some(&b"abc"[..])].into_iter(),
+                    3,
+                )
+                .unwrap(),
+            )],
+            1,
+        );
+
+        let err = encoder
+            .encode_batch(&batch)
+            .expect_err("varbinary mapping must not accept FixedSizeBinary physical arrays");
+
+        assert_value_conversion_diagnostic(
+            err,
+            DiagnosticCode::SchemaMismatch,
+            None,
+            Some((0, "payload")),
+        );
+
+        let planned_fixed = vec![mapping(
+            0,
+            "payload",
+            DataType::FixedSizeBinary(3),
+            MssqlType::Binary(3),
+            true,
+        )];
+        let encoder = DirectEncoder::new(&planned_fixed).unwrap();
+        let batch = unsafe_record_batch(
+            vec![Field::new("payload", DataType::FixedSizeBinary(3), true)],
+            vec![Arc::new(BinaryViewArray::from(vec![Some(&b"abc"[..])]))],
+            1,
+        );
+
+        let err = encoder
+            .encode_batch(&batch)
+            .expect_err("fixed binary mapping must not accept variable binary physical arrays");
+
+        assert_value_conversion_diagnostic(
+            err,
+            DiagnosticCode::SchemaMismatch,
+            None,
+            Some((0, "payload")),
+        );
+    }
+
+    #[test]
     fn direct_encoder_large_variable_width_measured_ranges_match_full_payload() {
         let mappings = vec![
             mapping(0, "id", DataType::Int32, MssqlType::Int, false),
@@ -2028,13 +2303,13 @@ mod tests {
     }
 
     #[test]
-    fn direct_encoder_rejects_large_variable_width_runtime_type_drift() {
+    fn direct_encoder_encodes_binary_family_runtime_representations() {
         let mappings = vec![
             mapping(
                 0,
                 "large_text",
                 DataType::LargeUtf8,
-                MssqlType::NVarChar(MssqlTypeLength::Max),
+                MssqlType::NVarChar(MssqlTypeLength::Bounded(8)),
                 true,
             ),
             mapping(
@@ -2046,25 +2321,7 @@ mod tests {
             ),
         ];
         let encoder = DirectEncoder::new(&mappings).unwrap();
-        let text_drift = record_batch(
-            vec![
-                Field::new("large_text", DataType::Utf8, true),
-                Field::new("large_bytes", DataType::LargeBinary, true),
-            ],
-            vec![
-                Arc::new(StringArray::from(vec![Some("not-large")])) as ArrayRef,
-                Arc::new(LargeBinaryArray::from_iter(vec![Some(&b"abc"[..])])),
-            ],
-        );
-
-        assert_value_conversion_diagnostic(
-            encoder.encode_batch(&text_drift).unwrap_err(),
-            DiagnosticCode::SchemaMismatch,
-            None,
-            Some((0, "large_text")),
-        );
-
-        let binary_drift = record_batch(
+        let batch = record_batch(
             vec![
                 Field::new("large_text", DataType::LargeUtf8, true),
                 Field::new("large_bytes", DataType::Binary, true),
@@ -2075,11 +2332,15 @@ mod tests {
             ],
         );
 
-        assert_value_conversion_diagnostic(
-            encoder.encode_batch(&binary_drift).unwrap_err(),
-            DiagnosticCode::SchemaMismatch,
-            None,
-            Some((1, "large_bytes")),
+        let payload = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(payload.row_token_offsets(), [0]);
+        assert_eq!(
+            payload.bytes(),
+            expected_rows([[
+                bounded_nvarchar_cell("large"),
+                max_varbinary_cell(b"not-large")
+            ]])
         );
     }
 
@@ -3787,6 +4048,36 @@ mod tests {
         assert_eq!(diagnostics.all()[0].code(), expected_code);
     }
 
+    fn string_family_types() -> [DataType; 3] {
+        [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View]
+    }
+
+    fn binary_family_types() -> [DataType; 3] {
+        [
+            DataType::Binary,
+            DataType::LargeBinary,
+            DataType::BinaryView,
+        ]
+    }
+
+    fn string_family_array(data_type: DataType, values: Vec<Option<&'static str>>) -> ArrayRef {
+        match data_type {
+            DataType::Utf8 => Arc::new(StringArray::from(values)) as ArrayRef,
+            DataType::LargeUtf8 => Arc::new(LargeStringArray::from(values)) as ArrayRef,
+            DataType::Utf8View => Arc::new(StringViewArray::from(values)) as ArrayRef,
+            _ => unreachable!("test helper only supports Arrow string-family types"),
+        }
+    }
+
+    fn binary_family_array(data_type: DataType, values: Vec<Option<&'static [u8]>>) -> ArrayRef {
+        match data_type {
+            DataType::Binary => Arc::new(BinaryArray::from_iter(values)) as ArrayRef,
+            DataType::LargeBinary => Arc::new(LargeBinaryArray::from_iter(values)) as ArrayRef,
+            DataType::BinaryView => Arc::new(BinaryViewArray::from(values)) as ArrayRef,
+            _ => unreachable!("test helper only supports Arrow binary-family types"),
+        }
+    }
+
     fn mapping(
         index: usize,
         name: &str,
@@ -3802,6 +4093,17 @@ mod tests {
 
     fn record_batch(fields: Vec<Field>, arrays: Vec<ArrayRef>) -> RecordBatch {
         RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap()
+    }
+
+    fn unsafe_record_batch(
+        fields: Vec<Field>,
+        arrays: Vec<ArrayRef>,
+        row_count: usize,
+    ) -> RecordBatch {
+        // SAFETY: these tests deliberately keep schema metadata compatible
+        // with the plan while passing a mismatched physical array to exercise
+        // unchecked-batch encoding-shape guards.
+        unsafe { RecordBatch::new_unchecked(Arc::new(Schema::new(fields)), arrays, row_count) }
     }
 
     fn expected_rows<const R: usize, const C: usize>(rows: [[Vec<u8>; C]; R]) -> Vec<u8> {

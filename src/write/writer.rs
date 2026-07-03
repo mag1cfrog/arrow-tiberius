@@ -544,14 +544,12 @@ fn expected_direct_bulk_column_type(column: &DirectColumnPlan) -> Option<tiberiu
         DirectColumnEncoding::UInt64Decimal20_0 | DirectColumnEncoding::Decimal(_) => {
             Some(tiberius::ColumnType::Decimaln)
         }
-        DirectColumnEncoding::VariableWidth(
-            VariableWidthArrowToMssql::Utf8ToNVarChar { .. }
-            | VariableWidthArrowToMssql::LargeUtf8ToNVarChar { .. },
-        ) => Some(tiberius::ColumnType::NVarchar),
-        DirectColumnEncoding::VariableWidth(
-            VariableWidthArrowToMssql::BinaryToVarBinary { .. }
-            | VariableWidthArrowToMssql::LargeBinaryToVarBinary { .. },
-        ) => Some(tiberius::ColumnType::BigVarBin),
+        DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::StringToNVarChar {
+            ..
+        }) => Some(tiberius::ColumnType::NVarchar),
+        DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::BytesToVarBinary {
+            ..
+        }) => Some(tiberius::ColumnType::BigVarBin),
         DirectColumnEncoding::FixedSizeBinary(
             FixedSizeBinaryArrowToMssql::FixedSizeBinaryToBinary { .. },
         ) => Some(tiberius::ColumnType::BigBinary),

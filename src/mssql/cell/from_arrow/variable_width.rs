@@ -18,8 +18,7 @@ pub(super) fn nvar_char_cell<'a>(
     cell: ArrowCell<'a>,
 ) -> Result<MssqlCell<'a>> {
     let classified = match VariableWidthArrowToMssql::classify(mapping, row_index)? {
-        VariableWidthArrowToMssql::Utf8ToNVarChar { length }
-        | VariableWidthArrowToMssql::LargeUtf8ToNVarChar { length } => length,
+        VariableWidthArrowToMssql::StringToNVarChar { length } => length,
         other => {
             return Err(value_conversion_error(row_mapping_diagnostic(
                 mapping,
@@ -55,8 +54,7 @@ pub(super) fn var_binary_cell<'a>(
     cell: ArrowCell<'a>,
 ) -> Result<MssqlCell<'a>> {
     let classified = match VariableWidthArrowToMssql::classify(mapping, row_index)? {
-        VariableWidthArrowToMssql::BinaryToVarBinary { length }
-        | VariableWidthArrowToMssql::LargeBinaryToVarBinary { length } => length,
+        VariableWidthArrowToMssql::BytesToVarBinary { length } => length,
         other => {
             return Err(value_conversion_error(row_mapping_diagnostic(
                 mapping,
