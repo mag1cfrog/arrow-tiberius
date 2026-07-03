@@ -1,0 +1,6 @@
+[workspace]
+release_always = false
+
+[[package]]
+name = "xtask"
+release = false
