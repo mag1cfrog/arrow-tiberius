@@ -6,10 +6,7 @@ use crate::write::{
     BinaryPolicy, Date64Policy, Decimal256Policy, DecimalPolicy, PlanOptions, StringPolicy,
     TimezonePolicy, UInt64Policy,
 };
-use crate::{
-    Diagnostic, DiagnosticCode, FieldRef, MssqlTimePrecision, MssqlType, MssqlTypeLength,
-    arrow::field::is_arrow_binary_family,
-};
+use crate::{Diagnostic, DiagnosticCode, FieldRef, MssqlTimePrecision, MssqlType, MssqlTypeLength};
 
 pub(crate) fn plan_arrow_data_type_as_mssql_type(
     index: usize,
@@ -30,7 +27,7 @@ pub(crate) fn plan_arrow_data_type_as_mssql_type(
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
             plan_arrow_string_as_mssql_type(options.string_policy, index, field)
         }
-        DataType::Binary | DataType::LargeBinary => {
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
             plan_arrow_binary_as_mssql_type(options.binary_policy, index, field)
         }
         DataType::FixedSizeBinary(length) => {
@@ -345,7 +342,6 @@ fn unsupported_arrow_type_family(data_type: &DataType) -> &'static str {
         DataType::Duration(_) => "duration",
         DataType::Interval(_) => "interval",
         DataType::FixedSizeBinary(_) => "fixed-size binary",
-        data_type @ DataType::BinaryView if is_arrow_binary_family(data_type) => "view",
         DataType::List(_)
         | DataType::ListView(_)
         | DataType::FixedSizeList(_, _)
@@ -401,6 +397,10 @@ mod tests {
                 DataType::LargeBinary,
                 MssqlType::VarBinary(MssqlTypeLength::Max),
             ),
+            (
+                DataType::BinaryView,
+                MssqlType::VarBinary(MssqlTypeLength::Max),
+            ),
             (DataType::FixedSizeBinary(1), MssqlType::Binary(1)),
             (DataType::FixedSizeBinary(16), MssqlType::Binary(16)),
             (DataType::FixedSizeBinary(8000), MssqlType::Binary(8000)),
@@ -441,6 +441,17 @@ mod tests {
         assert_eq!(
             plan_type(
                 DataType::Binary,
+                PlanOptions {
+                    binary_policy: crate::BinaryPolicy::VarBinary(256),
+                    ..PlanOptions::default()
+                },
+            )
+            .unwrap(),
+            MssqlType::VarBinary(MssqlTypeLength::Bounded(256))
+        );
+        assert_eq!(
+            plan_type(
+                DataType::BinaryView,
                 PlanOptions {
                     binary_policy: crate::BinaryPolicy::VarBinary(256),
                     ..PlanOptions::default()
@@ -762,7 +773,6 @@ mod tests {
             (DataType::Null, "null"),
             (DataType::Time32(TimeUnit::Microsecond), "time-only"),
             (DataType::Duration(TimeUnit::Microsecond), "duration"),
-            (DataType::BinaryView, "view"),
             (
                 DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
                 "encoded",

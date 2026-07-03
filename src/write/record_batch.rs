@@ -145,8 +145,8 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        ArrayRef, BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch,
-        StringArray, StringViewArray,
+        ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Float64Array, Int32Array, Int64Array,
+        RecordBatch, StringArray, StringViewArray,
     };
     use arrow_schema::{DataType, Field, Schema};
 
@@ -243,6 +243,42 @@ mod tests {
     }
 
     #[test]
+    fn public_schema_validation_accepts_binary_family_runtime_representations() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Binary,
+            true,
+        )]));
+        let schema = Schema::new(vec![Field::new("payload", DataType::BinaryView, true)]);
+
+        validate_arrow_schema_against_mappings(&schema, &mappings).unwrap();
+    }
+
+    #[test]
+    fn public_record_batch_validation_accepts_binary_view_runtime_batch() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Binary,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "payload",
+                DataType::BinaryView,
+                true,
+            )])),
+            vec![Arc::new(BinaryViewArray::from(vec![
+                Some(&b"view"[..]),
+                None,
+            ]))],
+        )
+        .unwrap();
+
+        validate_record_batch_schema_against_mappings(&batch, &mappings).unwrap();
+        validate_record_batch_encoding_shape(&batch, &mappings).unwrap();
+    }
+
+    #[test]
     fn converts_string_view_runtime_batch_for_planned_utf8_mapping() {
         let mappings =
             mappings_for_schema(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
@@ -265,6 +301,34 @@ mod tests {
     }
 
     #[test]
+    fn converts_binary_view_runtime_batch_for_planned_binary_mapping() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Binary,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "payload",
+                DataType::BinaryView,
+                true,
+            )])),
+            vec![Arc::new(BinaryViewArray::from(vec![
+                Some(&b"view"[..]),
+                None,
+            ]))],
+        )
+        .unwrap();
+        let view = RecordBatchView::new(&batch, &mappings).unwrap();
+
+        assert_eq!(
+            view.mssql_row(0).unwrap(),
+            vec![MssqlCell::VarBinary(Some(b"view"))]
+        );
+        assert_eq!(view.mssql_row(1).unwrap(), vec![MssqlCell::VarBinary(None)]);
+    }
+
+    #[test]
     fn public_schema_validation_rejects_cross_family_view_mismatch() {
         let mappings =
             mappings_for_schema(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
@@ -273,6 +337,29 @@ mod tests {
         let err = validate_arrow_schema_against_mappings(&schema, &mappings).unwrap_err();
 
         assert_single_diagnostic(err, DiagnosticCode::SchemaMismatch, None, Some((0, "name")));
+    }
+
+    #[test]
+    fn public_schema_validation_rejects_fixed_size_binary_as_binary_family_mismatch() {
+        let mappings = mappings_for_schema(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Binary,
+            true,
+        )]));
+        let schema = Schema::new(vec![Field::new(
+            "payload",
+            DataType::FixedSizeBinary(4),
+            true,
+        )]);
+
+        let err = validate_arrow_schema_against_mappings(&schema, &mappings).unwrap_err();
+
+        assert_single_diagnostic(
+            err,
+            DiagnosticCode::SchemaMismatch,
+            None,
+            Some((0, "payload")),
+        );
     }
 
     #[test]

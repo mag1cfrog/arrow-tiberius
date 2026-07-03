@@ -1,9 +1,9 @@
 //! Arrow runtime cell values.
 
 use arrow_array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
-    Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float16Array, Float32Array,
-    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
+    Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Decimal32Array,
+    Decimal64Array, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float16Array,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
     LargeStringArray, StringArray, StringViewArray, Time32MillisecondArray, Time32SecondArray,
     Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
@@ -14,7 +14,7 @@ use arrow_schema::{DataType, TimeUnit};
 
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, Result, SchemaMapping,
-    arrow::field::is_arrow_string_family,
+    arrow::field::{is_arrow_binary_family, is_arrow_string_family},
 };
 
 /// Borrowed value extracted from one Arrow array cell.
@@ -211,13 +211,8 @@ pub(crate) fn extract_arrow_cell<'a>(
             Ok(ArrowCell::Float64(array.value(row_index)))
         }
         planned if is_arrow_string_family(planned) => extract_utf8_cell(array, mapping, row_index),
-        DataType::Binary => {
-            let array = downcast_array::<BinaryArray>(array, mapping, row_index)?;
-            Ok(ArrowCell::Binary(array.value(row_index)))
-        }
-        DataType::LargeBinary => {
-            let array = downcast_array::<LargeBinaryArray>(array, mapping, row_index)?;
-            Ok(ArrowCell::Binary(array.value(row_index)))
+        planned if is_arrow_binary_family(planned) => {
+            extract_binary_cell(array, mapping, row_index)
         }
         DataType::FixedSizeBinary(_) => {
             let array = downcast_array::<FixedSizeBinaryArray>(array, mapping, row_index)?;
@@ -228,6 +223,37 @@ pub(crate) fn extract_arrow_cell<'a>(
             row_index,
             format!("Arrow value extraction for {other} is not supported yet"),
         )),
+    }
+}
+
+fn extract_binary_cell<'a>(
+    array: &'a dyn Array,
+    mapping: &SchemaMapping,
+    row_index: usize,
+) -> Result<ArrowCell<'a>> {
+    match array.data_type() {
+        DataType::Binary => {
+            let array = downcast_array::<BinaryArray>(array, mapping, row_index)?;
+            Ok(ArrowCell::Binary(array.value(row_index)))
+        }
+        DataType::LargeBinary => {
+            let array = downcast_array::<LargeBinaryArray>(array, mapping, row_index)?;
+            Ok(ArrowCell::Binary(array.value(row_index)))
+        }
+        DataType::BinaryView => {
+            let array = downcast_array::<BinaryViewArray>(array, mapping, row_index)?;
+            Ok(ArrowCell::Binary(array.value(row_index)))
+        }
+        _ => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!(
+                "runtime Arrow type {} does not match planned Arrow type {}",
+                array.data_type(),
+                mapping.arrow().data_type()
+            ),
+        ))),
     }
 }
 
@@ -319,9 +345,9 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array,
-        Decimal64Array, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float16Array,
-        Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
+        Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array, FixedSizeBinaryArray,
+        Float16Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
         LargeBinaryArray, LargeStringArray, StringArray, StringViewArray, Time32MillisecondArray,
         Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
         TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
@@ -420,6 +446,11 @@ mod tests {
                 ArrowCell::Binary(b"large"),
             ),
             (
+                mapping("view_bytes", DataType::BinaryView),
+                Arc::new(BinaryViewArray::from(vec![Some(&b"view"[..]), None])),
+                ArrowCell::Binary(b"view"),
+            ),
+            (
                 mapping("fixed_bytes", DataType::FixedSizeBinary(3)),
                 Arc::new(
                     FixedSizeBinaryArray::try_from_sparse_iter_with_size(
@@ -461,6 +492,38 @@ mod tests {
                 mapping("text", DataType::Utf8View),
                 Arc::new(LargeStringArray::from(vec![Some("large"), None])),
                 ArrowCell::Utf8("large"),
+            ),
+        ];
+
+        for (mapping, array, expected) in cases {
+            assert_eq!(
+                extract_arrow_cell(array.as_ref(), &mapping, 0).unwrap(),
+                expected
+            );
+            assert_eq!(
+                extract_arrow_cell(array.as_ref(), &mapping, 1).unwrap(),
+                ArrowCell::Null
+            );
+        }
+    }
+
+    #[test]
+    fn extracts_binary_family_cells_from_runtime_representations() {
+        let cases: Vec<(SchemaMapping, ArrayRef, ArrowCell<'_>)> = vec![
+            (
+                mapping("bytes", DataType::Binary),
+                Arc::new(BinaryViewArray::from(vec![Some(&b"view"[..]), None])),
+                ArrowCell::Binary(b"view"),
+            ),
+            (
+                mapping("bytes", DataType::BinaryView),
+                Arc::new(BinaryArray::from(vec![Some(&b"small"[..]), None])),
+                ArrowCell::Binary(b"small"),
+            ),
+            (
+                mapping("bytes", DataType::BinaryView),
+                Arc::new(LargeBinaryArray::from(vec![Some(&b"large"[..]), None])),
+                ArrowCell::Binary(b"large"),
             ),
         ];
 

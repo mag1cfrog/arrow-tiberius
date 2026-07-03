@@ -20,12 +20,13 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array,
-        Decimal64Array, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float16Array,
-        Float32Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
-        RecordBatch, StringArray, StringViewArray, Time32MillisecondArray, Time32SecondArray,
-        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
+        ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
+        Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array, FixedSizeBinaryArray,
+        Float16Array, Float32Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray,
+        LargeStringArray, RecordBatch, StringArray, StringViewArray, Time32MillisecondArray,
+        Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray, UInt64Array,
         types::{ArrowPrimitiveType, Float16Type},
     };
     use arrow_buffer::{NullBuffer, ScalarBuffer, i256};
@@ -1918,6 +1919,48 @@ mod tests {
     }
 
     #[test]
+    fn direct_encoder_encodes_binary_view_rows_like_binary_rows() {
+        let mappings = vec![mapping(
+            0,
+            "payload",
+            DataType::Binary,
+            MssqlType::VarBinary(MssqlTypeLength::Max),
+            true,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let binary_batch = record_batch(
+            vec![Field::new("payload", DataType::Binary, true)],
+            vec![Arc::new(BinaryArray::from_iter(vec![
+                Some(&b"abc"[..]),
+                Some(&b""[..]),
+                None,
+            ]))],
+        );
+        let binary_view_batch = record_batch(
+            vec![Field::new("payload", DataType::BinaryView, true)],
+            vec![Arc::new(BinaryViewArray::from(vec![
+                Some(&b"abc"[..]),
+                Some(&b""[..]),
+                None,
+            ]))],
+        );
+
+        let expected = encoder.encode_batch(&binary_batch).unwrap();
+        let actual = encoder.encode_batch(&binary_view_batch).unwrap();
+
+        assert_eq!(actual.row_token_offsets(), expected.row_token_offsets());
+        assert_eq!(actual.bytes(), expected.bytes());
+        assert_eq!(
+            actual.bytes(),
+            expected_rows([
+                [max_varbinary_cell(b"abc")],
+                [max_varbinary_cell(b"")],
+                [max_varbinary_null_cell()]
+            ])
+        );
+    }
+
+    #[test]
     fn direct_encoder_large_variable_width_measured_ranges_match_full_payload() {
         let mappings = vec![
             mapping(0, "id", DataType::Int32, MssqlType::Int, false),
@@ -2070,13 +2113,13 @@ mod tests {
     }
 
     #[test]
-    fn direct_encoder_rejects_binary_runtime_type_drift_until_binary_family_slice() {
+    fn direct_encoder_encodes_binary_family_runtime_representations() {
         let mappings = vec![
             mapping(
                 0,
                 "large_text",
                 DataType::LargeUtf8,
-                MssqlType::NVarChar(MssqlTypeLength::Max),
+                MssqlType::NVarChar(MssqlTypeLength::Bounded(8)),
                 true,
             ),
             mapping(
@@ -2088,7 +2131,7 @@ mod tests {
             ),
         ];
         let encoder = DirectEncoder::new(&mappings).unwrap();
-        let binary_drift = record_batch(
+        let batch = record_batch(
             vec![
                 Field::new("large_text", DataType::LargeUtf8, true),
                 Field::new("large_bytes", DataType::Binary, true),
@@ -2099,11 +2142,15 @@ mod tests {
             ],
         );
 
-        assert_value_conversion_diagnostic(
-            encoder.encode_batch(&binary_drift).unwrap_err(),
-            DiagnosticCode::SchemaMismatch,
-            None,
-            Some((1, "large_bytes")),
+        let payload = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(payload.row_token_offsets(), [0]);
+        assert_eq!(
+            payload.bytes(),
+            expected_rows([[
+                bounded_nvarchar_cell("large"),
+                max_varbinary_cell(b"not-large")
+            ]])
         );
     }
 
