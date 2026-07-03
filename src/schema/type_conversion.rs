@@ -6,7 +6,10 @@ use crate::write::{
     BinaryPolicy, Date64Policy, Decimal256Policy, DecimalPolicy, PlanOptions, StringPolicy,
     TimezonePolicy, UInt64Policy,
 };
-use crate::{Diagnostic, DiagnosticCode, FieldRef, MssqlTimePrecision, MssqlType, MssqlTypeLength};
+use crate::{
+    Diagnostic, DiagnosticCode, FieldRef, MssqlTimePrecision, MssqlType, MssqlTypeLength,
+    arrow::field::{is_arrow_binary_family, is_arrow_string_family},
+};
 
 pub(crate) fn plan_arrow_data_type_as_mssql_type(
     index: usize,
@@ -342,7 +345,11 @@ fn unsupported_arrow_type_family(data_type: &DataType) -> &'static str {
         DataType::Duration(_) => "duration",
         DataType::Interval(_) => "interval",
         DataType::FixedSizeBinary(_) => "fixed-size binary",
-        DataType::BinaryView | DataType::Utf8View => "view",
+        data_type @ (DataType::BinaryView | DataType::Utf8View)
+            if is_arrow_string_family(data_type) || is_arrow_binary_family(data_type) =>
+        {
+            "view"
+        }
         DataType::List(_)
         | DataType::ListView(_)
         | DataType::FixedSizeList(_, _)

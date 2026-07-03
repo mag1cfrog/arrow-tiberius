@@ -10,31 +10,21 @@ use crate::{
 /// Shared semantic conversion class for variable-width Arrow-to-MSSQL values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum VariableWidthArrowToMssql {
-    /// Arrow Utf8 to SQL Server `nvarchar(n|max)`.
-    Utf8ToNVarChar { length: MssqlTypeLength },
-    /// Arrow LargeUtf8 to SQL Server `nvarchar(n|max)`.
-    LargeUtf8ToNVarChar { length: MssqlTypeLength },
-    /// Arrow Binary to SQL Server `varbinary(n|max)`.
-    BinaryToVarBinary { length: MssqlTypeLength },
-    /// Arrow LargeBinary to SQL Server `varbinary(n|max)`.
-    LargeBinaryToVarBinary { length: MssqlTypeLength },
+    /// Arrow string family to SQL Server `nvarchar(n|max)`.
+    StringToNVarChar { length: MssqlTypeLength },
+    /// Arrow binary family to SQL Server `varbinary(n|max)`.
+    BytesToVarBinary { length: MssqlTypeLength },
 }
 
 impl VariableWidthArrowToMssql {
     /// Classifies a planned variable-width mapping.
     pub(crate) fn classify(mapping: &SchemaMapping, row_index: usize) -> Result<Self> {
         let classification = match (mapping.arrow().data_type(), mapping.mssql().ty()) {
-            (DataType::Utf8, MssqlType::NVarChar(length)) => {
-                Self::Utf8ToNVarChar { length: *length }
+            (DataType::Utf8 | DataType::LargeUtf8, MssqlType::NVarChar(length)) => {
+                Self::StringToNVarChar { length: *length }
             }
-            (DataType::LargeUtf8, MssqlType::NVarChar(length)) => {
-                Self::LargeUtf8ToNVarChar { length: *length }
-            }
-            (DataType::Binary, MssqlType::VarBinary(length)) => {
-                Self::BinaryToVarBinary { length: *length }
-            }
-            (DataType::LargeBinary, MssqlType::VarBinary(length)) => {
-                Self::LargeBinaryToVarBinary { length: *length }
+            (DataType::Binary | DataType::LargeBinary, MssqlType::VarBinary(length)) => {
+                Self::BytesToVarBinary { length: *length }
             }
             _ => {
                 return Err(value_conversion_error(row_mapping_diagnostic(
@@ -91,42 +81,42 @@ mod tests {
             (
                 DataType::Utf8,
                 MssqlType::NVarChar(MssqlTypeLength::Max),
-                VariableWidthArrowToMssql::Utf8ToNVarChar {
+                VariableWidthArrowToMssql::StringToNVarChar {
                     length: MssqlTypeLength::Max,
                 },
             ),
             (
                 DataType::Utf8,
                 MssqlType::NVarChar(MssqlTypeLength::Bounded(32)),
-                VariableWidthArrowToMssql::Utf8ToNVarChar {
+                VariableWidthArrowToMssql::StringToNVarChar {
                     length: MssqlTypeLength::Bounded(32),
                 },
             ),
             (
                 DataType::LargeUtf8,
                 MssqlType::NVarChar(MssqlTypeLength::Max),
-                VariableWidthArrowToMssql::LargeUtf8ToNVarChar {
+                VariableWidthArrowToMssql::StringToNVarChar {
                     length: MssqlTypeLength::Max,
                 },
             ),
             (
                 DataType::Binary,
                 MssqlType::VarBinary(MssqlTypeLength::Max),
-                VariableWidthArrowToMssql::BinaryToVarBinary {
+                VariableWidthArrowToMssql::BytesToVarBinary {
                     length: MssqlTypeLength::Max,
                 },
             ),
             (
                 DataType::Binary,
                 MssqlType::VarBinary(MssqlTypeLength::Bounded(16)),
-                VariableWidthArrowToMssql::BinaryToVarBinary {
+                VariableWidthArrowToMssql::BytesToVarBinary {
                     length: MssqlTypeLength::Bounded(16),
                 },
             ),
             (
                 DataType::LargeBinary,
                 MssqlType::VarBinary(MssqlTypeLength::Max),
-                VariableWidthArrowToMssql::LargeBinaryToVarBinary {
+                VariableWidthArrowToMssql::BytesToVarBinary {
                     length: MssqlTypeLength::Max,
                 },
             ),
@@ -143,13 +133,13 @@ mod tests {
     }
 
     #[test]
-    fn classifies_large_variable_width_mappings_for_scalar_reuse() {
+    fn classifies_large_variable_width_mappings_as_semantic_families() {
         let cases = [
             (
                 DataType::LargeUtf8,
                 MssqlType::NVarChar(MssqlTypeLength::Max),
                 "large_text",
-                VariableWidthArrowToMssql::LargeUtf8ToNVarChar {
+                VariableWidthArrowToMssql::StringToNVarChar {
                     length: MssqlTypeLength::Max,
                 },
             ),
@@ -157,7 +147,7 @@ mod tests {
                 DataType::LargeBinary,
                 MssqlType::VarBinary(MssqlTypeLength::Max),
                 "large_bytes",
-                VariableWidthArrowToMssql::LargeBinaryToVarBinary {
+                VariableWidthArrowToMssql::BytesToVarBinary {
                     length: MssqlTypeLength::Max,
                 },
             ),
@@ -171,11 +161,6 @@ mod tests {
             let classification = VariableWidthArrowToMssql::classify(&mapping, 7).unwrap();
 
             assert_eq!(classification, expected);
-            assert!(matches!(
-                classification,
-                VariableWidthArrowToMssql::LargeUtf8ToNVarChar { .. }
-                    | VariableWidthArrowToMssql::LargeBinaryToVarBinary { .. }
-            ));
         }
     }
 

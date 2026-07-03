@@ -13,6 +13,7 @@ use arrow_array::{
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
     UInt16Array, UInt32Array, UInt64Array,
 };
+use arrow_schema::DataType;
 
 use super::{
     DirectEncoder,
@@ -211,30 +212,20 @@ fn bind_direct_columns<'a>(
                 classification,
                 array: downcast_direct_array::<Decimal256Array>(array, column)?,
             },
-            DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::Utf8ToNVarChar {
+            DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::StringToNVarChar {
                 ..
-            }) => BoundDirectColumn::Utf8 {
+            }) => bind_direct_nvarchar_array(
+                array,
                 column,
-                array: downcast_direct_array::<StringArray>(array, column)?,
-            },
-            DirectColumnEncoding::VariableWidth(
-                VariableWidthArrowToMssql::LargeUtf8ToNVarChar { .. },
-            ) => BoundDirectColumn::LargeUtf8 {
-                column,
-                array: downcast_direct_array::<LargeStringArray>(array, column)?,
-            },
-            DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::BinaryToVarBinary {
+                encoder.mapping_for_column_index(column_index)?,
+            )?,
+            DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::BytesToVarBinary {
                 ..
-            }) => BoundDirectColumn::Binary {
+            }) => bind_direct_varbinary_array(
+                array,
                 column,
-                array: downcast_direct_array::<BinaryArray>(array, column)?,
-            },
-            DirectColumnEncoding::VariableWidth(
-                VariableWidthArrowToMssql::LargeBinaryToVarBinary { .. },
-            ) => BoundDirectColumn::LargeBinary {
-                column,
-                array: downcast_direct_array::<LargeBinaryArray>(array, column)?,
-            },
+                encoder.mapping_for_column_index(column_index)?,
+            )?,
             DirectColumnEncoding::FixedSizeBinary(classification) => {
                 BoundDirectColumn::FixedSizeBinary {
                     column,
@@ -353,6 +344,42 @@ fn bind_direct_columns<'a>(
     }
 
     Ok(columns)
+}
+
+fn bind_direct_nvarchar_array<'a>(
+    array: &'a dyn Array,
+    column: &'a plan::DirectColumnPlan,
+    mapping: &SchemaMapping,
+) -> Result<BoundDirectColumn<'a>> {
+    match mapping.arrow().data_type() {
+        DataType::Utf8 => Ok(BoundDirectColumn::Utf8 {
+            column,
+            array: downcast_direct_array::<StringArray>(array, column)?,
+        }),
+        DataType::LargeUtf8 => Ok(BoundDirectColumn::LargeUtf8 {
+            column,
+            array: downcast_direct_array::<LargeStringArray>(array, column)?,
+        }),
+        other => Err(unsupported_planned_direct_type(column, "nvarchar", other)),
+    }
+}
+
+fn bind_direct_varbinary_array<'a>(
+    array: &'a dyn Array,
+    column: &'a plan::DirectColumnPlan,
+    mapping: &SchemaMapping,
+) -> Result<BoundDirectColumn<'a>> {
+    match mapping.arrow().data_type() {
+        DataType::Binary => Ok(BoundDirectColumn::Binary {
+            column,
+            array: downcast_direct_array::<BinaryArray>(array, column)?,
+        }),
+        DataType::LargeBinary => Ok(BoundDirectColumn::LargeBinary {
+            column,
+            array: downcast_direct_array::<LargeBinaryArray>(array, column)?,
+        }),
+        other => Err(unsupported_planned_direct_type(column, "varbinary", other)),
+    }
 }
 
 pub(crate) enum BoundDirectColumn<'a> {
@@ -539,6 +566,21 @@ fn downcast_direct_array<'a, T: Array + 'static>(
             ),
         ))
     })
+}
+
+fn unsupported_planned_direct_type(
+    column: &plan::DirectColumnPlan,
+    target_family: &str,
+    data_type: &DataType,
+) -> crate::Error {
+    value_conversion_error(row_column_diagnostic(
+        column,
+        0,
+        DiagnosticCode::ValueConversionUnsupported,
+        format!(
+            "planned Arrow type {data_type} is not supported by direct {target_family} binding"
+        ),
+    ))
 }
 
 #[cfg(test)]

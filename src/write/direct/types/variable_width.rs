@@ -28,10 +28,9 @@ pub(crate) fn measure_nvarchar_column_cell_lengths(
     cell_lengths: &mut [usize],
 ) -> Result<()> {
     let length = match column.encoding() {
-        DirectColumnEncoding::VariableWidth(
-            VariableWidthArrowToMssql::Utf8ToNVarChar { length }
-            | VariableWidthArrowToMssql::LargeUtf8ToNVarChar { length },
-        ) => length,
+        DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::StringToNVarChar {
+            length,
+        }) => length,
         other => {
             return Err(unsupported_batch(format!(
                 "direct nvarchar layout cannot measure mapping {other:?}"
@@ -58,10 +57,9 @@ pub(crate) fn measure_varbinary_column_cell_lengths(
     cell_lengths: &mut [usize],
 ) -> Result<()> {
     let length = match column.encoding() {
-        DirectColumnEncoding::VariableWidth(
-            VariableWidthArrowToMssql::BinaryToVarBinary { length }
-            | VariableWidthArrowToMssql::LargeBinaryToVarBinary { length },
-        ) => length,
+        DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::BytesToVarBinary {
+            length,
+        }) => length,
         other => {
             return Err(unsupported_batch(format!(
                 "direct varbinary layout cannot measure mapping {other:?}"
@@ -89,10 +87,9 @@ pub(crate) fn fill_nvarchar_column(
     bytes: &mut [u8],
 ) -> Result<()> {
     let length = match column.encoding() {
-        DirectColumnEncoding::VariableWidth(
-            VariableWidthArrowToMssql::Utf8ToNVarChar { length }
-            | VariableWidthArrowToMssql::LargeUtf8ToNVarChar { length },
-        ) => length,
+        DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::StringToNVarChar {
+            length,
+        }) => length,
         other => {
             return Err(unsupported_batch(format!(
                 "direct nvarchar fill cannot encode mapping {other:?}"
@@ -130,10 +127,9 @@ pub(crate) fn fill_varbinary_column(
     bytes: &mut [u8],
 ) -> Result<()> {
     let length = match column.encoding() {
-        DirectColumnEncoding::VariableWidth(
-            VariableWidthArrowToMssql::BinaryToVarBinary { length }
-            | VariableWidthArrowToMssql::LargeBinaryToVarBinary { length },
-        ) => length,
+        DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::BytesToVarBinary {
+            length,
+        }) => length,
         other => {
             return Err(unsupported_batch(format!(
                 "direct varbinary fill cannot encode mapping {other:?}"
@@ -170,10 +166,9 @@ pub(crate) fn append_nvarchar_cell(
     measured_len: usize,
 ) -> Result<()> {
     let length = match column.encoding() {
-        DirectColumnEncoding::VariableWidth(
-            VariableWidthArrowToMssql::Utf8ToNVarChar { length }
-            | VariableWidthArrowToMssql::LargeUtf8ToNVarChar { length },
-        ) => length,
+        DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::StringToNVarChar {
+            length,
+        }) => length,
         other => {
             return Err(unsupported_batch(format!(
                 "direct nvarchar append cannot encode mapping {other:?}"
@@ -231,10 +226,9 @@ pub(crate) fn append_varbinary_cell(
     measured_len: usize,
 ) -> Result<()> {
     let length = match column.encoding() {
-        DirectColumnEncoding::VariableWidth(
-            VariableWidthArrowToMssql::BinaryToVarBinary { length }
-            | VariableWidthArrowToMssql::LargeBinaryToVarBinary { length },
-        ) => length,
+        DirectColumnEncoding::VariableWidth(VariableWidthArrowToMssql::BytesToVarBinary {
+            length,
+        }) => length,
         other => {
             return Err(unsupported_batch(format!(
                 "direct varbinary append cannot encode mapping {other:?}"
