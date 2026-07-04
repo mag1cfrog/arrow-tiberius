@@ -9,10 +9,16 @@ use arrow_array::{
 };
 
 use crate::{
-    Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, NanosecondPolicy, PlanOptions,
-    Result, SchemaMapping,
+    Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, MssqlType, NanosecondPolicy,
+    PlanOptions, Result, SchemaMapping,
     mssql::cell::{
-        MssqlDate, MssqlDateTime2, MssqlDateTimeOffset, MssqlTime,
+        MssqlDate, MssqlDateTime, MssqlDateTime2, MssqlDateTimeOffset, MssqlTime,
+        from_arrow::temporal::datetime::{
+            mssql_datetime_from_arrow_timestamp_microsecond,
+            mssql_datetime_from_arrow_timestamp_millisecond,
+            mssql_datetime_from_arrow_timestamp_nanosecond,
+            mssql_datetime_from_arrow_timestamp_second,
+        },
         from_arrow::temporal::datetime2::{
             mssql_datetime2_from_arrow_timestamp_microsecond,
             mssql_datetime2_from_arrow_timestamp_millisecond,
@@ -42,11 +48,11 @@ use super::super::{
 };
 
 pub(crate) use value::{
-    NULL_TEMPORAL_CELL_LEN, append_date_cell, append_datetime2_cell, append_datetimeoffset_cell,
-    append_null_temporal_cell, append_time_cell, date_cell_len, datetime2_cell_len,
-    datetimeoffset_cell_len, mssql_date_from_arrow_date32, mssql_datetime2_from_arrow_date64,
-    time_cell_len, write_date_cell, write_datetime2_cell, write_datetimeoffset_cell,
-    write_null_temporal_cell, write_time_cell,
+    NULL_TEMPORAL_CELL_LEN, append_date_cell, append_datetime_cell, append_datetime2_cell,
+    append_datetimeoffset_cell, append_null_temporal_cell, append_time_cell, date_cell_len,
+    datetime_cell_len, datetime2_cell_len, datetimeoffset_cell_len, mssql_date_from_arrow_date32,
+    mssql_datetime2_from_arrow_date64, time_cell_len, write_date_cell, write_datetime_cell,
+    write_datetime2_cell, write_datetimeoffset_cell, write_null_temporal_cell, write_time_cell,
 };
 
 #[derive(Clone, Copy)]
@@ -109,8 +115,14 @@ pub(crate) fn measure_timestamp_second_column_cell_lengths(
         context.column_count,
         cell_lengths,
         |array, mapping, row_index| {
-            mssql_datetime2_from_arrow_timestamp_second(mapping, row_index, array.value(row_index))
-                .and_then(datetime2_cell_len_for_value)
+            timestamp_second_value(
+                array,
+                mapping,
+                context.column,
+                row_index,
+                NanosecondPolicy::default(),
+            )
+            .and_then(temporal_value_cell_len)
         },
     )
 }
@@ -128,12 +140,14 @@ pub(crate) fn measure_timestamp_millisecond_column_cell_lengths(
         context.column_count,
         cell_lengths,
         |array, mapping, row_index| {
-            mssql_datetime2_from_arrow_timestamp_millisecond(
+            timestamp_millisecond_value(
+                array,
                 mapping,
+                context.column,
                 row_index,
-                array.value(row_index),
+                NanosecondPolicy::default(),
             )
-            .and_then(datetime2_cell_len_for_value)
+            .and_then(temporal_value_cell_len)
         },
     )
 }
@@ -151,12 +165,14 @@ pub(crate) fn measure_timestamp_microsecond_column_cell_lengths(
         context.column_count,
         cell_lengths,
         |array, mapping, row_index| {
-            mssql_datetime2_from_arrow_timestamp_microsecond(
+            timestamp_microsecond_value(
+                array,
                 mapping,
+                context.column,
                 row_index,
-                array.value(row_index),
+                NanosecondPolicy::default(),
             )
-            .and_then(datetime2_cell_len_for_value)
+            .and_then(temporal_value_cell_len)
         },
     )
 }
@@ -174,13 +190,14 @@ pub(crate) fn measure_timestamp_nanosecond_column_cell_lengths(
         context.column_count,
         cell_lengths,
         |array, mapping, row_index| {
-            mssql_datetime2_from_arrow_timestamp_nanosecond(
+            timestamp_nanosecond_value(
+                array,
                 mapping,
+                context.column,
                 row_index,
-                array.value(row_index),
                 context.plan_options.nanosecond_policy,
             )
-            .and_then(datetime2_cell_len_for_value)
+            .and_then(temporal_value_cell_len)
         },
     )
 }
@@ -405,15 +422,7 @@ pub(crate) fn fill_timestamp_second_direct_column(
     layout: &RowLayout,
     bytes: &mut [u8],
 ) -> Result<()> {
-    fill_timestamp_column(
-        array,
-        context,
-        layout,
-        bytes,
-        |array, mapping, row_index| {
-            mssql_datetime2_from_arrow_timestamp_second(mapping, row_index, array.value(row_index))
-        },
-    )
+    fill_timestamp_column(array, context, layout, bytes, timestamp_second_value)
 }
 
 pub(crate) fn fill_timestamp_millisecond_direct_column(
@@ -422,19 +431,7 @@ pub(crate) fn fill_timestamp_millisecond_direct_column(
     layout: &RowLayout,
     bytes: &mut [u8],
 ) -> Result<()> {
-    fill_timestamp_column(
-        array,
-        context,
-        layout,
-        bytes,
-        |array, mapping, row_index| {
-            mssql_datetime2_from_arrow_timestamp_millisecond(
-                mapping,
-                row_index,
-                array.value(row_index),
-            )
-        },
-    )
+    fill_timestamp_column(array, context, layout, bytes, timestamp_millisecond_value)
 }
 
 pub(crate) fn fill_timestamp_microsecond_direct_column(
@@ -443,19 +440,7 @@ pub(crate) fn fill_timestamp_microsecond_direct_column(
     layout: &RowLayout,
     bytes: &mut [u8],
 ) -> Result<()> {
-    fill_timestamp_column(
-        array,
-        context,
-        layout,
-        bytes,
-        |array, mapping, row_index| {
-            mssql_datetime2_from_arrow_timestamp_microsecond(
-                mapping,
-                row_index,
-                array.value(row_index),
-            )
-        },
-    )
+    fill_timestamp_column(array, context, layout, bytes, timestamp_microsecond_value)
 }
 
 pub(crate) fn fill_timestamp_nanosecond_direct_column(
@@ -464,20 +449,7 @@ pub(crate) fn fill_timestamp_nanosecond_direct_column(
     layout: &RowLayout,
     bytes: &mut [u8],
 ) -> Result<()> {
-    fill_timestamp_column(
-        array,
-        context,
-        layout,
-        bytes,
-        |array, mapping, row_index| {
-            mssql_datetime2_from_arrow_timestamp_nanosecond(
-                mapping,
-                row_index,
-                array.value(row_index),
-                context.plan_options.nanosecond_policy,
-            )
-        },
-    )
+    fill_timestamp_column(array, context, layout, bytes, timestamp_nanosecond_value)
 }
 
 pub(crate) fn fill_datetimeoffset_second_direct_column(
@@ -712,15 +684,14 @@ pub(crate) fn append_timestamp_second_cell(
         row_index,
         measured_len,
         |array, mapping, row_index| {
-            let value = mssql_datetime2_from_arrow_timestamp_second(
+            let value = timestamp_second_value(
+                array,
                 mapping,
+                column,
                 row_index,
-                array.value(row_index),
+                NanosecondPolicy::default(),
             )?;
-            Ok((
-                datetime2_cell_len_for_value(value)?,
-                TemporalValue::DateTime2(value),
-            ))
+            Ok((temporal_value_cell_len(value)?, value))
         },
     )
 }
@@ -741,15 +712,14 @@ pub(crate) fn append_timestamp_millisecond_cell(
         row_index,
         measured_len,
         |array, mapping, row_index| {
-            let value = mssql_datetime2_from_arrow_timestamp_millisecond(
+            let value = timestamp_millisecond_value(
+                array,
                 mapping,
+                column,
                 row_index,
-                array.value(row_index),
+                NanosecondPolicy::default(),
             )?;
-            Ok((
-                datetime2_cell_len_for_value(value)?,
-                TemporalValue::DateTime2(value),
-            ))
+            Ok((temporal_value_cell_len(value)?, value))
         },
     )
 }
@@ -770,15 +740,14 @@ pub(crate) fn append_timestamp_microsecond_cell(
         row_index,
         measured_len,
         |array, mapping, row_index| {
-            let value = mssql_datetime2_from_arrow_timestamp_microsecond(
+            let value = timestamp_microsecond_value(
+                array,
                 mapping,
+                column,
                 row_index,
-                array.value(row_index),
+                NanosecondPolicy::default(),
             )?;
-            Ok((
-                datetime2_cell_len_for_value(value)?,
-                TemporalValue::DateTime2(value),
-            ))
+            Ok((temporal_value_cell_len(value)?, value))
         },
     )
 }
@@ -800,16 +769,9 @@ pub(crate) fn append_timestamp_nanosecond_cell(
         row_index,
         measured_len,
         |array, mapping, row_index| {
-            let value = mssql_datetime2_from_arrow_timestamp_nanosecond(
-                mapping,
-                row_index,
-                array.value(row_index),
-                nanosecond_policy,
-            )?;
-            Ok((
-                datetime2_cell_len_for_value(value)?,
-                TemporalValue::DateTime2(value),
-            ))
+            let value =
+                timestamp_nanosecond_value(array, mapping, column, row_index, nanosecond_policy)?;
+            Ok((temporal_value_cell_len(value)?, value))
         },
     )
 }
@@ -1043,6 +1005,100 @@ pub(crate) fn append_time64_nanosecond_cell(
     )
 }
 
+fn timestamp_second_value(
+    array: &TimestampSecondArray,
+    mapping: &SchemaMapping,
+    column: &DirectColumnPlan,
+    row_index: usize,
+    _policy: NanosecondPolicy,
+) -> Result<TemporalValue> {
+    match column.target_type() {
+        MssqlType::DateTime => {
+            mssql_datetime_from_arrow_timestamp_second(mapping, row_index, array.value(row_index))
+                .map(TemporalValue::DateTime)
+        }
+        MssqlType::DateTime2 { .. } => {
+            mssql_datetime2_from_arrow_timestamp_second(mapping, row_index, array.value(row_index))
+                .map(TemporalValue::DateTime2)
+        }
+        _ => Err(unsupported_timestamp_target(column, row_index)),
+    }
+}
+
+fn timestamp_millisecond_value(
+    array: &TimestampMillisecondArray,
+    mapping: &SchemaMapping,
+    column: &DirectColumnPlan,
+    row_index: usize,
+    _policy: NanosecondPolicy,
+) -> Result<TemporalValue> {
+    match column.target_type() {
+        MssqlType::DateTime => mssql_datetime_from_arrow_timestamp_millisecond(
+            mapping,
+            row_index,
+            array.value(row_index),
+        )
+        .map(TemporalValue::DateTime),
+        MssqlType::DateTime2 { .. } => mssql_datetime2_from_arrow_timestamp_millisecond(
+            mapping,
+            row_index,
+            array.value(row_index),
+        )
+        .map(TemporalValue::DateTime2),
+        _ => Err(unsupported_timestamp_target(column, row_index)),
+    }
+}
+
+fn timestamp_microsecond_value(
+    array: &TimestampMicrosecondArray,
+    mapping: &SchemaMapping,
+    column: &DirectColumnPlan,
+    row_index: usize,
+    _policy: NanosecondPolicy,
+) -> Result<TemporalValue> {
+    match column.target_type() {
+        MssqlType::DateTime => mssql_datetime_from_arrow_timestamp_microsecond(
+            mapping,
+            row_index,
+            array.value(row_index),
+        )
+        .map(TemporalValue::DateTime),
+        MssqlType::DateTime2 { .. } => mssql_datetime2_from_arrow_timestamp_microsecond(
+            mapping,
+            row_index,
+            array.value(row_index),
+        )
+        .map(TemporalValue::DateTime2),
+        _ => Err(unsupported_timestamp_target(column, row_index)),
+    }
+}
+
+fn timestamp_nanosecond_value(
+    array: &TimestampNanosecondArray,
+    mapping: &SchemaMapping,
+    column: &DirectColumnPlan,
+    row_index: usize,
+    policy: NanosecondPolicy,
+) -> Result<TemporalValue> {
+    match column.target_type() {
+        MssqlType::DateTime => mssql_datetime_from_arrow_timestamp_nanosecond(
+            mapping,
+            row_index,
+            array.value(row_index),
+            policy,
+        )
+        .map(TemporalValue::DateTime),
+        MssqlType::DateTime2 { .. } => mssql_datetime2_from_arrow_timestamp_nanosecond(
+            mapping,
+            row_index,
+            array.value(row_index),
+            policy,
+        )
+        .map(TemporalValue::DateTime2),
+        _ => Err(unsupported_timestamp_target(column, row_index)),
+    }
+}
+
 /// Returns the byte length of a SQL Server NULL temporal cell.
 fn measure_temporal_values<A, F>(
     array: &A,
@@ -1081,7 +1137,7 @@ fn fill_timestamp_column<A, F>(
 ) -> Result<()>
 where
     A: Array,
-    F: Fn(&A, &SchemaMapping, usize) -> Result<MssqlDateTime2>,
+    F: Fn(&A, &SchemaMapping, &DirectColumnPlan, usize, NanosecondPolicy) -> Result<TemporalValue>,
 {
     for row_index in 0..array.len() {
         let cell = cell_position(
@@ -1096,8 +1152,14 @@ where
             write_null_direct_temporal_cell(bytes, cell, context.column, row_index)?;
         } else {
             validate_mapping_timestamp_timezone_metadata(context.mapping, row_index)?;
-            let value = value(array, context.mapping, row_index)?;
-            write_direct_datetime2_cell(bytes, cell, context.column, value)?;
+            let value = value(
+                array,
+                context.mapping,
+                context.column,
+                row_index,
+                context.plan_options.nanosecond_policy,
+            )?;
+            write_direct_temporal_value_cell(bytes, cell, context.column, value)?;
         }
     }
 
@@ -1260,21 +1322,40 @@ where
         TemporalValue::DateTime2(value) => {
             append_datetime2_cell(buf, value).map_err(|err| add_temporal_field(err, column))
         }
+        TemporalValue::DateTime(value) => {
+            append_datetime_cell(buf, value).map_err(|err| add_temporal_field(err, column))
+        }
         TemporalValue::DateTimeOffset(value) => {
             append_datetimeoffset_cell(buf, value).map_err(|err| add_temporal_field(err, column))
         }
     }
 }
 
+#[derive(Clone, Copy)]
 enum TemporalValue {
     Date(MssqlDate),
     Time(MssqlTime),
     DateTime2(MssqlDateTime2),
+    DateTime(MssqlDateTime),
     DateTimeOffset(MssqlDateTimeOffset),
+}
+
+fn temporal_value_cell_len(value: TemporalValue) -> Result<usize> {
+    match value {
+        TemporalValue::Date(_) => Ok(date_cell_len()),
+        TemporalValue::Time(value) => time_cell_len_for_value(value),
+        TemporalValue::DateTime2(value) => datetime2_cell_len_for_value(value),
+        TemporalValue::DateTime(value) => Ok(datetime_cell_len_for_value(value)),
+        TemporalValue::DateTimeOffset(value) => datetimeoffset_cell_len_for_value(value),
+    }
 }
 
 fn datetime2_cell_len_for_value(value: MssqlDateTime2) -> Result<usize> {
     datetime2_cell_len(value.time().scale())
+}
+
+fn datetime_cell_len_for_value(_value: MssqlDateTime) -> usize {
+    datetime_cell_len()
 }
 
 fn time_cell_len_for_value(value: MssqlTime) -> Result<usize> {
@@ -1296,6 +1377,18 @@ fn null_temporal_cell_len_for_column(column: &DirectColumnPlan, row_index: usize
     }
 
     Ok(NULL_TEMPORAL_CELL_LEN)
+}
+
+fn unsupported_timestamp_target(column: &DirectColumnPlan, row_index: usize) -> Error {
+    value_conversion_error(row_column_diagnostic(
+        column,
+        row_index,
+        DiagnosticCode::ValueTypeMismatch,
+        format!(
+            "planned direct timestamp target {} is not supported",
+            column.target_type().to_sql()
+        ),
+    ))
 }
 
 fn write_null_direct_temporal_cell(
@@ -1356,6 +1449,43 @@ fn write_direct_time_cell(
 
     let cell_bytes = cell_bytes_mut(bytes, cell)?;
     write_time_cell(cell_bytes, value).map_err(|err| add_temporal_field(err, column))
+}
+
+fn write_direct_temporal_value_cell(
+    bytes: &mut [u8],
+    cell: &CellPosition,
+    column: &DirectColumnPlan,
+    value: TemporalValue,
+) -> Result<()> {
+    match value {
+        TemporalValue::Date(value) => write_direct_date_cell(bytes, cell, column, value),
+        TemporalValue::Time(value) => write_direct_time_cell(bytes, cell, column, value),
+        TemporalValue::DateTime2(value) => write_direct_datetime2_cell(bytes, cell, column, value),
+        TemporalValue::DateTime(value) => write_direct_datetime_cell(bytes, cell, column, value),
+        TemporalValue::DateTimeOffset(value) => {
+            write_direct_datetimeoffset_cell(bytes, cell, column, value)
+        }
+    }
+}
+
+fn write_direct_datetime_cell(
+    bytes: &mut [u8],
+    cell: &CellPosition,
+    column: &DirectColumnPlan,
+    value: MssqlDateTime,
+) -> Result<()> {
+    let expected_len = datetime_cell_len_for_value(value);
+    if cell.len() != expected_len {
+        return Err(invalid_payload(format!(
+            "datetime cell at row {} column {} has length {}, expected {expected_len}",
+            cell.row_index(),
+            cell.column_index(),
+            cell.len()
+        )));
+    }
+
+    let cell_bytes = cell_bytes_mut(bytes, cell)?;
+    write_datetime_cell(cell_bytes, value).map_err(|err| add_temporal_field(err, column))
 }
 
 fn write_direct_datetime2_cell(
@@ -1521,14 +1651,15 @@ fn invalid_payload(message: impl Into<String>) -> Error {
 mod tests {
     use crate::{
         DiagnosticCode, Error,
-        mssql::cell::{MssqlDate, MssqlDateTime2, MssqlDateTimeOffset, MssqlTime},
+        mssql::cell::{MssqlDate, MssqlDateTime, MssqlDateTime2, MssqlDateTimeOffset, MssqlTime},
         write::direct::payload::TDS_ROW_TOKEN,
     };
 
     use super::value::null_temporal_cell_len;
     use super::{
-        date_cell_len, datetime2_cell_len, datetimeoffset_cell_len, time_cell_len, write_date_cell,
-        write_datetime2_cell, write_datetimeoffset_cell, write_null_temporal_cell, write_time_cell,
+        date_cell_len, datetime_cell_len, datetime2_cell_len, datetimeoffset_cell_len,
+        time_cell_len, write_date_cell, write_datetime_cell, write_datetime2_cell,
+        write_datetimeoffset_cell, write_null_temporal_cell, write_time_cell,
     };
 
     #[test]
@@ -1549,6 +1680,9 @@ mod tests {
         )
         .unwrap();
 
+        let mut datetime_zero = vec![255; datetime_cell_len()];
+        write_datetime_cell(&mut datetime_zero, MssqlDateTime::new(0, 0)).unwrap();
+
         let mut datetimeoffset_zero = vec![255; datetimeoffset_cell_len(7).unwrap()];
         write_datetimeoffset_cell(
             &mut datetimeoffset_zero,
@@ -1562,6 +1696,7 @@ mod tests {
         assert_eq!(null, [0]);
         assert_eq!(date_zero, [3, 0, 0, 0]);
         assert_ne!(time_zero, null);
+        assert_ne!(datetime_zero, null);
         assert_ne!(datetime2_zero, null);
         assert_ne!(datetimeoffset_zero, null);
     }
@@ -1620,6 +1755,15 @@ mod tests {
         write_datetime2_cell(&mut bytes, value).unwrap();
 
         assert_eq!(bytes, [7, 0x39, 0x30, 0x00, 0x00, 0x3A, 0xF9, 0x0A]);
+    }
+
+    #[test]
+    fn writes_datetime_days_before_fragments() {
+        let mut bytes = vec![0; datetime_cell_len()];
+
+        write_datetime_cell(&mut bytes, MssqlDateTime::new(25_567, 300)).unwrap();
+
+        assert_eq!(bytes, [8, 0xDF, 0x63, 0x00, 0x00, 0x2C, 0x01, 0x00, 0x00]);
     }
 
     #[test]

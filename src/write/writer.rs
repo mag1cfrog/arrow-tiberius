@@ -458,7 +458,15 @@ fn validate_direct_bulk_target_column_type(
     };
     let actual = column.column_type();
 
-    if actual != expected {
+    if actual != expected
+        && !matches!(
+            (actual, expected),
+            (
+                tiberius::ColumnType::Datetime,
+                tiberius::ColumnType::Datetimen
+            )
+        )
+    {
         diagnostics.push(
             Diagnostic::error(
                 DiagnosticCode::SchemaMismatch,
@@ -569,6 +577,16 @@ fn expected_direct_bulk_column_type(column: &DirectColumnPlan) -> Option<tiberiu
             | TemporalArrowToMssql::TimestampMicrosecondTzToDateTime2
             | TemporalArrowToMssql::TimestampNanosecondTzToDateTime2,
         ) => Some(tiberius::ColumnType::Datetime2),
+        DirectColumnEncoding::Temporal(
+            TemporalArrowToMssql::TimestampSecondToDateTime
+            | TemporalArrowToMssql::TimestampMillisecondToDateTime
+            | TemporalArrowToMssql::TimestampMicrosecondToDateTime
+            | TemporalArrowToMssql::TimestampNanosecondToDateTime
+            | TemporalArrowToMssql::TimestampSecondTzToDateTime
+            | TemporalArrowToMssql::TimestampMillisecondTzToDateTime
+            | TemporalArrowToMssql::TimestampMicrosecondTzToDateTime
+            | TemporalArrowToMssql::TimestampNanosecondTzToDateTime,
+        ) => Some(tiberius::ColumnType::Datetimen),
         DirectColumnEncoding::Temporal(
             TemporalArrowToMssql::Time32SecondToTime
             | TemporalArrowToMssql::Time32MillisecondToTime
@@ -982,8 +1000,10 @@ mod tests {
         task::{Context, Poll, Waker},
     };
 
-    use arrow_array::{BinaryArray, Float64Array, Int32Array, RecordBatch, UInt64Array};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_array::{
+        BinaryArray, Float64Array, Int32Array, RecordBatch, TimestampMicrosecondArray, UInt64Array,
+    };
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use futures_util::io::{AsyncRead, AsyncWrite};
 
     use super::{
@@ -996,7 +1016,7 @@ mod tests {
     use crate::observability::writer::DirectRawBatchObserver;
     use crate::{
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, MssqlTypeLength,
-        PlanOptions, SchemaCheck, SchemaMapping, TableName, WritePhase,
+        PlanOptions, SchemaCheck, SchemaMapping, TableName, TimestampPolicy, WritePhase,
     };
 
     static DIRECT_RAW_TRACE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -1684,6 +1704,47 @@ mod tests {
     }
 
     #[test]
+    fn direct_bulk_target_type_validation_accepts_datetime_metadata() {
+        let mappings = vec![SchemaMapping::new(
+            ArrowFieldRef::new(
+                0,
+                "created_at".to_owned(),
+                false,
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            MssqlColumn::new(
+                Identifier::new("created_at").unwrap(),
+                MssqlType::DateTime,
+                false,
+            ),
+        )];
+        let state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        for column_type in [
+            tiberius::ColumnType::Datetime,
+            tiberius::ColumnType::Datetimen,
+        ] {
+            let columns = vec![bulk_target_column_with_type(
+                0,
+                "created_at",
+                false,
+                column_type,
+            )];
+
+            validate_direct_bulk_target_column_types(
+                columns.into_iter(),
+                state.direct_encoder().unwrap().plan(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
     fn direct_bulk_target_type_validation_rejects_variable_width_type_swap() {
         let mappings = vec![utf8_mapping_at(0, "name"), binary_mapping_at(1, "payload")];
         let state = WriterState::new(
@@ -1827,6 +1888,64 @@ mod tests {
         assert_eq!(
             sink.rows[2].get(0),
             Some(&tiberius::ColumnData::I32(Some(30)))
+        );
+    }
+
+    #[test]
+    fn write_batch_to_sink_sends_timestamp_datetime_cells() {
+        let mappings = vec![SchemaMapping::new(
+            ArrowFieldRef::new(
+                0,
+                "created_at".to_owned(),
+                true,
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            MssqlColumn::new(
+                Identifier::new("created_at").unwrap(),
+                MssqlType::DateTime,
+                true,
+            ),
+        )];
+        let options = PlanOptions {
+            timestamp_policy: TimestampPolicy::DateTime,
+            ..PlanOptions::default()
+        };
+        let mut state = WriterState::new(
+            WriteBackend::BaselineTokenRow,
+            SchemaCheck::Strict,
+            options,
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingSink::default();
+        let batch =
+            timestamp_microsecond_batch("created_at", &[Some(1_700), Some(86_399_999_000), None]);
+
+        let stats = poll_ready(write_batch_to_sink(&mut state, &mut sink, &batch)).unwrap();
+
+        assert_eq!(
+            stats,
+            WriteStats {
+                rows_written: 3,
+                batches_written: 1
+            }
+        );
+        assert_eq!(sink.rows.len(), 3);
+        assert_eq!(
+            sink.rows[0].get(0),
+            Some(&tiberius::ColumnData::DateTime(Some(
+                tiberius::time::DateTime::new(25_567, 1)
+            )))
+        );
+        assert_eq!(
+            sink.rows[1].get(0),
+            Some(&tiberius::ColumnData::DateTime(Some(
+                tiberius::time::DateTime::new(25_568, 0)
+            )))
+        );
+        assert_eq!(
+            sink.rows[2].get(0),
+            Some(&tiberius::ColumnData::DateTime(None))
         );
     }
 
@@ -2266,6 +2385,17 @@ mod tests {
     fn binary_batch(name: &str, values: &[&[u8]]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Binary, false)]));
         let array = Arc::new(BinaryArray::from_iter_values(values.iter().copied()));
+
+        RecordBatch::try_new(schema, vec![array]).unwrap()
+    }
+
+    fn timestamp_microsecond_batch(name: &str, values: &[Option<i64>]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            name,
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        )]));
+        let array = Arc::new(TimestampMicrosecondArray::from(values.to_vec()));
 
         RecordBatch::try_new(schema, vec![array]).unwrap()
     }

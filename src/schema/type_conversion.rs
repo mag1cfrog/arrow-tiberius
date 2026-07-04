@@ -4,7 +4,7 @@ use arrow_schema::{DataType, Field, TimeUnit};
 
 use crate::write::{
     BinaryPolicy, Date64Policy, Decimal256Policy, DecimalPolicy, PlanOptions, StringPolicy,
-    TimezonePolicy, UInt64Policy,
+    TimestampPolicy, TimezonePolicy, UInt64Policy,
 };
 use crate::{Diagnostic, DiagnosticCode, FieldRef, MssqlTimePrecision, MssqlType, MssqlTypeLength};
 
@@ -59,6 +59,7 @@ pub(crate) fn plan_arrow_data_type_as_mssql_type(
         DataType::Timestamp(_, timezone) => plan_arrow_timestamp_as_mssql_type(
             timezone.as_deref(),
             options.timezone_policy,
+            options.timestamp_policy,
             index,
             field,
         ),
@@ -263,6 +264,7 @@ fn plan_arrow_date64_as_mssql_type(
 fn plan_arrow_timestamp_as_mssql_type(
     timezone: Option<&str>,
     timezone_policy: TimezonePolicy,
+    timestamp_policy: TimestampPolicy,
     index: usize,
     field: &Field,
 ) -> std::result::Result<MssqlType, Diagnostic> {
@@ -276,13 +278,29 @@ fn plan_arrow_timestamp_as_mssql_type(
         ));
     }
 
-    let ty = if has_timezone && matches!(timezone_policy, TimezonePolicy::DateTimeOffset) {
-        MssqlType::DateTimeOffset { precision: 7 }
-    } else {
-        MssqlType::DateTime2 { precision: 7 }
-    };
+    if has_timezone && matches!(timezone_policy, TimezonePolicy::DateTimeOffset) {
+        return Ok(MssqlType::DateTimeOffset { precision: 7 });
+    }
 
-    Ok(ty)
+    plan_timestamp_policy_as_mssql_type(timestamp_policy, index, field)
+}
+
+fn plan_timestamp_policy_as_mssql_type(
+    policy: TimestampPolicy,
+    index: usize,
+    field: &Field,
+) -> std::result::Result<MssqlType, Diagnostic> {
+    match policy {
+        TimestampPolicy::DateTime => Ok(MssqlType::DateTime),
+        TimestampPolicy::DateTime2 { precision } if precision <= 7 => {
+            Ok(MssqlType::DateTime2 { precision })
+        }
+        TimestampPolicy::DateTime2 { precision } => Err(policy_required_for_arrow_to_mssql(
+            index,
+            field,
+            format!("datetime2 precision {precision} is outside SQL Server range 0..=7"),
+        )),
+    }
 }
 
 fn policy_required_for_arrow_to_mssql(
@@ -366,7 +384,7 @@ mod tests {
     use crate::{
         Date64Policy, Decimal256Policy, DecimalPolicy, Diagnostic, DiagnosticCode,
         MssqlTimePrecision, MssqlType, MssqlTypeLength, NanosecondPolicy, PlanOptions,
-        StringPolicy, TimezonePolicy, UInt64Policy,
+        StringPolicy, TimestampPolicy, TimezonePolicy, UInt64Policy,
     };
 
     #[test]
@@ -715,7 +733,19 @@ mod tests {
         );
         assert_eq!(
             plan_type(
-                data_type,
+                data_type.clone(),
+                PlanOptions {
+                    timezone_policy: TimezonePolicy::DateTimeOffset,
+                    timestamp_policy: TimestampPolicy::DateTime,
+                    ..PlanOptions::default()
+                },
+            )
+            .unwrap(),
+            MssqlType::DateTimeOffset { precision: 7 }
+        );
+        assert_eq!(
+            plan_type(
+                data_type.clone(),
                 PlanOptions {
                     timezone_policy: TimezonePolicy::NormalizeUtcDateTime2,
                     ..PlanOptions::default()
@@ -723,6 +753,80 @@ mod tests {
             )
             .unwrap(),
             MssqlType::DateTime2 { precision: 7 }
+        );
+        assert_eq!(
+            plan_type(
+                data_type,
+                PlanOptions {
+                    timezone_policy: TimezonePolicy::NormalizeUtcDateTime2,
+                    timestamp_policy: TimestampPolicy::DateTime,
+                    ..PlanOptions::default()
+                },
+            )
+            .unwrap(),
+            MssqlType::DateTime
+        );
+    }
+
+    #[test]
+    fn timestamp_policy_controls_timezone_free_target_type() {
+        for precision in [0, 3, 6, 7] {
+            assert_eq!(
+                plan_type(
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    PlanOptions {
+                        timestamp_policy: TimestampPolicy::DateTime2 { precision },
+                        ..PlanOptions::default()
+                    },
+                )
+                .unwrap(),
+                MssqlType::DateTime2 { precision }
+            );
+        }
+
+        assert_eq!(
+            plan_type(
+                DataType::Timestamp(TimeUnit::Second, None),
+                PlanOptions {
+                    timestamp_policy: TimestampPolicy::DateTime,
+                    ..PlanOptions::default()
+                },
+            )
+            .unwrap(),
+            MssqlType::DateTime
+        );
+        assert_eq!(
+            plan_type(
+                DataType::Timestamp(TimeUnit::Second, Some("".into())),
+                PlanOptions {
+                    timestamp_policy: TimestampPolicy::DateTime,
+                    ..PlanOptions::default()
+                },
+            )
+            .unwrap(),
+            MssqlType::DateTime
+        );
+    }
+
+    #[test]
+    fn invalid_timestamp_datetime2_precision_returns_structured_planning_diagnostic() {
+        let diagnostic = plan_type(
+            DataType::Timestamp(TimeUnit::Second, None),
+            PlanOptions {
+                timestamp_policy: TimestampPolicy::DateTime2 { precision: 8 },
+                ..PlanOptions::default()
+            },
+        )
+        .unwrap_err();
+
+        assert_diagnostic(
+            diagnostic.clone(),
+            DiagnosticCode::ProfileDependentConversion,
+        );
+        assert!(
+            diagnostic.message().contains("0..=7"),
+            "diagnostic should mention valid datetime2 range: {}",
+            diagnostic.message()
         );
     }
 

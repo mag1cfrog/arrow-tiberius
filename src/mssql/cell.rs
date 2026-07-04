@@ -22,6 +22,8 @@ pub(crate) enum MssqlCell<'a> {
     Date(Option<MssqlDate>),
     /// SQL Server `time` cell.
     Time(Option<MssqlTime>),
+    /// SQL Server `datetime` cell.
+    DateTime(Option<MssqlDateTime>),
     /// SQL Server `datetime2` cell.
     DateTime2(Option<MssqlDateTime2>),
     /// SQL Server `datetimeoffset` cell.
@@ -75,6 +77,36 @@ impl MssqlDate {
     /// Returns the number of days from 0001-01-01.
     pub(crate) const fn days(self) -> u32 {
         self.days
+    }
+}
+
+/// Semantic SQL Server datetime value.
+///
+/// SQL Server `datetime` stores days since 1900-01-01 and 1/300-second
+/// fragments since midnight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MssqlDateTime {
+    days: i32,
+    seconds_fragments: u32,
+}
+
+impl MssqlDateTime {
+    /// Creates a semantic datetime value from its TDS components.
+    pub(crate) const fn new(days: i32, seconds_fragments: u32) -> Self {
+        Self {
+            days,
+            seconds_fragments,
+        }
+    }
+
+    /// Returns the number of days since 1900-01-01.
+    pub(crate) const fn days(self) -> i32 {
+        self.days
+    }
+
+    /// Returns the number of 1/300-second fragments since midnight.
+    pub(crate) const fn seconds_fragments(self) -> u32 {
+        self.seconds_fragments
     }
 }
 
