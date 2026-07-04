@@ -3377,6 +3377,146 @@ async fn round_trip_timezone_aware_timestamp_normalized_datetime2_values(
 }
 
 #[tokio::test]
+async fn writer_round_trips_timezone_aware_timestamp_normalized_datetime2_3_values_across_supported_backends()
+-> TestResult<()> {
+    let Some((connection_string, database)) = integration_config() else {
+        eprintln!(
+            "skipping SQL Server timezone-aware normalized datetime2(3) integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+        );
+        return Ok(());
+    };
+
+    for backend in [WriteBackend::BaselineTokenRow, WriteBackend::DirectRawBulk] {
+        let mut client = connect(&connection_string, &database).await?;
+        let table = unique_table_name()?;
+        let plan_options = PlanOptions {
+            timezone_policy: TimezonePolicy::NormalizeUtcDateTime2,
+            timestamp_policy: TimestampPolicy::DateTime2 { precision: 3 },
+            ..PlanOptions::default()
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("row_id", DataType::Int32, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("America/New_York".into())),
+                true,
+            ),
+        ]));
+        let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
+            Arc::clone(&schema),
+            MssqlProfile::sql_server_2016_compat_100(),
+            plan_options,
+        )?
+        .into_parts();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1_i32, 2, 3])) as ArrayRef,
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![
+                        Some(1_234_567_i64),
+                        Some(86_399_999_500_i64),
+                        None,
+                    ])
+                    .with_timezone("America/New_York"),
+                ),
+            ],
+        )?;
+
+        execute_sql(
+            &mut client,
+            create_table_sql_from_mappings(&table, &mappings),
+        )
+        .await?;
+
+        let result = async {
+            let mut writer = BulkWriter::new(
+                &mut client,
+                table.clone(),
+                mappings,
+                WriteOptions {
+                    backend,
+                    plan_options,
+                    ..WriteOptions::default()
+                },
+            )
+            .await?;
+            let stats = writer.write_batch(&batch).await?;
+
+            ensure_eq(
+                stats.rows_written,
+                3,
+                "timezone-aware normalized datetime2(3) rows_written",
+            )?;
+            ensure_eq(
+                stats.batches_written,
+                1,
+                "timezone-aware normalized datetime2(3) batches_written",
+            )?;
+            ensure_eq(
+                writer.finish().await?,
+                stats,
+                "timezone-aware normalized datetime2(3) finish stats",
+            )?;
+
+            let rows = client
+                .simple_query(format!(
+                    "SELECT [row_id], CONVERT(varchar(40), [ts], 126) FROM {} ORDER BY [row_id]",
+                    table.quoted_sql()
+                ))
+                .await?
+                .into_first_result()
+                .await?;
+
+            ensure_eq(
+                rows.len(),
+                3,
+                "timezone-aware normalized datetime2(3) row count",
+            )?;
+            ensure_eq(
+                rows[0].get::<i32, _>(0),
+                Some(1),
+                "timezone-aware normalized datetime2(3) row 0 id",
+            )?;
+            ensure_eq(
+                rows[0].get::<&str, _>(1),
+                Some("1970-01-01T00:00:01.235"),
+                "timezone-aware normalized datetime2(3) row 0 value",
+            )?;
+            ensure_eq(
+                rows[1].get::<i32, _>(0),
+                Some(2),
+                "timezone-aware normalized datetime2(3) row 1 id",
+            )?;
+            ensure_eq(
+                rows[1].get::<&str, _>(1),
+                Some("1970-01-02T00:00:00"),
+                "timezone-aware normalized datetime2(3) row 1 value",
+            )?;
+            ensure_eq(
+                rows[2].get::<i32, _>(0),
+                Some(3),
+                "timezone-aware normalized datetime2(3) row 2 id",
+            )?;
+            ensure_eq(
+                rows[2].get::<&str, _>(1),
+                None,
+                "timezone-aware normalized datetime2(3) row 2 value",
+            )?;
+
+            Ok::<(), Box<dyn std::error::Error>>(())
+        }
+        .await;
+
+        let drop_result = drop_table(&mut client, &table).await;
+        result?;
+        drop_result?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn writer_round_trips_timezone_aware_timestamp_normalized_datetime_values_across_supported_backends()
 -> TestResult<()> {
     let Some((connection_string, database)) = integration_config() else {
