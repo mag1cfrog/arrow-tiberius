@@ -85,6 +85,11 @@ pub(crate) fn mssql_cell_from_arrow_cell<'a>(
             row_index,
             cell,
         )?))),
+        MssqlType::DateTime => Err(unsupported_value_conversion(
+            mapping,
+            row_index,
+            "planned SQL Server datetime conversion is not supported yet",
+        )),
         MssqlType::DateTime2 { .. } => Ok(MssqlCell::DateTime2(Some(mssql_datetime2_value(
             runtime_mapping,
             row_index,

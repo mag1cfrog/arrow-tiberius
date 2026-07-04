@@ -224,6 +224,7 @@ fn mssql_type_family(ty: &MssqlType) -> &'static str {
         MssqlType::Decimal { .. } => "decimal",
         MssqlType::Date => "date",
         MssqlType::Time(_) => "time",
+        MssqlType::DateTime => "datetime",
         MssqlType::DateTime2 { .. } => "datetime2",
         MssqlType::DateTimeOffset { .. } => "datetimeoffset",
     }

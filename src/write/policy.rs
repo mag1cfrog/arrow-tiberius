@@ -9,6 +9,8 @@ pub struct PlanOptions {
     pub binary_policy: BinaryPolicy,
     /// Timezone-aware timestamp policy.
     pub timezone_policy: TimezonePolicy,
+    /// SQL Server timezone-free timestamp target policy.
+    pub timestamp_policy: TimestampPolicy,
     /// Nanosecond timestamp precision policy.
     pub nanosecond_policy: NanosecondPolicy,
     /// Unsigned 64-bit integer policy.
@@ -45,6 +47,24 @@ pub enum BinaryPolicy {
     VarBinary(usize),
     /// Infer bounded `varbinary(n)` from observed values.
     ObservedVarBinary,
+}
+
+/// Timezone-free timestamp target policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TimestampPolicy {
+    /// Use SQL Server `datetime2(p)`.
+    DateTime2 {
+        /// Fractional seconds precision.
+        precision: u8,
+    },
+    /// Use SQL Server legacy `datetime`.
+    DateTime,
+}
+
+impl Default for TimestampPolicy {
+    fn default() -> Self {
+        Self::DateTime2 { precision: 7 }
+    }
 }
 
 /// Timezone-aware timestamp conversion policy.
@@ -133,7 +153,7 @@ pub enum SchemaCheck {
 mod tests {
     use super::{
         BinaryPolicy, Date64Policy, Decimal256Policy, DecimalPolicy, FloatPolicy, NanosecondPolicy,
-        PlanOptions, SchemaCheck, StringPolicy, TimezonePolicy, UInt64Policy,
+        PlanOptions, SchemaCheck, StringPolicy, TimestampPolicy, TimezonePolicy, UInt64Policy,
     };
 
     #[test]
@@ -143,6 +163,10 @@ mod tests {
         assert_eq!(options.string_policy, StringPolicy::NVarCharMax);
         assert_eq!(options.binary_policy, BinaryPolicy::VarBinaryMax);
         assert_eq!(options.timezone_policy, TimezonePolicy::Reject);
+        assert_eq!(
+            options.timestamp_policy,
+            TimestampPolicy::DateTime2 { precision: 7 }
+        );
         assert_eq!(options.nanosecond_policy, NanosecondPolicy::RejectNon100ns);
         assert_eq!(options.uint64_policy, UInt64Policy::Reject);
         assert_eq!(options.decimal_policy, DecimalPolicy::RejectNegativeScale);
@@ -156,6 +180,10 @@ mod tests {
         assert_eq!(StringPolicy::default(), StringPolicy::NVarCharMax);
         assert_eq!(BinaryPolicy::default(), BinaryPolicy::VarBinaryMax);
         assert_eq!(TimezonePolicy::default(), TimezonePolicy::Reject);
+        assert_eq!(
+            TimestampPolicy::default(),
+            TimestampPolicy::DateTime2 { precision: 7 }
+        );
         assert_eq!(
             NanosecondPolicy::default(),
             NanosecondPolicy::RejectNon100ns
@@ -177,6 +205,7 @@ mod tests {
             string_policy: StringPolicy::NVarChar(128),
             binary_policy: BinaryPolicy::VarBinary(256),
             timezone_policy: TimezonePolicy::DateTimeOffset,
+            timestamp_policy: TimestampPolicy::DateTime,
             nanosecond_policy: NanosecondPolicy::RoundTo100ns,
             uint64_policy: UInt64Policy::Decimal20_0,
             decimal_policy: DecimalPolicy::NormalizeNegativeScale,
@@ -188,6 +217,7 @@ mod tests {
         assert_eq!(options.string_policy, StringPolicy::NVarChar(128));
         assert_eq!(options.binary_policy, BinaryPolicy::VarBinary(256));
         assert_eq!(options.timezone_policy, TimezonePolicy::DateTimeOffset);
+        assert_eq!(options.timestamp_policy, TimestampPolicy::DateTime);
         assert_eq!(options.nanosecond_policy, NanosecondPolicy::RoundTo100ns);
         assert_eq!(options.uint64_policy, UInt64Policy::Decimal20_0);
         assert_eq!(

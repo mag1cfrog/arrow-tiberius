@@ -85,6 +85,8 @@ pub enum MssqlType {
     Date,
     /// SQL Server `time(p)`.
     Time(MssqlTimePrecision),
+    /// SQL Server `datetime`.
+    DateTime,
     /// SQL Server `datetime2(p)`.
     DateTime2 {
         /// Fractional seconds precision.
@@ -114,6 +116,7 @@ impl MssqlType {
             Self::Decimal { precision, scale } => format!("decimal({precision},{scale})"),
             Self::Date => "date".to_owned(),
             Self::Time(precision) => format!("time({})", precision.get()),
+            Self::DateTime => "datetime".to_owned(),
             Self::DateTime2 { precision } => format!("datetime2({precision})"),
             Self::DateTimeOffset { precision } => format!("datetimeoffset({precision})"),
         }
@@ -196,6 +199,7 @@ mod tests {
             MssqlType::Time(MssqlTimePrecision::new(5).unwrap()).to_sql(),
             "time(5)"
         );
+        assert_eq!(MssqlType::DateTime.to_sql(), "datetime");
         assert_eq!(
             MssqlType::DateTime2 { precision: 7 }.to_sql(),
             "datetime2(7)"

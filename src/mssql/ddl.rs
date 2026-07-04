@@ -107,6 +107,11 @@ mod tests {
             ),
             MssqlColumn::new(
                 Identifier::new("created_at").unwrap(),
+                MssqlType::DateTime,
+                false,
+            ),
+            MssqlColumn::new(
+                Identifier::new("updated_at").unwrap(),
                 MssqlType::DateTime2 { precision: 7 },
                 false,
             ),
@@ -121,7 +126,7 @@ mod tests {
 
         assert_eq!(
             sql,
-            "CREATE TABLE [dbo].[events] (\n    [amount] decimal(38,9) NOT NULL,\n    [event_date] date NULL,\n    [event_time] time(7) NULL,\n    [created_at] datetime2(7) NOT NULL,\n    [source_offset] datetimeoffset(7) NULL\n);"
+            "CREATE TABLE [dbo].[events] (\n    [amount] decimal(38,9) NOT NULL,\n    [event_date] date NULL,\n    [event_time] time(7) NULL,\n    [created_at] datetime NOT NULL,\n    [updated_at] datetime2(7) NOT NULL,\n    [source_offset] datetimeoffset(7) NULL\n);"
         );
     }
 
