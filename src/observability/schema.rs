@@ -29,6 +29,7 @@ impl SchemaPlanningTrace {
             string_policy = ?options.string_policy,
             binary_policy = ?options.binary_policy,
             timezone_policy = ?options.timezone_policy,
+            timestamp_policy = ?options.timestamp_policy,
             nanosecond_policy = ?options.nanosecond_policy,
             uint64_policy = ?options.uint64_policy,
             decimal_policy = ?options.decimal_policy,
@@ -329,6 +330,10 @@ mod tests {
                         .fields()
                         .get("uint64_policy")
                         .is_some_and(|value| value == "Reject")
+                    && record
+                        .fields()
+                        .get("timestamp_policy")
+                        .is_some_and(|value| value == "DateTime2 { precision: 7 }")
             }),
             "captured records: {records:#?}"
         );
