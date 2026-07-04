@@ -2751,6 +2751,107 @@ async fn writer_round_trips_timezone_free_timestamp_datetime_values_across_suppo
 }
 
 #[tokio::test]
+async fn writer_rejects_datetime_timestamp_out_of_range_without_partial_insert() -> TestResult<()> {
+    let Some((connection_string, database)) = integration_config() else {
+        eprintln!(
+            "skipping SQL Server timestamp datetime out-of-range integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+        );
+        return Ok(());
+    };
+
+    let mut client = connect(&connection_string, &database).await?;
+    let plan_options = PlanOptions {
+        timestamp_policy: TimestampPolicy::DateTime,
+        ..PlanOptions::default()
+    };
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::Int32, false),
+        Field::new(
+            "created_at",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+    ]));
+    let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
+        Arc::clone(&schema),
+        MssqlProfile::sql_server_2016_compat_100(),
+        plan_options,
+    )?
+    .into_parts();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1_i32])) as ArrayRef,
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                -11_676_096_000_000_000_i64,
+            ])),
+        ],
+    )?;
+
+    for backend in [WriteBackend::BaselineTokenRow, WriteBackend::DirectRawBulk] {
+        let table = unique_table_name()?;
+
+        execute_sql(
+            &mut client,
+            create_table_sql_from_mappings(&table, &mappings),
+        )
+        .await?;
+
+        let result = async {
+            let mut writer = BulkWriter::new(
+                &mut client,
+                table.clone(),
+                mappings.clone(),
+                WriteOptions {
+                    backend,
+                    plan_options,
+                    ..WriteOptions::default()
+                },
+            )
+            .await?;
+            let err = match writer.write_batch(&batch).await {
+                Ok(_stats) => {
+                    let _stats = writer.finish().await?;
+                    return Err(test_error("datetime out-of-range timestamp was accepted"));
+                }
+                Err(err) => err,
+            };
+
+            let diagnostics = value_conversion_diagnostics(&err, WritePhase::ValueConversion)?;
+            ensure(
+                diagnostics.all().iter().any(|diagnostic| {
+                    diagnostic.code() == DiagnosticCode::TimestampOutOfRange
+                        && diagnostic.row() == Some(0)
+                        && diagnostic
+                            .field()
+                            .is_some_and(|field| field.name() == "created_at")
+                }),
+                "datetime out-of-range diagnostic should include row and field",
+            )?;
+            ensure_eq(
+                writer.finish().await?.rows_written,
+                0,
+                "finish rows_written",
+            )?;
+            ensure_eq(
+                select_count(&mut client, &table).await?,
+                0,
+                "row count after datetime out-of-range rejection",
+            )?;
+
+            Ok::<(), Box<dyn std::error::Error>>(())
+        }
+        .await;
+
+        let drop_result = drop_table(&mut client, &table).await;
+        result?;
+        drop_result?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn baseline_writer_round_trips_timezone_aware_timestamp_normalized_datetime2_values()
 -> TestResult<()> {
     round_trip_timezone_aware_timestamp_normalized_datetime2_values(
