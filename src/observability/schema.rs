@@ -238,13 +238,14 @@ mod tests {
     use tracing::Level;
 
     use crate::{
-        Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, MssqlProfile, PlanOptions,
-        TimezonePolicy, plan_arrow_schema_to_mssql_mappings,
+        Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, MssqlProfile, MssqlType,
+        PlanOptions, TimezonePolicy, plan_arrow_schema_to_mssql_mappings,
     };
 
     use super::{
         DiagnosticTraceSummary, SCHEMA_PLANNING_COMPLETED_EVENT, SCHEMA_PLANNING_FAILED_EVENT,
         SCHEMA_PLANNING_PHASE, SCHEMA_PLANNING_SPAN, SCHEMA_PLANNING_STARTED_EVENT, TRACE_TARGET,
+        mssql_type_family,
     };
     use crate::observability::test_support::{CapturedTraceKind, capture_traces};
 
@@ -276,6 +277,11 @@ mod tests {
         assert_eq!(summary.error_count, 1);
         assert_eq!(summary.codes, "PolicyApplied,ProfileDependentConversion");
         assert_eq!(summary.field_names, "amount,unsigned_huge");
+    }
+
+    #[test]
+    fn mssql_type_family_reports_datetime() {
+        assert_eq!(mssql_type_family(&MssqlType::DateTime), "datetime");
     }
 
     #[test]
