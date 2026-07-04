@@ -458,7 +458,15 @@ fn validate_direct_bulk_target_column_type(
     };
     let actual = column.column_type();
 
-    if actual != expected {
+    if actual != expected
+        && !matches!(
+            (actual, expected),
+            (
+                tiberius::ColumnType::Datetime,
+                tiberius::ColumnType::Datetimen
+            )
+        )
+    {
         diagnostics.push(
             Diagnostic::error(
                 DiagnosticCode::SchemaMismatch,
@@ -1717,18 +1725,23 @@ mod tests {
             mappings,
         )
         .unwrap();
-        let columns = vec![bulk_target_column_with_type(
-            0,
-            "created_at",
-            false,
+        for column_type in [
+            tiberius::ColumnType::Datetime,
             tiberius::ColumnType::Datetimen,
-        )];
+        ] {
+            let columns = vec![bulk_target_column_with_type(
+                0,
+                "created_at",
+                false,
+                column_type,
+            )];
 
-        validate_direct_bulk_target_column_types(
-            columns.into_iter(),
-            state.direct_encoder().unwrap().plan(),
-        )
-        .unwrap();
+            validate_direct_bulk_target_column_types(
+                columns.into_iter(),
+                state.direct_encoder().unwrap().plan(),
+            )
+            .unwrap();
+        }
     }
 
     #[test]
