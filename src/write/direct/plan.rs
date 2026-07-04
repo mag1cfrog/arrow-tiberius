@@ -276,8 +276,8 @@ mod tests {
 
     use crate::{
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlProfile,
-        MssqlTimePrecision, MssqlType, MssqlTypeLength, PlanOptions, SchemaMapping, TimezonePolicy,
-        plan_arrow_schema_to_mssql_mappings,
+        MssqlTimePrecision, MssqlType, MssqlTypeLength, PlanOptions, SchemaMapping,
+        TimestampPolicy, TimezonePolicy, plan_arrow_schema_to_mssql_mappings,
     };
 
     use super::{
@@ -919,6 +919,61 @@ mod tests {
                 ),
                 DirectColumnEncoding::Temporal(
                     TemporalArrowToMssql::TimestampNanosecondTzToDateTime2
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn current_direct_support_accepts_timezone_aware_timestamps_planned_as_datetime() {
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![
+                Field::new(
+                    "ts_s",
+                    DataType::Timestamp(TimeUnit::Second, Some("America/New_York".into())),
+                    false,
+                ),
+                Field::new(
+                    "ts_ms",
+                    DataType::Timestamp(TimeUnit::Millisecond, Some("+02:30".into())),
+                    false,
+                ),
+                Field::new(
+                    "ts_us",
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                    false,
+                ),
+                Field::new(
+                    "ts_ns",
+                    DataType::Timestamp(TimeUnit::Nanosecond, Some("-07".into())),
+                    false,
+                ),
+            ]),
+            PlanOptions {
+                timezone_policy: TimezonePolicy::NormalizeUtcDateTime2,
+                timestamp_policy: TimestampPolicy::DateTime,
+                ..PlanOptions::default()
+            },
+        );
+
+        let plan = DirectEncoderPlan::new(&mappings, &CurrentDirectMappings)
+            .expect("normalized timezone-aware timestamp datetime mappings should be direct");
+
+        assert_eq!(
+            plan.columns()
+                .iter()
+                .map(|column| column.encoding())
+                .collect::<Vec<_>>(),
+            [
+                DirectColumnEncoding::Temporal(TemporalArrowToMssql::TimestampSecondTzToDateTime),
+                DirectColumnEncoding::Temporal(
+                    TemporalArrowToMssql::TimestampMillisecondTzToDateTime
+                ),
+                DirectColumnEncoding::Temporal(
+                    TemporalArrowToMssql::TimestampMicrosecondTzToDateTime
+                ),
+                DirectColumnEncoding::Temporal(
+                    TemporalArrowToMssql::TimestampNanosecondTzToDateTime
                 ),
             ]
         );
