@@ -2649,8 +2649,9 @@ async fn writer_round_trips_timezone_free_timestamp_datetime_values_across_suppo
         let batch = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(Int32Array::from(vec![1_i32, 2, 3])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![1_i32, 2, 3, 4])) as ArrayRef,
                 Arc::new(TimestampMicrosecondArray::from(vec![
+                    Some(-315_619_200_000_000_i64),
                     Some(1_700_i64),
                     Some(86_399_999_000_i64),
                     None,
@@ -2678,7 +2679,7 @@ async fn writer_round_trips_timezone_free_timestamp_datetime_values_across_suppo
             .await?;
             let stats = writer.write_batch(&batch).await?;
 
-            ensure_eq(stats.rows_written, 3, "timestamp datetime rows_written")?;
+            ensure_eq(stats.rows_written, 4, "timestamp datetime rows_written")?;
             ensure_eq(stats.batches_written, 1, "timestamp datetime batches_written")?;
             ensure_eq(
                 writer.finish().await?,
@@ -2695,7 +2696,7 @@ async fn writer_round_trips_timezone_free_timestamp_datetime_values_across_suppo
                 .into_first_result()
                 .await?;
 
-            ensure_eq(rows.len(), 3, "timestamp datetime row count")?;
+            ensure_eq(rows.len(), 4, "timestamp datetime row count")?;
             ensure_eq(
                 rows[0].get::<i32, _>(0),
                 Some(1),
@@ -2703,7 +2704,7 @@ async fn writer_round_trips_timezone_free_timestamp_datetime_values_across_suppo
             )?;
             ensure_eq(
                 rows[0].get::<&str, _>(1),
-                Some("1970-01-01T00:00:00.003"),
+                Some("1960-01-01T00:00:00"),
                 "timestamp datetime row 0 value",
             )?;
             ensure_eq(
@@ -2713,7 +2714,7 @@ async fn writer_round_trips_timezone_free_timestamp_datetime_values_across_suppo
             )?;
             ensure_eq(
                 rows[1].get::<&str, _>(1),
-                Some("1970-01-02T00:00:00"),
+                Some("1970-01-01T00:00:00.003"),
                 "timestamp datetime row 1 value",
             )?;
             ensure_eq(
@@ -2723,8 +2724,18 @@ async fn writer_round_trips_timezone_free_timestamp_datetime_values_across_suppo
             )?;
             ensure_eq(
                 rows[2].get::<&str, _>(1),
-                None,
+                Some("1970-01-02T00:00:00"),
                 "timestamp datetime row 2 value",
+            )?;
+            ensure_eq(
+                rows[3].get::<i32, _>(0),
+                Some(4),
+                "timestamp datetime row 3 id",
+            )?;
+            ensure_eq(
+                rows[3].get::<&str, _>(1),
+                None,
+                "timestamp datetime row 3 value",
             )?;
 
             Ok::<(), Box<dyn std::error::Error>>(())
