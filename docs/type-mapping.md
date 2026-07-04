@@ -48,10 +48,10 @@ planning.
 | `Time32(Millisecond)` | `time(3)` | yes | yes | Requires TDS 7.3 time support. |
 | `Time64(Microsecond)` | `time(6)` | yes | yes | Requires TDS 7.3 time support. |
 | `Time64(Nanosecond)` | `time(7)` | runtime check | runtime check | SQL Server stores 100ns ticks; `NanosecondPolicy` controls non-100ns values. |
-| `Timestamp(Second, None)` | `datetime2(7)` | yes | yes | Requires TDS 7.3 `datetime2` support. |
-| `Timestamp(Millisecond, None)` | `datetime2(7)` | yes | yes | - |
-| `Timestamp(Microsecond, None)` | `datetime2(7)` | yes | yes | - |
-| `Timestamp(Nanosecond, None)` | `datetime2(7)` | runtime check | runtime check | SQL Server stores 100ns ticks; `NanosecondPolicy` controls non-100ns values. |
+| `Timestamp(Second, None)` | `datetime2(7)` | yes | yes | Default `TimestampPolicy::DateTime2 { precision: 7 }`. Requires TDS 7.3 `datetime2` support. |
+| `Timestamp(Millisecond, None)` | `datetime2(7)` | yes | yes | Default `TimestampPolicy::DateTime2 { precision: 7 }`. |
+| `Timestamp(Microsecond, None)` | `datetime2(7)` | yes | yes | Default `TimestampPolicy::DateTime2 { precision: 7 }`. |
+| `Timestamp(Nanosecond, None)` | `datetime2(7)` | runtime check | runtime check | Default `TimestampPolicy::DateTime2 { precision: 7 }`. SQL Server stores 100ns ticks; `NanosecondPolicy` controls non-100ns values. |
 
 ## Policy-Dependent Mappings
 
@@ -75,15 +75,17 @@ runtime checks.
 | `Decimal256` | `Decimal256Policy::Reject` | none | no | no | Rejects all `Decimal256` columns. |
 | `Date64` | `Date64Policy::RejectNonMidnight` | none | schema-only reject | schema-only reject | Default. The schema-only planner cannot prove every value is midnight. |
 | `Date64` | `Date64Policy::TimestampDateTime2` | `datetime2(3)` | yes | yes | Preserves millisecond timestamp information instead of forcing date-only values. |
-| Time or timestamp nanosecond values | `NanosecondPolicy::RejectNon100ns` | selected `time(7)`, `datetime2(7)`, or `datetimeoffset(7)` | runtime check | runtime check | Default. Rejects values not divisible by 100ns. |
+| Timezone-free `Timestamp(_, None)` | `TimestampPolicy::DateTime2 { precision: p }` | `datetime2(p)` | runtime check | runtime check | Default is `p = 7`; `p` must be in `0..=7`. Values finer than the selected precision are rounded. |
+| Timezone-free `Timestamp(_, None)` | `TimestampPolicy::DateTime` | `datetime` | runtime check | runtime check | Uses SQL Server legacy `datetime` range and 1/300 second rounding. Values before 1753 are rejected. |
+| Time or timestamp nanosecond values | `NanosecondPolicy::RejectNon100ns` | selected temporal type | runtime check | runtime check | Default. Rejects values not divisible by 100ns. |
 | Time or timestamp nanosecond values | `NanosecondPolicy::RoundTo100ns` | selected temporal type | runtime check | runtime check | Rounds to the nearest SQL Server 100ns tick. |
 | Time or timestamp nanosecond values | `NanosecondPolicy::TruncateTo100ns` | selected temporal type | runtime check | runtime check | Truncates toward the lower SQL Server 100ns tick. |
 | Timezone-aware `Timestamp(_, Some(tz))` | `TimezonePolicy::Reject` | none | no | no | Default when timezone string is non-empty. |
-| Timezone-aware `Timestamp(_, Some(tz))` | `TimezonePolicy::NormalizeUtcDateTime2` | `datetime2(7)` | runtime check | runtime check | Normalizes the Arrow instant to UTC and writes timezone-free `datetime2`. |
+| Timezone-aware `Timestamp(_, Some(tz))` | `TimezonePolicy::NormalizeUtcDateTime2` | selected by `TimestampPolicy` | runtime check | runtime check | Normalizes the Arrow instant to UTC and writes the timezone-free target. The default remains `datetime2(7)`. |
 | Timezone-aware `Timestamp(_, Some(tz))` | `TimezonePolicy::DateTimeOffset` | `datetimeoffset(7)` | runtime check | runtime check | Preserves the represented instant with a SQL Server offset. |
 
 An empty Arrow timestamp timezone string is treated as timezone-free and maps to
-`datetime2(7)`.
+the target selected by `TimestampPolicy`. The default target is `datetime2(7)`.
 
 ## Unsupported Arrow Types
 
