@@ -2,7 +2,7 @@
 
 mod date;
 mod date64;
-mod datetime;
+pub(crate) mod datetime;
 pub(crate) mod datetime2;
 pub(crate) mod datetimeoffset;
 pub(crate) mod time;

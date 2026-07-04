@@ -36,7 +36,7 @@ mod tests {
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlTimePrecision,
         MssqlType, MssqlTypeLength, NanosecondPolicy, PlanOptions, SchemaMapping,
         conversion::arrow_to_mssql::primitive::PrimitiveArrowToMssql,
-        mssql::cell::{MssqlDate, MssqlDateTime2, MssqlDateTimeOffset, MssqlTime},
+        mssql::cell::{MssqlDate, MssqlDateTime, MssqlDateTime2, MssqlDateTimeOffset, MssqlTime},
     };
 
     type F16 = <Float16Type as ArrowPrimitiveType>::Native;
@@ -48,7 +48,7 @@ mod tests {
         try_encode_fixed_width_rows, try_encode_fixed_width_rows_with_layout,
     };
     use super::types::temporal::{
-        write_datetime2_cell, write_datetimeoffset_cell, write_time_cell,
+        write_datetime_cell, write_datetime2_cell, write_datetimeoffset_cell, write_time_cell,
     };
     use super::{DirectEncoder, binding::BoundDirectBatch, payload};
 
@@ -767,6 +767,160 @@ mod tests {
                 datetime2_7_cell(719_162, 10_012_345),
             ]])
         );
+    }
+
+    #[test]
+    fn direct_encoder_encodes_timestamp_datetime_rows_through_general_path() {
+        let mappings = vec![
+            mapping(
+                0,
+                "label",
+                DataType::Utf8,
+                MssqlType::NVarChar(MssqlTypeLength::Bounded(16)),
+                false,
+            ),
+            mapping(
+                1,
+                "ts_s",
+                DataType::Timestamp(TimeUnit::Second, None),
+                MssqlType::DateTime,
+                false,
+            ),
+            mapping(
+                2,
+                "ts_ms",
+                DataType::Timestamp(TimeUnit::Millisecond, Some("".into())),
+                MssqlType::DateTime,
+                false,
+            ),
+            mapping(
+                3,
+                "ts_us",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                MssqlType::DateTime,
+                false,
+            ),
+            mapping(
+                4,
+                "ts_ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                MssqlType::DateTime,
+                false,
+            ),
+            mapping(
+                5,
+                "ts_tz",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                MssqlType::DateTime,
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("label", DataType::Utf8, false),
+                Field::new("ts_s", DataType::Timestamp(TimeUnit::Second, None), false),
+                Field::new(
+                    "ts_ms",
+                    DataType::Timestamp(TimeUnit::Millisecond, Some("".into())),
+                    false,
+                ),
+                Field::new(
+                    "ts_us",
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    false,
+                ),
+                Field::new(
+                    "ts_ns",
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    false,
+                ),
+                Field::new(
+                    "ts_tz",
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                    true,
+                ),
+            ],
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef,
+                Arc::new(TimestampSecondArray::from(vec![1, -1])),
+                Arc::new(TimestampMillisecondArray::from(vec![1, 86_399_999]).with_timezone("")),
+                Arc::new(TimestampMicrosecondArray::from(vec![1_700, 0])),
+                Arc::new(TimestampNanosecondArray::from(vec![1_700_000, 0])),
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![Some(86_399_999_000), None])
+                        .with_timezone("UTC"),
+                ),
+            ],
+        );
+
+        let payload = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(payload.row_token_offsets(), [0, 50]);
+        assert_eq!(
+            payload.bytes(),
+            expected_rows([
+                [
+                    bounded_nvarchar_cell("a"),
+                    datetime_cell(25_567, 300),
+                    datetime_cell(25_567, 0),
+                    datetime_cell(25_567, 1),
+                    datetime_cell(25_567, 1),
+                    datetime_cell(25_568, 0),
+                ],
+                [
+                    bounded_nvarchar_cell("b"),
+                    datetime_cell(25_566, 25_919_700),
+                    datetime_cell(25_568, 0),
+                    datetime_cell(25_567, 0),
+                    datetime_cell(25_567, 0),
+                    null_cell(),
+                ],
+            ])
+        );
+    }
+
+    #[test]
+    fn direct_encoder_applies_datetime_nanosecond_policy() {
+        let mappings = vec![mapping(
+            0,
+            "precise_at",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            MssqlType::DateTime,
+            false,
+        )];
+        let batch = record_batch(
+            vec![Field::new(
+                "precise_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            )],
+            vec![Arc::new(TimestampNanosecondArray::from(vec![150]))],
+        );
+
+        let reject = DirectEncoder::new(&mappings)
+            .unwrap()
+            .encode_batch(&batch)
+            .unwrap_err();
+        assert_value_conversion_diagnostic(
+            reject,
+            DiagnosticCode::LossyConversionRequiresPolicy,
+            Some(0),
+            Some((0, "precise_at")),
+        );
+
+        let round = DirectEncoder::new_with_options(
+            &mappings,
+            PlanOptions {
+                nanosecond_policy: NanosecondPolicy::RoundTo100ns,
+                ..PlanOptions::default()
+            },
+        )
+        .unwrap()
+        .encode_batch(&batch)
+        .unwrap();
+
+        assert_eq!(round.bytes(), expected_rows([[datetime_cell(25_567, 0)]]));
     }
 
     #[test]
@@ -2828,6 +2982,66 @@ mod tests {
     }
 
     #[test]
+    fn direct_encoder_fixed_width_fast_path_is_active_for_timestamp_datetime_columns() {
+        let mappings = vec![
+            mapping(0, "id", DataType::Int32, MssqlType::Int, false),
+            mapping(
+                1,
+                "created_at",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                MssqlType::DateTime,
+                true,
+            ),
+            mapping(
+                2,
+                "precise_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                MssqlType::DateTime,
+                false,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new(
+                    "created_at",
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    true,
+                ),
+                Field::new(
+                    "precise_at",
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    false,
+                ),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(TimestampMicrosecondArray::from(vec![Some(1_700), None])),
+                Arc::new(TimestampNanosecondArray::from(vec![1_700_000, 0])),
+            ],
+        );
+
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+        let payload = try_encode_fixed_width_rows(&bound)
+            .unwrap()
+            .expect("fixed-width timestamp datetime fast path should be active");
+
+        assert_eq!(payload.row_token_offsets(), [0, 23]);
+        assert_eq!(
+            payload.bytes(),
+            expected_rows([
+                [
+                    int32_cell(1),
+                    datetime_cell(25_567, 1),
+                    datetime_cell(25_567, 1),
+                ],
+                [int32_cell(2), null_cell(), datetime_cell(25_567, 0)],
+            ])
+        );
+    }
+
+    #[test]
     fn direct_encoder_fixed_width_fast_path_is_active_for_time_columns() {
         let mappings = vec![
             mapping(0, "id", DataType::Int32, MssqlType::Int, false),
@@ -4158,6 +4372,12 @@ mod tests {
 
     fn datetime2_7_cell(date_days: u32, time_increments: u64) -> Vec<u8> {
         datetime2_cell(7, date_days, time_increments)
+    }
+
+    fn datetime_cell(days: i32, seconds_fragments: u32) -> Vec<u8> {
+        let mut bytes = vec![0; 9];
+        write_datetime_cell(&mut bytes, MssqlDateTime::new(days, seconds_fragments)).unwrap();
+        bytes
     }
 
     fn datetime2_cell(scale: u8, date_days: u32, time_increments: u64) -> Vec<u8> {

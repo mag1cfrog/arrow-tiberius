@@ -38,6 +38,22 @@ pub(crate) enum TemporalArrowToMssql {
     TimestampMicrosecondTzToDateTime2,
     /// Timezone-aware Arrow timestamp nanoseconds normalized to SQL Server `datetime2(p)`.
     TimestampNanosecondTzToDateTime2,
+    /// Timezone-free Arrow timestamp seconds to SQL Server `datetime`.
+    TimestampSecondToDateTime,
+    /// Timezone-free Arrow timestamp milliseconds to SQL Server `datetime`.
+    TimestampMillisecondToDateTime,
+    /// Timezone-free Arrow timestamp microseconds to SQL Server `datetime`.
+    TimestampMicrosecondToDateTime,
+    /// Timezone-free Arrow timestamp nanoseconds to SQL Server `datetime`.
+    TimestampNanosecondToDateTime,
+    /// Timezone-aware Arrow timestamp seconds normalized to SQL Server `datetime`.
+    TimestampSecondTzToDateTime,
+    /// Timezone-aware Arrow timestamp milliseconds normalized to SQL Server `datetime`.
+    TimestampMillisecondTzToDateTime,
+    /// Timezone-aware Arrow timestamp microseconds normalized to SQL Server `datetime`.
+    TimestampMicrosecondTzToDateTime,
+    /// Timezone-aware Arrow timestamp nanoseconds normalized to SQL Server `datetime`.
+    TimestampNanosecondTzToDateTime,
     /// Timezone-aware Arrow timestamp seconds to SQL Server `datetimeoffset(7)`.
     TimestampSecondTzToDateTimeOffset,
     /// Timezone-aware Arrow timestamp milliseconds to SQL Server `datetimeoffset(7)`.
@@ -108,6 +124,46 @@ impl TemporalArrowToMssql {
                 DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone)),
                 MssqlType::DateTime2 { precision },
             ) if !timezone.is_empty() && *precision <= 7 => Self::TimestampNanosecondTzToDateTime2,
+            (DataType::Timestamp(TimeUnit::Second, timezone), MssqlType::DateTime)
+                if is_timezone_free(timezone.as_deref()) =>
+            {
+                Self::TimestampSecondToDateTime
+            }
+            (DataType::Timestamp(TimeUnit::Millisecond, timezone), MssqlType::DateTime)
+                if is_timezone_free(timezone.as_deref()) =>
+            {
+                Self::TimestampMillisecondToDateTime
+            }
+            (DataType::Timestamp(TimeUnit::Microsecond, timezone), MssqlType::DateTime)
+                if is_timezone_free(timezone.as_deref()) =>
+            {
+                Self::TimestampMicrosecondToDateTime
+            }
+            (DataType::Timestamp(TimeUnit::Nanosecond, timezone), MssqlType::DateTime)
+                if is_timezone_free(timezone.as_deref()) =>
+            {
+                Self::TimestampNanosecondToDateTime
+            }
+            (DataType::Timestamp(TimeUnit::Second, Some(timezone)), MssqlType::DateTime)
+                if !timezone.is_empty() =>
+            {
+                Self::TimestampSecondTzToDateTime
+            }
+            (DataType::Timestamp(TimeUnit::Millisecond, Some(timezone)), MssqlType::DateTime)
+                if !timezone.is_empty() =>
+            {
+                Self::TimestampMillisecondTzToDateTime
+            }
+            (DataType::Timestamp(TimeUnit::Microsecond, Some(timezone)), MssqlType::DateTime)
+                if !timezone.is_empty() =>
+            {
+                Self::TimestampMicrosecondTzToDateTime
+            }
+            (DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone)), MssqlType::DateTime)
+                if !timezone.is_empty() =>
+            {
+                Self::TimestampNanosecondTzToDateTime
+            }
             (
                 DataType::Timestamp(TimeUnit::Second, Some(timezone)),
                 MssqlType::DateTimeOffset { precision: 7 },
@@ -258,6 +314,46 @@ mod tests {
                 DataType::Timestamp(TimeUnit::Nanosecond, Some("America/New_York".into())),
                 MssqlType::DateTime2 { precision: 7 },
                 TemporalArrowToMssql::TimestampNanosecondTzToDateTime2,
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Second, None),
+                MssqlType::DateTime,
+                TemporalArrowToMssql::TimestampSecondToDateTime,
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Millisecond, Some("".into())),
+                MssqlType::DateTime,
+                TemporalArrowToMssql::TimestampMillisecondToDateTime,
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                MssqlType::DateTime,
+                TemporalArrowToMssql::TimestampMicrosecondToDateTime,
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                MssqlType::DateTime,
+                TemporalArrowToMssql::TimestampNanosecondToDateTime,
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Second, Some("America/New_York".into())),
+                MssqlType::DateTime,
+                TemporalArrowToMssql::TimestampSecondTzToDateTime,
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Millisecond, Some("+02:30".into())),
+                MssqlType::DateTime,
+                TemporalArrowToMssql::TimestampMillisecondTzToDateTime,
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                MssqlType::DateTime,
+                TemporalArrowToMssql::TimestampMicrosecondTzToDateTime,
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("-07".into())),
+                MssqlType::DateTime,
+                TemporalArrowToMssql::TimestampNanosecondTzToDateTime,
             ),
             (
                 DataType::Timestamp(TimeUnit::Second, Some("+02:30".into())),

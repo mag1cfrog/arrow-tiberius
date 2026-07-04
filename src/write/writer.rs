@@ -570,6 +570,16 @@ fn expected_direct_bulk_column_type(column: &DirectColumnPlan) -> Option<tiberiu
             | TemporalArrowToMssql::TimestampNanosecondTzToDateTime2,
         ) => Some(tiberius::ColumnType::Datetime2),
         DirectColumnEncoding::Temporal(
+            TemporalArrowToMssql::TimestampSecondToDateTime
+            | TemporalArrowToMssql::TimestampMillisecondToDateTime
+            | TemporalArrowToMssql::TimestampMicrosecondToDateTime
+            | TemporalArrowToMssql::TimestampNanosecondToDateTime
+            | TemporalArrowToMssql::TimestampSecondTzToDateTime
+            | TemporalArrowToMssql::TimestampMillisecondTzToDateTime
+            | TemporalArrowToMssql::TimestampMicrosecondTzToDateTime
+            | TemporalArrowToMssql::TimestampNanosecondTzToDateTime,
+        ) => Some(tiberius::ColumnType::Datetimen),
+        DirectColumnEncoding::Temporal(
             TemporalArrowToMssql::Time32SecondToTime
             | TemporalArrowToMssql::Time32MillisecondToTime
             | TemporalArrowToMssql::Time64MicrosecondToTime
@@ -1677,6 +1687,42 @@ mod tests {
             bulk_target_column_with_type(0, "created_on", true, tiberius::ColumnType::Daten),
             bulk_target_column_with_type(1, "created_at", true, tiberius::ColumnType::Datetime2),
         ];
+
+        validate_direct_bulk_target_column_types(
+            columns.into_iter(),
+            state.direct_encoder().unwrap().plan(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn direct_bulk_target_type_validation_accepts_datetime_metadata() {
+        let mappings = vec![SchemaMapping::new(
+            ArrowFieldRef::new(
+                0,
+                "created_at".to_owned(),
+                false,
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            MssqlColumn::new(
+                Identifier::new("created_at").unwrap(),
+                MssqlType::DateTime,
+                false,
+            ),
+        )];
+        let state = WriterState::new(
+            WriteBackend::DirectRawBulk,
+            SchemaCheck::Strict,
+            PlanOptions::default(),
+            mappings,
+        )
+        .unwrap();
+        let columns = vec![bulk_target_column_with_type(
+            0,
+            "created_at",
+            false,
+            tiberius::ColumnType::Datetimen,
+        )];
 
         validate_direct_bulk_target_column_types(
             columns.into_iter(),

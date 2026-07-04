@@ -253,7 +253,9 @@ fn bind_direct_columns<'a>(
             }
             DirectColumnEncoding::Temporal(
                 TemporalArrowToMssql::TimestampSecondToDateTime2
-                | TemporalArrowToMssql::TimestampSecondTzToDateTime2,
+                | TemporalArrowToMssql::TimestampSecondTzToDateTime2
+                | TemporalArrowToMssql::TimestampSecondToDateTime
+                | TemporalArrowToMssql::TimestampSecondTzToDateTime,
             ) => BoundDirectColumn::TimestampSecond {
                 column,
                 mapping: encoder.mapping_for_column_index(column_index)?,
@@ -261,7 +263,9 @@ fn bind_direct_columns<'a>(
             },
             DirectColumnEncoding::Temporal(
                 TemporalArrowToMssql::TimestampMillisecondToDateTime2
-                | TemporalArrowToMssql::TimestampMillisecondTzToDateTime2,
+                | TemporalArrowToMssql::TimestampMillisecondTzToDateTime2
+                | TemporalArrowToMssql::TimestampMillisecondToDateTime
+                | TemporalArrowToMssql::TimestampMillisecondTzToDateTime,
             ) => BoundDirectColumn::TimestampMillisecond {
                 column,
                 mapping: encoder.mapping_for_column_index(column_index)?,
@@ -269,7 +273,9 @@ fn bind_direct_columns<'a>(
             },
             DirectColumnEncoding::Temporal(
                 TemporalArrowToMssql::TimestampMicrosecondToDateTime2
-                | TemporalArrowToMssql::TimestampMicrosecondTzToDateTime2,
+                | TemporalArrowToMssql::TimestampMicrosecondTzToDateTime2
+                | TemporalArrowToMssql::TimestampMicrosecondToDateTime
+                | TemporalArrowToMssql::TimestampMicrosecondTzToDateTime,
             ) => BoundDirectColumn::TimestampMicrosecond {
                 column,
                 mapping: encoder.mapping_for_column_index(column_index)?,
@@ -277,7 +283,9 @@ fn bind_direct_columns<'a>(
             },
             DirectColumnEncoding::Temporal(
                 TemporalArrowToMssql::TimestampNanosecondToDateTime2
-                | TemporalArrowToMssql::TimestampNanosecondTzToDateTime2,
+                | TemporalArrowToMssql::TimestampNanosecondTzToDateTime2
+                | TemporalArrowToMssql::TimestampNanosecondToDateTime
+                | TemporalArrowToMssql::TimestampNanosecondTzToDateTime,
             ) => BoundDirectColumn::TimestampNanosecond {
                 column,
                 mapping: encoder.mapping_for_column_index(column_index)?,

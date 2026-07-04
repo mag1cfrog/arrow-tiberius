@@ -2,14 +2,18 @@
 
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, Result,
-    mssql::cell::{MssqlDate, MssqlDateTime2, MssqlDateTimeOffset, MssqlTime},
+    mssql::cell::{MssqlDate, MssqlDateTime, MssqlDateTime2, MssqlDateTimeOffset, MssqlTime},
     write::direct::plan::DirectColumnPlan,
 };
 
 pub(crate) const NULL_TEMPORAL_CELL_LEN: usize = 1;
 const DATE_PAYLOAD_LEN: usize = 3;
+const DATETIME_PAYLOAD_LEN: usize = 8;
 const DATETIMEOFFSET_OFFSET_LEN: usize = 2;
 const SQL_SERVER_DATE_MAX_DAYS: u32 = 3_652_058;
+const SQL_SERVER_DATETIME_MIN_DAYS: i32 = -53_690;
+const SQL_SERVER_DATETIME_MAX_DAYS: i32 = 2_958_463;
+const SQL_SERVER_DATETIME_FRAGMENTS_PER_DAY: u32 = 25_920_000;
 const SQL_SERVER_DATETIMEOFFSET_MAX_OFFSET_MINUTES: i16 = 14 * 60;
 const SECONDS_PER_DAY: u64 = 86_400;
 const SQL_SERVER_DATE_UNIX_EPOCH_DAYS: i64 = 719_162;
@@ -33,6 +37,11 @@ pub(crate) fn time_cell_len(precision: u8) -> Result<usize> {
 /// Returns the byte length of a non-null SQL Server `datetime2(p)` cell.
 pub(crate) fn datetime2_cell_len(precision: u8) -> Result<usize> {
     Ok(NULL_TEMPORAL_CELL_LEN + time_payload_len(precision)? + DATE_PAYLOAD_LEN)
+}
+
+/// Returns the byte length of a non-null SQL Server `datetime` cell.
+pub(crate) const fn datetime_cell_len() -> usize {
+    NULL_TEMPORAL_CELL_LEN + DATETIME_PAYLOAD_LEN
 }
 
 /// Returns the byte length of a non-null SQL Server `datetimeoffset(p)` cell.
@@ -108,6 +117,23 @@ pub(crate) fn write_datetime2_cell(dst: &mut [u8], value: MssqlDateTime2) -> Res
     )
 }
 
+/// Writes a non-null SQL Server `datetime` cell into an exactly sized cell buffer.
+pub(crate) fn write_datetime_cell(dst: &mut [u8], value: MssqlDateTime) -> Result<()> {
+    let expected_len = datetime_cell_len();
+    if dst.len() != expected_len {
+        return Err(invalid_payload(format!(
+            "datetime cell has length {}, expected {expected_len}",
+            dst.len()
+        )));
+    }
+
+    validate_datetime(value)?;
+    dst[0] = DATETIME_PAYLOAD_LEN as u8;
+    dst[1..5].copy_from_slice(&value.days().to_le_bytes());
+    dst[5..9].copy_from_slice(&value.seconds_fragments().to_le_bytes());
+    Ok(())
+}
+
 /// Writes a non-null SQL Server `datetimeoffset(p)` cell into an exactly sized cell buffer.
 pub(crate) fn write_datetimeoffset_cell(dst: &mut [u8], value: MssqlDateTimeOffset) -> Result<()> {
     let datetime2 = value.datetime2();
@@ -172,6 +198,17 @@ pub(crate) fn append_datetime2_cell(
 ) -> Result<()> {
     let mut bytes = vec![0; datetime2_cell_len(value.time().scale())?];
     write_datetime2_cell(&mut bytes, value)?;
+    buf.extend_from_slice(&bytes);
+    Ok(())
+}
+
+/// Appends a non-null SQL Server `datetime` cell to a raw rows append buffer.
+pub(crate) fn append_datetime_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    value: MssqlDateTime,
+) -> Result<()> {
+    let mut bytes = [0; NULL_TEMPORAL_CELL_LEN + DATETIME_PAYLOAD_LEN];
+    write_datetime_cell(&mut bytes, value)?;
     buf.extend_from_slice(&bytes);
     Ok(())
 }
@@ -244,6 +281,24 @@ fn validate_date(value: MssqlDate) -> Result<()> {
             value.days()
         )))
     }
+}
+
+fn validate_datetime(value: MssqlDateTime) -> Result<()> {
+    if !(SQL_SERVER_DATETIME_MIN_DAYS..=SQL_SERVER_DATETIME_MAX_DAYS).contains(&value.days()) {
+        return Err(invalid_payload(format!(
+            "datetime day count {} is outside SQL Server datetime range",
+            value.days()
+        )));
+    }
+
+    if value.seconds_fragments() >= SQL_SERVER_DATETIME_FRAGMENTS_PER_DAY {
+        return Err(invalid_payload(format!(
+            "datetime fragment count {} is outside one day",
+            value.seconds_fragments()
+        )));
+    }
+
+    Ok(())
 }
 
 fn validate_time(value: MssqlTime) -> Result<()> {
