@@ -3691,6 +3691,7 @@ async fn round_trip_timezone_aware_timestamp_datetimeoffset_values(
     let table = unique_table_name()?;
     let plan_options = PlanOptions {
         timezone_policy: TimezonePolicy::DateTimeOffset,
+        timestamp_policy: TimestampPolicy::DateTime,
         ..PlanOptions::default()
     };
     let schema = Arc::new(Schema::new(vec![
