@@ -765,7 +765,7 @@ mod tests {
                 2,
                 "ts_us",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
-                MssqlType::DateTime2 { precision: 7 },
+                MssqlType::DateTime2 { precision: 3 },
             ),
             mapping(
                 3,
@@ -777,7 +777,7 @@ mod tests {
                 4,
                 "ts_tz",
                 DataType::Timestamp(TimeUnit::Second, Some("America/New_York".into())),
-                MssqlType::DateTime2 { precision: 7 },
+                MssqlType::DateTime2 { precision: 0 },
             ),
         ];
 

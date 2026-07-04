@@ -2789,6 +2789,45 @@ mod tests {
     }
 
     #[test]
+    fn direct_encoder_fixed_width_fast_path_encodes_timestamp_datetime2_precision() {
+        let mappings = vec![mapping(
+            0,
+            "created_at",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            MssqlType::DateTime2 { precision: 3 },
+            true,
+        )];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            )],
+            vec![Arc::new(TimestampMicrosecondArray::from(vec![
+                Some(1_234_567),
+                Some(86_399_999_500),
+                None,
+            ]))],
+        );
+
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+        let payload = try_encode_fixed_width_rows(&bound)
+            .unwrap()
+            .expect("fixed-width datetime2 precision fast path should be active");
+
+        assert_eq!(payload.row_token_offsets(), [0, 9, 18]);
+        assert_eq!(
+            payload.bytes(),
+            expected_rows([
+                [datetime2_cell(3, 719_162, 1_235)],
+                [datetime2_cell(3, 719_163, 0)],
+                [null_cell()],
+            ])
+        );
+    }
+
+    #[test]
     fn direct_encoder_fixed_width_fast_path_is_active_for_time_columns() {
         let mappings = vec![
             mapping(0, "id", DataType::Int32, MssqlType::Int, false),
@@ -4118,12 +4157,22 @@ mod tests {
     }
 
     fn datetime2_7_cell(date_days: u32, time_increments: u64) -> Vec<u8> {
-        let mut bytes = vec![0; 9];
+        datetime2_cell(7, date_days, time_increments)
+    }
+
+    fn datetime2_cell(scale: u8, date_days: u32, time_increments: u64) -> Vec<u8> {
+        let len = match scale {
+            0..=2 => 7,
+            3..=4 => 8,
+            5..=7 => 9,
+            _ => panic!("unsupported test datetime2 scale"),
+        };
+        let mut bytes = vec![0; len];
         write_datetime2_cell(
             &mut bytes,
             MssqlDateTime2::new(
                 MssqlDate::new(date_days),
-                MssqlTime::new(time_increments, 7),
+                MssqlTime::new(time_increments, scale),
             ),
         )
         .unwrap();

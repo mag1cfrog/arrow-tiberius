@@ -10,7 +10,8 @@ use arrow_array::{
 use std::cell::Cell;
 
 use crate::{
-    Diagnostic, DiagnosticCode, Error, FieldRef, NanosecondPolicy, Result, SchemaMapping,
+    Diagnostic, DiagnosticCode, Error, FieldRef, MssqlType, NanosecondPolicy, Result,
+    SchemaMapping,
     conversion::arrow_to_mssql::{
         fixed_size_binary::FixedSizeBinaryArrowToMssql, primitive::PrimitiveArrowToMssql,
         temporal::TemporalArrowToMssql,
@@ -887,7 +888,10 @@ fn fixed_width_non_null_cell_len(column: &DirectColumnPlan) -> Option<usize> {
             | TemporalArrowToMssql::TimestampMillisecondTzToDateTime2
             | TemporalArrowToMssql::TimestampMicrosecondTzToDateTime2
             | TemporalArrowToMssql::TimestampNanosecondTzToDateTime2,
-        ) => Some(datetime2_cell_len(7).ok()?),
+        ) => match column.target_type() {
+            MssqlType::DateTime2 { precision } => Some(datetime2_cell_len(*precision).ok()?),
+            _ => None,
+        },
         DirectColumnEncoding::Temporal(TemporalArrowToMssql::Time32SecondToTime) => {
             Some(time_cell_len(0).ok()?)
         }
