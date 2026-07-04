@@ -3168,7 +3168,7 @@ async fn writer_rejects_datetime_timestamp_out_of_range_without_partial_insert()
         vec![
             Arc::new(Int32Array::from(vec![1_i32])) as ArrayRef,
             Arc::new(TimestampMicrosecondArray::from(vec![
-                -11_676_096_000_000_000_i64,
+                -6_847_804_800_001_000_i64,
             ])),
         ],
     )?;

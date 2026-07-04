@@ -5,8 +5,8 @@ use crate::{DiagnosticCode, NanosecondPolicy, Result, SchemaMapping};
 
 use super::datetime2::nanoseconds_to_100ns_ticks;
 use super::{
-    TICKS_100NS_PER_MICROSECOND, TICKS_100NS_PER_MILLISECOND, TICKS_100NS_PER_SECOND,
-    row_mapping_diagnostic, value_conversion_error,
+    TICKS_100NS_PER_DAY, TICKS_100NS_PER_MICROSECOND, TICKS_100NS_PER_MILLISECOND,
+    TICKS_100NS_PER_SECOND, row_mapping_diagnostic, value_conversion_error,
 };
 
 const SQL_SERVER_DATETIME_DAYS_FROM_1900_TO_UNIX_EPOCH: i128 = 25_567;
@@ -15,6 +15,9 @@ const SQL_SERVER_DATETIME_MAX_DAYS: i128 = 2_958_463;
 const SQL_SERVER_DATETIME_FRAGMENTS_PER_SECOND: i128 = 300;
 const SQL_SERVER_DATETIME_FRAGMENTS_PER_DAY: i128 =
     86_400 * SQL_SERVER_DATETIME_FRAGMENTS_PER_SECOND;
+const SQL_SERVER_DATETIME_MIN_UNIX_EPOCH_100NS_TICKS: i128 = (SQL_SERVER_DATETIME_MIN_DAYS
+    - SQL_SERVER_DATETIME_DAYS_FROM_1900_TO_UNIX_EPOCH)
+    * TICKS_100NS_PER_DAY;
 
 pub(crate) fn mssql_datetime_from_arrow_timestamp_second(
     mapping: &SchemaMapping,
@@ -85,6 +88,15 @@ pub(crate) fn mssql_datetime_from_unix_epoch_100ns_ticks(
     unit_name: &str,
     source_value: i64,
 ) -> Result<MssqlDateTime> {
+    if ticks_from_unix_epoch < SQL_SERVER_DATETIME_MIN_UNIX_EPOCH_100NS_TICKS {
+        return Err(timestamp_out_of_datetime_range(
+            mapping,
+            row_index,
+            unit_name,
+            source_value,
+        ));
+    }
+
     let fragments =
         round_100ns_ticks_to_datetime_fragments(mapping, row_index, ticks_from_unix_epoch)?;
     let days_from_unix_epoch = fragments.div_euclid(SQL_SERVER_DATETIME_FRAGMENTS_PER_DAY);
@@ -92,14 +104,12 @@ pub(crate) fn mssql_datetime_from_unix_epoch_100ns_ticks(
     let days = days_from_unix_epoch + SQL_SERVER_DATETIME_DAYS_FROM_1900_TO_UNIX_EPOCH;
 
     if !(SQL_SERVER_DATETIME_MIN_DAYS..=SQL_SERVER_DATETIME_MAX_DAYS).contains(&days) {
-        return Err(value_conversion_error(row_mapping_diagnostic(
+        return Err(timestamp_out_of_datetime_range(
             mapping,
             row_index,
-            DiagnosticCode::TimestampOutOfRange,
-            format!(
-                "Arrow timestamp {unit_name} value {source_value} is outside SQL Server datetime range"
-            ),
-        )));
+            unit_name,
+            source_value,
+        ));
     }
 
     let days = i32::try_from(days).map_err(|_| {
@@ -124,6 +134,22 @@ pub(crate) fn mssql_datetime_from_unix_epoch_100ns_ticks(
     })?;
 
     Ok(MssqlDateTime::new(days, seconds_fragments))
+}
+
+fn timestamp_out_of_datetime_range(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    unit_name: &str,
+    source_value: i64,
+) -> crate::Error {
+    value_conversion_error(row_mapping_diagnostic(
+        mapping,
+        row_index,
+        DiagnosticCode::TimestampOutOfRange,
+        format!(
+            "Arrow timestamp {unit_name} value {source_value} is outside SQL Server datetime range"
+        ),
+    ))
 }
 
 fn round_100ns_ticks_to_datetime_fragments(
@@ -220,6 +246,11 @@ mod tests {
                 2,
                 ArrowCell::TimestampMicrosecond(86_399_999_000),
                 MssqlCell::DateTime(Some(MssqlDateTime::new(25_568, 0))),
+            ),
+            (
+                2,
+                ArrowCell::TimestampMicrosecond(-6_847_804_800_000_000),
+                MssqlCell::DateTime(Some(MssqlDateTime::new(-53_690, 0))),
             ),
             (2, ArrowCell::Null, MssqlCell::DateTime(None)),
         ];
@@ -335,6 +366,7 @@ mod tests {
             options,
         );
         let cases = [
+            ArrowCell::TimestampMicrosecond(-6_847_804_800_001_000),
             ArrowCell::TimestampMicrosecond(-6_847_891_200_000_000),
             ArrowCell::TimestampMicrosecond(253_402_300_799_999_000),
         ];

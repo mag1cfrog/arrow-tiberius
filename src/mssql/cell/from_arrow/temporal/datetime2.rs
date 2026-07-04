@@ -10,6 +10,9 @@ use super::{
 };
 use crate::mssql::cell::{MssqlDate, MssqlDateTime2, MssqlTime};
 
+const SQL_SERVER_DATETIME2_MIN_UNIX_EPOCH_100NS_TICKS: i128 =
+    -(SQL_SERVER_DATE_UNIX_EPOCH_DAYS as i128) * TICKS_100NS_PER_DAY;
+
 pub(crate) fn nanoseconds_to_100ns_ticks(
     mapping: &SchemaMapping,
     row_index: usize,
@@ -75,6 +78,15 @@ fn mssql_datetime2_from_unix_epoch_100ns_ticks_at_scale(
     source_value: i64,
     scale: u8,
 ) -> Result<MssqlDateTime2> {
+    if ticks_from_unix_epoch < SQL_SERVER_DATETIME2_MIN_UNIX_EPOCH_100NS_TICKS {
+        return Err(timestamp_out_of_datetime2_range(
+            mapping,
+            row_index,
+            unit_name,
+            source_value,
+        ));
+    }
+
     let ticks_from_unix_epoch =
         round_100ns_ticks_to_datetime2_scale(mapping, row_index, ticks_from_unix_epoch, scale)?;
     let days_from_unix_epoch = ticks_from_unix_epoch.div_euclid(TICKS_100NS_PER_DAY);
@@ -82,14 +94,12 @@ fn mssql_datetime2_from_unix_epoch_100ns_ticks_at_scale(
     let days = days_from_unix_epoch + i128::from(SQL_SERVER_DATE_UNIX_EPOCH_DAYS);
 
     if !(0..=i128::from(SQL_SERVER_DATE_MAX_DAYS)).contains(&days) {
-        return Err(value_conversion_error(row_mapping_diagnostic(
+        return Err(timestamp_out_of_datetime2_range(
             mapping,
             row_index,
-            DiagnosticCode::TimestampOutOfRange,
-            format!(
-                "Arrow timestamp {unit_name} value {source_value} is outside SQL Server datetime2 range"
-            ),
-        )));
+            unit_name,
+            source_value,
+        ));
     }
 
     let days = u32::try_from(days).map_err(|_| {
@@ -118,6 +128,22 @@ fn mssql_datetime2_from_unix_epoch_100ns_ticks_at_scale(
     Ok(MssqlDateTime2::new(
         MssqlDate::new(days),
         MssqlTime::new(increments, scale),
+    ))
+}
+
+fn timestamp_out_of_datetime2_range(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    unit_name: &str,
+    source_value: i64,
+) -> crate::Error {
+    value_conversion_error(row_mapping_diagnostic(
+        mapping,
+        row_index,
+        DiagnosticCode::TimestampOutOfRange,
+        format!(
+            "Arrow timestamp {unit_name} value {source_value} is outside SQL Server datetime2 range"
+        ),
     ))
 }
 
@@ -404,6 +430,14 @@ mod tests {
                     MssqlTime::new(0, 3),
                 ))),
             ),
+            (
+                3,
+                ArrowCell::TimestampMicrosecond(-62_135_596_800_000_000),
+                MssqlCell::DateTime2(Some(MssqlDateTime2::new(
+                    MssqlDate::new(0),
+                    MssqlTime::new(0, 3),
+                ))),
+            ),
         ];
 
         for (precision, cell, expected) in cases {
@@ -574,6 +608,38 @@ mod tests {
                 convert_cell_with_options(&mappings[0], cell, row_index, &truncate_options)
                     .unwrap(),
                 expected
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_datetime2_values_below_min_before_precision_rounding() {
+        for (row_index, precision) in [0, 3].into_iter().enumerate() {
+            let options = PlanOptions {
+                timestamp_policy: TimestampPolicy::DateTime2 { precision },
+                ..PlanOptions::default()
+            };
+            let mappings = mappings_for_schema_with_options(
+                Schema::new(vec![Field::new(
+                    "ts",
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    false,
+                )]),
+                options,
+            );
+            let err = convert_cell_with_options(
+                &mappings[0],
+                ArrowCell::TimestampMicrosecond(-62_135_596_800_000_001),
+                row_index,
+                &options,
+            )
+            .expect_err("datetime2 values below min should fail before precision rounding");
+
+            assert_single_diagnostic(
+                err,
+                DiagnosticCode::TimestampOutOfRange,
+                Some(row_index),
+                Some((0, "ts")),
             );
         }
     }
