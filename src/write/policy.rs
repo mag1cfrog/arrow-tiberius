@@ -75,7 +75,7 @@ pub enum TimezonePolicy {
     Reject,
     /// Target SQL Server `datetimeoffset`.
     DateTimeOffset,
-    /// Normalize to UTC and target timezone-free `datetime2`.
+    /// Normalize to UTC and use the timezone-free timestamp target.
     NormalizeUtcDateTime2,
 }
 
