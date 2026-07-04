@@ -982,8 +982,10 @@ mod tests {
         task::{Context, Poll, Waker},
     };
 
-    use arrow_array::{BinaryArray, Float64Array, Int32Array, RecordBatch, UInt64Array};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_array::{
+        BinaryArray, Float64Array, Int32Array, RecordBatch, TimestampMicrosecondArray, UInt64Array,
+    };
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use futures_util::io::{AsyncRead, AsyncWrite};
 
     use super::{
@@ -996,7 +998,7 @@ mod tests {
     use crate::observability::writer::DirectRawBatchObserver;
     use crate::{
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, MssqlTypeLength,
-        PlanOptions, SchemaCheck, SchemaMapping, TableName, WritePhase,
+        PlanOptions, SchemaCheck, SchemaMapping, TableName, TimestampPolicy, WritePhase,
     };
 
     static DIRECT_RAW_TRACE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -1831,6 +1833,64 @@ mod tests {
     }
 
     #[test]
+    fn write_batch_to_sink_sends_timestamp_datetime_cells() {
+        let mappings = vec![SchemaMapping::new(
+            ArrowFieldRef::new(
+                0,
+                "created_at".to_owned(),
+                true,
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            MssqlColumn::new(
+                Identifier::new("created_at").unwrap(),
+                MssqlType::DateTime,
+                true,
+            ),
+        )];
+        let options = PlanOptions {
+            timestamp_policy: TimestampPolicy::DateTime,
+            ..PlanOptions::default()
+        };
+        let mut state = WriterState::new(
+            WriteBackend::BaselineTokenRow,
+            SchemaCheck::Strict,
+            options,
+            mappings,
+        )
+        .unwrap();
+        let mut sink = RecordingSink::default();
+        let batch =
+            timestamp_microsecond_batch("created_at", &[Some(1_700), Some(86_399_999_000), None]);
+
+        let stats = poll_ready(write_batch_to_sink(&mut state, &mut sink, &batch)).unwrap();
+
+        assert_eq!(
+            stats,
+            WriteStats {
+                rows_written: 3,
+                batches_written: 1
+            }
+        );
+        assert_eq!(sink.rows.len(), 3);
+        assert_eq!(
+            sink.rows[0].get(0),
+            Some(&tiberius::ColumnData::DateTime(Some(
+                tiberius::time::DateTime::new(25_567, 1)
+            )))
+        );
+        assert_eq!(
+            sink.rows[1].get(0),
+            Some(&tiberius::ColumnData::DateTime(Some(
+                tiberius::time::DateTime::new(25_568, 0)
+            )))
+        );
+        assert_eq!(
+            sink.rows[2].get(0),
+            Some(&tiberius::ColumnData::DateTime(None))
+        );
+    }
+
+    #[test]
     fn write_batch_to_sink_conversion_failure_sends_nothing_and_keeps_stats() {
         let mappings = vec![float_mapping("amount")];
         let mut state = WriterState::new(
@@ -2266,6 +2326,17 @@ mod tests {
     fn binary_batch(name: &str, values: &[&[u8]]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Binary, false)]));
         let array = Arc::new(BinaryArray::from_iter_values(values.iter().copied()));
+
+        RecordBatch::try_new(schema, vec![array]).unwrap()
+    }
+
+    fn timestamp_microsecond_batch(name: &str, values: &[Option<i64>]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            name,
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        )]));
+        let array = Arc::new(TimestampMicrosecondArray::from(values.to_vec()));
 
         RecordBatch::try_new(schema, vec![array]).unwrap()
     }

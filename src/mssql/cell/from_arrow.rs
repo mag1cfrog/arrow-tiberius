@@ -14,8 +14,9 @@ use super::MssqlCell;
 use decimal::{mssql_decimal_value, supports_null_decimal_cell};
 use primitive::primitive_mssql_cell;
 use temporal::{
-    mssql_date_value, mssql_datetime2_value, mssql_datetimeoffset_value, mssql_time_value,
-    null_datetime2_cell, null_datetimeoffset_cell, null_time_cell,
+    mssql_date_value, mssql_datetime_value, mssql_datetime2_value, mssql_datetimeoffset_value,
+    mssql_time_value, null_datetime_cell, null_datetime2_cell, null_datetimeoffset_cell,
+    null_time_cell,
 };
 use variable_width::{binary_cell, nvar_char_cell, var_binary_cell};
 
@@ -85,11 +86,11 @@ pub(crate) fn mssql_cell_from_arrow_cell<'a>(
             row_index,
             cell,
         )?))),
-        MssqlType::DateTime => Err(unsupported_value_conversion(
-            mapping,
+        MssqlType::DateTime => Ok(MssqlCell::DateTime(Some(mssql_datetime_value(
+            runtime_mapping,
             row_index,
-            "planned SQL Server datetime conversion is not supported yet",
-        )),
+            cell,
+        )?))),
         MssqlType::DateTime2 { .. } => Ok(MssqlCell::DateTime2(Some(mssql_datetime2_value(
             runtime_mapping,
             row_index,
@@ -116,6 +117,7 @@ fn null_mssql_cell<'a>(mapping: &SchemaMapping, row_index: usize) -> Result<Mssq
         }
         MssqlType::Date => Ok(MssqlCell::Date(None)),
         MssqlType::Time(_) => null_time_cell(mapping, row_index),
+        MssqlType::DateTime => null_datetime_cell(mapping, row_index),
         MssqlType::DateTime2 { .. } => null_datetime2_cell(mapping, row_index),
         MssqlType::DateTimeOffset { .. } => null_datetimeoffset_cell(mapping, row_index),
         MssqlType::Real => Ok(MssqlCell::Real(None)),

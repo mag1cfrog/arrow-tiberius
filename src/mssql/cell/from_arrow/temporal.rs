@@ -2,6 +2,7 @@
 
 mod date;
 mod date64;
+mod datetime;
 pub(crate) mod datetime2;
 pub(crate) mod datetimeoffset;
 pub(crate) mod time;
@@ -18,9 +19,14 @@ use super::{
     value_conversion_error,
 };
 use crate::MssqlType;
-use crate::mssql::cell::{MssqlCell, MssqlDateTime2};
+use crate::mssql::cell::{MssqlCell, MssqlDateTime, MssqlDateTime2};
 pub(super) use date::mssql_date_value;
 pub(super) use date64::mssql_datetime2_from_arrow_date64;
+use datetime::{
+    mssql_datetime_from_arrow_timestamp_microsecond,
+    mssql_datetime_from_arrow_timestamp_millisecond,
+    mssql_datetime_from_arrow_timestamp_nanosecond, mssql_datetime_from_arrow_timestamp_second,
+};
 use datetime2::{
     mssql_datetime2_from_arrow_timestamp_microsecond,
     mssql_datetime2_from_arrow_timestamp_millisecond,
@@ -40,6 +46,79 @@ const TICKS_100NS_PER_MILLISECOND: i128 = 10_000;
 const TICKS_100NS_PER_MICROSECOND: i128 = 10;
 const TICKS_100NS_PER_DAY: i128 = 864_000_000_000;
 const NANOSECONDS_PER_100NS_TICK: i64 = 100;
+
+pub(super) fn mssql_datetime_value(
+    runtime_mapping: ArrowToMssqlRuntimeMapping<'_>,
+    row_index: usize,
+    cell: ArrowCell<'_>,
+) -> Result<MssqlDateTime> {
+    let mapping = runtime_mapping.mapping();
+    datetime_mapping_kind(mapping, row_index)?;
+
+    match cell {
+        ArrowCell::TimestampSecond(value) => {
+            validate_mapping_timestamp_timezone_metadata(mapping, row_index)?;
+            mssql_datetime_from_arrow_timestamp_second(mapping, row_index, value)
+        }
+        ArrowCell::TimestampMillisecond(value) => {
+            validate_mapping_timestamp_timezone_metadata(mapping, row_index)?;
+            mssql_datetime_from_arrow_timestamp_millisecond(mapping, row_index, value)
+        }
+        ArrowCell::TimestampMicrosecond(value) => {
+            validate_mapping_timestamp_timezone_metadata(mapping, row_index)?;
+            mssql_datetime_from_arrow_timestamp_microsecond(mapping, row_index, value)
+        }
+        ArrowCell::TimestampNanosecond(value) => {
+            validate_mapping_timestamp_timezone_metadata(mapping, row_index)?;
+            mssql_datetime_from_arrow_timestamp_nanosecond(
+                mapping,
+                row_index,
+                value,
+                runtime_mapping.nanosecond_policy(),
+            )
+        }
+        other => Err(value_conversion_error(row_mapping_diagnostic(
+            mapping,
+            row_index,
+            DiagnosticCode::ValueTypeMismatch,
+            format!("expected Arrow timestamp payload planned as datetime, got {other:?}"),
+        ))),
+    }
+}
+
+pub(super) fn null_datetime_cell<'a>(
+    mapping: &SchemaMapping,
+    row_index: usize,
+) -> Result<MssqlCell<'a>> {
+    datetime_mapping_kind(mapping, row_index)?;
+    validate_null_timestamp_timezone_metadata(mapping, row_index)?;
+    Ok(MssqlCell::DateTime(None))
+}
+
+fn datetime_mapping_kind(mapping: &SchemaMapping, row_index: usize) -> Result<()> {
+    match (mapping.arrow().data_type(), mapping.mssql().ty()) {
+        (
+            DataType::Timestamp(
+                TimeUnit::Second
+                | TimeUnit::Millisecond
+                | TimeUnit::Microsecond
+                | TimeUnit::Nanosecond,
+                _,
+            ),
+            MssqlType::DateTime,
+        ) => Ok(()),
+        _ => Err(unsupported_value_conversion(
+            mapping,
+            row_index,
+            format!(
+                "temporal conversion from Arrow {} to SQL Server {} is not supported",
+                mapping.arrow().data_type(),
+                mapping.mssql().ty().to_sql()
+            ),
+        )),
+    }
+}
+
 pub(super) fn mssql_datetime2_value(
     runtime_mapping: ArrowToMssqlRuntimeMapping<'_>,
     row_index: usize,

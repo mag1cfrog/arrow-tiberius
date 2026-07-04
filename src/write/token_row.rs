@@ -5,7 +5,8 @@ use std::borrow::Cow;
 use crate::{
     Result,
     mssql::cell::{
-        MssqlCell, MssqlDate, MssqlDateTime2, MssqlDateTimeOffset, MssqlDecimal, MssqlTime,
+        MssqlCell, MssqlDate, MssqlDateTime, MssqlDateTime2, MssqlDateTimeOffset, MssqlDecimal,
+        MssqlTime,
     },
 };
 
@@ -38,6 +39,7 @@ pub(crate) fn mssql_cell_to_tiberius_borrowed(cell: MssqlCell<'_>) -> tiberius::
         MssqlCell::Decimal(value) => tiberius::ColumnData::Numeric(value.map(tiberius_numeric)),
         MssqlCell::Date(value) => tiberius::ColumnData::Date(value.map(tiberius_date)),
         MssqlCell::Time(value) => tiberius::ColumnData::Time(value.map(tiberius_time)),
+        MssqlCell::DateTime(value) => tiberius::ColumnData::DateTime(value.map(tiberius_datetime)),
         MssqlCell::DateTime2(value) => {
             tiberius::ColumnData::DateTime2(value.map(tiberius_datetime2))
         }
@@ -62,6 +64,7 @@ pub(crate) fn mssql_cell_to_tiberius_owned(cell: MssqlCell<'_>) -> tiberius::Col
         MssqlCell::Decimal(value) => tiberius::ColumnData::Numeric(value.map(tiberius_numeric)),
         MssqlCell::Date(value) => tiberius::ColumnData::Date(value.map(tiberius_date)),
         MssqlCell::Time(value) => tiberius::ColumnData::Time(value.map(tiberius_time)),
+        MssqlCell::DateTime(value) => tiberius::ColumnData::DateTime(value.map(tiberius_datetime)),
         MssqlCell::DateTime2(value) => {
             tiberius::ColumnData::DateTime2(value.map(tiberius_datetime2))
         }
@@ -91,6 +94,10 @@ fn tiberius_time(value: MssqlTime) -> tiberius::time::Time {
     tiberius::time::Time::new(value.increments(), value.scale())
 }
 
+fn tiberius_datetime(value: MssqlDateTime) -> tiberius::time::DateTime {
+    tiberius::time::DateTime::new(value.days(), value.seconds_fragments())
+}
+
 fn tiberius_datetime2(value: MssqlDateTime2) -> tiberius::time::DateTime2 {
     tiberius::time::DateTime2::new(tiberius_date(value.date()), tiberius_time(value.time()))
 }
@@ -110,8 +117,9 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
-        MssqlCell, MssqlDate, MssqlDateTime2, MssqlDateTimeOffset, MssqlDecimal, MssqlTime,
-        mssql_cell_to_tiberius_borrowed, mssql_cell_to_tiberius_owned, tiberius_row_owned,
+        MssqlCell, MssqlDate, MssqlDateTime, MssqlDateTime2, MssqlDateTimeOffset, MssqlDecimal,
+        MssqlTime, mssql_cell_to_tiberius_borrowed, mssql_cell_to_tiberius_owned,
+        tiberius_row_owned,
     };
     use crate::{
         DiagnosticCode, Error, MssqlProfile, PlanOptions, SchemaMapping,
@@ -225,6 +233,12 @@ mod tests {
             tiberius::ColumnData::Time(Some(tiberius::time::Time::new(12_345, 3)))
         );
         assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::DateTime(Some(MssqlDateTime::new(
+                25_567, 3_704,
+            )))),
+            tiberius::ColumnData::DateTime(Some(tiberius::time::DateTime::new(25_567, 3_704)))
+        );
+        assert_eq!(
             mssql_cell_to_tiberius_borrowed(MssqlCell::DateTime2(Some(MssqlDateTime2::new(
                 MssqlDate::new(719_163),
                 MssqlTime::new(12_345, 4),
@@ -282,6 +296,10 @@ mod tests {
             mssql_cell_to_tiberius_borrowed(MssqlCell::Time(None)),
             tiberius::ColumnData::Time(None)
         );
+        assert_eq!(
+            mssql_cell_to_tiberius_borrowed(MssqlCell::DateTime(None)),
+            tiberius::ColumnData::DateTime(None)
+        );
     }
 
     #[test]
@@ -303,6 +321,12 @@ mod tests {
         assert_eq!(
             mssql_cell_to_tiberius_owned(MssqlCell::Time(Some(MssqlTime::new(12_345, 3)))),
             tiberius::ColumnData::Time(Some(tiberius::time::Time::new(12_345, 3)))
+        );
+        assert_eq!(
+            mssql_cell_to_tiberius_owned(MssqlCell::DateTime(Some(MssqlDateTime::new(
+                25_567, 3_704,
+            )))),
+            tiberius::ColumnData::DateTime(Some(tiberius::time::DateTime::new(25_567, 3_704)))
         );
         assert_eq!(
             mssql_cell_to_tiberius_owned(MssqlCell::Real(Some(1.25))),
