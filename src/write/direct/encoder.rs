@@ -3,12 +3,13 @@
 use arrow_array::RecordBatch;
 
 use crate::{
-    Diagnostic, DiagnosticCode, DiagnosticSet, Error, MssqlProfile, PlanOptions, Result,
-    SchemaMapping,
+    Diagnostic, DiagnosticCode, DiagnosticSet, Error, Result, SchemaMapping,
     write::{
         context::RuntimeConversionContext, record_batch::validate_record_batch_encoding_shape,
     },
 };
+#[cfg(test)]
+use crate::{MssqlProfile, PlanOptions};
 
 use super::{
     MeasuredDirectBatch,
@@ -27,12 +28,14 @@ pub(crate) struct DirectEncoder {
 
 impl DirectEncoder {
     /// Creates a direct encoder using the current supported direct mappings.
+    #[cfg(test)]
     pub(crate) fn new(mappings: &[SchemaMapping]) -> Result<Self> {
         Self::new_with_options(mappings, PlanOptions::default())
     }
 
     /// Creates a direct encoder using the current supported direct mappings and
     /// runtime conversion policies.
+    #[cfg(test)]
     pub(crate) fn new_with_options(
         mappings: &[SchemaMapping],
         plan_options: PlanOptions,
@@ -53,6 +56,7 @@ impl DirectEncoder {
     }
 
     /// Creates a direct encoder using an explicit support checker.
+    #[cfg(test)]
     pub(crate) fn new_with_support(
         mappings: &[SchemaMapping],
         support: &impl super::plan::DirectEncoderSupport,

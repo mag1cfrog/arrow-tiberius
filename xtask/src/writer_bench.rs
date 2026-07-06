@@ -7732,6 +7732,7 @@ odbc-bcp runner
         assert!(batch.column(4).null_count() > 0);
         assert_eq!(
             mappings
+                .mappings()
                 .iter()
                 .map(|mapping| mapping.mssql().ty())
                 .collect::<Vec<_>>(),
@@ -7762,6 +7763,7 @@ odbc-bcp runner
         let scenario = super::scenario_by_name("date_fast_path").unwrap();
         let mappings = super::benchmark_mappings_for_scenario(scenario).unwrap();
         let mssql_types = mappings
+            .mappings()
             .iter()
             .map(|mapping| mapping.mssql().ty())
             .collect::<Vec<_>>();
@@ -7840,6 +7842,7 @@ odbc-bcp runner
         let schema = batch.schema();
         let mappings = super::benchmark_mappings_for_scenario(scenario).unwrap();
         let mssql_types = mappings
+            .mappings()
             .iter()
             .map(|mapping| mapping.mssql().ty())
             .collect::<Vec<_>>();

@@ -1051,7 +1051,6 @@ mod tests {
             let options = WriteOptions {
                 backend,
                 schema_check: SchemaCheck::Strict,
-                ..WriteOptions::default()
             };
 
             assert_eq!(options.backend, backend);
