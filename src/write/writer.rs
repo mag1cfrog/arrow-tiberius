@@ -85,9 +85,9 @@ impl WriterState {
             RuntimeConversionContext::new(planned_schema.profile(), planned_schema.plan_options());
         let mappings = planned_schema.into_mappings();
         let direct_encoder = match backend {
-            WriteBackend::DirectFramedBulk | WriteBackend::DirectRawBulk => Some(
-                DirectEncoder::new_with_options(&mappings, runtime_context.plan_options())?,
-            ),
+            WriteBackend::DirectFramedBulk | WriteBackend::DirectRawBulk => {
+                Some(DirectEncoder::new_with_context(&mappings, runtime_context)?)
+            }
             WriteBackend::Auto | WriteBackend::BaselineTokenRow => None,
         };
 

@@ -3,8 +3,11 @@
 use arrow_array::RecordBatch;
 
 use crate::{
-    Diagnostic, DiagnosticCode, DiagnosticSet, Error, PlanOptions, Result, SchemaMapping,
-    write::record_batch::validate_record_batch_encoding_shape,
+    Diagnostic, DiagnosticCode, DiagnosticSet, Error, MssqlProfile, PlanOptions, Result,
+    SchemaMapping,
+    write::{
+        context::RuntimeConversionContext, record_batch::validate_record_batch_encoding_shape,
+    },
 };
 
 use super::{
@@ -18,7 +21,7 @@ use super::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DirectEncoder {
     pub(crate) mappings: Vec<SchemaMapping>,
-    pub(crate) plan_options: PlanOptions,
+    pub(crate) runtime_context: RuntimeConversionContext,
     pub(crate) plan: DirectEncoderPlan,
 }
 
@@ -34,7 +37,19 @@ impl DirectEncoder {
         mappings: &[SchemaMapping],
         plan_options: PlanOptions,
     ) -> Result<Self> {
-        Self::new_with_options_and_support(mappings, plan_options, &CurrentDirectMappings)
+        Self::new_with_context(
+            mappings,
+            RuntimeConversionContext::new(MssqlProfile::sql_server_2016_compat_100(), plan_options),
+        )
+    }
+
+    /// Creates a direct encoder using the current supported direct mappings and
+    /// runtime conversion context.
+    pub(crate) fn new_with_context(
+        mappings: &[SchemaMapping],
+        runtime_context: RuntimeConversionContext,
+    ) -> Result<Self> {
+        Self::new_with_context_and_support(mappings, runtime_context, &CurrentDirectMappings)
     }
 
     /// Creates a direct encoder using an explicit support checker.
@@ -42,17 +57,24 @@ impl DirectEncoder {
         mappings: &[SchemaMapping],
         support: &impl super::plan::DirectEncoderSupport,
     ) -> Result<Self> {
-        Self::new_with_options_and_support(mappings, PlanOptions::default(), support)
+        Self::new_with_context_and_support(
+            mappings,
+            RuntimeConversionContext::new(
+                MssqlProfile::sql_server_2016_compat_100(),
+                PlanOptions::default(),
+            ),
+            support,
+        )
     }
 
-    pub(crate) fn new_with_options_and_support(
+    pub(crate) fn new_with_context_and_support(
         mappings: &[SchemaMapping],
-        plan_options: PlanOptions,
+        runtime_context: RuntimeConversionContext,
         support: &impl super::plan::DirectEncoderSupport,
     ) -> Result<Self> {
         Ok(Self {
             mappings: mappings.to_vec(),
-            plan_options,
+            runtime_context,
             plan: DirectEncoderPlan::new(mappings, support)?,
         })
     }

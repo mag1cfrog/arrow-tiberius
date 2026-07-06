@@ -33,10 +33,12 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
     use crate::{
-        ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlTimePrecision,
-        MssqlType, MssqlTypeLength, NanosecondPolicy, PlanOptions, SchemaMapping,
+        ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlProfile,
+        MssqlTimePrecision, MssqlType, MssqlTypeLength, NanosecondPolicy, PlanOptions,
+        SchemaMapping,
         conversion::arrow_to_mssql::primitive::PrimitiveArrowToMssql,
         mssql::cell::{MssqlDate, MssqlDateTime, MssqlDateTime2, MssqlDateTimeOffset, MssqlTime},
+        write::context::RuntimeConversionContext,
     };
 
     type F16 = <Float16Type as ArrowPrimitiveType>::Native;
@@ -126,6 +128,41 @@ mod tests {
         assert!(payload.is_empty());
         assert_eq!(payload.bytes(), []);
         assert_eq!(payload.row_token_offsets(), []);
+    }
+
+    #[test]
+    fn direct_encoder_uses_runtime_context() {
+        let plan_options = PlanOptions {
+            nanosecond_policy: NanosecondPolicy::TruncateTo100ns,
+            ..PlanOptions::default()
+        };
+        let runtime_context =
+            RuntimeConversionContext::new(MssqlProfile::sql_server_2017_compat_140(), plan_options);
+        let mappings = vec![mapping(
+            0,
+            "precise_at",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            MssqlType::DateTime2 { precision: 7 },
+            false,
+        )];
+        let batch = record_batch(
+            vec![Field::new(
+                "precise_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            )],
+            vec![Arc::new(TimestampNanosecondArray::from(vec![150]))],
+        );
+
+        let payload = DirectEncoder::new_with_context(&mappings, runtime_context)
+            .unwrap()
+            .encode_batch(&batch)
+            .unwrap();
+
+        assert_eq!(
+            payload.bytes(),
+            [payload::TDS_ROW_TOKEN, 8, 1, 0, 0, 0, 0, 0x3A, 0xF9, 0x0A,]
+        );
     }
 
     #[test]

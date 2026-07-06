@@ -25,6 +25,7 @@ impl RuntimeConversionContext {
     }
 
     /// Returns the conversion policies selected during planning.
+    #[allow(dead_code)]
     pub(crate) const fn plan_options(self) -> PlanOptions {
         self.plan_options
     }
