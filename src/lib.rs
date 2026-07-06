@@ -79,8 +79,11 @@
 //!
 //! # SQL Server Compatibility
 //!
-//! The initial profile is [`MssqlProfile::sql_server_2016_compat_100`], which
-//! targets SQL Server 2016 with database compatibility level 100.
+//! Choose the [`MssqlProfile`] that matches the SQL Server version and database
+//! compatibility level you plan to write against. The original
+//! [`MssqlProfile::sql_server_2016_compat_100`] profile remains available. The
+//! profile surface also models SQL Server 2017 database compatibility levels
+//! 100, 110, 120, 130, and 140.
 //!
 //! # Tiberius Dependency Model
 //!
