@@ -145,7 +145,7 @@ pub use connection::{
 pub use diagnostic::{
     Diagnostic, DiagnosticCode, DiagnosticSet, DiagnosticSeverity, FieldRef, PlanOutcome,
 };
-pub use error::{Error, Result};
+pub use error::{Error, ErrorInfo, Result};
 pub use mssql::{
     CompatibilityLevel, CreateTableOptions, Identifier, IdentifierPolicy, MssqlColumn,
     MssqlProfile, MssqlTimePrecision, MssqlType, MssqlTypeLength, MssqlVersion, TableName,

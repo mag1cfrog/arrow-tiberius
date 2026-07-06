@@ -132,6 +132,13 @@ Failure events use sanitized `error_summary` values and machine-readable
 `diagnostic_codes`. Detailed diagnostics remain available from returned
 `Error` values for callers that need to inspect them in process.
 
+For application reports, prefer `Error::safe_error_info()`. It returns the same
+safe summary shape used by tracing, plus the outer write phase, inner error
+kind, diagnostic codes, and structured diagnostics when the error carries them.
+`Display` stays short and redacted. `Error::without_write_phase()` and
+`std::error::Error::source()` are for trusted in-process matching or debug
+paths, not default end-user output.
+
 ## Downstream Workflow Spans
 
 Applications should add workflow, source, and output context outside
