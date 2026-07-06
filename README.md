@@ -103,6 +103,11 @@ Planning and write failures return structured diagnostics instead of requiring
 string parsing. Diagnostics include severity, machine-readable code, field
 context, row context when available, and message text.
 
+For user-facing write failure reports, use `Error::safe_error_info()`. It
+exposes the write phase, inner error kind, sanitized summary, diagnostic codes,
+and structured diagnostics when available while keeping dependency source text
+out of default reports.
+
 For the complete planning surface, see
 [Arrow to SQL Server Type Mapping](docs/type-mapping.md).
 

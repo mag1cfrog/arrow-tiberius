@@ -1,10 +1,10 @@
 //! Error types for `arrow-tiberius`.
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 use snafu::Snafu;
 
-use crate::{DiagnosticSet, WriteBackend};
+use crate::{DiagnosticCode, DiagnosticSet, WriteBackend};
 
 /// Crate-local result type.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -60,6 +60,52 @@ impl WritePhase {
 impl fmt::Display for WritePhase {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// Safe, structured information for user-facing error reports.
+///
+/// This view keeps dependency source text out of default reports. Use
+/// [`std::error::Error::source`] only for trusted debug paths that apply their
+/// own redaction policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ErrorInfo<'a> {
+    phase: Option<WritePhase>,
+    kind: &'static str,
+    summary: &'static str,
+    diagnostics: Option<&'a DiagnosticSet>,
+}
+
+impl<'a> ErrorInfo<'a> {
+    /// Returns the classified write phase when one is known.
+    pub const fn phase(&self) -> Option<WritePhase> {
+        self.phase
+    }
+
+    /// Returns the inner error kind after write phase context is removed.
+    pub const fn kind(&self) -> &'static str {
+        self.kind
+    }
+
+    /// Returns a sanitized, user-facing summary.
+    pub const fn summary(&self) -> &'static str {
+        self.summary
+    }
+
+    /// Returns structured diagnostics carried by this error, when present.
+    pub const fn diagnostics(&self) -> Option<&'a DiagnosticSet> {
+        self.diagnostics
+    }
+
+    /// Returns comma-separated diagnostic code names for compact reports.
+    pub fn diagnostic_codes(&self) -> String {
+        if let Some(diagnostics) = self.diagnostics {
+            diagnostic_codes(diagnostics)
+        } else if self.kind == "BackendUnavailable" {
+            format!("{:?}", DiagnosticCode::BackendUnavailable)
+        } else {
+            String::new()
+        }
     }
 }
 
@@ -215,6 +261,84 @@ impl Error {
             _ => self,
         }
     }
+
+    /// Returns safe, structured information for user-facing reports.
+    pub fn safe_error_info(&self) -> ErrorInfo<'_> {
+        let inner = self.without_write_phase();
+        ErrorInfo {
+            phase: self.write_phase(),
+            kind: inner.kind(),
+            summary: inner.safe_summary(),
+            diagnostics: inner.diagnostics(),
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::WritePhaseContext { source, .. } => source.kind(),
+            Self::InvalidCompatibilityLevel { .. } => "InvalidCompatibilityLevel",
+            Self::InvalidIdentifier { .. } => "InvalidIdentifier",
+            Self::Planning { .. } => "Planning",
+            Self::ValueConversion { .. } => "ValueConversion",
+            Self::DirectEncoding { .. } => "DirectEncoding",
+            Self::BackendUnavailable { .. } => "BackendUnavailable",
+            Self::InvalidConnectionString => "InvalidConnectionString",
+            Self::ConnectionTcpConnect { .. } => "ConnectionTcpConnect",
+            Self::ConnectionClientSetup { .. } => "ConnectionClientSetup",
+            Self::TableExistsQuery { .. } => "TableExistsQuery",
+            Self::TableExistsUnexpectedResult { .. } => "TableExistsUnexpectedResult",
+            Self::TargetRowCountQuery { .. } => "TargetRowCountQuery",
+            Self::TargetRowCountUnexpectedResult { .. } => "TargetRowCountUnexpectedResult",
+            Self::SqlExecution { .. } => "SqlExecution",
+            Self::Tiberius { .. } => "Tiberius",
+        }
+    }
+
+    fn safe_summary(&self) -> &'static str {
+        match self {
+            Self::WritePhaseContext { source, .. } => source.safe_summary(),
+            Self::InvalidCompatibilityLevel { .. } => "invalid compatibility level",
+            Self::InvalidIdentifier { .. } => "invalid identifier",
+            Self::Planning { .. } => "planning failed with diagnostics",
+            Self::ValueConversion { .. } => "value conversion failed with diagnostics",
+            Self::DirectEncoding { .. } => "direct encoding failed with diagnostics",
+            Self::BackendUnavailable { .. } => "write backend unavailable",
+            Self::InvalidConnectionString => "invalid connection string",
+            Self::ConnectionTcpConnect { .. } => "TCP connection failed",
+            Self::ConnectionClientSetup { .. } => "SQL Server client setup failed",
+            Self::TableExistsQuery { .. } => "table existence query failed",
+            Self::TableExistsUnexpectedResult { .. } => {
+                "table existence query returned unexpected result"
+            }
+            Self::TargetRowCountQuery { .. } => "target row count query failed",
+            Self::TargetRowCountUnexpectedResult { .. } => {
+                "target row count query returned unexpected result"
+            }
+            Self::SqlExecution { .. } => "SQL statement execution failed",
+            Self::Tiberius { .. } => "tiberius operation failed",
+        }
+    }
+
+    fn diagnostics(&self) -> Option<&DiagnosticSet> {
+        match self {
+            Self::WritePhaseContext { source, .. } => source.diagnostics(),
+            Self::Planning { diagnostics }
+            | Self::ValueConversion { diagnostics }
+            | Self::DirectEncoding { diagnostics } => Some(diagnostics),
+            _ => None,
+        }
+    }
+}
+
+fn diagnostic_codes(diagnostics: &DiagnosticSet) -> String {
+    let mut codes = String::new();
+    for diagnostic in diagnostics.all() {
+        if !codes.is_empty() {
+            codes.push(',');
+        }
+        let _ = write!(codes, "{:?}", diagnostic.code());
+    }
+    codes
 }
 
 #[cfg(test)]
@@ -320,6 +444,51 @@ mod tests {
         assert!(!err.to_string().contains("password=secret"));
         assert!(!err.to_string().contains("User ID=sa"));
         assert!(!err.to_string().contains("sql.example.com"));
+    }
+
+    #[test]
+    fn safe_error_info_exposes_finalize_tiberius_cause_without_source_text() {
+        let err = Error::Tiberius {
+            source: tiberius::error::Error::BulkInput(Cow::Borrowed(
+                "server=tcp:sql.example.com;User ID=sa;password=secret",
+            )),
+        }
+        .with_write_phase(WritePhase::Finalize);
+
+        let info = err.safe_error_info();
+
+        assert_eq!(info.phase(), Some(WritePhase::Finalize));
+        assert_eq!(info.kind(), "Tiberius");
+        assert_eq!(info.summary(), "tiberius operation failed");
+        assert!(info.diagnostics().is_none());
+        assert_eq!(info.diagnostic_codes(), "");
+        assert!(!info.summary().contains("password=secret"));
+        assert!(!info.summary().contains("User ID=sa"));
+        assert!(!info.summary().contains("sql.example.com"));
+    }
+
+    #[test]
+    fn safe_error_info_exposes_nested_diagnostics() {
+        let err = Error::DirectEncoding {
+            diagnostics: DiagnosticSet::from(vec![Diagnostic::error(
+                DiagnosticCode::DirectEncodingInvalidPayload,
+                "invalid payload",
+            )]),
+        }
+        .with_write_phase(WritePhase::WriterInitialization);
+
+        let info = err.safe_error_info();
+
+        assert_eq!(info.phase(), Some(WritePhase::WriterInitialization));
+        assert_eq!(info.kind(), "DirectEncoding");
+        assert_eq!(info.summary(), "direct encoding failed with diagnostics");
+        assert_eq!(info.diagnostic_codes(), "DirectEncodingInvalidPayload");
+        assert_eq!(
+            info.diagnostics()
+                .and_then(|diagnostics| diagnostics.all().first())
+                .map(Diagnostic::code),
+            Some(DiagnosticCode::DirectEncodingInvalidPayload)
+        );
     }
 
     #[test]

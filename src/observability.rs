@@ -2,8 +2,6 @@
 
 use std::{fmt::Write as _, time::Duration};
 
-use crate::DiagnosticSet;
-
 pub(crate) mod schema;
 pub(crate) mod writer;
 
@@ -124,14 +122,6 @@ pub(crate) fn duration_micros_u64(duration: Duration) -> u64 {
 
 pub(crate) fn usize_to_u64_saturating(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
-}
-
-pub(crate) fn diagnostic_codes(diagnostics: &DiagnosticSet) -> String {
-    let mut codes = String::new();
-    for diagnostic in diagnostics.all() {
-        append_debug_name(&mut codes, diagnostic.code());
-    }
-    codes
 }
 
 pub(crate) fn append_debug_name<T: std::fmt::Debug>(target: &mut String, value: T) {
