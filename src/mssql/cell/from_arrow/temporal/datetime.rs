@@ -437,7 +437,7 @@ mod tests {
         options: &PlanOptions,
     ) -> crate::Result<MssqlCell<'a>> {
         mssql_cell_from_arrow_cell(
-            ArrowToMssqlRuntimeMapping::new(mapping, options),
+            ArrowToMssqlRuntimeMapping::new_with_options(mapping, options),
             cell,
             row_index,
         )

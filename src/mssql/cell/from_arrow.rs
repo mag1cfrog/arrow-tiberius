@@ -6,9 +6,11 @@ pub(crate) mod temporal;
 mod variable_width;
 
 use crate::{
-    Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, MssqlType, NanosecondPolicy, PlanOptions,
-    Result, SchemaMapping, arrow::cell::ArrowCell,
+    Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, MssqlType, NanosecondPolicy, Result,
+    SchemaMapping, arrow::cell::ArrowCell, write::context::RuntimeConversionContext,
 };
+#[cfg(test)]
+use crate::{MssqlProfile, PlanOptions};
 
 use super::MssqlCell;
 use decimal::{mssql_decimal_value, supports_null_decimal_cell};
@@ -24,16 +26,28 @@ use variable_width::{binary_cell, nvar_char_cell, var_binary_cell};
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ArrowToMssqlRuntimeMapping<'a> {
     mapping: &'a SchemaMapping,
-    nanosecond_policy: NanosecondPolicy,
+    runtime_context: RuntimeConversionContext,
 }
 
 impl<'a> ArrowToMssqlRuntimeMapping<'a> {
-    /// Creates runtime conversion context from structural mapping and write options.
-    pub(crate) const fn new(mapping: &'a SchemaMapping, options: &PlanOptions) -> Self {
+    /// Creates runtime conversion context from structural mapping and write context.
+    pub(crate) const fn new(
+        mapping: &'a SchemaMapping,
+        runtime_context: RuntimeConversionContext,
+    ) -> Self {
         Self {
             mapping,
-            nanosecond_policy: options.nanosecond_policy,
+            runtime_context,
         }
+    }
+
+    /// Creates runtime mapping with test-only write conversion policies.
+    #[cfg(test)]
+    pub(crate) fn new_with_options(mapping: &'a SchemaMapping, options: &PlanOptions) -> Self {
+        Self::new(
+            mapping,
+            RuntimeConversionContext::new(MssqlProfile::sql_server_2016_compat_100(), *options),
+        )
     }
 
     /// Returns the structural Arrow/MSSQL mapping.
@@ -43,7 +57,7 @@ impl<'a> ArrowToMssqlRuntimeMapping<'a> {
 
     /// Returns the nanosecond timestamp policy selected for write conversion.
     pub(crate) const fn nanosecond_policy(self) -> NanosecondPolicy {
-        self.nanosecond_policy
+        self.runtime_context.nanosecond_policy()
     }
 }
 
@@ -228,7 +242,7 @@ mod tests {
             options,
         );
 
-        let runtime_mapping = ArrowToMssqlRuntimeMapping::new(&mappings[0], &options);
+        let runtime_mapping = ArrowToMssqlRuntimeMapping::new_with_options(&mappings[0], &options);
 
         assert_eq!(runtime_mapping.mapping(), &mappings[0]);
         assert_eq!(

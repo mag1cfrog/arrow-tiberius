@@ -10,8 +10,8 @@ use crate::observability::{
     writer::{BatchWriteTrace, DirectRawBatchObserver, FinishTrace, WriterInitializationTrace},
 };
 use crate::{
-    Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, PlanOptions, PlannedSchema, Result,
-    SchemaMapping, TableName, WritePhase,
+    Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, PlannedSchema, Result, SchemaMapping,
+    TableName, WritePhase,
 };
 
 use super::{
@@ -117,8 +117,8 @@ impl WriterState {
         self.schema_check
     }
 
-    fn plan_options(&self) -> PlanOptions {
-        self.runtime_context.plan_options()
+    fn runtime_context(&self) -> RuntimeConversionContext {
+        self.runtime_context
     }
 
     fn stats(&self) -> WriteStats {
@@ -316,10 +316,10 @@ fn record_batch_view<'a>(
     batch: &'a RecordBatch,
     mappings: &'a [SchemaMapping],
     schema_check: SchemaCheck,
-    plan_options: &PlanOptions,
+    runtime_context: RuntimeConversionContext,
 ) -> Result<RecordBatchView<'a>> {
     match schema_check {
-        SchemaCheck::Strict => RecordBatchView::new_with_options(batch, mappings, plan_options),
+        SchemaCheck::Strict => RecordBatchView::new_with_context(batch, mappings, runtime_context),
     }
 }
 
@@ -702,7 +702,7 @@ where
         batch,
         state.mappings(),
         state.schema_check(),
-        &state.plan_options(),
+        state.runtime_context(),
     ) {
         Ok(view) => view,
         Err(err) => return Err(err.with_write_phase(WritePhase::BatchSchemaValidation)),
@@ -1011,6 +1011,7 @@ mod tests {
         validate_direct_bulk_target_column_types, write_batch_to_sink, write_direct_batch_to_sink,
     };
     use crate::observability::writer::DirectRawBatchObserver;
+    use crate::write::context::RuntimeConversionContext;
     use crate::{
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlProfile, MssqlType,
         MssqlTypeLength, NanosecondPolicy, PlanOptions, PlannedSchema, SchemaCheck, SchemaMapping,
@@ -1105,7 +1106,10 @@ mod tests {
         assert!(state.direct_encoder().is_some());
         assert_eq!(state.schema_check(), SchemaCheck::Strict);
         assert_eq!(state.mappings(), mappings.as_slice());
-        assert_eq!(state.plan_options(), PlanOptions::default());
+        assert_eq!(
+            state.runtime_context().plan_options(),
+            PlanOptions::default()
+        );
         assert_eq!(state.stats(), WriteStats::default());
     }
 
@@ -1123,13 +1127,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(state.runtime_context.profile(), profile);
-        assert_eq!(state.runtime_context.plan_options(), plan_options);
+        assert_eq!(state.runtime_context().profile(), profile);
+        assert_eq!(state.runtime_context().plan_options(), plan_options);
         assert_eq!(
-            state.runtime_context.nanosecond_policy(),
+            state.runtime_context().nanosecond_policy(),
             NanosecondPolicy::TruncateTo100ns
         );
-        assert_eq!(state.plan_options(), plan_options);
     }
 
     #[test]
@@ -1244,7 +1247,7 @@ mod tests {
             &batch,
             &mappings,
             SchemaCheck::Strict,
-            &PlanOptions::default(),
+            runtime_context_with_options(PlanOptions::default()),
         )
         .unwrap();
 
@@ -1261,7 +1264,7 @@ mod tests {
             &batch,
             &[mapping("id")],
             SchemaCheck::Strict,
-            &PlanOptions::default(),
+            runtime_context_with_options(PlanOptions::default()),
         )
         .unwrap_err();
 
@@ -1302,7 +1305,7 @@ mod tests {
             &batch,
             &mappings,
             SchemaCheck::Strict,
-            &PlanOptions::default(),
+            runtime_context_with_options(PlanOptions::default()),
         )
         .unwrap();
         let err = validate_batch_rows(&view).unwrap_err();
@@ -2361,6 +2364,10 @@ mod tests {
 
     fn planned_schema(mappings: Vec<SchemaMapping>) -> PlannedSchema {
         planned_schema_with_options(mappings, PlanOptions::default())
+    }
+
+    fn runtime_context_with_options(plan_options: PlanOptions) -> RuntimeConversionContext {
+        RuntimeConversionContext::new(MssqlProfile::sql_server_2016_compat_100(), plan_options)
     }
 
     fn planned_schema_with_options(

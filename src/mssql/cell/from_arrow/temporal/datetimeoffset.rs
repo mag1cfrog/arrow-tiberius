@@ -494,7 +494,7 @@ mod tests {
         row_index: usize,
         options: &PlanOptions,
     ) -> crate::Result<MssqlCell<'a>> {
-        let runtime_mapping = ArrowToMssqlRuntimeMapping::new(mapping, options);
+        let runtime_mapping = ArrowToMssqlRuntimeMapping::new_with_options(mapping, options);
         mssql_cell_from_arrow_cell(runtime_mapping, cell, row_index)
     }
 
