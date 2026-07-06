@@ -32,7 +32,6 @@ Plan an Arrow schema and render SQL Server DDL:
 use arrow_schema::{DataType, Field, Schema};
 use arrow_tiberius::{
     MssqlProfile, PlanOptions, TableName, create_table_sql_from_mappings,
-    plan_arrow_schema_to_mssql_mappings,
 };
 
 fn main() -> arrow_tiberius::Result<()> {
@@ -41,14 +40,11 @@ fn main() -> arrow_tiberius::Result<()> {
         Field::new("name", DataType::Utf8, true),
     ]);
 
-    let outcome = plan_arrow_schema_to_mssql_mappings(
-        &schema,
-        MssqlProfile::sql_server_2016_compat_100(),
-        PlanOptions::default(),
-    )?;
+    let profile = MssqlProfile::sql_server_2016_compat_100();
+    let outcome = profile.plan_arrow_schema(&schema, PlanOptions::default())?;
 
     let table = TableName::new("dbo", "people")?;
-    let ddl = create_table_sql_from_mappings(&table, outcome.value());
+    let ddl = create_table_sql_from_mappings(&table, outcome.mappings());
 
     assert!(ddl.contains("CREATE TABLE [dbo].[people]"));
     Ok(())
@@ -61,7 +57,7 @@ Write a batch to an existing SQL Server table:
 use arrow_array::RecordBatch;
 use arrow_tiberius::{
     MssqlProfile, PlanOptions, TableName, WriteBackend, WriteOptions,
-    connect_mssql_client_from_ado_string, plan_arrow_schema_to_mssql_mappings,
+    connect_mssql_client_from_ado_string,
 };
 
 async fn write_batch(
@@ -69,17 +65,16 @@ async fn write_batch(
     batch: &RecordBatch,
 ) -> arrow_tiberius::Result<()> {
     let mut client = connect_mssql_client_from_ado_string(connection_string).await?;
-    let outcome = plan_arrow_schema_to_mssql_mappings(
-        batch.schema().as_ref(),
-        MssqlProfile::sql_server_2016_compat_100(),
-        PlanOptions::default(),
-    )?;
+    let profile = MssqlProfile::sql_server_2016_compat_100();
+    let planned_schema = profile
+        .plan_arrow_schema(batch.schema().as_ref(), PlanOptions::default())?
+        .into_value();
 
     let table = TableName::new("dbo", "people")?;
     let mut writer = client
         .bulk_writer(
             table,
-            outcome.value().to_vec(),
+            planned_schema,
             WriteOptions {
                 backend: WriteBackend::DirectRawBulk,
                 ..WriteOptions::default()
@@ -163,13 +158,19 @@ By default, the SQL Server example creates, writes to, and drops
 
 ## Compatibility
 
-The v0.1 profile targets SQL Server 2016 with database compatibility level 100:
+Choose the `MssqlProfile` that matches the SQL Server version and database
+compatibility level you plan to write against. The original v0.1 profile remains
+available:
 
 ```rust
 use arrow_tiberius::MssqlProfile;
 
 let profile = MssqlProfile::sql_server_2016_compat_100();
 ```
+
+This release also models SQL Server 2017 database compatibility levels 100,
+110, 120, 130, and 140, including the SQL Server 2017 compatibility-level-100
+target used by the integration harness.
 
 `arrow-tiberius` depends on the published `tiberius-raw-bulk` package as the
 crate name `tiberius` and owns that compatibility boundary internally:

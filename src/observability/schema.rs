@@ -2,7 +2,8 @@ use std::time::Instant;
 
 use crate::diagnostic::DiagnosticSeverity;
 use crate::{
-    DiagnosticSet, Error, MssqlProfile, MssqlType, PlanOptions, PlanOutcome, Result, SchemaMapping,
+    DiagnosticSet, Error, MssqlProfile, MssqlType, PlanOptions, PlanOutcome, PlannedSchema, Result,
+    SchemaMapping,
 };
 
 use super::{
@@ -54,12 +55,12 @@ impl SchemaPlanningTrace {
         }
     }
 
-    pub(crate) fn trace_result(
+    pub(crate) fn trace_planned_schema_result(
         &self,
-        result: Result<PlanOutcome<Vec<SchemaMapping>>>,
-    ) -> Result<PlanOutcome<Vec<SchemaMapping>>> {
+        result: Result<PlanOutcome<PlannedSchema>>,
+    ) -> Result<PlanOutcome<PlannedSchema>> {
         match &result {
-            Ok(outcome) => self.completed(outcome.value(), outcome.diagnostics()),
+            Ok(outcome) => self.completed(outcome.mappings(), outcome.diagnostics()),
             Err(Error::Planning { diagnostics }) => self.failed(diagnostics),
             Err(_) => {}
         }

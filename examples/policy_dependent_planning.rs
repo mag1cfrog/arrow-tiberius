@@ -3,7 +3,6 @@
 use arrow_schema::{DataType, Field, Schema};
 use arrow_tiberius::{
     MssqlProfile, PlanOptions, TableName, UInt64Policy, create_table_sql_from_mappings,
-    plan_arrow_schema_to_mssql_mappings,
 };
 
 fn main() -> arrow_tiberius::Result<()> {
@@ -17,13 +16,10 @@ fn main() -> arrow_tiberius::Result<()> {
         ..PlanOptions::default()
     };
 
-    let outcome = plan_arrow_schema_to_mssql_mappings(
-        &schema,
-        MssqlProfile::sql_server_2016_compat_100(),
-        plan_options,
-    )?;
+    let profile = MssqlProfile::sql_server_2016_compat_100();
+    let outcome = profile.plan_arrow_schema(&schema, plan_options)?;
 
-    for mapping in outcome.value() {
+    for mapping in outcome.mappings() {
         println!(
             "{} -> {}",
             mapping.arrow().name(),
@@ -32,7 +28,7 @@ fn main() -> arrow_tiberius::Result<()> {
     }
 
     let table = TableName::new("dbo", "events")?;
-    let ddl = create_table_sql_from_mappings(&table, outcome.value());
+    let ddl = create_table_sql_from_mappings(&table, outcome.mappings());
     println!("{ddl}");
 
     Ok(())

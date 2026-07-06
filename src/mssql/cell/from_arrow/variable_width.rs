@@ -338,7 +338,7 @@ mod tests {
         row_index: usize,
     ) -> crate::Result<MssqlCell<'a>> {
         let options = PlanOptions::default();
-        let runtime_mapping = ArrowToMssqlRuntimeMapping::new(mapping, &options);
+        let runtime_mapping = ArrowToMssqlRuntimeMapping::new_with_options(mapping, &options);
         mssql_cell_from_arrow_cell(runtime_mapping, cell, row_index)
     }
 

@@ -5,13 +5,17 @@ mod validate;
 use arrow_array::RecordBatch;
 
 use crate::{
-    Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, PlanOptions, Result, SchemaMapping,
+    Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, Result, SchemaMapping,
     arrow::cell::{ArrowCell, extract_arrow_cell},
     mssql::cell::{
         MssqlCell,
         from_arrow::{ArrowToMssqlRuntimeMapping, mssql_cell_from_arrow_cell},
     },
 };
+#[cfg(test)]
+use crate::{MssqlProfile, PlanOptions};
+
+use super::context::RuntimeConversionContext;
 pub(crate) use validate::validate_record_batch_encoding_shape;
 pub use validate::{
     validate_arrow_schema_against_mappings, validate_record_batch_schema_against_mappings,
@@ -22,28 +26,35 @@ pub use validate::{
 pub(crate) struct RecordBatchView<'a> {
     batch: &'a RecordBatch,
     mappings: &'a [SchemaMapping],
-    plan_options: PlanOptions,
+    runtime_context: RuntimeConversionContext,
 }
 
 impl<'a> RecordBatchView<'a> {
     /// Creates a conversion view after validating batch columns against mappings.
     #[cfg(test)]
     pub(crate) fn new(batch: &'a RecordBatch, mappings: &'a [SchemaMapping]) -> Result<Self> {
-        Self::new_with_options(batch, mappings, &PlanOptions::default())
+        Self::new_with_context(
+            batch,
+            mappings,
+            RuntimeConversionContext::new(
+                MssqlProfile::sql_server_2016_compat_100(),
+                PlanOptions::default(),
+            ),
+        )
     }
 
-    /// Creates a conversion view with explicit write conversion policies.
-    pub(crate) fn new_with_options(
+    /// Creates a conversion view with explicit write conversion context.
+    pub(crate) fn new_with_context(
         batch: &'a RecordBatch,
         mappings: &'a [SchemaMapping],
-        plan_options: &PlanOptions,
+        runtime_context: RuntimeConversionContext,
     ) -> Result<Self> {
         validate_record_batch_encoding_shape(batch, mappings)?;
 
         Ok(Self {
             batch,
             mappings,
-            plan_options: *plan_options,
+            runtime_context,
         })
     }
 
@@ -97,7 +108,7 @@ impl<'a> RecordBatchView<'a> {
     /// Converts one planned cell into a semantic SQL Server cell.
     fn mssql_cell(&self, mapping: &SchemaMapping, row_index: usize) -> Result<MssqlCell<'_>> {
         let cell = self.arrow_cell(mapping, row_index)?;
-        let runtime_mapping = ArrowToMssqlRuntimeMapping::new(mapping, &self.plan_options);
+        let runtime_mapping = ArrowToMssqlRuntimeMapping::new(mapping, self.runtime_context);
         mssql_cell_from_arrow_cell(runtime_mapping, cell, row_index)
     }
 
@@ -147,14 +158,16 @@ mod tests {
     use arrow_array::{
         ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Float64Array, Int32Array, Int64Array,
         LargeBinaryArray, LargeStringArray, RecordBatch, StringArray, StringViewArray,
+        TimestampNanosecondArray,
     };
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
     use super::{RecordBatchView, validate_record_batch_encoding_shape};
     use crate::mssql::cell::MssqlCell;
+    use crate::write::context::RuntimeConversionContext;
     use crate::{
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlProfile, MssqlType,
-        PlanOptions, SchemaMapping, plan_arrow_schema_to_mssql_mappings,
+        NanosecondPolicy, PlanOptions, SchemaMapping, plan_arrow_schema_to_mssql_mappings,
         validate_arrow_schema_against_mappings, validate_record_batch_schema_against_mappings,
     };
 
@@ -181,6 +194,54 @@ mod tests {
         assert_eq!(view.row_count(), 2);
         assert_eq!(view.mappings().len(), 2);
         view.check_row_index(1).unwrap();
+    }
+
+    #[test]
+    fn baseline_view_uses_runtime_context_plan_options() {
+        let schema = Schema::new(vec![Field::new(
+            "created_at",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        )]);
+        let plan_options = PlanOptions {
+            nanosecond_policy: NanosecondPolicy::TruncateTo100ns,
+            ..PlanOptions::default()
+        };
+        let mappings = mappings_for_schema_with_options(schema.clone(), plan_options);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(TimestampNanosecondArray::from(vec![Some(
+                123_456_789_i64,
+            )]))],
+        )
+        .unwrap();
+
+        let reject_view = RecordBatchView::new_with_context(
+            &batch,
+            &mappings,
+            RuntimeConversionContext::new(
+                MssqlProfile::sql_server_2016_compat_100(),
+                PlanOptions::default(),
+            ),
+        )
+        .unwrap();
+        let truncate_view = RecordBatchView::new_with_context(
+            &batch,
+            &mappings,
+            RuntimeConversionContext::new(MssqlProfile::sql_server_2017_compat_140(), plan_options),
+        )
+        .unwrap();
+
+        assert_single_diagnostic(
+            reject_view.mssql_row(0).unwrap_err(),
+            DiagnosticCode::LossyConversionRequiresPolicy,
+            Some(0),
+            Some((0, "created_at")),
+        );
+        assert!(matches!(
+            truncate_view.mssql_row(0).unwrap().as_slice(),
+            [MssqlCell::DateTime2(Some(_))]
+        ));
     }
 
     #[test]

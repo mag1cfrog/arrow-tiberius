@@ -1,6 +1,10 @@
 //! SQL Server profile types.
 
-use crate::error::Result;
+use arrow_schema::Schema;
+
+use crate::schema::{PlannedSchema, plan_arrow_schema_to_mssql_schema};
+use crate::write::PlanOptions;
+use crate::{PlanOutcome, Result};
 
 /// SQL Server engine version targeted by planning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -8,6 +12,8 @@ use crate::error::Result;
 pub enum MssqlVersion {
     /// SQL Server 2016.
     SqlServer2016,
+    /// SQL Server 2017.
+    SqlServer2017,
 }
 
 /// SQL Server database compatibility level.
@@ -17,6 +23,14 @@ pub struct CompatibilityLevel(u16);
 impl CompatibilityLevel {
     /// SQL Server 2008 / 2008 R2 compatibility level.
     pub const SQL_SERVER_2008: Self = Self(100);
+    /// SQL Server 2012 compatibility level.
+    pub const SQL_SERVER_2012: Self = Self(110);
+    /// SQL Server 2014 compatibility level.
+    pub const SQL_SERVER_2014: Self = Self(120);
+    /// SQL Server 2016 compatibility level.
+    pub const SQL_SERVER_2016: Self = Self(130);
+    /// SQL Server 2017 compatibility level.
+    pub const SQL_SERVER_2017: Self = Self(140);
 
     /// Creates a validated compatibility level.
     pub fn new(level: u16) -> Result<Self> {
@@ -33,7 +47,7 @@ impl CompatibilityLevel {
     }
 
     const fn is_supported(level: u16) -> bool {
-        matches!(level, 100)
+        matches!(level, 100 | 110 | 120 | 130 | 140)
     }
 }
 
@@ -62,6 +76,60 @@ impl MssqlProfile {
         }
     }
 
+    /// Creates the SQL Server 2017 profile with database compatibility
+    /// level 100.
+    pub const fn sql_server_2017_compat_100() -> Self {
+        Self {
+            version: MssqlVersion::SqlServer2017,
+            compatibility_level: CompatibilityLevel::SQL_SERVER_2008,
+        }
+    }
+
+    /// Creates the SQL Server 2017 profile with database compatibility
+    /// level 110.
+    pub const fn sql_server_2017_compat_110() -> Self {
+        Self {
+            version: MssqlVersion::SqlServer2017,
+            compatibility_level: CompatibilityLevel::SQL_SERVER_2012,
+        }
+    }
+
+    /// Creates the SQL Server 2017 profile with database compatibility
+    /// level 120.
+    pub const fn sql_server_2017_compat_120() -> Self {
+        Self {
+            version: MssqlVersion::SqlServer2017,
+            compatibility_level: CompatibilityLevel::SQL_SERVER_2014,
+        }
+    }
+
+    /// Creates the SQL Server 2017 profile with database compatibility
+    /// level 130.
+    pub const fn sql_server_2017_compat_130() -> Self {
+        Self {
+            version: MssqlVersion::SqlServer2017,
+            compatibility_level: CompatibilityLevel::SQL_SERVER_2016,
+        }
+    }
+
+    /// Creates the SQL Server 2017 profile with database compatibility
+    /// level 140.
+    pub const fn sql_server_2017_compat_140() -> Self {
+        Self {
+            version: MssqlVersion::SqlServer2017,
+            compatibility_level: CompatibilityLevel::SQL_SERVER_2017,
+        }
+    }
+
+    /// Plans an Arrow schema using this SQL Server profile.
+    pub fn plan_arrow_schema(
+        self,
+        schema: impl AsRef<Schema>,
+        options: PlanOptions,
+    ) -> Result<PlanOutcome<PlannedSchema>> {
+        plan_arrow_schema_to_mssql_schema(schema, self, options)
+    }
+
     /// Returns the SQL Server engine version.
     pub const fn version(self) -> MssqlVersion {
         self.version
@@ -86,17 +154,46 @@ mod tests {
     }
 
     #[test]
-    fn accepts_supported_compatibility_level() {
-        let level = CompatibilityLevel::new(100).unwrap();
+    fn constructs_sql_server_2017_profiles() {
+        let cases = [
+            (MssqlProfile::sql_server_2017_compat_100(), 100),
+            (MssqlProfile::sql_server_2017_compat_110(), 110),
+            (MssqlProfile::sql_server_2017_compat_120(), 120),
+            (MssqlProfile::sql_server_2017_compat_130(), 130),
+            (MssqlProfile::sql_server_2017_compat_140(), 140),
+        ];
 
-        assert_eq!(level.as_u16(), 100);
+        for (profile, compatibility_level) in cases {
+            assert_eq!(profile.version(), MssqlVersion::SqlServer2017);
+            assert_eq!(profile.compatibility_level().as_u16(), compatibility_level);
+        }
     }
 
     #[test]
-    fn try_from_accepts_supported_compatibility_level() {
-        let level = CompatibilityLevel::try_from(100).unwrap();
+    fn accepts_supported_compatibility_levels() {
+        let cases = [
+            (100, CompatibilityLevel::SQL_SERVER_2008),
+            (110, CompatibilityLevel::SQL_SERVER_2012),
+            (120, CompatibilityLevel::SQL_SERVER_2014),
+            (130, CompatibilityLevel::SQL_SERVER_2016),
+            (140, CompatibilityLevel::SQL_SERVER_2017),
+        ];
 
-        assert_eq!(level, CompatibilityLevel::SQL_SERVER_2008);
+        for (value, expected) in cases {
+            let level = CompatibilityLevel::new(value).unwrap();
+
+            assert_eq!(level, expected);
+            assert_eq!(level.as_u16(), value);
+        }
+    }
+
+    #[test]
+    fn try_from_accepts_supported_compatibility_levels() {
+        for value in [100, 110, 120, 130, 140] {
+            let level = CompatibilityLevel::try_from(value).unwrap();
+
+            assert_eq!(level.as_u16(), value);
+        }
     }
 
     #[test]
@@ -108,7 +205,7 @@ mod tests {
 
     #[test]
     fn rejects_nearby_and_extreme_compatibility_levels() {
-        for level in [0, 99, 101, 150, u16::MAX] {
+        for level in [0, 99, 101, 109, 111, 119, 121, 129, 131, 139, 141, u16::MAX] {
             let err = CompatibilityLevel::new(level).expect_err("level should be rejected");
 
             assert!(

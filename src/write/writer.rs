@@ -10,12 +10,13 @@ use crate::observability::{
     writer::{BatchWriteTrace, DirectRawBatchObserver, FinishTrace, WriterInitializationTrace},
 };
 use crate::{
-    Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, PlanOptions, Result, SchemaMapping,
+    Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, PlannedSchema, Result, SchemaMapping,
     TableName, WritePhase,
 };
 
 use super::{
     SchemaCheck,
+    context::RuntimeConversionContext,
     direct::{
         DirectEncoder, MeasuredDirectBatch, MeasuredRowRange,
         plan::{DirectColumnEncoding, DirectColumnPlan, DirectEncoderPlan},
@@ -52,8 +53,6 @@ pub struct WriteOptions {
     pub backend: WriteBackend,
     /// Batch schema validation policy.
     pub schema_check: SchemaCheck,
-    /// Planning/runtime conversion policies used by policy-dependent write conversions.
-    pub plan_options: PlanOptions,
 }
 
 /// Cumulative write statistics.
@@ -70,7 +69,7 @@ struct WriterState {
     backend: WriteBackend,
     direct_encoder: Option<DirectEncoder>,
     schema_check: SchemaCheck,
-    plan_options: PlanOptions,
+    runtime_context: RuntimeConversionContext,
     mappings: Vec<SchemaMapping>,
     stats: WriteStats,
 }
@@ -79,13 +78,15 @@ impl WriterState {
     fn new(
         requested_backend: WriteBackend,
         schema_check: SchemaCheck,
-        plan_options: PlanOptions,
-        mappings: Vec<SchemaMapping>,
+        planned_schema: PlannedSchema,
     ) -> Result<Self> {
         let backend = resolve_backend(requested_backend)?;
+        let runtime_context =
+            RuntimeConversionContext::new(planned_schema.profile(), planned_schema.plan_options());
+        let mappings = planned_schema.into_mappings();
         let direct_encoder = match backend {
             WriteBackend::DirectFramedBulk | WriteBackend::DirectRawBulk => {
-                Some(DirectEncoder::new_with_options(&mappings, plan_options)?)
+                Some(DirectEncoder::new_with_context(&mappings, runtime_context)?)
             }
             WriteBackend::Auto | WriteBackend::BaselineTokenRow => None,
         };
@@ -94,7 +95,7 @@ impl WriterState {
             backend,
             direct_encoder,
             schema_check,
-            plan_options,
+            runtime_context,
             mappings,
             stats: WriteStats::default(),
         })
@@ -116,8 +117,8 @@ impl WriterState {
         self.schema_check
     }
 
-    fn plan_options(&self) -> &PlanOptions {
-        &self.plan_options
+    fn runtime_context(&self) -> RuntimeConversionContext {
+        self.runtime_context
     }
 
     fn stats(&self) -> WriteStats {
@@ -149,18 +150,14 @@ where
     pub async fn new(
         client: &'client mut tiberius::Client<S>,
         table: TableName,
-        mappings: Vec<SchemaMapping>,
+        planned_schema: PlannedSchema,
         options: WriteOptions,
     ) -> Result<Self> {
-        let mut trace = WriterInitializationTrace::new(&table, options.backend, mappings.len());
+        let mapping_count = planned_schema.mappings().len();
+        let mut trace = WriterInitializationTrace::new(&table, options.backend, mapping_count);
         trace.emit_started();
 
-        let state = match WriterState::new(
-            options.backend,
-            options.schema_check,
-            options.plan_options,
-            mappings,
-        ) {
+        let state = match WriterState::new(options.backend, options.schema_check, planned_schema) {
             Ok(state) => state,
             Err(err) => {
                 trace.emit_failed(WRITER_INITIALIZATION_PHASE, &err);
@@ -319,10 +316,10 @@ fn record_batch_view<'a>(
     batch: &'a RecordBatch,
     mappings: &'a [SchemaMapping],
     schema_check: SchemaCheck,
-    plan_options: &PlanOptions,
+    runtime_context: RuntimeConversionContext,
 ) -> Result<RecordBatchView<'a>> {
     match schema_check {
-        SchemaCheck::Strict => RecordBatchView::new_with_options(batch, mappings, plan_options),
+        SchemaCheck::Strict => RecordBatchView::new_with_context(batch, mappings, runtime_context),
     }
 }
 
@@ -705,7 +702,7 @@ where
         batch,
         state.mappings(),
         state.schema_check(),
-        state.plan_options(),
+        state.runtime_context(),
     ) {
         Ok(view) => view,
         Err(err) => return Err(err.with_write_phase(WritePhase::BatchSchemaValidation)),
@@ -1014,9 +1011,11 @@ mod tests {
         validate_direct_bulk_target_column_types, write_batch_to_sink, write_direct_batch_to_sink,
     };
     use crate::observability::writer::DirectRawBatchObserver;
+    use crate::write::context::RuntimeConversionContext;
     use crate::{
-        ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlType, MssqlTypeLength,
-        PlanOptions, SchemaCheck, SchemaMapping, TableName, TimestampPolicy, WritePhase,
+        ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlProfile, MssqlType,
+        MssqlTypeLength, NanosecondPolicy, PlanOptions, PlannedSchema, SchemaCheck, SchemaMapping,
+        TableName, TimestampPolicy, WritePhase,
     };
 
     static DIRECT_RAW_TRACE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -1039,7 +1038,6 @@ mod tests {
 
         assert_eq!(options.backend, WriteBackend::Auto);
         assert_eq!(options.schema_check, SchemaCheck::Strict);
-        assert_eq!(options.plan_options, PlanOptions::default());
     }
 
     #[test]
@@ -1053,7 +1051,6 @@ mod tests {
             let options = WriteOptions {
                 backend,
                 schema_check: SchemaCheck::Strict,
-                ..WriteOptions::default()
             };
 
             assert_eq!(options.backend, backend);
@@ -1100,8 +1097,7 @@ mod tests {
         let state = WriterState::new(
             WriteBackend::Auto,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings.clone(),
+            planned_schema(mappings.clone()),
         )
         .unwrap();
 
@@ -1109,7 +1105,33 @@ mod tests {
         assert!(state.direct_encoder().is_some());
         assert_eq!(state.schema_check(), SchemaCheck::Strict);
         assert_eq!(state.mappings(), mappings.as_slice());
+        assert_eq!(
+            state.runtime_context().plan_options(),
+            PlanOptions::default()
+        );
         assert_eq!(state.stats(), WriteStats::default());
+    }
+
+    #[test]
+    fn writer_state_uses_runtime_context_from_planned_schema() {
+        let profile = MssqlProfile::sql_server_2017_compat_140();
+        let plan_options = PlanOptions {
+            nanosecond_policy: NanosecondPolicy::TruncateTo100ns,
+            ..PlanOptions::default()
+        };
+        let state = WriterState::new(
+            WriteBackend::BaselineTokenRow,
+            SchemaCheck::Strict,
+            planned_schema_with_profile_and_options(profile, plan_options, vec![mapping("id")]),
+        )
+        .unwrap();
+
+        assert_eq!(state.runtime_context().profile(), profile);
+        assert_eq!(state.runtime_context().plan_options(), plan_options);
+        assert_eq!(
+            state.runtime_context().nanosecond_policy(),
+            NanosecondPolicy::TruncateTo100ns
+        );
     }
 
     #[test]
@@ -1135,8 +1157,7 @@ mod tests {
             let state = WriterState::new(
                 backend,
                 SchemaCheck::Strict,
-                PlanOptions::default(),
-                mappings.clone(),
+                planned_schema(mappings.clone()),
             )
             .unwrap();
 
@@ -1164,8 +1185,7 @@ mod tests {
         let err = WriterState::new(
             WriteBackend::DirectRawBulk,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
+            planned_schema(mappings),
         )
         .unwrap_err();
 
@@ -1184,8 +1204,7 @@ mod tests {
         let mut state = WriterState::new(
             WriteBackend::BaselineTokenRow,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            Vec::new(),
+            planned_schema(Vec::new()),
         )
         .unwrap();
 
@@ -1227,7 +1246,7 @@ mod tests {
             &batch,
             &mappings,
             SchemaCheck::Strict,
-            &PlanOptions::default(),
+            runtime_context_with_options(PlanOptions::default()),
         )
         .unwrap();
 
@@ -1244,7 +1263,7 @@ mod tests {
             &batch,
             &[mapping("id")],
             SchemaCheck::Strict,
-            &PlanOptions::default(),
+            runtime_context_with_options(PlanOptions::default()),
         )
         .unwrap_err();
 
@@ -1285,7 +1304,7 @@ mod tests {
             &batch,
             &mappings,
             SchemaCheck::Strict,
-            &PlanOptions::default(),
+            runtime_context_with_options(PlanOptions::default()),
         )
         .unwrap();
         let err = validate_batch_rows(&view).unwrap_err();
@@ -1374,8 +1393,7 @@ mod tests {
         let state = WriterState::new(
             WriteBackend::DirectRawBulk,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
+            planned_schema(mappings),
         )
         .unwrap();
         let columns = vec![bulk_target_column_with_type(
@@ -1416,8 +1434,7 @@ mod tests {
         let state = WriterState::new(
             WriteBackend::DirectRawBulk,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
+            planned_schema(mappings),
         )
         .unwrap();
         let columns = vec![
@@ -1447,8 +1464,7 @@ mod tests {
         let state = WriterState::new(
             WriteBackend::DirectRawBulk,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
+            planned_schema(mappings),
         )
         .unwrap();
         let columns = vec![bulk_target_column_with_type(
@@ -1483,8 +1499,7 @@ mod tests {
         let state = WriterState::new(
             WriteBackend::DirectRawBulk,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
+            planned_schema(mappings),
         )
         .unwrap();
         let columns = vec![
@@ -1514,8 +1529,7 @@ mod tests {
         let state = WriterState::new(
             WriteBackend::DirectRawBulk,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
+            planned_schema(mappings),
         )
         .unwrap();
         let columns = vec![bulk_target_decimal_column(0, "decimal", false, 19, 0)];
@@ -1547,8 +1561,7 @@ mod tests {
         let state = WriterState::new(
             WriteBackend::DirectRawBulk,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
+            planned_schema(mappings),
         )
         .unwrap();
         let columns = vec![
@@ -1584,8 +1597,7 @@ mod tests {
         let state = WriterState::new(
             WriteBackend::DirectRawBulk,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
+            planned_schema(mappings),
         )
         .unwrap();
         let columns = vec![
@@ -1611,8 +1623,7 @@ mod tests {
         let state = WriterState::new(
             WriteBackend::DirectRawBulk,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
+            planned_schema(mappings),
         )
         .unwrap();
         let columns = vec![bulk_target_column_with_type(
@@ -1635,8 +1646,7 @@ mod tests {
         let state = WriterState::new(
             WriteBackend::DirectRawBulk,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
+            planned_schema(mappings),
         )
         .unwrap();
         let columns = vec![bulk_target_column_with_type(
@@ -1687,8 +1697,7 @@ mod tests {
         let state = WriterState::new(
             WriteBackend::DirectRawBulk,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
+            planned_schema(mappings),
         )
         .unwrap();
         let columns = vec![
@@ -1721,8 +1730,7 @@ mod tests {
         let state = WriterState::new(
             WriteBackend::DirectRawBulk,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
+            planned_schema(mappings),
         )
         .unwrap();
         for column_type in [
@@ -1750,8 +1758,7 @@ mod tests {
         let state = WriterState::new(
             WriteBackend::DirectRawBulk,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
+            planned_schema(mappings),
         )
         .unwrap();
         let columns = vec![
@@ -1789,8 +1796,7 @@ mod tests {
         let state = WriterState::new(
             WriteBackend::DirectRawBulk,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
+            planned_schema(mappings),
         )
         .unwrap();
         let columns = vec![bulk_target_column_with_type(
@@ -1826,8 +1832,7 @@ mod tests {
         let mut state = WriterState::new(
             WriteBackend::BaselineTokenRow,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
+            planned_schema(mappings),
         )
         .unwrap();
         let mut sink = RecordingSink::default();
@@ -1851,8 +1856,7 @@ mod tests {
         let mut state = WriterState::new(
             WriteBackend::BaselineTokenRow,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
+            planned_schema(mappings),
         )
         .unwrap();
         let mut sink = RecordingSink::default();
@@ -1913,8 +1917,7 @@ mod tests {
         let mut state = WriterState::new(
             WriteBackend::BaselineTokenRow,
             SchemaCheck::Strict,
-            options,
-            mappings,
+            planned_schema_with_options(mappings, options),
         )
         .unwrap();
         let mut sink = RecordingSink::default();
@@ -1955,8 +1958,7 @@ mod tests {
         let mut state = WriterState::new(
             WriteBackend::BaselineTokenRow,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
+            planned_schema(mappings),
         )
         .unwrap();
         let mut sink = RecordingSink::default();
@@ -1980,8 +1982,7 @@ mod tests {
         let mut state = WriterState::new(
             WriteBackend::BaselineTokenRow,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
+            planned_schema(mappings),
         )
         .unwrap();
         let mut sink = RecordingSink {
@@ -2011,8 +2012,7 @@ mod tests {
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
+            planned_schema(mappings),
         )
         .unwrap();
         let mut sink = RecordingRawSink::default();
@@ -2042,8 +2042,7 @@ mod tests {
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
+            planned_schema(mappings),
         )
         .unwrap();
         let mut sink = RecordingRawSink::default();
@@ -2086,8 +2085,7 @@ mod tests {
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
+            planned_schema(mappings),
         )
         .unwrap();
         let mut sink = RecordingRawSink::default();
@@ -2115,8 +2113,7 @@ mod tests {
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
+            planned_schema(mappings),
         )
         .unwrap();
         let mut sink = RecordingRawSink::default();
@@ -2141,8 +2138,7 @@ mod tests {
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
+            planned_schema(mappings),
         )
         .unwrap();
         let mut sink = RecordingRawSink::default();
@@ -2174,8 +2170,7 @@ mod tests {
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
+            planned_schema(mappings),
         )
         .unwrap();
         let mut sink = RecordingRawSink::default();
@@ -2207,8 +2202,7 @@ mod tests {
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
+            planned_schema(mappings),
         )
         .unwrap();
         let mut sink = RecordingRawSink::default();
@@ -2246,8 +2240,7 @@ mod tests {
         let mut state = WriterState::new(
             WriteBackend::DirectRawBulk,
             SchemaCheck::Strict,
-            PlanOptions::default(),
-            mappings,
+            planned_schema(mappings),
         )
         .unwrap();
         let mut sink = RecordingRawSink {
@@ -2366,6 +2359,33 @@ mod tests {
                 false,
             ),
         )
+    }
+
+    fn planned_schema(mappings: Vec<SchemaMapping>) -> PlannedSchema {
+        planned_schema_with_options(mappings, PlanOptions::default())
+    }
+
+    fn runtime_context_with_options(plan_options: PlanOptions) -> RuntimeConversionContext {
+        RuntimeConversionContext::new(MssqlProfile::sql_server_2016_compat_100(), plan_options)
+    }
+
+    fn planned_schema_with_options(
+        mappings: Vec<SchemaMapping>,
+        plan_options: PlanOptions,
+    ) -> PlannedSchema {
+        planned_schema_with_profile_and_options(
+            MssqlProfile::sql_server_2016_compat_100(),
+            plan_options,
+            mappings,
+        )
+    }
+
+    fn planned_schema_with_profile_and_options(
+        profile: MssqlProfile,
+        plan_options: PlanOptions,
+        mappings: Vec<SchemaMapping>,
+    ) -> PlannedSchema {
+        PlannedSchema::new(profile, plan_options, mappings)
     }
 
     fn int32_batch(name: &str, values: &[i32]) -> RecordBatch {

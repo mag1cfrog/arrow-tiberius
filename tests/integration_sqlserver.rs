@@ -22,9 +22,9 @@ use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use arrow_tiberius::{
     ArrowFieldRef, BulkWriter, Date64Policy, DecimalPolicy, DiagnosticCode, DiagnosticSet, Error,
     Identifier, MssqlColumn, MssqlProfile, MssqlType, MssqlTypeLength, NanosecondPolicy,
-    PlanOptions, SchemaMapping, TableName, TimestampPolicy, TimezonePolicy, UInt64Policy,
-    WriteBackend, WriteOptions, WritePhase, create_table_sql_from_mappings,
-    plan_arrow_schema_to_mssql_mappings,
+    PlanOptions, PlanOutcome, PlannedSchema, SchemaMapping, TableName, TimestampPolicy,
+    TimezonePolicy, UInt64Policy, WriteBackend, WriteOptions, WritePhase,
+    create_table_sql_from_mappings,
 };
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -34,6 +34,18 @@ const TEST_DATABASE_ENV: &str = "ARROW_TIBERIUS_TEST_MSSQL_DATABASE";
 static TABLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 type F16 = <Float16Type as ArrowPrimitiveType>::Native;
+
+fn plan_arrow_schema_to_mssql_mappings(
+    schema: impl AsRef<Schema>,
+    profile: MssqlProfile,
+    options: PlanOptions,
+) -> arrow_tiberius::Result<PlanOutcome<PlannedSchema>> {
+    profile.plan_arrow_schema(schema, options)
+}
+
+fn integration_mssql_profile() -> MssqlProfile {
+    MssqlProfile::sql_server_2017_compat_100()
+}
 
 #[test]
 fn sqlserver_integration_harness_is_configured() {
@@ -97,7 +109,7 @@ async fn baseline_writer_inserts_int32_and_utf8_batch() -> TestResult<()> {
     ]));
     let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
         Arc::clone(&schema),
-        MssqlProfile::sql_server_2016_compat_100(),
+        integration_mssql_profile(),
         PlanOptions::default(),
     )?
     .into_parts();
@@ -182,7 +194,7 @@ async fn baseline_writer_round_trips_supported_value_matrix() -> TestResult<()> 
     ]));
     let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
         Arc::clone(&schema),
-        MssqlProfile::sql_server_2016_compat_100(),
+        integration_mssql_profile(),
         PlanOptions::default(),
     )?
     .into_parts();
@@ -368,7 +380,7 @@ async fn writer_round_trips_empty_and_multi_batch_values_across_supported_backen
     ]));
     let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
         Arc::clone(&schema),
-        MssqlProfile::sql_server_2016_compat_100(),
+        integration_mssql_profile(),
         PlanOptions::default(),
     )?
     .into_parts();
@@ -514,7 +526,7 @@ async fn direct_raw_writer_round_trips_fixed_size_binary_with_variable_width_val
     ]));
     let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
         Arc::clone(&schema),
-        MssqlProfile::sql_server_2016_compat_100(),
+        integration_mssql_profile(),
         PlanOptions::default(),
     )?
     .into_parts();
@@ -613,7 +625,7 @@ async fn round_trip_fixed_size_binary_values(
     ]));
     let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
         Arc::clone(&schema),
-        MssqlProfile::sql_server_2016_compat_100(),
+        integration_mssql_profile(),
         PlanOptions::default(),
     )?
     .into_parts();
@@ -758,7 +770,7 @@ async fn direct_raw_writer_round_trips_fast_path_primitive_matrix() -> TestResul
     ]));
     let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
         Arc::clone(&schema),
-        MssqlProfile::sql_server_2016_compat_100(),
+        integration_mssql_profile(),
         PlanOptions::default(),
     )?
     .into_parts();
@@ -1079,7 +1091,7 @@ async fn writer_round_trips_float16_real_values_across_supported_backends() -> T
         ]));
         let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
             Arc::clone(&schema),
-            MssqlProfile::sql_server_2016_compat_100(),
+            integration_mssql_profile(),
             PlanOptions::default(),
         )?
         .into_parts();
@@ -1178,7 +1190,7 @@ async fn direct_raw_writer_round_trips_variable_width_matrix() -> TestResult<()>
     ]));
     let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
         Arc::clone(&schema),
-        MssqlProfile::sql_server_2016_compat_100(),
+        integration_mssql_profile(),
         PlanOptions::default(),
     )?
     .into_parts();
@@ -1406,7 +1418,7 @@ async fn direct_raw_writer_round_trips_large_variable_width_values() -> TestResu
     ]));
     let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
         Arc::clone(&schema),
-        MssqlProfile::sql_server_2016_compat_100(),
+        integration_mssql_profile(),
         PlanOptions::default(),
     )?
     .into_parts();
@@ -1530,7 +1542,7 @@ async fn direct_raw_writer_round_trips_large_binary_offsets_above_i32_boundary()
     ]));
     let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
         Arc::clone(&schema),
-        MssqlProfile::sql_server_2016_compat_100(),
+        integration_mssql_profile(),
         PlanOptions::default(),
     )?
     .into_parts();
@@ -1667,7 +1679,7 @@ async fn writer_round_trips_uint64_policy_values_across_supported_backends() -> 
     ]));
     let (decimal_mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
         Arc::clone(&decimal_schema),
-        MssqlProfile::sql_server_2016_compat_100(),
+        integration_mssql_profile(),
         PlanOptions {
             uint64_policy: UInt64Policy::Decimal20_0,
             ..PlanOptions::default()
@@ -1676,7 +1688,7 @@ async fn writer_round_trips_uint64_policy_values_across_supported_backends() -> 
     .into_parts();
     let (bigint_mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
         Arc::clone(&bigint_schema),
-        MssqlProfile::sql_server_2016_compat_100(),
+        integration_mssql_profile(),
         PlanOptions {
             uint64_policy: UInt64Policy::CheckedBigInt,
             ..PlanOptions::default()
@@ -1895,7 +1907,7 @@ async fn writer_rejects_uint64_checked_bigint_overflow_without_partial_insert() 
     ]));
     let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
         Arc::clone(&schema),
-        MssqlProfile::sql_server_2016_compat_100(),
+        integration_mssql_profile(),
         PlanOptions {
             uint64_policy: UInt64Policy::CheckedBigInt,
             ..PlanOptions::default()
@@ -2017,7 +2029,7 @@ async fn round_trip_decimal_policy_values(
     ]));
     let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
         Arc::clone(&schema),
-        MssqlProfile::sql_server_2016_compat_100(),
+        integration_mssql_profile(),
         PlanOptions {
             decimal_policy: DecimalPolicy::NormalizeNegativeScale,
             ..PlanOptions::default()
@@ -2216,7 +2228,7 @@ async fn round_trip_date32_values(backend: WriteBackend, test_name: &str) -> Tes
     ]));
     let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
         Arc::clone(&schema),
-        MssqlProfile::sql_server_2016_compat_100(),
+        integration_mssql_profile(),
         PlanOptions::default(),
     )?
     .into_parts();
@@ -2335,7 +2347,7 @@ async fn round_trip_date64_datetime2_values(
     ]));
     let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
         Arc::clone(&schema),
-        MssqlProfile::sql_server_2016_compat_100(),
+        integration_mssql_profile(),
         PlanOptions {
             date64_policy: Date64Policy::TimestampDateTime2,
             ..PlanOptions::default()
@@ -2477,7 +2489,7 @@ async fn round_trip_timezone_free_timestamp_datetime2_values(
     ]));
     let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
         Arc::clone(&schema),
-        MssqlProfile::sql_server_2016_compat_100(),
+        integration_mssql_profile(),
         plan_options,
     )?
     .into_parts();
@@ -2521,7 +2533,6 @@ async fn round_trip_timezone_free_timestamp_datetime2_values(
             mappings,
             WriteOptions {
                 backend,
-                plan_options,
                 ..WriteOptions::default()
             },
         )
@@ -2642,7 +2653,7 @@ async fn writer_round_trips_timezone_free_timestamp_datetime2_0_values_across_su
         ]));
         let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
             Arc::clone(&schema),
-            MssqlProfile::sql_server_2016_compat_100(),
+            integration_mssql_profile(),
             plan_options,
         )?
         .into_parts();
@@ -2671,7 +2682,6 @@ async fn writer_round_trips_timezone_free_timestamp_datetime2_0_values_across_su
                 mappings,
                 WriteOptions {
                     backend,
-                    plan_options,
                     ..WriteOptions::default()
                 },
             )
@@ -2770,7 +2780,7 @@ async fn writer_round_trips_timezone_free_timestamp_datetime2_3_values_across_su
         ]));
         let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
             Arc::clone(&schema),
-            MssqlProfile::sql_server_2016_compat_100(),
+            integration_mssql_profile(),
             plan_options,
         )?
         .into_parts();
@@ -2799,7 +2809,6 @@ async fn writer_round_trips_timezone_free_timestamp_datetime2_3_values_across_su
                 mappings,
                 WriteOptions {
                     backend,
-                    plan_options,
                     ..WriteOptions::default()
                 },
             )
@@ -2899,7 +2908,7 @@ async fn writer_round_trips_timezone_free_timestamp_datetime2_6_values_across_su
         ]));
         let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
             Arc::clone(&schema),
-            MssqlProfile::sql_server_2016_compat_100(),
+            integration_mssql_profile(),
             plan_options,
         )?
         .into_parts();
@@ -2928,7 +2937,6 @@ async fn writer_round_trips_timezone_free_timestamp_datetime2_6_values_across_su
                 mappings,
                 WriteOptions {
                     backend,
-                    plan_options,
                     ..WriteOptions::default()
                 },
             )
@@ -3027,7 +3035,7 @@ async fn writer_round_trips_timezone_free_timestamp_datetime_values_across_suppo
         ]));
         let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
             Arc::clone(&schema),
-            MssqlProfile::sql_server_2016_compat_100(),
+            integration_mssql_profile(),
             plan_options,
         )?
         .into_parts();
@@ -3057,7 +3065,6 @@ async fn writer_round_trips_timezone_free_timestamp_datetime_values_across_suppo
                 mappings,
                 WriteOptions {
                     backend,
-                    plan_options,
                     ..WriteOptions::default()
                 },
             )
@@ -3158,7 +3165,7 @@ async fn writer_round_trips_non_nullable_timestamp_ns_datetime_issue_171() -> Te
     ]));
     let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
         Arc::clone(&schema),
-        MssqlProfile::sql_server_2016_compat_100(),
+        integration_mssql_profile(),
         plan_options,
     )?
     .into_parts();
@@ -3213,7 +3220,6 @@ async fn writer_round_trips_non_nullable_timestamp_ns_datetime_issue_171() -> Te
                 mappings.clone(),
                 WriteOptions {
                     backend,
-                    plan_options,
                     ..WriteOptions::default()
                 },
             )
@@ -3303,7 +3309,7 @@ async fn writer_rejects_datetime_timestamp_out_of_range_without_partial_insert()
     ]));
     let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
         Arc::clone(&schema),
-        MssqlProfile::sql_server_2016_compat_100(),
+        integration_mssql_profile(),
         plan_options,
     )?
     .into_parts();
@@ -3333,7 +3339,6 @@ async fn writer_rejects_datetime_timestamp_out_of_range_without_partial_insert()
                 mappings.clone(),
                 WriteOptions {
                     backend,
-                    plan_options,
                     ..WriteOptions::default()
                 },
             )
@@ -3427,7 +3432,7 @@ async fn round_trip_timezone_aware_timestamp_normalized_datetime2_values(
     ]));
     let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
         Arc::clone(&schema),
-        MssqlProfile::sql_server_2016_compat_100(),
+        integration_mssql_profile(),
         plan_options,
     )?
     .into_parts();
@@ -3455,7 +3460,6 @@ async fn round_trip_timezone_aware_timestamp_normalized_datetime2_values(
             mappings,
             WriteOptions {
                 backend,
-                plan_options,
                 ..WriteOptions::default()
             },
         )
@@ -3548,7 +3552,7 @@ async fn writer_round_trips_timezone_aware_timestamp_normalized_datetime2_3_valu
         ]));
         let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
             Arc::clone(&schema),
-            MssqlProfile::sql_server_2016_compat_100(),
+            integration_mssql_profile(),
             plan_options,
         )?
         .into_parts();
@@ -3580,7 +3584,6 @@ async fn writer_round_trips_timezone_aware_timestamp_normalized_datetime2_3_valu
                 mappings,
                 WriteOptions {
                     backend,
-                    plan_options,
                     ..WriteOptions::default()
                 },
             )
@@ -3688,7 +3691,7 @@ async fn writer_round_trips_timezone_aware_timestamp_normalized_datetime_values_
         ]));
         let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
             Arc::clone(&schema),
-            MssqlProfile::sql_server_2016_compat_100(),
+            integration_mssql_profile(),
             plan_options,
         )?
         .into_parts();
@@ -3720,7 +3723,6 @@ async fn writer_round_trips_timezone_aware_timestamp_normalized_datetime_values_
                 mappings,
                 WriteOptions {
                     backend,
-                    plan_options,
                     ..WriteOptions::default()
                 },
             )
@@ -3853,7 +3855,7 @@ async fn round_trip_timezone_aware_timestamp_datetimeoffset_values(
     ]));
     let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
         Arc::clone(&schema),
-        MssqlProfile::sql_server_2016_compat_100(),
+        integration_mssql_profile(),
         plan_options,
     )?
     .into_parts();
@@ -3882,7 +3884,6 @@ async fn round_trip_timezone_aware_timestamp_datetimeoffset_values(
             mappings,
             WriteOptions {
                 backend,
-                plan_options,
                 ..WriteOptions::default()
             },
         )
@@ -3995,7 +3996,7 @@ async fn round_trip_time_only_values(backend: WriteBackend, test_name: &str) -> 
     ]));
     let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
         Arc::clone(&schema),
-        MssqlProfile::sql_server_2016_compat_100(),
+        integration_mssql_profile(),
         PlanOptions::default(),
     )?
     .into_parts();
@@ -4125,7 +4126,7 @@ async fn baseline_writer_rejects_decimal_precision_overflow_without_partial_inse
     ]));
     let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
         Arc::clone(&schema),
-        MssqlProfile::sql_server_2016_compat_100(),
+        integration_mssql_profile(),
         PlanOptions::default(),
     )?
     .into_parts();
@@ -4209,7 +4210,7 @@ async fn baseline_writer_rejects_target_table_schema_drift() -> TestResult<()> {
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
     let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
         Arc::clone(&schema),
-        MssqlProfile::sql_server_2016_compat_100(),
+        integration_mssql_profile(),
         PlanOptions::default(),
     )?
     .into_parts();
@@ -4263,10 +4264,14 @@ async fn baseline_writer_rejects_target_table_schema_drift() -> TestResult<()> {
         let mut writer = BulkWriter::new(
             &mut client,
             table.clone(),
-            vec![SchemaMapping::new(
-                ArrowFieldRef::new(0, "renamed_id".to_owned(), false, DataType::Int32),
-                MssqlColumn::new(Identifier::new("renamed_id")?, MssqlType::Int, false),
-            )],
+            PlannedSchema::new(
+                integration_mssql_profile(),
+                PlanOptions::default(),
+                vec![SchemaMapping::new(
+                    ArrowFieldRef::new(0, "renamed_id".to_owned(), false, DataType::Int32),
+                    MssqlColumn::new(Identifier::new("renamed_id")?, MssqlType::Int, false),
+                )],
+            ),
             WriteOptions {
                 backend: WriteBackend::BaselineTokenRow,
                 ..WriteOptions::default()
@@ -4344,7 +4349,11 @@ async fn direct_raw_writer_rejects_unsupported_schema_without_partial_insert() -
         let err = match BulkWriter::new(
             &mut client,
             table.clone(),
-            mappings,
+            PlannedSchema::new(
+                integration_mssql_profile(),
+                PlanOptions::default(),
+                mappings,
+            ),
             WriteOptions {
                 backend: WriteBackend::DirectRawBulk,
                 ..WriteOptions::default()

@@ -6,7 +6,7 @@ use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use arrow_tiberius::{
     BulkWriter, MssqlProfile, PlanOptions, TableName, WriteBackend, WriteOptions,
-    create_table_sql_from_mappings, plan_arrow_schema_to_mssql_mappings,
+    create_table_sql_from_mappings,
 };
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -36,13 +36,11 @@ async fn main() -> ExampleResult<()> {
     let schema = example_schema();
     let batches = example_batches(schema.clone())?;
 
-    let outcome = plan_arrow_schema_to_mssql_mappings(
-        schema.as_ref(),
-        MssqlProfile::sql_server_2016_compat_100(),
-        PlanOptions::default(),
-    )?;
-    let mappings = outcome.value().to_vec();
-    let create_table_sql = create_table_sql_from_mappings(&config.table, &mappings);
+    let profile = MssqlProfile::sql_server_2016_compat_100();
+    let planned_schema = profile
+        .plan_arrow_schema(schema.as_ref(), PlanOptions::default())?
+        .into_value();
+    let create_table_sql = create_table_sql_from_mappings(&config.table, &planned_schema);
 
     let mut client = connect(&connection_string).await?;
 
@@ -61,7 +59,7 @@ async fn main() -> ExampleResult<()> {
     let mut writer = BulkWriter::new(
         &mut client,
         config.table.clone(),
-        mappings,
+        planned_schema,
         WriteOptions {
             backend: WriteBackend::DirectRawBulk,
             ..WriteOptions::default()

@@ -289,7 +289,7 @@ fn bind_direct_columns<'a>(
             ) => BoundDirectColumn::TimestampNanosecond {
                 column,
                 mapping: encoder.mapping_for_column_index(column_index)?,
-                nanosecond_policy: encoder.plan_options.nanosecond_policy,
+                nanosecond_policy: encoder.runtime_context.nanosecond_policy(),
                 array: downcast_direct_array::<TimestampNanosecondArray>(array, column)?,
             },
             DirectColumnEncoding::Temporal(TemporalArrowToMssql::Time32SecondToTime) => {
@@ -317,7 +317,7 @@ fn bind_direct_columns<'a>(
                 BoundDirectColumn::Time64Nanosecond {
                     column,
                     mapping: encoder.mapping_for_column_index(column_index)?,
-                    nanosecond_policy: encoder.plan_options.nanosecond_policy,
+                    nanosecond_policy: encoder.runtime_context.nanosecond_policy(),
                     array: downcast_direct_array::<Time64NanosecondArray>(array, column)?,
                 }
             }
@@ -347,7 +347,7 @@ fn bind_direct_columns<'a>(
             ) => BoundDirectColumn::DateTimeOffsetNanosecond {
                 column,
                 mapping: encoder.mapping_for_column_index(column_index)?,
-                nanosecond_policy: encoder.plan_options.nanosecond_policy,
+                nanosecond_policy: encoder.runtime_context.nanosecond_policy(),
                 array: downcast_direct_array::<TimestampNanosecondArray>(array, column)?,
             },
         };

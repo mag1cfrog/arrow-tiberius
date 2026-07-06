@@ -6,7 +6,7 @@ use arrow_array::RecordBatch;
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
-use crate::{BulkWriter, Error, Result, SchemaMapping, TableName, WriteOptions, WriteStats};
+use crate::{BulkWriter, Error, PlannedSchema, Result, TableName, WriteOptions, WriteStats};
 
 type CompatibleMssqlTransport = Compat<TcpStream>;
 
@@ -144,10 +144,10 @@ impl ConnectedMssqlClient {
     pub async fn bulk_writer(
         &mut self,
         table: TableName,
-        mappings: Vec<SchemaMapping>,
+        planned_schema: PlannedSchema,
         options: WriteOptions,
     ) -> Result<ConnectedBulkWriter<'_>> {
-        let writer = BulkWriter::new(&mut self.client, table, mappings, options).await?;
+        let writer = BulkWriter::new(&mut self.client, table, planned_schema, options).await?;
 
         Ok(ConnectedBulkWriter { writer })
     }

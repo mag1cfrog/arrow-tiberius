@@ -252,6 +252,11 @@ impl<T> PlanOutcome<T> {
     pub fn into_parts(self) -> (T, DiagnosticSet) {
         (self.value, self.diagnostics)
     }
+
+    /// Consumes this outcome into its planned value.
+    pub fn into_value(self) -> T {
+        self.value
+    }
 }
 
 #[cfg(test)]
