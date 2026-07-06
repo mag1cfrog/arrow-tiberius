@@ -3136,6 +3136,128 @@ async fn writer_round_trips_timezone_free_timestamp_datetime_values_across_suppo
 }
 
 #[tokio::test]
+async fn direct_raw_writer_reports_finalize_failure_for_non_nullable_timestamp_ns_datetime()
+-> TestResult<()> {
+    let Some((connection_string, database)) = integration_config() else {
+        eprintln!(
+            "skipping SQL Server issue 171 direct raw datetime finalize diagnostic integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+        );
+        return Ok(());
+    };
+
+    let plan_options = PlanOptions {
+        timestamp_policy: TimestampPolicy::DateTime,
+        ..PlanOptions::default()
+    };
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+    ]));
+    let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
+        Arc::clone(&schema),
+        MssqlProfile::sql_server_2016_compat_100(),
+        plan_options,
+    )?
+    .into_parts();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1_i32, 2, 3])) as ArrayRef,
+            Arc::new(TimestampNanosecondArray::from(vec![
+                1_780_529_793_687_000_000_i64,
+                1_778_615_767_493_000_000_i64,
+                1_774_840_482_427_000_000_i64,
+            ])),
+        ],
+    )?;
+
+    for backend in [WriteBackend::BaselineTokenRow, WriteBackend::DirectRawBulk] {
+        let mut client = connect(&connection_string, &database).await?;
+        let table = unique_table_name()?;
+
+        execute_sql(
+            &mut client,
+            create_table_sql_from_mappings(&table, &mappings),
+        )
+        .await?;
+
+        let result = async {
+            let mut writer = BulkWriter::new(
+                &mut client,
+                table.clone(),
+                mappings.clone(),
+                WriteOptions {
+                    backend,
+                    plan_options,
+                    ..WriteOptions::default()
+                },
+            )
+            .await?;
+            let stats = writer.write_batch(&batch).await?;
+
+            ensure_eq(
+                stats.rows_written,
+                3,
+                "issue 171 timestamp datetime rows_written",
+            )?;
+
+            if backend == WriteBackend::BaselineTokenRow {
+                ensure_eq(
+                    writer.finish().await?,
+                    stats,
+                    "issue 171 baseline finish stats",
+                )?;
+                return Ok::<(), Box<dyn std::error::Error>>(());
+            }
+
+            let err = match writer.finish().await {
+                Ok(_stats) => {
+                    return Err(test_error(
+                        "issue 171 DirectRawBulk non-null timestamp datetime unexpectedly finalized",
+                    ));
+                }
+                Err(err) => err,
+            };
+
+            ensure_eq(err.write_phase(), Some(WritePhase::Finalize), "write phase")?;
+            ensure_eq(
+                err.to_string().as_str(),
+                "write phase finalize failed",
+                "redacted display",
+            )?;
+
+            let info = err.safe_error_info();
+            ensure_eq(info.phase(), Some(WritePhase::Finalize), "safe phase")?;
+            ensure_eq(info.kind(), "Tiberius", "safe error kind")?;
+            ensure_eq(
+                info.summary(),
+                "tiberius operation failed",
+                "safe error summary",
+            )?;
+            ensure_eq(
+                info.diagnostic_codes().as_str(),
+                "",
+                "safe diagnostic codes",
+            )?;
+            ensure(info.diagnostics().is_none(), "safe diagnostics")?;
+
+            Ok::<(), Box<dyn std::error::Error>>(())
+        }
+        .await;
+
+        let drop_result = drop_table(&mut client, &table).await;
+        result?;
+        drop_result?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn writer_rejects_datetime_timestamp_out_of_range_without_partial_insert() -> TestResult<()> {
     let Some((connection_string, database)) = integration_config() else {
         eprintln!(
