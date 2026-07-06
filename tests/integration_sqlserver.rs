@@ -3136,11 +3136,10 @@ async fn writer_round_trips_timezone_free_timestamp_datetime_values_across_suppo
 }
 
 #[tokio::test]
-async fn direct_raw_writer_reports_finalize_failure_for_non_nullable_timestamp_ns_datetime()
--> TestResult<()> {
+async fn writer_round_trips_non_nullable_timestamp_ns_datetime_issue_171() -> TestResult<()> {
     let Some((connection_string, database)) = integration_config() else {
         eprintln!(
-            "skipping SQL Server issue 171 direct raw datetime finalize diagnostic integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+            "skipping SQL Server issue 171 timestamp datetime round-trip integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
         );
         return Ok(());
     };
@@ -3163,15 +3162,37 @@ async fn direct_raw_writer_reports_finalize_failure_for_non_nullable_timestamp_n
         plan_options,
     )?
     .into_parts();
+    let cases = [
+        (
+            1_i32,
+            1_780_529_793_687_000_000_i64,
+            "2026-06-03T23:36:33.687000",
+        ),
+        (2, 1_778_615_767_493_000_000, "2026-05-12T19:56:07.493000"),
+        (3, 1_774_840_482_427_000_000, "2026-03-30T03:14:42.427000"),
+    ];
+    let expected_values_sql = cases
+        .iter()
+        .map(|(row_id, _nanos, literal)| {
+            format!("({row_id}, CAST(CAST(N'{literal}' AS datetime2(6)) AS datetime))")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     let batch = RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(Int32Array::from(vec![1_i32, 2, 3])) as ArrayRef,
-            Arc::new(TimestampNanosecondArray::from(vec![
-                1_780_529_793_687_000_000_i64,
-                1_778_615_767_493_000_000_i64,
-                1_774_840_482_427_000_000_i64,
-            ])),
+            Arc::new(Int32Array::from(
+                cases
+                    .iter()
+                    .map(|(row_id, _nanos, _literal)| *row_id)
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(TimestampNanosecondArray::from(
+                cases
+                    .iter()
+                    .map(|(_row_id, nanos, _literal)| *nanos)
+                    .collect::<Vec<_>>(),
+            )),
         ],
     )?;
 
@@ -3201,49 +3222,50 @@ async fn direct_raw_writer_reports_finalize_failure_for_non_nullable_timestamp_n
 
             ensure_eq(
                 stats.rows_written,
-                3,
+                cases.len() as u64,
                 "issue 171 timestamp datetime rows_written",
             )?;
+            ensure_eq(
+                writer.finish().await?,
+                stats,
+                "issue 171 timestamp datetime finish stats",
+            )?;
 
-            if backend == WriteBackend::BaselineTokenRow {
+            let actual_rows = client
+                .simple_query(format!(
+                    "SELECT [id], CONVERT(varchar(40), [event_time], 126) FROM {} ORDER BY [id]",
+                    table.quoted_sql()
+                ))
+                .await?
+                .into_first_result()
+                .await?;
+            let expected_rows = client
+                .simple_query(format!(
+                    "SELECT [id], CONVERT(varchar(40), [expected_at], 126) FROM (VALUES {expected_values_sql}) AS v([id], [expected_at]) ORDER BY [id]"
+                ))
+                .await?
+                .into_first_result()
+                .await?;
+
+            ensure_eq(
+                actual_rows.len(),
+                expected_rows.len(),
+                "issue 171 timestamp datetime row count",
+            )?;
+            for (index, (actual, expected)) in
+                actual_rows.iter().zip(expected_rows.iter()).enumerate()
+            {
                 ensure_eq(
-                    writer.finish().await?,
-                    stats,
-                    "issue 171 baseline finish stats",
+                    actual.get::<i32, _>(0),
+                    expected.get::<i32, _>(0),
+                    &format!("issue 171 timestamp datetime row {index} id"),
                 )?;
-                return Ok::<(), Box<dyn std::error::Error>>(());
+                ensure_eq(
+                    actual.get::<&str, _>(1),
+                    expected.get::<&str, _>(1),
+                    &format!("issue 171 timestamp datetime row {index} value"),
+                )?;
             }
-
-            let err = match writer.finish().await {
-                Ok(_stats) => {
-                    return Err(test_error(
-                        "issue 171 DirectRawBulk non-null timestamp datetime unexpectedly finalized",
-                    ));
-                }
-                Err(err) => err,
-            };
-
-            ensure_eq(err.write_phase(), Some(WritePhase::Finalize), "write phase")?;
-            ensure_eq(
-                err.to_string().as_str(),
-                "write phase finalize failed",
-                "redacted display",
-            )?;
-
-            let info = err.safe_error_info();
-            ensure_eq(info.phase(), Some(WritePhase::Finalize), "safe phase")?;
-            ensure_eq(info.kind(), "Tiberius", "safe error kind")?;
-            ensure_eq(
-                info.summary(),
-                "tiberius operation failed",
-                "safe error summary",
-            )?;
-            ensure_eq(
-                info.diagnostic_codes().as_str(),
-                "",
-                "safe diagnostic codes",
-            )?;
-            ensure(info.diagnostics().is_none(), "safe diagnostics")?;
 
             Ok::<(), Box<dyn std::error::Error>>(())
         }

@@ -50,9 +50,10 @@ use super::super::{
 pub(crate) use value::{
     NULL_TEMPORAL_CELL_LEN, append_date_cell, append_datetime_cell, append_datetime2_cell,
     append_datetimeoffset_cell, append_null_temporal_cell, append_time_cell, date_cell_len,
-    datetime_cell_len, datetime2_cell_len, datetimeoffset_cell_len, mssql_date_from_arrow_date32,
-    mssql_datetime2_from_arrow_date64, time_cell_len, write_date_cell, write_datetime_cell,
-    write_datetime2_cell, write_datetimeoffset_cell, write_null_temporal_cell, write_time_cell,
+    datetime_cell_len, datetime_payload_len, datetime2_cell_len, datetimeoffset_cell_len,
+    mssql_date_from_arrow_date32, mssql_datetime2_from_arrow_date64, time_cell_len,
+    write_date_cell, write_datetime_cell, write_datetime_payload, write_datetime2_cell,
+    write_datetimeoffset_cell, write_null_temporal_cell, write_time_cell,
 };
 
 #[derive(Clone, Copy)]
@@ -122,7 +123,7 @@ pub(crate) fn measure_timestamp_second_column_cell_lengths(
                 row_index,
                 NanosecondPolicy::default(),
             )
-            .and_then(temporal_value_cell_len)
+            .and_then(|value| temporal_value_cell_len(context.column, value))
         },
     )
 }
@@ -147,7 +148,7 @@ pub(crate) fn measure_timestamp_millisecond_column_cell_lengths(
                 row_index,
                 NanosecondPolicy::default(),
             )
-            .and_then(temporal_value_cell_len)
+            .and_then(|value| temporal_value_cell_len(context.column, value))
         },
     )
 }
@@ -172,7 +173,7 @@ pub(crate) fn measure_timestamp_microsecond_column_cell_lengths(
                 row_index,
                 NanosecondPolicy::default(),
             )
-            .and_then(temporal_value_cell_len)
+            .and_then(|value| temporal_value_cell_len(context.column, value))
         },
     )
 }
@@ -197,7 +198,7 @@ pub(crate) fn measure_timestamp_nanosecond_column_cell_lengths(
                 row_index,
                 context.plan_options.nanosecond_policy,
             )
-            .and_then(temporal_value_cell_len)
+            .and_then(|value| temporal_value_cell_len(context.column, value))
         },
     )
 }
@@ -691,7 +692,7 @@ pub(crate) fn append_timestamp_second_cell(
                 row_index,
                 NanosecondPolicy::default(),
             )?;
-            Ok((temporal_value_cell_len(value)?, value))
+            Ok((temporal_value_cell_len(column, value)?, value))
         },
     )
 }
@@ -719,7 +720,7 @@ pub(crate) fn append_timestamp_millisecond_cell(
                 row_index,
                 NanosecondPolicy::default(),
             )?;
-            Ok((temporal_value_cell_len(value)?, value))
+            Ok((temporal_value_cell_len(column, value)?, value))
         },
     )
 }
@@ -747,7 +748,7 @@ pub(crate) fn append_timestamp_microsecond_cell(
                 row_index,
                 NanosecondPolicy::default(),
             )?;
-            Ok((temporal_value_cell_len(value)?, value))
+            Ok((temporal_value_cell_len(column, value)?, value))
         },
     )
 }
@@ -771,7 +772,7 @@ pub(crate) fn append_timestamp_nanosecond_cell(
         |array, mapping, row_index| {
             let value =
                 timestamp_nanosecond_value(array, mapping, column, row_index, nanosecond_policy)?;
-            Ok((temporal_value_cell_len(value)?, value))
+            Ok((temporal_value_cell_len(column, value)?, value))
         },
     )
 }
@@ -1322,9 +1323,7 @@ where
         TemporalValue::DateTime2(value) => {
             append_datetime2_cell(buf, value).map_err(|err| add_temporal_field(err, column))
         }
-        TemporalValue::DateTime(value) => {
-            append_datetime_cell(buf, value).map_err(|err| add_temporal_field(err, column))
-        }
+        TemporalValue::DateTime(value) => append_direct_datetime_cell(buf, column, value),
         TemporalValue::DateTimeOffset(value) => {
             append_datetimeoffset_cell(buf, value).map_err(|err| add_temporal_field(err, column))
         }
@@ -1340,12 +1339,12 @@ enum TemporalValue {
     DateTimeOffset(MssqlDateTimeOffset),
 }
 
-fn temporal_value_cell_len(value: TemporalValue) -> Result<usize> {
+fn temporal_value_cell_len(column: &DirectColumnPlan, value: TemporalValue) -> Result<usize> {
     match value {
         TemporalValue::Date(_) => Ok(date_cell_len()),
         TemporalValue::Time(value) => time_cell_len_for_value(value),
         TemporalValue::DateTime2(value) => datetime2_cell_len_for_value(value),
-        TemporalValue::DateTime(value) => Ok(datetime_cell_len_for_value(value)),
+        TemporalValue::DateTime(value) => Ok(datetime_cell_len_for_column(column, value)),
         TemporalValue::DateTimeOffset(value) => datetimeoffset_cell_len_for_value(value),
     }
 }
@@ -1354,8 +1353,12 @@ fn datetime2_cell_len_for_value(value: MssqlDateTime2) -> Result<usize> {
     datetime2_cell_len(value.time().scale())
 }
 
-fn datetime_cell_len_for_value(_value: MssqlDateTime) -> usize {
-    datetime_cell_len()
+fn datetime_cell_len_for_column(column: &DirectColumnPlan, _value: MssqlDateTime) -> usize {
+    if column.nullable() {
+        datetime_cell_len()
+    } else {
+        datetime_payload_len()
+    }
 }
 
 fn time_cell_len_for_value(value: MssqlTime) -> Result<usize> {
@@ -1364,6 +1367,21 @@ fn time_cell_len_for_value(value: MssqlTime) -> Result<usize> {
 
 fn datetimeoffset_cell_len_for_value(value: MssqlDateTimeOffset) -> Result<usize> {
     datetimeoffset_cell_len(value.datetime2().time().scale())
+}
+
+fn append_direct_datetime_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    column: &DirectColumnPlan,
+    value: MssqlDateTime,
+) -> Result<()> {
+    if column.nullable() {
+        append_datetime_cell(buf, value).map_err(|err| add_temporal_field(err, column))
+    } else {
+        let mut bytes = [0; datetime_payload_len()];
+        write_datetime_payload(&mut bytes, value).map_err(|err| add_temporal_field(err, column))?;
+        buf.extend_from_slice(&bytes);
+        Ok(())
+    }
 }
 
 fn null_temporal_cell_len_for_column(column: &DirectColumnPlan, row_index: usize) -> Result<usize> {
@@ -1474,7 +1492,7 @@ fn write_direct_datetime_cell(
     column: &DirectColumnPlan,
     value: MssqlDateTime,
 ) -> Result<()> {
-    let expected_len = datetime_cell_len_for_value(value);
+    let expected_len = datetime_cell_len_for_column(column, value);
     if cell.len() != expected_len {
         return Err(invalid_payload(format!(
             "datetime cell at row {} column {} has length {}, expected {expected_len}",
@@ -1485,7 +1503,11 @@ fn write_direct_datetime_cell(
     }
 
     let cell_bytes = cell_bytes_mut(bytes, cell)?;
-    write_datetime_cell(cell_bytes, value).map_err(|err| add_temporal_field(err, column))
+    if column.nullable() {
+        write_datetime_cell(cell_bytes, value).map_err(|err| add_temporal_field(err, column))
+    } else {
+        write_datetime_payload(cell_bytes, value).map_err(|err| add_temporal_field(err, column))
+    }
 }
 
 fn write_direct_datetime2_cell(
