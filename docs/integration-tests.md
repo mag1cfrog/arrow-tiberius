@@ -56,7 +56,7 @@ SQL Server is configured with:
 ALTER DATABASE [arrow_tiberius_integration] SET COMPATIBILITY_LEVEL = 100;
 ```
 
-This gives local coverage for the SQL Server 2016 compatibility-level-100 target behavior using a SQL Server 2017 Linux container.
+This gives local coverage for SQL Server 2017 running at database compatibility level 100, matching the profile used by the integration harness.
 
 ## Existing SQL Server
 

@@ -4104,7 +4104,7 @@ fn benchmark_mappings_for_schema_with_options(
     schema: SchemaRef,
     plan_options: PlanOptions,
 ) -> Result<PlannedSchema, WriterBenchError> {
-    let profile = MssqlProfile::sql_server_2016_compat_100();
+    let profile = MssqlProfile::sql_server_2017_compat_100();
     let planned_schema = profile
         .plan_arrow_schema(schema, plan_options)
         .map_err(WriterBenchError::ArrowTiberius)?
