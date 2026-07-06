@@ -44,6 +44,11 @@ pub(crate) const fn datetime_cell_len() -> usize {
     NULL_TEMPORAL_CELL_LEN + DATETIME_PAYLOAD_LEN
 }
 
+/// Returns the byte length of a fixed SQL Server `datetime` payload.
+pub(crate) const fn datetime_payload_len() -> usize {
+    DATETIME_PAYLOAD_LEN
+}
+
 /// Returns the byte length of a non-null SQL Server `datetimeoffset(p)` cell.
 pub(crate) fn datetimeoffset_cell_len(precision: u8) -> Result<usize> {
     Ok(NULL_TEMPORAL_CELL_LEN
@@ -127,10 +132,23 @@ pub(crate) fn write_datetime_cell(dst: &mut [u8], value: MssqlDateTime) -> Resul
         )));
     }
 
-    validate_datetime(value)?;
     dst[0] = DATETIME_PAYLOAD_LEN as u8;
-    dst[1..5].copy_from_slice(&value.days().to_le_bytes());
-    dst[5..9].copy_from_slice(&value.seconds_fragments().to_le_bytes());
+    write_datetime_payload(&mut dst[1..], value)
+}
+
+/// Writes a fixed SQL Server `datetime` payload into an exactly sized buffer.
+pub(crate) fn write_datetime_payload(dst: &mut [u8], value: MssqlDateTime) -> Result<()> {
+    let expected_len = datetime_payload_len();
+    if dst.len() != expected_len {
+        return Err(invalid_payload(format!(
+            "datetime payload has length {}, expected {expected_len}",
+            dst.len()
+        )));
+    }
+
+    validate_datetime(value)?;
+    dst[..4].copy_from_slice(&value.days().to_le_bytes());
+    dst[4..8].copy_from_slice(&value.seconds_fragments().to_le_bytes());
     Ok(())
 }
 

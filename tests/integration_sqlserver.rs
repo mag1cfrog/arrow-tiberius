@@ -3136,6 +3136,150 @@ async fn writer_round_trips_timezone_free_timestamp_datetime_values_across_suppo
 }
 
 #[tokio::test]
+async fn writer_round_trips_non_nullable_timestamp_ns_datetime_issue_171() -> TestResult<()> {
+    let Some((connection_string, database)) = integration_config() else {
+        eprintln!(
+            "skipping SQL Server issue 171 timestamp datetime round-trip integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+        );
+        return Ok(());
+    };
+
+    let plan_options = PlanOptions {
+        timestamp_policy: TimestampPolicy::DateTime,
+        ..PlanOptions::default()
+    };
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+    ]));
+    let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
+        Arc::clone(&schema),
+        MssqlProfile::sql_server_2016_compat_100(),
+        plan_options,
+    )?
+    .into_parts();
+    let cases = [
+        (
+            1_i32,
+            1_780_529_793_687_000_000_i64,
+            "2026-06-03T23:36:33.687000",
+        ),
+        (2, 1_778_615_767_493_000_000, "2026-05-12T19:56:07.493000"),
+        (3, 1_774_840_482_427_000_000, "2026-03-30T03:14:42.427000"),
+    ];
+    let expected_values_sql = cases
+        .iter()
+        .map(|(row_id, _nanos, literal)| {
+            format!("({row_id}, CAST(CAST(N'{literal}' AS datetime2(6)) AS datetime))")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(
+                cases
+                    .iter()
+                    .map(|(row_id, _nanos, _literal)| *row_id)
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(TimestampNanosecondArray::from(
+                cases
+                    .iter()
+                    .map(|(_row_id, nanos, _literal)| *nanos)
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+
+    for backend in [WriteBackend::BaselineTokenRow, WriteBackend::DirectRawBulk] {
+        let mut client = connect(&connection_string, &database).await?;
+        let table = unique_table_name()?;
+
+        execute_sql(
+            &mut client,
+            create_table_sql_from_mappings(&table, &mappings),
+        )
+        .await?;
+
+        let result = async {
+            let mut writer = BulkWriter::new(
+                &mut client,
+                table.clone(),
+                mappings.clone(),
+                WriteOptions {
+                    backend,
+                    plan_options,
+                    ..WriteOptions::default()
+                },
+            )
+            .await?;
+            let stats = writer.write_batch(&batch).await?;
+
+            ensure_eq(
+                stats.rows_written,
+                cases.len() as u64,
+                "issue 171 timestamp datetime rows_written",
+            )?;
+            ensure_eq(
+                writer.finish().await?,
+                stats,
+                "issue 171 timestamp datetime finish stats",
+            )?;
+
+            let actual_rows = client
+                .simple_query(format!(
+                    "SELECT [id], CONVERT(varchar(40), [event_time], 126) FROM {} ORDER BY [id]",
+                    table.quoted_sql()
+                ))
+                .await?
+                .into_first_result()
+                .await?;
+            let expected_rows = client
+                .simple_query(format!(
+                    "SELECT [id], CONVERT(varchar(40), [expected_at], 126) FROM (VALUES {expected_values_sql}) AS v([id], [expected_at]) ORDER BY [id]"
+                ))
+                .await?
+                .into_first_result()
+                .await?;
+
+            ensure_eq(
+                actual_rows.len(),
+                expected_rows.len(),
+                "issue 171 timestamp datetime row count",
+            )?;
+            for (index, (actual, expected)) in
+                actual_rows.iter().zip(expected_rows.iter()).enumerate()
+            {
+                ensure_eq(
+                    actual.get::<i32, _>(0),
+                    expected.get::<i32, _>(0),
+                    &format!("issue 171 timestamp datetime row {index} id"),
+                )?;
+                ensure_eq(
+                    actual.get::<&str, _>(1),
+                    expected.get::<&str, _>(1),
+                    &format!("issue 171 timestamp datetime row {index} value"),
+                )?;
+            }
+
+            Ok::<(), Box<dyn std::error::Error>>(())
+        }
+        .await;
+
+        let drop_result = drop_table(&mut client, &table).await;
+        result?;
+        drop_result?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn writer_rejects_datetime_timestamp_out_of_range_without_partial_insert() -> TestResult<()> {
     let Some((connection_string, database)) = integration_config() else {
         eprintln!(

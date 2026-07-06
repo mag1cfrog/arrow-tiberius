@@ -56,10 +56,10 @@ use super::super::{
     row_column_diagnostic,
     types::primitive::uint64_checked_bigint_bytes,
     types::temporal::{
-        date_cell_len, datetime_cell_len, datetime2_cell_len, datetimeoffset_cell_len,
-        mssql_date_from_arrow_date32, mssql_datetime2_from_arrow_date64, time_cell_len,
-        write_date_cell, write_datetime_cell, write_datetime2_cell, write_datetimeoffset_cell,
-        write_time_cell,
+        date_cell_len, datetime_cell_len, datetime_payload_len, datetime2_cell_len,
+        datetimeoffset_cell_len, mssql_date_from_arrow_date32, mssql_datetime2_from_arrow_date64,
+        time_cell_len, write_date_cell, write_datetime_cell, write_datetime_payload,
+        write_datetime2_cell, write_datetimeoffset_cell, write_time_cell,
     },
     value_conversion_error,
 };
@@ -923,7 +923,8 @@ fn fixed_width_non_null_cell_len(column: &DirectColumnPlan) -> Option<usize> {
             | TemporalArrowToMssql::TimestampMicrosecondTzToDateTime
             | TemporalArrowToMssql::TimestampNanosecondTzToDateTime,
         ) => match column.target_type() {
-            MssqlType::DateTime => Some(datetime_cell_len()),
+            MssqlType::DateTime if column.nullable() => Some(datetime_cell_len()),
+            MssqlType::DateTime => Some(datetime_payload_len()),
             MssqlType::DateTime2 { precision } => Some(datetime2_cell_len(*precision).ok()?),
             _ => None,
         },
@@ -1422,11 +1423,11 @@ where
 
         validate_mapping_timestamp_timezone_metadata(mapping, row_index)?;
         let value = value(array, mapping, column, row_index, nanosecond_policy)?;
-        let cell_len = timestamp_fixed_width_value_len(value)?;
+        let cell_len = timestamp_fixed_width_value_len(column, value)?;
         let cell_bytes = bytes.get_mut(offset..offset + cell_len).ok_or_else(|| {
             invalid_payload("fixed-width timestamp temporal cell range is outside payload")
         })?;
-        write_timestamp_fixed_width_value(cell_bytes, value)?;
+        write_timestamp_fixed_width_value(cell_bytes, column, value)?;
         *current_offset += cell_len;
     }
 
@@ -1497,19 +1498,27 @@ fn timestamp_fixed_width_value(
     }
 }
 
-fn timestamp_fixed_width_value_len(value: TimestampFixedWidthValue) -> Result<usize> {
+fn timestamp_fixed_width_value_len(
+    column: &DirectColumnPlan,
+    value: TimestampFixedWidthValue,
+) -> Result<usize> {
     match value {
-        TimestampFixedWidthValue::DateTime(_) => Ok(datetime_cell_len()),
+        TimestampFixedWidthValue::DateTime(_) if column.nullable() => Ok(datetime_cell_len()),
+        TimestampFixedWidthValue::DateTime(_) => Ok(datetime_payload_len()),
         TimestampFixedWidthValue::DateTime2(value) => datetime2_cell_len(value.time().scale()),
     }
 }
 
 fn write_timestamp_fixed_width_value(
     cell_bytes: &mut [u8],
+    column: &DirectColumnPlan,
     value: TimestampFixedWidthValue,
 ) -> Result<()> {
     match value {
-        TimestampFixedWidthValue::DateTime(value) => write_datetime_cell(cell_bytes, value),
+        TimestampFixedWidthValue::DateTime(value) if column.nullable() => {
+            write_datetime_cell(cell_bytes, value)
+        }
+        TimestampFixedWidthValue::DateTime(value) => write_datetime_payload(cell_bytes, value),
         TimestampFixedWidthValue::DateTime2(value) => write_datetime2_cell(cell_bytes, value),
     }
 }

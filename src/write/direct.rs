@@ -856,24 +856,24 @@ mod tests {
 
         let payload = encoder.encode_batch(&batch).unwrap();
 
-        assert_eq!(payload.row_token_offsets(), [0, 50]);
+        assert_eq!(payload.row_token_offsets(), [0, 46]);
         assert_eq!(
             payload.bytes(),
             expected_rows([
                 [
                     bounded_nvarchar_cell("a"),
-                    datetime_cell(25_567, 300),
-                    datetime_cell(25_567, 0),
-                    datetime_cell(25_567, 1),
-                    datetime_cell(25_567, 1),
+                    datetime_payload(25_567, 300),
+                    datetime_payload(25_567, 0),
+                    datetime_payload(25_567, 1),
+                    datetime_payload(25_567, 1),
                     datetime_cell(25_568, 0),
                 ],
                 [
                     bounded_nvarchar_cell("b"),
-                    datetime_cell(25_566, 25_919_700),
-                    datetime_cell(25_568, 0),
-                    datetime_cell(25_567, 0),
-                    datetime_cell(25_567, 0),
+                    datetime_payload(25_566, 25_919_700),
+                    datetime_payload(25_568, 0),
+                    datetime_payload(25_567, 0),
+                    datetime_payload(25_567, 0),
                     null_cell(),
                 ],
             ])
@@ -920,7 +920,10 @@ mod tests {
         .encode_batch(&batch)
         .unwrap();
 
-        assert_eq!(round.bytes(), expected_rows([[datetime_cell(25_567, 0)]]));
+        assert_eq!(
+            round.bytes(),
+            expected_rows([[datetime_payload(25_567, 0)]])
+        );
     }
 
     #[test]
@@ -3027,17 +3030,67 @@ mod tests {
             .unwrap()
             .expect("fixed-width timestamp datetime fast path should be active");
 
-        assert_eq!(payload.row_token_offsets(), [0, 23]);
+        assert_eq!(payload.row_token_offsets(), [0, 22]);
         assert_eq!(
             payload.bytes(),
             expected_rows([
                 [
                     int32_cell(1),
                     datetime_cell(25_567, 1),
-                    datetime_cell(25_567, 1),
+                    datetime_payload(25_567, 1),
                 ],
-                [int32_cell(2), null_cell(), datetime_cell(25_567, 0)],
+                [int32_cell(2), null_cell(), datetime_payload(25_567, 0)],
             ])
+        );
+    }
+
+    #[test]
+    fn direct_encoder_fixed_width_datetime_uses_fixed_payload_for_non_nullable_column() {
+        let mappings = vec![
+            mapping(
+                0,
+                "required_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                MssqlType::DateTime,
+                false,
+            ),
+            mapping(
+                1,
+                "optional_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                MssqlType::DateTime,
+                true,
+            ),
+        ];
+        let encoder = DirectEncoder::new(&mappings).unwrap();
+        let batch = record_batch(
+            vec![
+                Field::new(
+                    "required_at",
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    false,
+                ),
+                Field::new(
+                    "optional_at",
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    true,
+                ),
+            ],
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![1_700_000_i64])) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(vec![Some(1_700_000_i64)])),
+            ],
+        );
+
+        let bound = BoundDirectBatch::new(&encoder, &batch).unwrap();
+        let payload = try_encode_fixed_width_rows(&bound)
+            .unwrap()
+            .expect("fixed-width timestamp datetime fast path should be active");
+
+        assert_eq!(payload.row_token_offsets(), [0]);
+        assert_eq!(
+            payload.bytes(),
+            expected_rows([[datetime_payload(25_567, 1), datetime_cell(25_567, 1),]])
         );
     }
 
@@ -4378,6 +4431,10 @@ mod tests {
         let mut bytes = vec![0; 9];
         write_datetime_cell(&mut bytes, MssqlDateTime::new(days, seconds_fragments)).unwrap();
         bytes
+    }
+
+    fn datetime_payload(days: i32, seconds_fragments: u32) -> Vec<u8> {
+        datetime_cell(days, seconds_fragments)[1..].to_vec()
     }
 
     fn datetime2_cell(scale: u8, date_days: u32, time_increments: u64) -> Vec<u8> {
