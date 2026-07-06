@@ -17,8 +17,9 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow_tiberius::{
-    BulkWriter, Date64Policy, MssqlProfile, PlanOptions, SchemaMapping, TableName, UInt64Policy,
-    WriteBackend, WriteOptions, create_table_sql_from_mappings, write::profile::DirectWriteProfile,
+    BulkWriter, Date64Policy, MssqlProfile, PlanOptions, PlannedSchema, SchemaMapping, TableName,
+    UInt64Policy, WriteBackend, WriteOptions, create_table_sql_from_mappings,
+    write::profile::DirectWriteProfile,
 };
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -1986,8 +1987,8 @@ fn arrow_odbc_create_table_sql_template(
 ) -> Result<String, WriterBenchError> {
     let placeholder_table =
         TableName::new("dbo", ODBC_TABLE_PLACEHOLDER).map_err(WriterBenchError::ArrowTiberius)?;
-    let mappings = benchmark_mappings_for_scenario(benchmark.scenario)?;
-    let sql = benchmark_table_sql(&placeholder_table, &mappings);
+    let planned_schema = benchmark_mappings_for_scenario(benchmark.scenario)?;
+    let sql = benchmark_table_sql(&placeholder_table, &planned_schema);
     let quoted_placeholder = placeholder_table.quoted_sql();
     let sql = if bulk_table_lock {
         format!(
@@ -3442,7 +3443,7 @@ async fn run_tiberius_benchmark_from_ipc(
     } else {
         None
     };
-    let mappings = benchmark_mappings_for_scenario(benchmark.scenario)?;
+    let planned_schema = benchmark_mappings_for_scenario(benchmark.scenario)?;
     report.timings.setup += setup_start.elapsed();
 
     for _repeat_index in 0..benchmark.repeat {
@@ -3459,7 +3460,7 @@ async fn run_tiberius_benchmark_from_ipc(
                         disable_fixed_width_fast_path: config.disable_fixed_width_fast_path,
                         bulk_table_lock: config.bulk_table_lock,
                     },
-                    &mappings,
+                    &planned_schema,
                     &table,
                     ipc_path,
                     sql_server_profile_session.as_mut(),
@@ -3543,7 +3544,7 @@ fn prepare_baseline_ipc_dataset(
 async fn run_tiberius_repeat_from_ipc(
     client: &mut BenchClient,
     config: TiberiusRepeatConfig,
-    mappings: &[arrow_tiberius::SchemaMapping],
+    planned_schema: &PlannedSchema,
     table: &TableName,
     ipc_path: &Path,
     sql_server_profile_session: Option<&mut SqlServerProfileSession>,
@@ -3554,7 +3555,7 @@ async fn run_tiberius_repeat_from_ipc(
     run_tiberius_repeat_with_batches(
         client,
         config,
-        mappings,
+        planned_schema,
         table,
         batches,
         sql_server_profile_session,
@@ -3565,7 +3566,7 @@ async fn run_tiberius_repeat_from_ipc(
 async fn run_tiberius_repeat_with_batches(
     client: &mut BenchClient,
     config: TiberiusRepeatConfig,
-    mappings: &[arrow_tiberius::SchemaMapping],
+    planned_schema: &PlannedSchema,
     table: &TableName,
     batches: impl IntoIterator<Item = Result<RecordBatch, WriterBenchError>>,
     mut sql_server_profile_session: Option<&mut SqlServerProfileSession>,
@@ -3578,14 +3579,14 @@ async fn run_tiberius_repeat_with_batches(
         format!("DROP TABLE IF EXISTS {}", table.quoted_sql()),
     )
     .await?;
-    execute_sql(client, benchmark_table_sql(table, mappings)).await?;
+    execute_sql(client, benchmark_table_sql(table, planned_schema)).await?;
     if config.bulk_table_lock {
         execute_sql(client, benchmark_bulk_table_lock_sql(table)).await?;
     }
     let mut writer = BulkWriter::new(
         client,
         table.clone(),
-        mappings.to_vec(),
+        planned_schema.clone(),
         WriteOptions {
             backend: config.backend,
             ..WriteOptions::default()
@@ -4052,7 +4053,7 @@ fn unique_benchmark_table_name() -> Result<TableName, WriterBenchError> {
     TableName::new("dbo", table).map_err(WriterBenchError::ArrowTiberius)
 }
 
-fn benchmark_table_sql(table: &TableName, mappings: &[SchemaMapping]) -> String {
+fn benchmark_table_sql(table: &TableName, mappings: impl AsRef<[SchemaMapping]>) -> String {
     create_table_sql_from_mappings(table, mappings)
 }
 
@@ -4068,15 +4069,13 @@ fn escape_sql_string_literal(value: &str) -> String {
 }
 
 #[cfg(test)]
-fn benchmark_mappings_for_schema(
-    schema: SchemaRef,
-) -> Result<Vec<SchemaMapping>, WriterBenchError> {
+fn benchmark_mappings_for_schema(schema: SchemaRef) -> Result<PlannedSchema, WriterBenchError> {
     benchmark_mappings_for_schema_with_options(schema, PlanOptions::default())
 }
 
 fn benchmark_mappings_for_scenario(
     scenario: &BenchmarkScenarioDefinition,
-) -> Result<Vec<SchemaMapping>, WriterBenchError> {
+) -> Result<PlannedSchema, WriterBenchError> {
     benchmark_mappings_for_schema_with_options(
         (scenario.schema)(),
         benchmark_plan_options(scenario),
@@ -4104,14 +4103,14 @@ fn benchmark_plan_options(scenario: &BenchmarkScenarioDefinition) -> PlanOptions
 fn benchmark_mappings_for_schema_with_options(
     schema: SchemaRef,
     plan_options: PlanOptions,
-) -> Result<Vec<SchemaMapping>, WriterBenchError> {
+) -> Result<PlannedSchema, WriterBenchError> {
     let profile = MssqlProfile::sql_server_2016_compat_100();
-    let (planned_schema, _diagnostics) = profile
+    let planned_schema = profile
         .plan_arrow_schema(schema, plan_options)
         .map_err(WriterBenchError::ArrowTiberius)?
-        .into_parts();
+        .into_value();
 
-    Ok(planned_schema.into_mappings())
+    Ok(planned_schema)
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -7659,9 +7658,9 @@ odbc-bcp runner
         assert!(nullable_code4.is_valid(1));
 
         let mappings = super::benchmark_mappings_for_scenario(options.scenario).unwrap();
-        assert_eq!(mappings[1].mssql().ty(), &MssqlType::Binary(16));
-        assert_eq!(mappings[2].mssql().ty(), &MssqlType::Binary(4));
-        assert_eq!(mappings[3].mssql().ty(), &MssqlType::Binary(64));
+        assert_eq!(mappings.mappings()[1].mssql().ty(), &MssqlType::Binary(16));
+        assert_eq!(mappings.mappings()[2].mssql().ty(), &MssqlType::Binary(4));
+        assert_eq!(mappings.mappings()[3].mssql().ty(), &MssqlType::Binary(64));
         super::ensure_direct_raw_supported_scenario(&options).unwrap();
     }
 
@@ -7814,7 +7813,7 @@ odbc-bcp runner
         assert!(batch.column(2).as_any().is::<Int64Array>());
         assert!(batch.column(4).as_any().is::<Float64Array>());
         assert!(batch.column(6).as_any().is::<BooleanArray>());
-        assert!(mappings.iter().all(|mapping| {
+        assert!(mappings.mappings().iter().all(|mapping| {
             matches!(
                 mapping.mssql().ty(),
                 MssqlType::Int

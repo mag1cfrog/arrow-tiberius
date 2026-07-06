@@ -66,13 +66,15 @@ async fn write_batch(
 ) -> arrow_tiberius::Result<()> {
     let mut client = connect_mssql_client_from_ado_string(connection_string).await?;
     let profile = MssqlProfile::sql_server_2016_compat_100();
-    let outcome = profile.plan_arrow_schema(batch.schema().as_ref(), PlanOptions::default())?;
+    let planned_schema = profile
+        .plan_arrow_schema(batch.schema().as_ref(), PlanOptions::default())?
+        .into_value();
 
     let table = TableName::new("dbo", "people")?;
     let mut writer = client
         .bulk_writer(
             table,
-            outcome.mappings().to_vec(),
+            planned_schema,
             WriteOptions {
                 backend: WriteBackend::DirectRawBulk,
                 ..WriteOptions::default()

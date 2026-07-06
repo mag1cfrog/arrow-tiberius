@@ -20,18 +20,32 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedSchema {
     profile: MssqlProfile,
+    plan_options: PlanOptions,
     mappings: Vec<SchemaMapping>,
 }
 
 impl PlannedSchema {
     /// Creates a planned schema.
-    pub fn new(profile: MssqlProfile, mappings: Vec<SchemaMapping>) -> Self {
-        Self { profile, mappings }
+    pub fn new(
+        profile: MssqlProfile,
+        plan_options: PlanOptions,
+        mappings: Vec<SchemaMapping>,
+    ) -> Self {
+        Self {
+            profile,
+            plan_options,
+            mappings,
+        }
     }
 
     /// Returns the SQL Server profile used for planning.
     pub const fn profile(&self) -> MssqlProfile {
         self.profile
+    }
+
+    /// Returns the conversion policies used for planning.
+    pub const fn plan_options(&self) -> PlanOptions {
+        self.plan_options
     }
 
     /// Returns planned column mappings.
@@ -42,6 +56,12 @@ impl PlannedSchema {
     /// Consumes the planned schema into its mappings.
     pub fn into_mappings(self) -> Vec<SchemaMapping> {
         self.mappings
+    }
+}
+
+impl AsRef<[SchemaMapping]> for PlannedSchema {
+    fn as_ref(&self) -> &[SchemaMapping] {
+        self.mappings()
     }
 }
 
@@ -103,13 +123,15 @@ fn plan_arrow_schema_to_mssql_schema_inner(
     }
 
     Ok(PlanOutcome::new(
-        PlannedSchema::new(profile, mappings),
+        PlannedSchema::new(profile, *options, mappings),
         diagnostics,
     ))
 }
 
 /// Returns the planned MSSQL columns in mapping order.
-pub fn mssql_columns_from_mappings(mappings: &[SchemaMapping]) -> Vec<MssqlColumn> {
+pub fn mssql_columns_from_mappings(mappings: impl AsRef<[SchemaMapping]>) -> Vec<MssqlColumn> {
+    let mappings = mappings.as_ref();
+
     mappings
         .iter()
         .map(|mapping| mapping.mssql().clone())
@@ -117,10 +139,13 @@ pub fn mssql_columns_from_mappings(mappings: &[SchemaMapping]) -> Vec<MssqlColum
 }
 
 /// Renders deterministic `CREATE TABLE` SQL from mapping metadata.
-pub fn create_table_sql_from_mappings(table: &TableName, mappings: &[SchemaMapping]) -> String {
+pub fn create_table_sql_from_mappings(
+    table: &TableName,
+    mappings: impl AsRef<[SchemaMapping]>,
+) -> String {
     create_table_sql(
         table,
-        &mssql_columns_from_mappings(mappings),
+        &mssql_columns_from_mappings(mappings.as_ref()),
         crate::CreateTableOptions,
     )
 }
@@ -239,12 +264,13 @@ mod tests {
     fn planned_schema_preserves_profile() {
         let profile = MssqlProfile::sql_server_2017_compat_140();
         let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let options = PlanOptions::default();
         let outcome =
-            plan_arrow_schema_to_mssql_schema(Arc::new(schema), profile, PlanOptions::default())
-                .unwrap();
+            plan_arrow_schema_to_mssql_schema(Arc::new(schema), profile, options).unwrap();
         let planned_schema = outcome.value();
 
         assert_eq!(planned_schema.profile(), profile);
+        assert_eq!(planned_schema.plan_options(), options);
         assert_eq!(planned_schema.mappings().len(), 1);
         assert_eq!(planned_schema.mappings()[0].mssql().ty(), &MssqlType::Int);
     }

@@ -37,9 +37,10 @@ async fn main() -> ExampleResult<()> {
     let batches = example_batches(schema.clone())?;
 
     let profile = MssqlProfile::sql_server_2016_compat_100();
-    let outcome = profile.plan_arrow_schema(schema.as_ref(), PlanOptions::default())?;
-    let mappings = outcome.mappings().to_vec();
-    let create_table_sql = create_table_sql_from_mappings(&config.table, &mappings);
+    let planned_schema = profile
+        .plan_arrow_schema(schema.as_ref(), PlanOptions::default())?
+        .into_value();
+    let create_table_sql = create_table_sql_from_mappings(&config.table, &planned_schema);
 
     let mut client = connect(&connection_string).await?;
 
@@ -58,7 +59,7 @@ async fn main() -> ExampleResult<()> {
     let mut writer = BulkWriter::new(
         &mut client,
         config.table.clone(),
-        mappings,
+        planned_schema,
         WriteOptions {
             backend: WriteBackend::DirectRawBulk,
             ..WriteOptions::default()

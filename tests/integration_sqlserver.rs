@@ -22,8 +22,9 @@ use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use arrow_tiberius::{
     ArrowFieldRef, BulkWriter, Date64Policy, DecimalPolicy, DiagnosticCode, DiagnosticSet, Error,
     Identifier, MssqlColumn, MssqlProfile, MssqlType, MssqlTypeLength, NanosecondPolicy,
-    PlanOptions, PlanOutcome, SchemaMapping, TableName, TimestampPolicy, TimezonePolicy,
-    UInt64Policy, WriteBackend, WriteOptions, WritePhase, create_table_sql_from_mappings,
+    PlanOptions, PlanOutcome, PlannedSchema, SchemaMapping, TableName, TimestampPolicy,
+    TimezonePolicy, UInt64Policy, WriteBackend, WriteOptions, WritePhase,
+    create_table_sql_from_mappings,
 };
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -38,14 +39,8 @@ fn plan_arrow_schema_to_mssql_mappings(
     schema: impl AsRef<Schema>,
     profile: MssqlProfile,
     options: PlanOptions,
-) -> arrow_tiberius::Result<PlanOutcome<Vec<SchemaMapping>>> {
-    let outcome = profile.plan_arrow_schema(schema, options)?;
-    let (planned_schema, diagnostics) = outcome.into_parts();
-
-    Ok(PlanOutcome::new(
-        planned_schema.into_mappings(),
-        diagnostics,
-    ))
+) -> arrow_tiberius::Result<PlanOutcome<PlannedSchema>> {
+    profile.plan_arrow_schema(schema, options)
 }
 
 #[test]
@@ -2534,7 +2529,6 @@ async fn round_trip_timezone_free_timestamp_datetime2_values(
             mappings,
             WriteOptions {
                 backend,
-                plan_options,
                 ..WriteOptions::default()
             },
         )
@@ -2684,7 +2678,6 @@ async fn writer_round_trips_timezone_free_timestamp_datetime2_0_values_across_su
                 mappings,
                 WriteOptions {
                     backend,
-                    plan_options,
                     ..WriteOptions::default()
                 },
             )
@@ -2812,7 +2805,6 @@ async fn writer_round_trips_timezone_free_timestamp_datetime2_3_values_across_su
                 mappings,
                 WriteOptions {
                     backend,
-                    plan_options,
                     ..WriteOptions::default()
                 },
             )
@@ -2941,7 +2933,6 @@ async fn writer_round_trips_timezone_free_timestamp_datetime2_6_values_across_su
                 mappings,
                 WriteOptions {
                     backend,
-                    plan_options,
                     ..WriteOptions::default()
                 },
             )
@@ -3070,7 +3061,6 @@ async fn writer_round_trips_timezone_free_timestamp_datetime_values_across_suppo
                 mappings,
                 WriteOptions {
                     backend,
-                    plan_options,
                     ..WriteOptions::default()
                 },
             )
@@ -3226,7 +3216,6 @@ async fn writer_round_trips_non_nullable_timestamp_ns_datetime_issue_171() -> Te
                 mappings.clone(),
                 WriteOptions {
                     backend,
-                    plan_options,
                     ..WriteOptions::default()
                 },
             )
@@ -3346,7 +3335,6 @@ async fn writer_rejects_datetime_timestamp_out_of_range_without_partial_insert()
                 mappings.clone(),
                 WriteOptions {
                     backend,
-                    plan_options,
                     ..WriteOptions::default()
                 },
             )
@@ -3468,7 +3456,6 @@ async fn round_trip_timezone_aware_timestamp_normalized_datetime2_values(
             mappings,
             WriteOptions {
                 backend,
-                plan_options,
                 ..WriteOptions::default()
             },
         )
@@ -3593,7 +3580,6 @@ async fn writer_round_trips_timezone_aware_timestamp_normalized_datetime2_3_valu
                 mappings,
                 WriteOptions {
                     backend,
-                    plan_options,
                     ..WriteOptions::default()
                 },
             )
@@ -3733,7 +3719,6 @@ async fn writer_round_trips_timezone_aware_timestamp_normalized_datetime_values_
                 mappings,
                 WriteOptions {
                     backend,
-                    plan_options,
                     ..WriteOptions::default()
                 },
             )
@@ -3895,7 +3880,6 @@ async fn round_trip_timezone_aware_timestamp_datetimeoffset_values(
             mappings,
             WriteOptions {
                 backend,
-                plan_options,
                 ..WriteOptions::default()
             },
         )
@@ -4276,10 +4260,14 @@ async fn baseline_writer_rejects_target_table_schema_drift() -> TestResult<()> {
         let mut writer = BulkWriter::new(
             &mut client,
             table.clone(),
-            vec![SchemaMapping::new(
-                ArrowFieldRef::new(0, "renamed_id".to_owned(), false, DataType::Int32),
-                MssqlColumn::new(Identifier::new("renamed_id")?, MssqlType::Int, false),
-            )],
+            PlannedSchema::new(
+                MssqlProfile::sql_server_2016_compat_100(),
+                PlanOptions::default(),
+                vec![SchemaMapping::new(
+                    ArrowFieldRef::new(0, "renamed_id".to_owned(), false, DataType::Int32),
+                    MssqlColumn::new(Identifier::new("renamed_id")?, MssqlType::Int, false),
+                )],
+            ),
             WriteOptions {
                 backend: WriteBackend::BaselineTokenRow,
                 ..WriteOptions::default()
@@ -4357,7 +4345,11 @@ async fn direct_raw_writer_rejects_unsupported_schema_without_partial_insert() -
         let err = match BulkWriter::new(
             &mut client,
             table.clone(),
-            mappings,
+            PlannedSchema::new(
+                MssqlProfile::sql_server_2016_compat_100(),
+                PlanOptions::default(),
+                mappings,
+            ),
             WriteOptions {
                 backend: WriteBackend::DirectRawBulk,
                 ..WriteOptions::default()
