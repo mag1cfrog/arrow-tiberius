@@ -16,6 +16,7 @@ use crate::{
 
 use super::{
     SchemaCheck,
+    context::RuntimeConversionContext,
     direct::{
         DirectEncoder, MeasuredDirectBatch, MeasuredRowRange,
         plan::{DirectColumnEncoding, DirectColumnPlan, DirectEncoderPlan},
@@ -68,7 +69,7 @@ struct WriterState {
     backend: WriteBackend,
     direct_encoder: Option<DirectEncoder>,
     schema_check: SchemaCheck,
-    plan_options: PlanOptions,
+    runtime_context: RuntimeConversionContext,
     mappings: Vec<SchemaMapping>,
     stats: WriteStats,
 }
@@ -80,12 +81,13 @@ impl WriterState {
         planned_schema: PlannedSchema,
     ) -> Result<Self> {
         let backend = resolve_backend(requested_backend)?;
-        let plan_options = planned_schema.plan_options();
+        let runtime_context =
+            RuntimeConversionContext::new(planned_schema.profile(), planned_schema.plan_options());
         let mappings = planned_schema.into_mappings();
         let direct_encoder = match backend {
-            WriteBackend::DirectFramedBulk | WriteBackend::DirectRawBulk => {
-                Some(DirectEncoder::new_with_options(&mappings, plan_options)?)
-            }
+            WriteBackend::DirectFramedBulk | WriteBackend::DirectRawBulk => Some(
+                DirectEncoder::new_with_options(&mappings, runtime_context.plan_options())?,
+            ),
             WriteBackend::Auto | WriteBackend::BaselineTokenRow => None,
         };
 
@@ -93,7 +95,7 @@ impl WriterState {
             backend,
             direct_encoder,
             schema_check,
-            plan_options,
+            runtime_context,
             mappings,
             stats: WriteStats::default(),
         })
@@ -115,8 +117,8 @@ impl WriterState {
         self.schema_check
     }
 
-    fn plan_options(&self) -> &PlanOptions {
-        &self.plan_options
+    fn plan_options(&self) -> PlanOptions {
+        self.runtime_context.plan_options()
     }
 
     fn stats(&self) -> WriteStats {
@@ -700,7 +702,7 @@ where
         batch,
         state.mappings(),
         state.schema_check(),
-        state.plan_options(),
+        &state.plan_options(),
     ) {
         Ok(view) => view,
         Err(err) => return Err(err.with_write_phase(WritePhase::BatchSchemaValidation)),
@@ -1011,8 +1013,8 @@ mod tests {
     use crate::observability::writer::DirectRawBatchObserver;
     use crate::{
         ArrowFieldRef, DiagnosticCode, Error, Identifier, MssqlColumn, MssqlProfile, MssqlType,
-        MssqlTypeLength, PlanOptions, PlannedSchema, SchemaCheck, SchemaMapping, TableName,
-        TimestampPolicy, WritePhase,
+        MssqlTypeLength, NanosecondPolicy, PlanOptions, PlannedSchema, SchemaCheck, SchemaMapping,
+        TableName, TimestampPolicy, WritePhase,
     };
 
     static DIRECT_RAW_TRACE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -1103,8 +1105,31 @@ mod tests {
         assert!(state.direct_encoder().is_some());
         assert_eq!(state.schema_check(), SchemaCheck::Strict);
         assert_eq!(state.mappings(), mappings.as_slice());
-        assert_eq!(state.plan_options(), &PlanOptions::default());
+        assert_eq!(state.plan_options(), PlanOptions::default());
         assert_eq!(state.stats(), WriteStats::default());
+    }
+
+    #[test]
+    fn writer_state_uses_runtime_context_from_planned_schema() {
+        let profile = MssqlProfile::sql_server_2017_compat_140();
+        let plan_options = PlanOptions {
+            nanosecond_policy: NanosecondPolicy::TruncateTo100ns,
+            ..PlanOptions::default()
+        };
+        let state = WriterState::new(
+            WriteBackend::BaselineTokenRow,
+            SchemaCheck::Strict,
+            planned_schema_with_profile_and_options(profile, plan_options, vec![mapping("id")]),
+        )
+        .unwrap();
+
+        assert_eq!(state.runtime_context.profile(), profile);
+        assert_eq!(state.runtime_context.plan_options(), plan_options);
+        assert_eq!(
+            state.runtime_context.nanosecond_policy(),
+            NanosecondPolicy::TruncateTo100ns
+        );
+        assert_eq!(state.plan_options(), plan_options);
     }
 
     #[test]
@@ -2342,11 +2367,19 @@ mod tests {
         mappings: Vec<SchemaMapping>,
         plan_options: PlanOptions,
     ) -> PlannedSchema {
-        PlannedSchema::new(
+        planned_schema_with_profile_and_options(
             MssqlProfile::sql_server_2016_compat_100(),
             plan_options,
             mappings,
         )
+    }
+
+    fn planned_schema_with_profile_and_options(
+        profile: MssqlProfile,
+        plan_options: PlanOptions,
+        mappings: Vec<SchemaMapping>,
+    ) -> PlannedSchema {
+        PlannedSchema::new(profile, plan_options, mappings)
     }
 
     fn int32_batch(name: &str, values: &[i32]) -> RecordBatch {

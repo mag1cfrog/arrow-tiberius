@@ -2,6 +2,7 @@
 
 pub use crate::error::WritePhase;
 
+pub(crate) mod context;
 pub(crate) mod direct;
 /// Write-path planning and conversion policies.
 pub mod policy;
