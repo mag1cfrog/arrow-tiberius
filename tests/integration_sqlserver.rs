@@ -22,9 +22,8 @@ use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use arrow_tiberius::{
     ArrowFieldRef, BulkWriter, Date64Policy, DecimalPolicy, DiagnosticCode, DiagnosticSet, Error,
     Identifier, MssqlColumn, MssqlProfile, MssqlType, MssqlTypeLength, NanosecondPolicy,
-    PlanOptions, SchemaMapping, TableName, TimestampPolicy, TimezonePolicy, UInt64Policy,
-    WriteBackend, WriteOptions, WritePhase, create_table_sql_from_mappings,
-    plan_arrow_schema_to_mssql_mappings,
+    PlanOptions, PlanOutcome, SchemaMapping, TableName, TimestampPolicy, TimezonePolicy,
+    UInt64Policy, WriteBackend, WriteOptions, WritePhase, create_table_sql_from_mappings,
 };
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -34,6 +33,20 @@ const TEST_DATABASE_ENV: &str = "ARROW_TIBERIUS_TEST_MSSQL_DATABASE";
 static TABLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 type F16 = <Float16Type as ArrowPrimitiveType>::Native;
+
+fn plan_arrow_schema_to_mssql_mappings(
+    schema: impl AsRef<Schema>,
+    profile: MssqlProfile,
+    options: PlanOptions,
+) -> arrow_tiberius::Result<PlanOutcome<Vec<SchemaMapping>>> {
+    let outcome = profile.plan_arrow_schema(schema, options)?;
+    let (planned_schema, diagnostics) = outcome.into_parts();
+
+    Ok(PlanOutcome::new(
+        planned_schema.into_mappings(),
+        diagnostics,
+    ))
+}
 
 #[test]
 fn sqlserver_integration_harness_is_configured() {

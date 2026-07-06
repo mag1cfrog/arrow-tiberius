@@ -21,7 +21,6 @@
 //! use arrow_schema::{DataType, Field, Schema};
 //! use arrow_tiberius::{
 //!     MssqlProfile, PlanOptions, TableName, create_table_sql_from_mappings,
-//!     plan_arrow_schema_to_mssql_mappings,
 //! };
 //!
 //! # fn main() -> arrow_tiberius::Result<()> {
@@ -30,14 +29,11 @@
 //!     Field::new("name", DataType::Utf8, true),
 //! ]);
 //!
-//! let outcome = plan_arrow_schema_to_mssql_mappings(
-//!     &schema,
-//!     MssqlProfile::sql_server_2016_compat_100(),
-//!     PlanOptions::default(),
-//! )?;
+//! let profile = MssqlProfile::sql_server_2016_compat_100();
+//! let outcome = profile.plan_arrow_schema(&schema, PlanOptions::default())?;
 //!
 //! let table = TableName::new("dbo", "people")?;
-//! let ddl = create_table_sql_from_mappings(&table, outcome.value());
+//! let ddl = create_table_sql_from_mappings(&table, outcome.mappings());
 //! assert!(ddl.contains("CREATE TABLE [dbo].[people]"));
 //! # Ok(())
 //! # }
@@ -151,9 +147,11 @@ pub use mssql::{
     MssqlProfile, MssqlTimePrecision, MssqlType, MssqlTypeLength, MssqlVersion, TableName,
     create_table_sql,
 };
+#[cfg(test)]
+pub(crate) use schema::plan_arrow_schema_to_mssql_mappings;
 pub use schema::{
-    SchemaMapping, create_table_sql_from_mappings, mssql_columns_from_mappings,
-    plan_arrow_schema_to_mssql_mappings,
+    PlannedSchema, SchemaMapping, create_table_sql_from_mappings, mssql_columns_from_mappings,
+    plan_arrow_schema_to_mssql_schema,
 };
 pub use write::{
     BinaryPolicy, BulkWriter, Date64Policy, Decimal256Policy, DecimalPolicy, FloatPolicy,

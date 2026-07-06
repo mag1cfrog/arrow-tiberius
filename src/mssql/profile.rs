@@ -1,6 +1,10 @@
 //! SQL Server profile types.
 
-use crate::error::Result;
+use arrow_schema::Schema;
+
+use crate::schema::{PlannedSchema, plan_arrow_schema_to_mssql_schema};
+use crate::write::PlanOptions;
+use crate::{PlanOutcome, Result};
 
 /// SQL Server engine version targeted by planning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -115,6 +119,15 @@ impl MssqlProfile {
             version: MssqlVersion::SqlServer2017,
             compatibility_level: CompatibilityLevel::SQL_SERVER_2017,
         }
+    }
+
+    /// Plans an Arrow schema using this SQL Server profile.
+    pub fn plan_arrow_schema(
+        self,
+        schema: impl AsRef<Schema>,
+        options: PlanOptions,
+    ) -> Result<PlanOutcome<PlannedSchema>> {
+        plan_arrow_schema_to_mssql_schema(schema, self, options)
     }
 
     /// Returns the SQL Server engine version.

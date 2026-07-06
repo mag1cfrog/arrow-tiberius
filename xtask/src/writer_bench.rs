@@ -18,8 +18,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow_tiberius::{
     BulkWriter, Date64Policy, MssqlProfile, PlanOptions, SchemaMapping, TableName, UInt64Policy,
-    WriteBackend, WriteOptions, create_table_sql_from_mappings,
-    plan_arrow_schema_to_mssql_mappings, write::profile::DirectWriteProfile,
+    WriteBackend, WriteOptions, create_table_sql_from_mappings, write::profile::DirectWriteProfile,
 };
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -4106,15 +4105,13 @@ fn benchmark_mappings_for_schema_with_options(
     schema: SchemaRef,
     plan_options: PlanOptions,
 ) -> Result<Vec<SchemaMapping>, WriterBenchError> {
-    let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
-        schema,
-        MssqlProfile::sql_server_2016_compat_100(),
-        plan_options,
-    )
-    .map_err(WriterBenchError::ArrowTiberius)?
-    .into_parts();
+    let profile = MssqlProfile::sql_server_2016_compat_100();
+    let (planned_schema, _diagnostics) = profile
+        .plan_arrow_schema(schema, plan_options)
+        .map_err(WriterBenchError::ArrowTiberius)?
+        .into_parts();
 
-    Ok(mappings)
+    Ok(planned_schema.into_mappings())
 }
 
 fn format_duration(duration: Duration) -> String {
