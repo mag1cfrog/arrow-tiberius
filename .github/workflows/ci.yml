@@ -70,10 +70,27 @@ jobs:
         run: cargo xtask sqlserver-test
 
   sqlserver-compat-probe:
-    name: SQL Server compat probe
+    name: SQL Server compat probe (${{ matrix.version }})
     runs-on: ubuntu-latest
     needs: rust-checks
     timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: "2017"
+            image: mcr.microsoft.com/mssql/server:2017-latest
+            compatibility-levels: "100 110 120 130 140"
+          - version: "2019"
+            image: mcr.microsoft.com/mssql/server:2019-latest
+            compatibility-levels: "120 130 150"
+          - version: "2022"
+            image: mcr.microsoft.com/mssql/server:2022-latest
+            compatibility-levels: "120 130 160"
+          - version: "2025"
+            image: mcr.microsoft.com/mssql/server:2025-latest
+            compatibility-levels: "120 130 170"
 
     env:
       ARROW_TIBERIUS_CONTAINER_RUNTIME: docker
@@ -95,16 +112,19 @@ jobs:
 
       - name: Run SQL Server compatibility probe
         run: |
-          for compatibility_level in 100 110 120 130 140; do
-            echo "::group::SQL Server compatibility level ${compatibility_level}"
+          for compatibility_level in ${{ matrix.compatibility-levels }}; do
+            echo "::group::SQL Server ${{ matrix.version }} compatibility level ${compatibility_level}"
             set +e
-            cargo xtask sqlserver-compat-probe --compatibility-level "$compatibility_level"
+            cargo xtask sqlserver-compat-probe \
+              --image "${{ matrix.image }}" \
+              --version "${{ matrix.version }}" \
+              --compatibility-level "$compatibility_level"
             status=$?
             set -e
             echo "::endgroup::"
 
             if [ "$status" -ne 0 ]; then
-              echo "SQL Server compatibility probe failed for compatibility level ${compatibility_level}"
+              echo "SQL Server ${{ matrix.version }} compatibility probe failed for compatibility level ${compatibility_level}"
               exit "$status"
             fi
           done
