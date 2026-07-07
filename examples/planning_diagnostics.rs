@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
-use arrow_tiberius::{Error, MssqlProfile, PlanOptions};
+use arrow_tiberius::{CompatibilityLevel, Error, MssqlProfile, MssqlVersion, PlanOptions};
 
 fn main() -> arrow_tiberius::Result<()> {
     let schema = Schema::new(vec![
@@ -15,7 +15,10 @@ fn main() -> arrow_tiberius::Result<()> {
         ),
     ]);
 
-    let profile = MssqlProfile::sql_server_2016_compat_100();
+    let profile = MssqlProfile::new(
+        MssqlVersion::SqlServer2022,
+        CompatibilityLevel::SQL_SERVER_2022,
+    )?;
 
     match profile.plan_arrow_schema(&schema, PlanOptions::default()) {
         Err(Error::Planning { diagnostics }) => {

@@ -5,8 +5,8 @@ use std::{env, error::Error, io, sync::Arc};
 use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use arrow_tiberius::{
-    BulkWriter, MssqlProfile, PlanOptions, TableName, WriteBackend, WriteOptions,
-    create_table_sql_from_mappings,
+    BulkWriter, CompatibilityLevel, MssqlProfile, MssqlVersion, PlanOptions, TableName,
+    WriteBackend, WriteOptions, create_table_sql_from_mappings,
 };
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -36,7 +36,10 @@ async fn main() -> ExampleResult<()> {
     let schema = example_schema();
     let batches = example_batches(schema.clone())?;
 
-    let profile = MssqlProfile::sql_server_2016_compat_100();
+    let profile = MssqlProfile::new(
+        MssqlVersion::SqlServer2022,
+        CompatibilityLevel::SQL_SERVER_2022,
+    )?;
     let planned_schema = profile
         .plan_arrow_schema(schema.as_ref(), PlanOptions::default())?
         .into_value();
