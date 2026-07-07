@@ -66,6 +66,16 @@ pub struct MssqlProfile {
     compatibility_level: CompatibilityLevel,
 }
 
+/// Profile-selected SQL Server `datetime` rounding behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
+pub(crate) enum DateTimeRounding {
+    /// Compatibility levels before 130 round through legacy cast behavior.
+    LegacyPre130,
+    /// Compatibility levels 130 and later use direct nearest-fragment rounding.
+    Compat130Plus,
+}
+
 impl MssqlProfile {
     /// Creates the v0.1 SQL Server 2016 profile with database compatibility
     /// level 100.
@@ -139,11 +149,21 @@ impl MssqlProfile {
     pub const fn compatibility_level(self) -> CompatibilityLevel {
         self.compatibility_level
     }
+
+    /// Returns the `datetime` rounding behavior selected by compatibility level.
+    #[allow(dead_code)]
+    pub(crate) const fn datetime_rounding(self) -> DateTimeRounding {
+        if self.compatibility_level.as_u16() < 130 {
+            DateTimeRounding::LegacyPre130
+        } else {
+            DateTimeRounding::Compat130Plus
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CompatibilityLevel, MssqlProfile, MssqlVersion};
+    use super::{CompatibilityLevel, DateTimeRounding, MssqlProfile, MssqlVersion};
 
     #[test]
     fn constructs_sql_server_2016_compat_100_profile() {
@@ -213,6 +233,40 @@ mod tests {
                     .contains(&format!("invalid compatibility level {level}")),
                 "unexpected error: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn selects_datetime_rounding_by_compatibility_level() {
+        let cases = [
+            (
+                MssqlProfile::sql_server_2016_compat_100(),
+                DateTimeRounding::LegacyPre130,
+            ),
+            (
+                MssqlProfile::sql_server_2017_compat_100(),
+                DateTimeRounding::LegacyPre130,
+            ),
+            (
+                MssqlProfile::sql_server_2017_compat_110(),
+                DateTimeRounding::LegacyPre130,
+            ),
+            (
+                MssqlProfile::sql_server_2017_compat_120(),
+                DateTimeRounding::LegacyPre130,
+            ),
+            (
+                MssqlProfile::sql_server_2017_compat_130(),
+                DateTimeRounding::Compat130Plus,
+            ),
+            (
+                MssqlProfile::sql_server_2017_compat_140(),
+                DateTimeRounding::Compat130Plus,
+            ),
+        ];
+
+        for (profile, expected) in cases {
+            assert_eq!(profile.datetime_rounding(), expected);
         }
     }
 }
