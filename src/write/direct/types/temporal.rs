@@ -770,15 +770,14 @@ pub(crate) fn append_timestamp_microsecond_cell(
 
 /// Appends one Arrow nanosecond timestamp cell to a direct raw-row buffer.
 ///
-/// Nanosecond normalization and SQL Server `datetime` rounding are both taken
-/// from the runtime context by the caller.
+/// Nanosecond normalization and SQL Server `datetime` rounding both come from
+/// the runtime context.
 pub(crate) fn append_timestamp_nanosecond_cell(
     buf: &mut tiberius::RawRowsAppendBuffer<'_>,
     array: &TimestampNanosecondArray,
     mapping: &SchemaMapping,
     column: &DirectColumnPlan,
-    nanosecond_policy: NanosecondPolicy,
-    datetime_rounding: DateTimeRounding,
+    runtime_context: RuntimeConversionContext,
     row_index: usize,
     measured_len: usize,
 ) -> Result<()> {
@@ -795,8 +794,8 @@ pub(crate) fn append_timestamp_nanosecond_cell(
                 mapping,
                 column,
                 row_index,
-                nanosecond_policy,
-                datetime_rounding,
+                runtime_context.nanosecond_policy(),
+                runtime_context.datetime_rounding(),
             )?;
             Ok((temporal_value_cell_len(column, value)?, value))
         },

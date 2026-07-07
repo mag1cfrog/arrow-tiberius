@@ -284,8 +284,7 @@ fn encode_fixed_width_rows(
                             rounding,
                         )
                     },
-                    runtime_context.nanosecond_policy(),
-                    runtime_context.datetime_rounding(),
+                    runtime_context,
                 )?;
             }
             BoundDirectColumn::TimestampMillisecond {
@@ -310,8 +309,7 @@ fn encode_fixed_width_rows(
                             rounding,
                         )
                     },
-                    runtime_context.nanosecond_policy(),
-                    runtime_context.datetime_rounding(),
+                    runtime_context,
                 )?;
             }
             BoundDirectColumn::TimestampMicrosecond {
@@ -336,8 +334,7 @@ fn encode_fixed_width_rows(
                             rounding,
                         )
                     },
-                    runtime_context.nanosecond_policy(),
-                    runtime_context.datetime_rounding(),
+                    runtime_context,
                 )?;
             }
             BoundDirectColumn::TimestampNanosecond {
@@ -362,8 +359,7 @@ fn encode_fixed_width_rows(
                             rounding,
                         )
                     },
-                    runtime_context.nanosecond_policy(),
-                    runtime_context.datetime_rounding(),
+                    runtime_context,
                 )?;
             }
             BoundDirectColumn::Time32Second {
@@ -1413,8 +1409,7 @@ fn fill_timestamp_fixed_width_column<A, F>(
     current_offsets: &mut [usize],
     bytes: &mut [u8],
     value: F,
-    nanosecond_policy: NanosecondPolicy,
-    datetime_rounding: DateTimeRounding,
+    runtime_context: RuntimeConversionContext,
 ) -> Result<()>
 where
     A: Array,
@@ -1443,8 +1438,8 @@ where
             mapping,
             column,
             row_index,
-            nanosecond_policy,
-            datetime_rounding,
+            runtime_context.nanosecond_policy(),
+            runtime_context.datetime_rounding(),
         )?;
         let cell_len = timestamp_fixed_width_value_len(column, value)?;
         let cell_bytes = bytes.get_mut(offset..offset + cell_len).ok_or_else(|| {
