@@ -10,7 +10,7 @@ use arrow_array::{
 
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, MssqlType, NanosecondPolicy,
-    PlanOptions, Result, SchemaMapping,
+    Result, SchemaMapping,
     mssql::cell::{
         MssqlDate, MssqlDateTime, MssqlDateTime2, MssqlDateTimeOffset, MssqlTime,
         from_arrow::temporal::datetime::{
@@ -39,7 +39,7 @@ use crate::{
             validate_mapping_timestamp_timezone_metadata, validate_null_timestamp_timezone_metadata,
         },
     },
-    write::profile,
+    write::{context::RuntimeConversionContext, profile},
 };
 
 use super::super::{
@@ -59,7 +59,7 @@ pub(crate) use value::{
 #[derive(Clone, Copy)]
 pub(crate) struct TemporalColumnContext<'a> {
     pub(crate) mapping: &'a SchemaMapping,
-    pub(crate) plan_options: PlanOptions,
+    pub(crate) runtime_context: RuntimeConversionContext,
     pub(crate) column: &'a DirectColumnPlan,
     pub(crate) column_index: usize,
     pub(crate) column_count: usize,
@@ -196,7 +196,7 @@ pub(crate) fn measure_timestamp_nanosecond_column_cell_lengths(
                 mapping,
                 context.column,
                 row_index,
-                context.plan_options.nanosecond_policy,
+                context.runtime_context.nanosecond_policy(),
             )
             .and_then(|value| temporal_value_cell_len(context.column, value))
         },
@@ -297,7 +297,7 @@ pub(crate) fn measure_datetimeoffset_nanosecond_column_cell_lengths(
                 row_index,
                 array.value(row_index),
                 timezone,
-                context.plan_options.nanosecond_policy,
+                context.runtime_context.nanosecond_policy(),
             )
             .and_then(datetimeoffset_cell_len_for_value)
         },
@@ -378,7 +378,7 @@ pub(crate) fn measure_time64_nanosecond_column_cell_lengths(
                 mapping,
                 row_index,
                 array.value(row_index),
-                context.plan_options.nanosecond_policy,
+                context.runtime_context.nanosecond_policy(),
             )
             .and_then(time_cell_len_for_value)
         },
@@ -540,7 +540,7 @@ pub(crate) fn fill_datetimeoffset_nanosecond_direct_column(
                 row_index,
                 array.value(row_index),
                 timezone,
-                context.plan_options.nanosecond_policy,
+                context.runtime_context.nanosecond_policy(),
             )
         },
     )
@@ -613,7 +613,7 @@ pub(crate) fn fill_time64_nanosecond_direct_column(
                 mapping,
                 row_index,
                 array.value(row_index),
-                context.plan_options.nanosecond_policy,
+                context.runtime_context.nanosecond_policy(),
             )
         },
     )
@@ -1158,7 +1158,7 @@ where
                 context.mapping,
                 context.column,
                 row_index,
-                context.plan_options.nanosecond_policy,
+                context.runtime_context.nanosecond_policy(),
             )?;
             write_direct_temporal_value_cell(bytes, cell, context.column, value)?;
         }

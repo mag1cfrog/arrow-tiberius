@@ -23,7 +23,7 @@ use super::{
     row_column_diagnostic, value_conversion_error,
 };
 use crate::{
-    DiagnosticCode, NanosecondPolicy, Result, SchemaMapping,
+    DiagnosticCode, Result, SchemaMapping,
     conversion::arrow_to_mssql::{
         decimal::DecimalArrowToMssql,
         fixed_size_binary::FixedSizeBinaryArrowToMssql,
@@ -33,10 +33,12 @@ use crate::{
             VariableWidthArrowToMssql, is_binary_family_to_varbinary, is_string_family_to_nvarchar,
         },
     },
+    write::context::RuntimeConversionContext,
 };
 
 pub(crate) struct BoundDirectBatch<'a> {
     columns: Vec<BoundDirectColumn<'a>>,
+    runtime_context: RuntimeConversionContext,
     row_count: usize,
 }
 
@@ -44,12 +46,17 @@ impl<'a> BoundDirectBatch<'a> {
     pub(crate) fn new(encoder: &'a DirectEncoder, batch: &'a RecordBatch) -> Result<Self> {
         Ok(Self {
             columns: bind_direct_columns(encoder, batch)?,
+            runtime_context: encoder.runtime_context,
             row_count: batch.num_rows(),
         })
     }
 
     pub(crate) fn columns(&self) -> &[BoundDirectColumn<'a>] {
         &self.columns
+    }
+
+    pub(crate) const fn runtime_context(&self) -> RuntimeConversionContext {
+        self.runtime_context
     }
 
     pub(crate) const fn row_count(&self) -> usize {
@@ -65,7 +72,12 @@ impl<'a> BoundDirectBatch<'a> {
         let mut cell_lengths = vec![0; self.row_count * column_count];
 
         for (column_index, column) in self.columns.iter().enumerate() {
-            column.measure_cell_lengths(column_index, column_count, &mut cell_lengths)?;
+            column.measure_cell_lengths(
+                self.runtime_context,
+                column_index,
+                column_count,
+                &mut cell_lengths,
+            )?;
         }
 
         Ok(cell_lengths)
@@ -84,7 +96,13 @@ impl<'a> BoundDirectBatch<'a> {
         let column_count = self.columns.len();
 
         for (column_index, column) in self.columns.iter().enumerate() {
-            column.fill_column(column_index, column_count, layout, bytes)?;
+            column.fill_column(
+                self.runtime_context,
+                column_index,
+                column_count,
+                layout,
+                bytes,
+            )?;
         }
 
         Ok(())
@@ -289,7 +307,6 @@ fn bind_direct_columns<'a>(
             ) => BoundDirectColumn::TimestampNanosecond {
                 column,
                 mapping: encoder.mapping_for_column_index(column_index)?,
-                nanosecond_policy: encoder.runtime_context.nanosecond_policy(),
                 array: downcast_direct_array::<TimestampNanosecondArray>(array, column)?,
             },
             DirectColumnEncoding::Temporal(TemporalArrowToMssql::Time32SecondToTime) => {
@@ -317,7 +334,6 @@ fn bind_direct_columns<'a>(
                 BoundDirectColumn::Time64Nanosecond {
                     column,
                     mapping: encoder.mapping_for_column_index(column_index)?,
-                    nanosecond_policy: encoder.runtime_context.nanosecond_policy(),
                     array: downcast_direct_array::<Time64NanosecondArray>(array, column)?,
                 }
             }
@@ -347,7 +363,6 @@ fn bind_direct_columns<'a>(
             ) => BoundDirectColumn::DateTimeOffsetNanosecond {
                 column,
                 mapping: encoder.mapping_for_column_index(column_index)?,
-                nanosecond_policy: encoder.runtime_context.nanosecond_policy(),
                 array: downcast_direct_array::<TimestampNanosecondArray>(array, column)?,
             },
         };
@@ -548,7 +563,6 @@ pub(crate) enum BoundDirectColumn<'a> {
     TimestampNanosecond {
         column: &'a plan::DirectColumnPlan,
         mapping: &'a SchemaMapping,
-        nanosecond_policy: NanosecondPolicy,
         array: &'a TimestampNanosecondArray,
     },
     Time32Second {
@@ -569,7 +583,6 @@ pub(crate) enum BoundDirectColumn<'a> {
     Time64Nanosecond {
         column: &'a plan::DirectColumnPlan,
         mapping: &'a SchemaMapping,
-        nanosecond_policy: NanosecondPolicy,
         array: &'a Time64NanosecondArray,
     },
     DateTimeOffsetSecond {
@@ -590,7 +603,6 @@ pub(crate) enum BoundDirectColumn<'a> {
     DateTimeOffsetNanosecond {
         column: &'a plan::DirectColumnPlan,
         mapping: &'a SchemaMapping,
-        nanosecond_policy: NanosecondPolicy,
         array: &'a TimestampNanosecondArray,
     },
 }

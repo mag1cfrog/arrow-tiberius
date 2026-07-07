@@ -44,7 +44,7 @@ use crate::{
             validate_mapping_timestamp_timezone_metadata, validate_null_timestamp_timezone_metadata,
         },
     },
-    write::profile,
+    write::{context::RuntimeConversionContext, profile},
 };
 
 use super::super::{
@@ -110,7 +110,7 @@ pub(crate) fn try_encode_fixed_width_rows(
     };
 
     let layout = measure_fixed_width_rows(bound.row_count(), &columns)?;
-    encode_fixed_width_rows(&columns, layout)
+    encode_fixed_width_rows(&columns, layout, bound.runtime_context())
 }
 
 /// Encodes fixed-size direct columns into an already measured row layout.
@@ -137,12 +137,13 @@ pub(crate) fn try_encode_fixed_width_rows_with_layout(
     };
 
     let layout = FixedWidthRowsLayout::from_row_layout(layout, bound.columns().len())?;
-    encode_fixed_width_rows(&columns, layout)
+    encode_fixed_width_rows(&columns, layout, bound.runtime_context())
 }
 
 fn encode_fixed_width_rows(
     columns: &[FixedWidthColumn<'_>],
     layout: FixedWidthRowsLayout,
+    runtime_context: RuntimeConversionContext,
 ) -> Result<Option<EncodedRowsPayload>> {
     let mut current_offsets = layout.current_offsets.clone();
     let mut bytes = vec![0; layout.payload_len];
@@ -278,7 +279,7 @@ fn encode_fixed_width_rows(
                             policy,
                         )
                     },
-                    NanosecondPolicy::default(),
+                    runtime_context.nanosecond_policy(),
                 )?;
             }
             BoundDirectColumn::TimestampMillisecond {
@@ -302,7 +303,7 @@ fn encode_fixed_width_rows(
                             policy,
                         )
                     },
-                    NanosecondPolicy::default(),
+                    runtime_context.nanosecond_policy(),
                 )?;
             }
             BoundDirectColumn::TimestampMicrosecond {
@@ -326,13 +327,12 @@ fn encode_fixed_width_rows(
                             policy,
                         )
                     },
-                    NanosecondPolicy::default(),
+                    runtime_context.nanosecond_policy(),
                 )?;
             }
             BoundDirectColumn::TimestampNanosecond {
                 column: plan,
                 mapping,
-                nanosecond_policy,
                 array,
             } => {
                 fill_timestamp_fixed_width_column(
@@ -351,7 +351,7 @@ fn encode_fixed_width_rows(
                             policy,
                         )
                     },
-                    *nanosecond_policy,
+                    runtime_context.nanosecond_policy(),
                 )?;
             }
             BoundDirectColumn::Time32Second {
@@ -372,7 +372,7 @@ fn encode_fixed_width_rows(
                             array.value(row_index),
                         )
                     },
-                    NanosecondPolicy::default(),
+                    runtime_context.nanosecond_policy(),
                 )?;
             }
             BoundDirectColumn::Time32Millisecond {
@@ -393,7 +393,7 @@ fn encode_fixed_width_rows(
                             array.value(row_index),
                         )
                     },
-                    NanosecondPolicy::default(),
+                    runtime_context.nanosecond_policy(),
                 )?;
             }
             BoundDirectColumn::Time64Microsecond {
@@ -414,13 +414,12 @@ fn encode_fixed_width_rows(
                             array.value(row_index),
                         )
                     },
-                    NanosecondPolicy::default(),
+                    runtime_context.nanosecond_policy(),
                 )?;
             }
             BoundDirectColumn::Time64Nanosecond {
                 column: plan,
                 mapping,
-                nanosecond_policy,
                 array,
             } => {
                 fill_time_fixed_width_column(
@@ -437,7 +436,7 @@ fn encode_fixed_width_rows(
                             policy,
                         )
                     },
-                    *nanosecond_policy,
+                    runtime_context.nanosecond_policy(),
                 )?;
             }
             BoundDirectColumn::DateTimeOffsetSecond {
@@ -460,7 +459,7 @@ fn encode_fixed_width_rows(
                             timezone,
                         )
                     },
-                    NanosecondPolicy::default(),
+                    runtime_context.nanosecond_policy(),
                 )?;
             }
             BoundDirectColumn::DateTimeOffsetMillisecond {
@@ -483,7 +482,7 @@ fn encode_fixed_width_rows(
                             timezone,
                         )
                     },
-                    NanosecondPolicy::default(),
+                    runtime_context.nanosecond_policy(),
                 )?;
             }
             BoundDirectColumn::DateTimeOffsetMicrosecond {
@@ -506,13 +505,12 @@ fn encode_fixed_width_rows(
                             timezone,
                         )
                     },
-                    NanosecondPolicy::default(),
+                    runtime_context.nanosecond_policy(),
                 )?;
             }
             BoundDirectColumn::DateTimeOffsetNanosecond {
                 column: plan,
                 mapping,
-                nanosecond_policy,
                 array,
             } => {
                 fill_datetimeoffset_fixed_width_column(
@@ -531,7 +529,7 @@ fn encode_fixed_width_rows(
                             policy,
                         )
                     },
-                    *nanosecond_policy,
+                    runtime_context.nanosecond_policy(),
                 )?;
             }
             _ => return Ok(None),
