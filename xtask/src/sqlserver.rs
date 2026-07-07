@@ -98,12 +98,27 @@ impl SqlServerConnectionOptions {
     }
 
     pub(crate) fn connect_or_start(&self) -> Result<SqlServerConnection, SqlServerError> {
-        self.connect_or_start_with_network(None)
+        self.connect_or_start_with_compatibility_level(100)
+    }
+
+    pub(crate) fn connect_or_start_with_compatibility_level(
+        &self,
+        compatibility_level: u16,
+    ) -> Result<SqlServerConnection, SqlServerError> {
+        self.connect_or_start_with_network_and_compatibility_level(None, compatibility_level)
     }
 
     pub(crate) fn connect_or_start_with_network(
         &self,
         network: Option<&ManagedNetwork>,
+    ) -> Result<SqlServerConnection, SqlServerError> {
+        self.connect_or_start_with_network_and_compatibility_level(network, 100)
+    }
+
+    fn connect_or_start_with_network_and_compatibility_level(
+        &self,
+        network: Option<&ManagedNetwork>,
+        compatibility_level: u16,
     ) -> Result<SqlServerConnection, SqlServerError> {
         if let Some(connection_string) = &self.connection_string {
             return Ok(SqlServerConnection {
@@ -119,7 +134,7 @@ impl SqlServerConnectionOptions {
         let connection = container.host_connection();
         let container_connection = network.is_some().then(|| container.container_connection());
         container.wait_until_ready()?;
-        container.initialize_database(&self.database)?;
+        container.initialize_database(&self.database, compatibility_level)?;
 
         Ok(SqlServerConnection {
             connection_string: connection,
@@ -233,11 +248,15 @@ impl SqlServerContainer {
         })
     }
 
-    fn initialize_database(&self, database: &str) -> Result<(), SqlServerError> {
+    fn initialize_database(
+        &self,
+        database: &str,
+        compatibility_level: u16,
+    ) -> Result<(), SqlServerError> {
         validate_database_name(database)?;
         let escaped_database = database.replace(']', "]]");
         let sql = format!(
-            "IF DB_ID(N'{database}') IS NULL CREATE DATABASE [{escaped_database}]; ALTER DATABASE [{escaped_database}] SET COMPATIBILITY_LEVEL = 100;"
+            "IF DB_ID(N'{database}') IS NULL CREATE DATABASE [{escaped_database}]; ALTER DATABASE [{escaped_database}] SET COMPATIBILITY_LEVEL = {compatibility_level};"
         );
 
         self.sqlcmd(&sql)
@@ -456,6 +475,7 @@ impl fmt::Display for SqlServerError {
 
 pub(crate) const CONNECTION_STRING_ENV: &str = "ARROW_TIBERIUS_TEST_MSSQL_URL";
 pub(crate) const TEST_DATABASE_ENV: &str = "ARROW_TIBERIUS_TEST_MSSQL_DATABASE";
+pub(crate) const COMPATIBILITY_LEVEL_ENV: &str = "ARROW_TIBERIUS_TEST_MSSQL_COMPATIBILITY_LEVEL";
 pub(crate) const CONTAINER_RUNTIME_ENV: &str = "ARROW_TIBERIUS_CONTAINER_RUNTIME";
 const SQLSERVER_READY_TIMEOUT_SECS: u64 = 120;
 
