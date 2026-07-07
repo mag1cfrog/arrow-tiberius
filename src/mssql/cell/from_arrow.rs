@@ -7,7 +7,8 @@ mod variable_width;
 
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, FieldRef, MssqlType, NanosecondPolicy, Result,
-    SchemaMapping, arrow::cell::ArrowCell, write::context::RuntimeConversionContext,
+    SchemaMapping, arrow::cell::ArrowCell, mssql::profile::DateTimeRounding,
+    write::context::RuntimeConversionContext,
 };
 #[cfg(test)]
 use crate::{MssqlProfile, PlanOptions};
@@ -58,6 +59,12 @@ impl<'a> ArrowToMssqlRuntimeMapping<'a> {
     /// Returns the nanosecond timestamp policy selected for write conversion.
     pub(crate) const fn nanosecond_policy(self) -> NanosecondPolicy {
         self.runtime_context.nanosecond_policy()
+    }
+
+    /// Returns the SQL Server datetime rounding behavior selected for write conversion.
+    #[allow(dead_code)]
+    pub(crate) const fn datetime_rounding(self) -> DateTimeRounding {
+        self.runtime_context.datetime_rounding()
     }
 }
 
