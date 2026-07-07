@@ -2,7 +2,8 @@
 
 use arrow_schema::{DataType, Field, Schema};
 use arrow_tiberius::{
-    MssqlProfile, PlanOptions, TableName, UInt64Policy, create_table_sql_from_mappings,
+    CompatibilityLevel, MssqlProfile, MssqlVersion, PlanOptions, TableName, UInt64Policy,
+    create_table_sql_from_mappings,
 };
 
 fn main() -> arrow_tiberius::Result<()> {
@@ -16,7 +17,10 @@ fn main() -> arrow_tiberius::Result<()> {
         ..PlanOptions::default()
     };
 
-    let profile = MssqlProfile::sql_server_2016_compat_100();
+    let profile = MssqlProfile::new(
+        MssqlVersion::SqlServer2022,
+        CompatibilityLevel::SQL_SERVER_2022,
+    )?;
     let outcome = profile.plan_arrow_schema(&schema, plan_options)?;
 
     for mapping in outcome.mappings() {

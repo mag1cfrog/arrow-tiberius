@@ -1,7 +1,10 @@
 //! Plan an Arrow schema and render SQL Server `CREATE TABLE` DDL.
 
 use arrow_schema::{DataType, Field, Schema};
-use arrow_tiberius::{MssqlProfile, PlanOptions, TableName, create_table_sql_from_mappings};
+use arrow_tiberius::{
+    CompatibilityLevel, MssqlProfile, MssqlVersion, PlanOptions, TableName,
+    create_table_sql_from_mappings,
+};
 
 fn main() -> arrow_tiberius::Result<()> {
     let schema = Schema::new(vec![
@@ -10,7 +13,10 @@ fn main() -> arrow_tiberius::Result<()> {
         Field::new("is_active", DataType::Boolean, false),
     ]);
 
-    let profile = MssqlProfile::sql_server_2016_compat_100();
+    let profile = MssqlProfile::new(
+        MssqlVersion::SqlServer2022,
+        CompatibilityLevel::SQL_SERVER_2022,
+    )?;
     let outcome = profile.plan_arrow_schema(&schema, PlanOptions::default())?;
 
     let table = TableName::new("dbo", "customers")?;

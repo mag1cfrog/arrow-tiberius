@@ -7,7 +7,7 @@
 `arrow-tiberius` bridges Apache Arrow and Microsoft SQL Server through the
 Tiberius TDS driver.
 
-The v0.1 API focuses on Arrow-to-SQL Server writes:
+The current API focuses on Arrow-to-SQL Server writes:
 
 - plan SQL Server-compatible schemas from Arrow schemas,
 - render deterministic `CREATE TABLE` SQL,
@@ -21,7 +21,7 @@ SQL Server-to-Arrow reads are reserved for a later release.
 
 ```toml
 [dependencies]
-arrow-tiberius = "0.1"
+arrow-tiberius = "0.2"
 ```
 
 ## Quick Start
@@ -31,7 +31,8 @@ Plan an Arrow schema and render SQL Server DDL:
 ```rust
 use arrow_schema::{DataType, Field, Schema};
 use arrow_tiberius::{
-    MssqlProfile, PlanOptions, TableName, create_table_sql_from_mappings,
+    CompatibilityLevel, MssqlProfile, MssqlVersion, PlanOptions, TableName,
+    create_table_sql_from_mappings,
 };
 
 fn main() -> arrow_tiberius::Result<()> {
@@ -40,7 +41,10 @@ fn main() -> arrow_tiberius::Result<()> {
         Field::new("name", DataType::Utf8, true),
     ]);
 
-    let profile = MssqlProfile::sql_server_2016_compat_100();
+    let profile = MssqlProfile::new(
+        MssqlVersion::SqlServer2022,
+        CompatibilityLevel::SQL_SERVER_2022,
+    )?;
     let outcome = profile.plan_arrow_schema(&schema, PlanOptions::default())?;
 
     let table = TableName::new("dbo", "people")?;
@@ -56,8 +60,8 @@ Write a batch to an existing SQL Server table:
 ```rust
 use arrow_array::RecordBatch;
 use arrow_tiberius::{
-    MssqlProfile, PlanOptions, TableName, WriteBackend, WriteOptions,
-    connect_mssql_client_from_ado_string,
+    CompatibilityLevel, MssqlProfile, MssqlVersion, PlanOptions, TableName,
+    WriteBackend, WriteOptions, connect_mssql_client_from_ado_string,
 };
 
 async fn write_batch(
@@ -65,7 +69,10 @@ async fn write_batch(
     batch: &RecordBatch,
 ) -> arrow_tiberius::Result<()> {
     let mut client = connect_mssql_client_from_ado_string(connection_string).await?;
-    let profile = MssqlProfile::sql_server_2016_compat_100();
+    let profile = MssqlProfile::new(
+        MssqlVersion::SqlServer2022,
+        CompatibilityLevel::SQL_SERVER_2022,
+    )?;
     let planned_schema = profile
         .plan_arrow_schema(batch.schema().as_ref(), PlanOptions::default())?
         .into_value();
@@ -159,18 +166,22 @@ By default, the SQL Server example creates, writes to, and drops
 ## Compatibility
 
 Choose the `MssqlProfile` that matches the SQL Server version and database
-compatibility level you plan to write against. The original v0.1 profile remains
-available:
+compatibility level you plan to write against:
 
 ```rust
-use arrow_tiberius::MssqlProfile;
+use arrow_tiberius::{CompatibilityLevel, MssqlProfile, MssqlVersion};
 
-let profile = MssqlProfile::sql_server_2016_compat_100();
+let profile = MssqlProfile::new(
+    MssqlVersion::SqlServer2022,
+    CompatibilityLevel::SQL_SERVER_2022,
+)?;
 ```
 
-This release also models SQL Server 2017 database compatibility levels 100,
-110, 120, 130, and 140, including the SQL Server 2017 compatibility-level-100
-target used by the integration harness.
+The profile surface models SQL Server 2016, 2017, 2019, 2022, and 2025
+version/compatibility-level pairs. Legacy convenience constructors such as
+`MssqlProfile::sql_server_2016_compat_100()` and
+`MssqlProfile::sql_server_2017_compat_100()` remain available for callers that
+target those exact environments.
 
 `arrow-tiberius` depends on the published `tiberius-raw-bulk` package as the
 crate name `tiberius` and owns that compatibility boundary internally:
@@ -208,6 +219,7 @@ Run SQL Server integration tests through the xtask harness:
 
 ```bash
 cargo xtask sqlserver-test
+cargo xtask sqlserver-compat-probe
 ```
 
 ## Documentation

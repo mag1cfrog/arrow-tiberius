@@ -6,7 +6,7 @@
 //! Server, and future read-side APIs can map SQL Server metadata and rows back
 //! to Arrow.
 //!
-//! The v0.1 API implements the Arrow-to-SQL Server write path first: plan an
+//! The current API implements the Arrow-to-SQL Server write path first: plan an
 //! Arrow schema for SQL Server, render deterministic DDL, inspect structured
 //! diagnostics, and bulk load one or more record batches. SQL Server-to-Arrow
 //! reads are reserved for a later release.
@@ -20,7 +20,8 @@
 //! ```
 //! use arrow_schema::{DataType, Field, Schema};
 //! use arrow_tiberius::{
-//!     MssqlProfile, PlanOptions, TableName, create_table_sql_from_mappings,
+//!     CompatibilityLevel, MssqlProfile, MssqlVersion, PlanOptions, TableName,
+//!     create_table_sql_from_mappings,
 //! };
 //!
 //! # fn main() -> arrow_tiberius::Result<()> {
@@ -29,7 +30,10 @@
 //!     Field::new("name", DataType::Utf8, true),
 //! ]);
 //!
-//! let profile = MssqlProfile::sql_server_2016_compat_100();
+//! let profile = MssqlProfile::new(
+//!     MssqlVersion::SqlServer2022,
+//!     CompatibilityLevel::SQL_SERVER_2022,
+//! )?;
 //! let outcome = profile.plan_arrow_schema(&schema, PlanOptions::default())?;
 //!
 //! let table = TableName::new("dbo", "people")?;
@@ -80,10 +84,11 @@
 //! # SQL Server Compatibility
 //!
 //! Choose the [`MssqlProfile`] that matches the SQL Server version and database
-//! compatibility level you plan to write against. The original
-//! [`MssqlProfile::sql_server_2016_compat_100`] profile remains available. The
-//! profile surface also models SQL Server 2016, 2017, 2019, 2022, and 2025
-//! version/compatibility-level pairs through [`MssqlProfile::new`].
+//! compatibility level you plan to write against. The profile surface models
+//! SQL Server 2016, 2017, 2019, 2022, and 2025 version/compatibility-level pairs
+//! through [`MssqlProfile::new`]. Legacy convenience constructors such as
+//! [`MssqlProfile::sql_server_2016_compat_100`] remain available for exact
+//! legacy targets.
 //!
 //! # Tiberius Dependency Model
 //!
@@ -95,7 +100,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! arrow-tiberius = "0.1"
+//! arrow-tiberius = "0.2"
 //! ```
 //!
 //! Depending on upstream `tiberius` separately creates a distinct crate type and

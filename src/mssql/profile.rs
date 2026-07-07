@@ -157,7 +157,7 @@ impl MssqlProfile {
         })
     }
 
-    /// Creates the v0.1 SQL Server 2016 profile with database compatibility
+    /// Creates the legacy SQL Server 2016 profile with database compatibility
     /// level 100.
     pub const fn sql_server_2016_compat_100() -> Self {
         Self {
