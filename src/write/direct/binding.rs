@@ -36,6 +36,11 @@ use crate::{
     write::context::RuntimeConversionContext,
 };
 
+/// Runtime direct-column binding for one Arrow record batch.
+///
+/// The batch owns the runtime conversion context so every direct path uses the
+/// same profile and planning policies for measurement, fill, append, and
+/// fixed-width fast-path encoding.
 pub(crate) struct BoundDirectBatch<'a> {
     columns: Vec<BoundDirectColumn<'a>>,
     runtime_context: RuntimeConversionContext,
@@ -43,6 +48,7 @@ pub(crate) struct BoundDirectBatch<'a> {
 }
 
 impl<'a> BoundDirectBatch<'a> {
+    /// Binds a runtime Arrow batch to an already planned direct encoder.
     pub(crate) fn new(encoder: &'a DirectEncoder, batch: &'a RecordBatch) -> Result<Self> {
         Ok(Self {
             columns: bind_direct_columns(encoder, batch)?,
@@ -51,18 +57,22 @@ impl<'a> BoundDirectBatch<'a> {
         })
     }
 
+    /// Returns the bound direct columns in planned output order.
     pub(crate) fn columns(&self) -> &[BoundDirectColumn<'a>] {
         &self.columns
     }
 
+    /// Returns the runtime conversion context shared by every bound column.
     pub(crate) const fn runtime_context(&self) -> RuntimeConversionContext {
         self.runtime_context
     }
 
+    /// Returns the number of rows in the bound Arrow batch.
     pub(crate) const fn row_count(&self) -> usize {
         self.row_count
     }
 
+    /// Measures the encoded cell length matrix for all rows and columns.
     pub(crate) fn measure_cell_lengths(&self) -> Result<Vec<usize>> {
         if self.row_count == 0 {
             return Ok(Vec::new());
@@ -83,6 +93,7 @@ impl<'a> BoundDirectBatch<'a> {
         Ok(cell_lengths)
     }
 
+    /// Measures the complete row layout for the bound batch.
     pub(crate) fn measure_layout(&self) -> Result<RowLayout> {
         if self.row_count == 0 {
             return RowLayout::new(Vec::new(), Vec::new(), Vec::new(), 0);
@@ -92,6 +103,7 @@ impl<'a> BoundDirectBatch<'a> {
         build_fixed_width_row_layout(self.row_count, self.columns.len(), &cell_lengths)
     }
 
+    /// Fills all bound columns into an already allocated row payload.
     pub(crate) fn fill_columns(&self, layout: &RowLayout, bytes: &mut [u8]) -> Result<()> {
         let column_count = self.columns.len();
 

@@ -66,13 +66,18 @@ pub struct MssqlProfile {
     compatibility_level: CompatibilityLevel,
 }
 
-/// Profile-selected SQL Server `datetime` rounding behavior.
+/// Profile-selected strategy for converting Arrow timestamps to SQL Server
+/// `datetime` fragments.
+///
+/// SQL Server can round `datetime` casts differently by database
+/// compatibility level. Writers should ask the profile for this semantic
+/// behavior instead of checking raw compatibility-level numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
 pub(crate) enum DateTimeRounding {
-    /// Compatibility levels before 130 round through legacy cast behavior.
+    /// Use legacy pre-130 `datetime` cast semantics.
     LegacyPre130,
-    /// Compatibility levels 130 and later use direct nearest-fragment rounding.
+    /// Use compatibility-level 130 and later nearest-fragment semantics.
     Compat130Plus,
 }
 
@@ -151,6 +156,9 @@ impl MssqlProfile {
     }
 
     /// Returns the `datetime` rounding behavior selected by compatibility level.
+    ///
+    /// This is the single place that maps raw SQL Server compatibility levels
+    /// to runtime timestamp-conversion behavior.
     #[allow(dead_code)]
     pub(crate) const fn datetime_rounding(self) -> DateTimeRounding {
         if self.compatibility_level.as_u16() < 130 {

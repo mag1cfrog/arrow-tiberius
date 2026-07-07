@@ -16,33 +16,37 @@ use crate::{
         fixed_size_binary::FixedSizeBinaryArrowToMssql, primitive::PrimitiveArrowToMssql,
         temporal::TemporalArrowToMssql,
     },
-    mssql::cell::{
-        MssqlDateTime, MssqlDateTime2, MssqlDateTimeOffset, MssqlTime,
-        from_arrow::temporal::datetime::{
-            mssql_datetime_from_arrow_timestamp_microsecond,
-            mssql_datetime_from_arrow_timestamp_millisecond,
-            mssql_datetime_from_arrow_timestamp_nanosecond,
-            mssql_datetime_from_arrow_timestamp_second,
+    mssql::{
+        cell::{
+            MssqlDateTime, MssqlDateTime2, MssqlDateTimeOffset, MssqlTime,
+            from_arrow::temporal::datetime::{
+                mssql_datetime_from_arrow_timestamp_microsecond,
+                mssql_datetime_from_arrow_timestamp_millisecond,
+                mssql_datetime_from_arrow_timestamp_nanosecond,
+                mssql_datetime_from_arrow_timestamp_second,
+            },
+            from_arrow::temporal::datetime2::{
+                mssql_datetime2_from_arrow_timestamp_microsecond,
+                mssql_datetime2_from_arrow_timestamp_millisecond,
+                mssql_datetime2_from_arrow_timestamp_nanosecond,
+                mssql_datetime2_from_arrow_timestamp_second,
+            },
+            from_arrow::temporal::datetimeoffset::{
+                mssql_datetimeoffset_from_arrow_timestamp_microsecond,
+                mssql_datetimeoffset_from_arrow_timestamp_millisecond,
+                mssql_datetimeoffset_from_arrow_timestamp_nanosecond,
+                mssql_datetimeoffset_from_arrow_timestamp_second,
+            },
+            from_arrow::temporal::time::{
+                mssql_time_from_arrow_time32_millisecond, mssql_time_from_arrow_time32_second,
+                mssql_time_from_arrow_time64_microsecond, mssql_time_from_arrow_time64_nanosecond,
+            },
+            from_arrow::temporal::{
+                validate_mapping_timestamp_timezone_metadata,
+                validate_null_timestamp_timezone_metadata,
+            },
         },
-        from_arrow::temporal::datetime2::{
-            mssql_datetime2_from_arrow_timestamp_microsecond,
-            mssql_datetime2_from_arrow_timestamp_millisecond,
-            mssql_datetime2_from_arrow_timestamp_nanosecond,
-            mssql_datetime2_from_arrow_timestamp_second,
-        },
-        from_arrow::temporal::datetimeoffset::{
-            mssql_datetimeoffset_from_arrow_timestamp_microsecond,
-            mssql_datetimeoffset_from_arrow_timestamp_millisecond,
-            mssql_datetimeoffset_from_arrow_timestamp_nanosecond,
-            mssql_datetimeoffset_from_arrow_timestamp_second,
-        },
-        from_arrow::temporal::time::{
-            mssql_time_from_arrow_time32_millisecond, mssql_time_from_arrow_time32_second,
-            mssql_time_from_arrow_time64_microsecond, mssql_time_from_arrow_time64_nanosecond,
-        },
-        from_arrow::temporal::{
-            validate_mapping_timestamp_timezone_metadata, validate_null_timestamp_timezone_metadata,
-        },
+        profile::DateTimeRounding,
     },
     write::{context::RuntimeConversionContext, profile},
 };
@@ -269,7 +273,7 @@ fn encode_fixed_width_rows(
                     plan,
                     &mut current_offsets,
                     &mut bytes,
-                    |array, mapping, column, row_index, policy| {
+                    |array, mapping, column, row_index, policy, rounding| {
                         timestamp_fixed_width_value(
                             mapping,
                             column,
@@ -277,9 +281,11 @@ fn encode_fixed_width_rows(
                             array.value(row_index),
                             TimestampUnit::Second,
                             policy,
+                            rounding,
                         )
                     },
                     runtime_context.nanosecond_policy(),
+                    runtime_context.datetime_rounding(),
                 )?;
             }
             BoundDirectColumn::TimestampMillisecond {
@@ -293,7 +299,7 @@ fn encode_fixed_width_rows(
                     plan,
                     &mut current_offsets,
                     &mut bytes,
-                    |array, mapping, column, row_index, policy| {
+                    |array, mapping, column, row_index, policy, rounding| {
                         timestamp_fixed_width_value(
                             mapping,
                             column,
@@ -301,9 +307,11 @@ fn encode_fixed_width_rows(
                             array.value(row_index),
                             TimestampUnit::Millisecond,
                             policy,
+                            rounding,
                         )
                     },
                     runtime_context.nanosecond_policy(),
+                    runtime_context.datetime_rounding(),
                 )?;
             }
             BoundDirectColumn::TimestampMicrosecond {
@@ -317,7 +325,7 @@ fn encode_fixed_width_rows(
                     plan,
                     &mut current_offsets,
                     &mut bytes,
-                    |array, mapping, column, row_index, policy| {
+                    |array, mapping, column, row_index, policy, rounding| {
                         timestamp_fixed_width_value(
                             mapping,
                             column,
@@ -325,9 +333,11 @@ fn encode_fixed_width_rows(
                             array.value(row_index),
                             TimestampUnit::Microsecond,
                             policy,
+                            rounding,
                         )
                     },
                     runtime_context.nanosecond_policy(),
+                    runtime_context.datetime_rounding(),
                 )?;
             }
             BoundDirectColumn::TimestampNanosecond {
@@ -341,7 +351,7 @@ fn encode_fixed_width_rows(
                     plan,
                     &mut current_offsets,
                     &mut bytes,
-                    |array, mapping, column, row_index, policy| {
+                    |array, mapping, column, row_index, policy, rounding| {
                         timestamp_fixed_width_value(
                             mapping,
                             column,
@@ -349,9 +359,11 @@ fn encode_fixed_width_rows(
                             array.value(row_index),
                             TimestampUnit::Nanosecond,
                             policy,
+                            rounding,
                         )
                     },
                     runtime_context.nanosecond_policy(),
+                    runtime_context.datetime_rounding(),
                 )?;
             }
             BoundDirectColumn::Time32Second {
@@ -1390,6 +1402,10 @@ fn fill_date64_fixed_width_column(
     Ok(())
 }
 
+/// Fills one fixed-width timestamp column without building per-cell layout.
+///
+/// Both nanosecond normalization and `datetime` rounding behavior come from
+/// the direct encoder runtime context.
 fn fill_timestamp_fixed_width_column<A, F>(
     array: &A,
     mapping: &SchemaMapping,
@@ -1398,6 +1414,7 @@ fn fill_timestamp_fixed_width_column<A, F>(
     bytes: &mut [u8],
     value: F,
     nanosecond_policy: NanosecondPolicy,
+    datetime_rounding: DateTimeRounding,
 ) -> Result<()>
 where
     A: Array,
@@ -1407,6 +1424,7 @@ where
         &DirectColumnPlan,
         usize,
         NanosecondPolicy,
+        DateTimeRounding,
     ) -> Result<TimestampFixedWidthValue>,
 {
     for (row_index, current_offset) in current_offsets.iter_mut().enumerate().take(array.len()) {
@@ -1420,7 +1438,14 @@ where
         }
 
         validate_mapping_timestamp_timezone_metadata(mapping, row_index)?;
-        let value = value(array, mapping, column, row_index, nanosecond_policy)?;
+        let value = value(
+            array,
+            mapping,
+            column,
+            row_index,
+            nanosecond_policy,
+            datetime_rounding,
+        )?;
         let cell_len = timestamp_fixed_width_value_len(column, value)?;
         let cell_bytes = bytes.get_mut(offset..offset + cell_len).ok_or_else(|| {
             invalid_payload("fixed-width timestamp temporal cell range is outside payload")
@@ -1446,6 +1471,7 @@ enum TimestampUnit {
     Nanosecond,
 }
 
+/// Converts one timestamp value for the fixed-width direct encoder path.
 fn timestamp_fixed_width_value(
     mapping: &SchemaMapping,
     column: &DirectColumnPlan,
@@ -1453,23 +1479,40 @@ fn timestamp_fixed_width_value(
     source_value: i64,
     unit: TimestampUnit,
     policy: NanosecondPolicy,
+    rounding: DateTimeRounding,
 ) -> Result<TimestampFixedWidthValue> {
     match (column.target_type(), unit) {
         (MssqlType::DateTime, TimestampUnit::Second) => {
-            mssql_datetime_from_arrow_timestamp_second(mapping, row_index, source_value)
+            mssql_datetime_from_arrow_timestamp_second(mapping, row_index, source_value, rounding)
                 .map(TimestampFixedWidthValue::DateTime)
         }
         (MssqlType::DateTime, TimestampUnit::Millisecond) => {
-            mssql_datetime_from_arrow_timestamp_millisecond(mapping, row_index, source_value)
-                .map(TimestampFixedWidthValue::DateTime)
+            mssql_datetime_from_arrow_timestamp_millisecond(
+                mapping,
+                row_index,
+                source_value,
+                rounding,
+            )
+            .map(TimestampFixedWidthValue::DateTime)
         }
         (MssqlType::DateTime, TimestampUnit::Microsecond) => {
-            mssql_datetime_from_arrow_timestamp_microsecond(mapping, row_index, source_value)
-                .map(TimestampFixedWidthValue::DateTime)
+            mssql_datetime_from_arrow_timestamp_microsecond(
+                mapping,
+                row_index,
+                source_value,
+                rounding,
+            )
+            .map(TimestampFixedWidthValue::DateTime)
         }
         (MssqlType::DateTime, TimestampUnit::Nanosecond) => {
-            mssql_datetime_from_arrow_timestamp_nanosecond(mapping, row_index, source_value, policy)
-                .map(TimestampFixedWidthValue::DateTime)
+            mssql_datetime_from_arrow_timestamp_nanosecond(
+                mapping,
+                row_index,
+                source_value,
+                policy,
+                rounding,
+            )
+            .map(TimestampFixedWidthValue::DateTime)
         }
         (MssqlType::DateTime2 { .. }, TimestampUnit::Second) => {
             mssql_datetime2_from_arrow_timestamp_second(mapping, row_index, source_value)

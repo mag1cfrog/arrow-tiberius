@@ -1,6 +1,6 @@
 //! Timestamp Arrow-to-MSSQL datetime runtime cell conversion.
 
-use crate::mssql::cell::MssqlDateTime;
+use crate::mssql::{cell::MssqlDateTime, profile::DateTimeRounding};
 use crate::{DiagnosticCode, NanosecondPolicy, Result, SchemaMapping};
 
 use super::datetime2::nanoseconds_to_100ns_ticks;
@@ -19,10 +19,12 @@ const SQL_SERVER_DATETIME_MIN_UNIX_EPOCH_100NS_TICKS: i128 = (SQL_SERVER_DATETIM
     - SQL_SERVER_DATETIME_DAYS_FROM_1900_TO_UNIX_EPOCH)
     * TICKS_100NS_PER_DAY;
 
+/// Converts an Arrow second timestamp to SQL Server `datetime`.
 pub(crate) fn mssql_datetime_from_arrow_timestamp_second(
     mapping: &SchemaMapping,
     row_index: usize,
     seconds_from_unix_epoch: i64,
+    rounding: DateTimeRounding,
 ) -> Result<MssqlDateTime> {
     let ticks = i128::from(seconds_from_unix_epoch) * TICKS_100NS_PER_SECOND;
     mssql_datetime_from_unix_epoch_100ns_ticks(
@@ -31,13 +33,16 @@ pub(crate) fn mssql_datetime_from_arrow_timestamp_second(
         ticks,
         "second",
         seconds_from_unix_epoch,
+        rounding,
     )
 }
 
+/// Converts an Arrow millisecond timestamp to SQL Server `datetime`.
 pub(crate) fn mssql_datetime_from_arrow_timestamp_millisecond(
     mapping: &SchemaMapping,
     row_index: usize,
     milliseconds_from_unix_epoch: i64,
+    rounding: DateTimeRounding,
 ) -> Result<MssqlDateTime> {
     let ticks = i128::from(milliseconds_from_unix_epoch) * TICKS_100NS_PER_MILLISECOND;
     mssql_datetime_from_unix_epoch_100ns_ticks(
@@ -46,13 +51,16 @@ pub(crate) fn mssql_datetime_from_arrow_timestamp_millisecond(
         ticks,
         "millisecond",
         milliseconds_from_unix_epoch,
+        rounding,
     )
 }
 
+/// Converts an Arrow microsecond timestamp to SQL Server `datetime`.
 pub(crate) fn mssql_datetime_from_arrow_timestamp_microsecond(
     mapping: &SchemaMapping,
     row_index: usize,
     microseconds_from_unix_epoch: i64,
+    rounding: DateTimeRounding,
 ) -> Result<MssqlDateTime> {
     let ticks = i128::from(microseconds_from_unix_epoch) * TICKS_100NS_PER_MICROSECOND;
     mssql_datetime_from_unix_epoch_100ns_ticks(
@@ -61,14 +69,21 @@ pub(crate) fn mssql_datetime_from_arrow_timestamp_microsecond(
         ticks,
         "microsecond",
         microseconds_from_unix_epoch,
+        rounding,
     )
 }
 
+/// Converts an Arrow nanosecond timestamp to SQL Server `datetime`.
+///
+/// Nanoseconds are first normalized according to the runtime nanosecond policy,
+/// then rounded to SQL Server `datetime` fragments according to the selected
+/// profile behavior.
 pub(crate) fn mssql_datetime_from_arrow_timestamp_nanosecond(
     mapping: &SchemaMapping,
     row_index: usize,
     nanoseconds_from_unix_epoch: i64,
     policy: NanosecondPolicy,
+    rounding: DateTimeRounding,
 ) -> Result<MssqlDateTime> {
     let ticks =
         nanoseconds_to_100ns_ticks(mapping, row_index, nanoseconds_from_unix_epoch, policy)?;
@@ -78,15 +93,21 @@ pub(crate) fn mssql_datetime_from_arrow_timestamp_nanosecond(
         ticks,
         "nanosecond",
         nanoseconds_from_unix_epoch,
+        rounding,
     )
 }
 
+/// Converts Unix-epoch 100ns ticks to SQL Server `datetime`.
+///
+/// The caller supplies the source unit name and value so range errors can point
+/// back to the original Arrow timestamp payload.
 pub(crate) fn mssql_datetime_from_unix_epoch_100ns_ticks(
     mapping: &SchemaMapping,
     row_index: usize,
     ticks_from_unix_epoch: i128,
     unit_name: &str,
     source_value: i64,
+    rounding: DateTimeRounding,
 ) -> Result<MssqlDateTime> {
     if ticks_from_unix_epoch < SQL_SERVER_DATETIME_MIN_UNIX_EPOCH_100NS_TICKS {
         return Err(timestamp_out_of_datetime_range(
@@ -97,8 +118,12 @@ pub(crate) fn mssql_datetime_from_unix_epoch_100ns_ticks(
         ));
     }
 
-    let fragments =
-        round_100ns_ticks_to_datetime_fragments(mapping, row_index, ticks_from_unix_epoch)?;
+    let fragments = round_100ns_ticks_to_datetime_fragments(
+        mapping,
+        row_index,
+        ticks_from_unix_epoch,
+        rounding,
+    )?;
     let days_from_unix_epoch = fragments.div_euclid(SQL_SERVER_DATETIME_FRAGMENTS_PER_DAY);
     let seconds_fragments = fragments.rem_euclid(SQL_SERVER_DATETIME_FRAGMENTS_PER_DAY);
     let days = days_from_unix_epoch + SQL_SERVER_DATETIME_DAYS_FROM_1900_TO_UNIX_EPOCH;
@@ -152,7 +177,22 @@ fn timestamp_out_of_datetime_range(
     ))
 }
 
+/// Selects the SQL Server `datetime` fragment-rounding rule for a profile.
 fn round_100ns_ticks_to_datetime_fragments(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    ticks: i128,
+    rounding: DateTimeRounding,
+) -> Result<i128> {
+    match rounding {
+        DateTimeRounding::LegacyPre130 | DateTimeRounding::Compat130Plus => {
+            round_100ns_ticks_to_nearest_datetime_fragment(mapping, row_index, ticks)
+        }
+    }
+}
+
+/// Rounds Unix-epoch 100ns ticks to SQL Server `datetime` 1/300-second fragments.
+fn round_100ns_ticks_to_nearest_datetime_fragment(
     mapping: &SchemaMapping,
     row_index: usize,
     ticks: i128,
