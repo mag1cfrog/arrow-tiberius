@@ -68,3 +68,63 @@ jobs:
       # and cleanup so local and CI validation use the same entrypoint.
       - name: Run SQL Server integration tests
         run: cargo xtask sqlserver-test
+
+  sqlserver-compat-probe:
+    name: SQL Server compat probe (${{ matrix.version }})
+    runs-on: ubuntu-latest
+    needs: rust-checks
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: "2017"
+            image: mcr.microsoft.com/mssql/server:2017-latest
+            compatibility-levels: "100 110 120 130 140"
+          - version: "2019"
+            image: mcr.microsoft.com/mssql/server:2019-latest
+            compatibility-levels: "120 130 150"
+          - version: "2022"
+            image: mcr.microsoft.com/mssql/server:2022-latest
+            compatibility-levels: "120 130 160"
+          - version: "2025"
+            image: mcr.microsoft.com/mssql/server:2025-latest
+            compatibility-levels: "120 130 170"
+
+    env:
+      ARROW_TIBERIUS_CONTAINER_RUNTIME: docker
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ubuntu-rust
+
+      - name: Show Rust toolchain
+        run: rustup show
+
+      - name: Show Docker version
+        run: docker version
+
+      - name: Run SQL Server compatibility probe
+        run: |
+          for compatibility_level in ${{ matrix.compatibility-levels }}; do
+            echo "::group::SQL Server ${{ matrix.version }} compatibility level ${compatibility_level}"
+            set +e
+            cargo xtask sqlserver-compat-probe \
+              --image "${{ matrix.image }}" \
+              --version "${{ matrix.version }}" \
+              --compatibility-level "$compatibility_level"
+            status=$?
+            set -e
+            echo "::endgroup::"
+
+            if [ "$status" -ne 0 ]; then
+              echo "SQL Server ${{ matrix.version }} compatibility probe failed for compatibility level ${compatibility_level}"
+              exit "$status"
+            fi
+          done

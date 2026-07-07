@@ -14,6 +14,41 @@ pub enum MssqlVersion {
     SqlServer2016,
     /// SQL Server 2017.
     SqlServer2017,
+    /// SQL Server 2019.
+    SqlServer2019,
+    /// SQL Server 2022.
+    SqlServer2022,
+    /// SQL Server 2025.
+    SqlServer2025,
+}
+
+impl MssqlVersion {
+    /// Returns the default database compatibility level for this SQL Server
+    /// engine version.
+    pub const fn default_compatibility_level(self) -> CompatibilityLevel {
+        match self {
+            Self::SqlServer2016 => CompatibilityLevel::SQL_SERVER_2016,
+            Self::SqlServer2017 => CompatibilityLevel::SQL_SERVER_2017,
+            Self::SqlServer2019 => CompatibilityLevel::SQL_SERVER_2019,
+            Self::SqlServer2022 => CompatibilityLevel::SQL_SERVER_2022,
+            Self::SqlServer2025 => CompatibilityLevel::SQL_SERVER_2025,
+        }
+    }
+
+    /// Returns whether this SQL Server engine version supports the database
+    /// compatibility level.
+    pub const fn supports_compatibility_level(
+        self,
+        compatibility_level: CompatibilityLevel,
+    ) -> bool {
+        match self {
+            Self::SqlServer2016 => compatibility_level.as_u16() <= 130,
+            Self::SqlServer2017 => compatibility_level.as_u16() <= 140,
+            Self::SqlServer2019 => compatibility_level.as_u16() <= 150,
+            Self::SqlServer2022 => compatibility_level.as_u16() <= 160,
+            Self::SqlServer2025 => compatibility_level.as_u16() <= 170,
+        }
+    }
 }
 
 /// SQL Server database compatibility level.
@@ -31,6 +66,12 @@ impl CompatibilityLevel {
     pub const SQL_SERVER_2016: Self = Self(130);
     /// SQL Server 2017 compatibility level.
     pub const SQL_SERVER_2017: Self = Self(140);
+    /// SQL Server 2019 compatibility level.
+    pub const SQL_SERVER_2019: Self = Self(150);
+    /// SQL Server 2022 compatibility level.
+    pub const SQL_SERVER_2022: Self = Self(160);
+    /// SQL Server 2025 compatibility level.
+    pub const SQL_SERVER_2025: Self = Self(170);
 
     /// Creates a validated compatibility level.
     pub fn new(level: u16) -> Result<Self> {
@@ -47,7 +88,7 @@ impl CompatibilityLevel {
     }
 
     const fn is_supported(level: u16) -> bool {
-        matches!(level, 100 | 110 | 120 | 130 | 140)
+        matches!(level, 100 | 110 | 120 | 130 | 140 | 150 | 160 | 170)
     }
 }
 
@@ -100,6 +141,22 @@ pub(crate) enum DateTimeRounding {
 }
 
 impl MssqlProfile {
+    /// Creates a SQL Server profile after validating that the engine version
+    /// supports the requested database compatibility level.
+    pub fn new(version: MssqlVersion, compatibility_level: CompatibilityLevel) -> Result<Self> {
+        if !version.supports_compatibility_level(compatibility_level) {
+            return Err(crate::Error::UnsupportedCompatibilityLevel {
+                version,
+                compatibility_level: compatibility_level.as_u16(),
+            });
+        }
+
+        Ok(Self {
+            version,
+            compatibility_level,
+        })
+    }
+
     /// Creates the v0.1 SQL Server 2016 profile with database compatibility
     /// level 100.
     pub const fn sql_server_2016_compat_100() -> Self {
@@ -216,6 +273,73 @@ mod tests {
     }
 
     #[test]
+    fn reports_default_compatibility_level_by_version() {
+        let cases = [
+            (MssqlVersion::SqlServer2016, 130),
+            (MssqlVersion::SqlServer2017, 140),
+            (MssqlVersion::SqlServer2019, 150),
+            (MssqlVersion::SqlServer2022, 160),
+            (MssqlVersion::SqlServer2025, 170),
+        ];
+
+        for (version, compatibility_level) in cases {
+            assert_eq!(
+                version.default_compatibility_level().as_u16(),
+                compatibility_level
+            );
+        }
+    }
+
+    #[test]
+    fn creates_profiles_for_supported_version_compatibility_pairs() {
+        let cases: &[(MssqlVersion, &[u16])] = &[
+            (MssqlVersion::SqlServer2016, &[100, 110, 120, 130]),
+            (MssqlVersion::SqlServer2017, &[100, 110, 120, 130, 140]),
+            (MssqlVersion::SqlServer2019, &[100, 110, 120, 130, 140, 150]),
+            (
+                MssqlVersion::SqlServer2022,
+                &[100, 110, 120, 130, 140, 150, 160],
+            ),
+            (
+                MssqlVersion::SqlServer2025,
+                &[100, 110, 120, 130, 140, 150, 160, 170],
+            ),
+        ];
+
+        for (version, compatibility_levels) in cases {
+            for compatibility_level in *compatibility_levels {
+                let compatibility_level = CompatibilityLevel::new(*compatibility_level).unwrap();
+                let profile = MssqlProfile::new(*version, compatibility_level).unwrap();
+
+                assert_eq!(profile.version(), *version);
+                assert_eq!(profile.compatibility_level(), compatibility_level);
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_version_compatibility_pairs_not_supported_by_sql_server() {
+        let cases = [
+            (MssqlVersion::SqlServer2016, 140),
+            (MssqlVersion::SqlServer2017, 150),
+            (MssqlVersion::SqlServer2019, 160),
+            (MssqlVersion::SqlServer2022, 170),
+        ];
+
+        for (version, compatibility_level) in cases {
+            let level = CompatibilityLevel::new(compatibility_level).unwrap();
+            let err = MssqlProfile::new(version, level).expect_err("profile should be rejected");
+
+            assert!(
+                err.to_string().contains(&format!(
+                    "does not support database compatibility level {compatibility_level}"
+                )),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn accepts_supported_compatibility_levels() {
         let cases = [
             (100, CompatibilityLevel::SQL_SERVER_2008),
@@ -223,6 +347,9 @@ mod tests {
             (120, CompatibilityLevel::SQL_SERVER_2014),
             (130, CompatibilityLevel::SQL_SERVER_2016),
             (140, CompatibilityLevel::SQL_SERVER_2017),
+            (150, CompatibilityLevel::SQL_SERVER_2019),
+            (160, CompatibilityLevel::SQL_SERVER_2022),
+            (170, CompatibilityLevel::SQL_SERVER_2025),
         ];
 
         for (value, expected) in cases {
@@ -235,7 +362,7 @@ mod tests {
 
     #[test]
     fn try_from_accepts_supported_compatibility_levels() {
-        for value in [100, 110, 120, 130, 140] {
+        for value in [100, 110, 120, 130, 140, 150, 160, 170] {
             let level = CompatibilityLevel::try_from(value).unwrap();
 
             assert_eq!(level.as_u16(), value);
@@ -251,7 +378,26 @@ mod tests {
 
     #[test]
     fn rejects_nearby_and_extreme_compatibility_levels() {
-        for level in [0, 99, 101, 109, 111, 119, 121, 129, 131, 139, 141, u16::MAX] {
+        for level in [
+            0,
+            99,
+            101,
+            109,
+            111,
+            119,
+            121,
+            129,
+            131,
+            139,
+            141,
+            149,
+            151,
+            159,
+            161,
+            169,
+            171,
+            u16::MAX,
+        ] {
             let err = CompatibilityLevel::new(level).expect_err("level should be rejected");
 
             assert!(
@@ -287,6 +433,30 @@ mod tests {
             ),
             (
                 MssqlProfile::sql_server_2017_compat_140(),
+                DateTimeRounding::Compat130Plus,
+            ),
+            (
+                MssqlProfile::new(
+                    MssqlVersion::SqlServer2019,
+                    CompatibilityLevel::SQL_SERVER_2019,
+                )
+                .unwrap(),
+                DateTimeRounding::Compat130Plus,
+            ),
+            (
+                MssqlProfile::new(
+                    MssqlVersion::SqlServer2022,
+                    CompatibilityLevel::SQL_SERVER_2022,
+                )
+                .unwrap(),
+                DateTimeRounding::Compat130Plus,
+            ),
+            (
+                MssqlProfile::new(
+                    MssqlVersion::SqlServer2025,
+                    CompatibilityLevel::SQL_SERVER_2025,
+                )
+                .unwrap(),
                 DateTimeRounding::Compat130Plus,
             ),
         ];
