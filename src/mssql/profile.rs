@@ -66,6 +66,39 @@ pub struct MssqlProfile {
     compatibility_level: CompatibilityLevel,
 }
 
+/// Profile-selected strategy for converting Arrow timestamps to SQL Server
+/// `datetime` fragments.
+///
+/// SQL Server can round `datetime` casts differently by database
+/// compatibility level. Writers should ask the profile for this semantic
+/// behavior instead of checking raw compatibility-level numbers.
+///
+/// The important boundary is database compatibility level 130. Older
+/// compatibility levels keep the legacy precision-loss step used by SQL Server
+/// casts from high-precision temporal values to `datetime`; level 130 and newer
+/// use the improved direct rounding behavior.
+///
+/// Legacy mode does not preserve more source precision. It can store a larger
+/// displayed `datetime` value for some inputs because the source is rounded to
+/// milliseconds before SQL Server chooses the final 1/300-second fragment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
+pub(crate) enum DateTimeRounding {
+    /// Use legacy pre-130 `datetime` cast semantics.
+    ///
+    /// This first rounds the source instant to whole milliseconds, then rounds
+    /// that millisecond value to SQL Server's 1/300-second `datetime`
+    /// fragments. For example, `2026-06-03T23:36:33.684582` stores as `.687`
+    /// after losing the sub-millisecond portion.
+    LegacyPre130,
+    /// Use compatibility-level 130 and later nearest-fragment semantics.
+    ///
+    /// This rounds the original high-precision source instant directly to the
+    /// nearest 1/300-second `datetime` fragment. For example,
+    /// `2026-06-03T23:36:33.684582` stores as `.683`.
+    Compat130Plus,
+}
+
 impl MssqlProfile {
     /// Creates the v0.1 SQL Server 2016 profile with database compatibility
     /// level 100.
@@ -139,11 +172,24 @@ impl MssqlProfile {
     pub const fn compatibility_level(self) -> CompatibilityLevel {
         self.compatibility_level
     }
+
+    /// Returns the `datetime` rounding behavior selected by compatibility level.
+    ///
+    /// This is the single place that maps raw SQL Server compatibility levels
+    /// to runtime timestamp-conversion behavior.
+    #[allow(dead_code)]
+    pub(crate) const fn datetime_rounding(self) -> DateTimeRounding {
+        if self.compatibility_level.as_u16() < 130 {
+            DateTimeRounding::LegacyPre130
+        } else {
+            DateTimeRounding::Compat130Plus
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CompatibilityLevel, MssqlProfile, MssqlVersion};
+    use super::{CompatibilityLevel, DateTimeRounding, MssqlProfile, MssqlVersion};
 
     #[test]
     fn constructs_sql_server_2016_compat_100_profile() {
@@ -213,6 +259,40 @@ mod tests {
                     .contains(&format!("invalid compatibility level {level}")),
                 "unexpected error: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn selects_datetime_rounding_by_compatibility_level() {
+        let cases = [
+            (
+                MssqlProfile::sql_server_2016_compat_100(),
+                DateTimeRounding::LegacyPre130,
+            ),
+            (
+                MssqlProfile::sql_server_2017_compat_100(),
+                DateTimeRounding::LegacyPre130,
+            ),
+            (
+                MssqlProfile::sql_server_2017_compat_110(),
+                DateTimeRounding::LegacyPre130,
+            ),
+            (
+                MssqlProfile::sql_server_2017_compat_120(),
+                DateTimeRounding::LegacyPre130,
+            ),
+            (
+                MssqlProfile::sql_server_2017_compat_130(),
+                DateTimeRounding::Compat130Plus,
+            ),
+            (
+                MssqlProfile::sql_server_2017_compat_140(),
+                DateTimeRounding::Compat130Plus,
+            ),
+        ];
+
+        for (profile, expected) in cases {
+            assert_eq!(profile.datetime_rounding(), expected);
         }
     }
 }

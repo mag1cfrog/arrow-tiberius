@@ -1,6 +1,6 @@
 //! Shared write-runtime conversion context.
 
-use crate::{MssqlProfile, NanosecondPolicy, PlanOptions};
+use crate::{MssqlProfile, NanosecondPolicy, PlanOptions, mssql::profile::DateTimeRounding};
 
 /// Runtime conversion context derived from a planned schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -34,5 +34,32 @@ impl RuntimeConversionContext {
     #[allow(dead_code)]
     pub(crate) const fn nanosecond_policy(self) -> NanosecondPolicy {
         self.plan_options.nanosecond_policy
+    }
+
+    /// Returns the SQL Server datetime rounding behavior selected by the profile.
+    #[allow(dead_code)]
+    pub(crate) const fn datetime_rounding(self) -> DateTimeRounding {
+        self.profile.datetime_rounding()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selects_datetime_rounding_from_profile() {
+        let options = PlanOptions::default();
+
+        assert_eq!(
+            RuntimeConversionContext::new(MssqlProfile::sql_server_2016_compat_100(), options)
+                .datetime_rounding(),
+            DateTimeRounding::LegacyPre130
+        );
+        assert_eq!(
+            RuntimeConversionContext::new(MssqlProfile::sql_server_2017_compat_140(), options)
+                .datetime_rounding(),
+            DateTimeRounding::Compat130Plus
+        );
     }
 }

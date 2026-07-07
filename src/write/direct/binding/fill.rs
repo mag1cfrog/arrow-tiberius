@@ -1,4 +1,4 @@
-use crate::{PlanOptions, Result};
+use crate::{Result, write::context::RuntimeConversionContext};
 
 use super::super::{
     layout::RowLayout,
@@ -33,13 +33,12 @@ use super::BoundDirectColumn;
 impl BoundDirectColumn<'_> {
     pub(crate) fn fill_column(
         &self,
+        runtime_context: RuntimeConversionContext,
         column_index: usize,
         column_count: usize,
         layout: &RowLayout,
         bytes: &mut [u8],
     ) -> Result<()> {
-        let default_options = PlanOptions::default();
-
         match self {
             Self::Boolean { column, array } => {
                 fill_boolean_column(array, column, column_index, column_count, layout, bytes)
@@ -181,7 +180,7 @@ impl BoundDirectColumn<'_> {
                 array,
                 TemporalColumnContext {
                     mapping,
-                    plan_options: default_options,
+                    runtime_context,
                     column,
                     column_index,
                     column_count,
@@ -197,7 +196,7 @@ impl BoundDirectColumn<'_> {
                 array,
                 TemporalColumnContext {
                     mapping,
-                    plan_options: default_options,
+                    runtime_context,
                     column,
                     column_index,
                     column_count,
@@ -213,7 +212,7 @@ impl BoundDirectColumn<'_> {
                 array,
                 TemporalColumnContext {
                     mapping,
-                    plan_options: default_options,
+                    runtime_context,
                     column,
                     column_index,
                     column_count,
@@ -229,7 +228,7 @@ impl BoundDirectColumn<'_> {
                 array,
                 TemporalColumnContext {
                     mapping,
-                    plan_options: default_options,
+                    runtime_context,
                     column,
                     column_index,
                     column_count,
@@ -245,7 +244,7 @@ impl BoundDirectColumn<'_> {
                 array,
                 TemporalColumnContext {
                     mapping,
-                    plan_options: default_options,
+                    runtime_context,
                     column,
                     column_index,
                     column_count,
@@ -256,16 +255,12 @@ impl BoundDirectColumn<'_> {
             Self::TimestampNanosecond {
                 column,
                 mapping,
-                nanosecond_policy,
                 array,
             } => fill_timestamp_nanosecond_direct_column(
                 array,
                 TemporalColumnContext {
                     mapping,
-                    plan_options: PlanOptions {
-                        nanosecond_policy: *nanosecond_policy,
-                        ..Default::default()
-                    },
+                    runtime_context,
                     column,
                     column_index,
                     column_count,
@@ -281,7 +276,7 @@ impl BoundDirectColumn<'_> {
                 array,
                 TemporalColumnContext {
                     mapping,
-                    plan_options: default_options,
+                    runtime_context,
                     column,
                     column_index,
                     column_count,
@@ -297,7 +292,7 @@ impl BoundDirectColumn<'_> {
                 array,
                 TemporalColumnContext {
                     mapping,
-                    plan_options: default_options,
+                    runtime_context,
                     column,
                     column_index,
                     column_count,
@@ -313,7 +308,7 @@ impl BoundDirectColumn<'_> {
                 array,
                 TemporalColumnContext {
                     mapping,
-                    plan_options: default_options,
+                    runtime_context,
                     column,
                     column_index,
                     column_count,
@@ -324,16 +319,12 @@ impl BoundDirectColumn<'_> {
             Self::Time64Nanosecond {
                 column,
                 mapping,
-                nanosecond_policy,
                 array,
             } => fill_time64_nanosecond_direct_column(
                 array,
                 TemporalColumnContext {
                     mapping,
-                    plan_options: PlanOptions {
-                        nanosecond_policy: *nanosecond_policy,
-                        ..Default::default()
-                    },
+                    runtime_context,
                     column,
                     column_index,
                     column_count,
@@ -349,7 +340,7 @@ impl BoundDirectColumn<'_> {
                 array,
                 TemporalColumnContext {
                     mapping,
-                    plan_options: default_options,
+                    runtime_context,
                     column,
                     column_index,
                     column_count,
@@ -365,7 +356,7 @@ impl BoundDirectColumn<'_> {
                 array,
                 TemporalColumnContext {
                     mapping,
-                    plan_options: default_options,
+                    runtime_context,
                     column,
                     column_index,
                     column_count,
@@ -381,7 +372,7 @@ impl BoundDirectColumn<'_> {
                 array,
                 TemporalColumnContext {
                     mapping,
-                    plan_options: default_options,
+                    runtime_context,
                     column,
                     column_index,
                     column_count,
@@ -392,16 +383,12 @@ impl BoundDirectColumn<'_> {
             Self::DateTimeOffsetNanosecond {
                 column,
                 mapping,
-                nanosecond_policy,
                 array,
             } => fill_datetimeoffset_nanosecond_direct_column(
                 array,
                 TemporalColumnContext {
                     mapping,
-                    plan_options: PlanOptions {
-                        nanosecond_policy: *nanosecond_policy,
-                        ..Default::default()
-                    },
+                    runtime_context,
                     column,
                     column_index,
                     column_count,

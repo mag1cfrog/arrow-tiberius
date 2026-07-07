@@ -10,7 +10,7 @@ use arrow_array::{
 
 use crate::{
     Diagnostic, DiagnosticCode, DiagnosticSet, Error, FieldRef, MssqlType, NanosecondPolicy,
-    PlanOptions, Result, SchemaMapping,
+    Result, SchemaMapping,
     mssql::cell::{
         MssqlDate, MssqlDateTime, MssqlDateTime2, MssqlDateTimeOffset, MssqlTime,
         from_arrow::temporal::datetime::{
@@ -39,7 +39,8 @@ use crate::{
             validate_mapping_timestamp_timezone_metadata, validate_null_timestamp_timezone_metadata,
         },
     },
-    write::profile,
+    mssql::profile::DateTimeRounding,
+    write::{context::RuntimeConversionContext, profile},
 };
 
 use super::super::{
@@ -56,12 +57,18 @@ pub(crate) use value::{
     write_datetimeoffset_cell, write_null_temporal_cell, write_time_cell,
 };
 
+/// Shared context for direct temporal column measurement and encoding.
 #[derive(Clone, Copy)]
 pub(crate) struct TemporalColumnContext<'a> {
+    /// Planned Arrow-to-MSSQL schema mapping for diagnostics and validation.
     pub(crate) mapping: &'a SchemaMapping,
-    pub(crate) plan_options: PlanOptions,
+    /// Runtime conversion behavior derived from the planned schema.
+    pub(crate) runtime_context: RuntimeConversionContext,
+    /// Direct column plan used to choose payload encoding and null handling.
     pub(crate) column: &'a DirectColumnPlan,
+    /// Zero-based column position in the encoded row.
     pub(crate) column_index: usize,
+    /// Number of columns in each encoded row.
     pub(crate) column_count: usize,
 }
 
@@ -121,7 +128,7 @@ pub(crate) fn measure_timestamp_second_column_cell_lengths(
                 mapping,
                 context.column,
                 row_index,
-                NanosecondPolicy::default(),
+                context.runtime_context.datetime_rounding(),
             )
             .and_then(|value| temporal_value_cell_len(context.column, value))
         },
@@ -146,7 +153,7 @@ pub(crate) fn measure_timestamp_millisecond_column_cell_lengths(
                 mapping,
                 context.column,
                 row_index,
-                NanosecondPolicy::default(),
+                context.runtime_context.datetime_rounding(),
             )
             .and_then(|value| temporal_value_cell_len(context.column, value))
         },
@@ -171,7 +178,7 @@ pub(crate) fn measure_timestamp_microsecond_column_cell_lengths(
                 mapping,
                 context.column,
                 row_index,
-                NanosecondPolicy::default(),
+                context.runtime_context.datetime_rounding(),
             )
             .and_then(|value| temporal_value_cell_len(context.column, value))
         },
@@ -196,7 +203,8 @@ pub(crate) fn measure_timestamp_nanosecond_column_cell_lengths(
                 mapping,
                 context.column,
                 row_index,
-                context.plan_options.nanosecond_policy,
+                context.runtime_context.nanosecond_policy(),
+                context.runtime_context.datetime_rounding(),
             )
             .and_then(|value| temporal_value_cell_len(context.column, value))
         },
@@ -297,7 +305,7 @@ pub(crate) fn measure_datetimeoffset_nanosecond_column_cell_lengths(
                 row_index,
                 array.value(row_index),
                 timezone,
-                context.plan_options.nanosecond_policy,
+                context.runtime_context.nanosecond_policy(),
             )
             .and_then(datetimeoffset_cell_len_for_value)
         },
@@ -378,7 +386,7 @@ pub(crate) fn measure_time64_nanosecond_column_cell_lengths(
                 mapping,
                 row_index,
                 array.value(row_index),
-                context.plan_options.nanosecond_policy,
+                context.runtime_context.nanosecond_policy(),
             )
             .and_then(time_cell_len_for_value)
         },
@@ -450,7 +458,23 @@ pub(crate) fn fill_timestamp_nanosecond_direct_column(
     layout: &RowLayout,
     bytes: &mut [u8],
 ) -> Result<()> {
-    fill_timestamp_column(array, context, layout, bytes, timestamp_nanosecond_value)
+    let nanosecond_policy = context.runtime_context.nanosecond_policy();
+    fill_timestamp_column(
+        array,
+        context,
+        layout,
+        bytes,
+        |array, mapping, column, row_index, rounding| {
+            timestamp_nanosecond_value(
+                array,
+                mapping,
+                column,
+                row_index,
+                nanosecond_policy,
+                rounding,
+            )
+        },
+    )
 }
 
 pub(crate) fn fill_datetimeoffset_second_direct_column(
@@ -540,7 +564,7 @@ pub(crate) fn fill_datetimeoffset_nanosecond_direct_column(
                 row_index,
                 array.value(row_index),
                 timezone,
-                context.plan_options.nanosecond_policy,
+                context.runtime_context.nanosecond_policy(),
             )
         },
     )
@@ -613,7 +637,7 @@ pub(crate) fn fill_time64_nanosecond_direct_column(
                 mapping,
                 row_index,
                 array.value(row_index),
-                context.plan_options.nanosecond_policy,
+                context.runtime_context.nanosecond_policy(),
             )
         },
     )
@@ -669,96 +693,13 @@ pub(crate) fn append_date64_cell(
     )
 }
 
+/// Appends one Arrow second timestamp cell to a direct raw-row buffer.
 pub(crate) fn append_timestamp_second_cell(
     buf: &mut tiberius::RawRowsAppendBuffer<'_>,
     array: &TimestampSecondArray,
     mapping: &SchemaMapping,
     column: &DirectColumnPlan,
-    row_index: usize,
-    measured_len: usize,
-) -> Result<()> {
-    append_temporal_value(
-        buf,
-        array,
-        mapping,
-        column,
-        row_index,
-        measured_len,
-        |array, mapping, row_index| {
-            let value = timestamp_second_value(
-                array,
-                mapping,
-                column,
-                row_index,
-                NanosecondPolicy::default(),
-            )?;
-            Ok((temporal_value_cell_len(column, value)?, value))
-        },
-    )
-}
-
-pub(crate) fn append_timestamp_millisecond_cell(
-    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
-    array: &TimestampMillisecondArray,
-    mapping: &SchemaMapping,
-    column: &DirectColumnPlan,
-    row_index: usize,
-    measured_len: usize,
-) -> Result<()> {
-    append_temporal_value(
-        buf,
-        array,
-        mapping,
-        column,
-        row_index,
-        measured_len,
-        |array, mapping, row_index| {
-            let value = timestamp_millisecond_value(
-                array,
-                mapping,
-                column,
-                row_index,
-                NanosecondPolicy::default(),
-            )?;
-            Ok((temporal_value_cell_len(column, value)?, value))
-        },
-    )
-}
-
-pub(crate) fn append_timestamp_microsecond_cell(
-    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
-    array: &TimestampMicrosecondArray,
-    mapping: &SchemaMapping,
-    column: &DirectColumnPlan,
-    row_index: usize,
-    measured_len: usize,
-) -> Result<()> {
-    append_temporal_value(
-        buf,
-        array,
-        mapping,
-        column,
-        row_index,
-        measured_len,
-        |array, mapping, row_index| {
-            let value = timestamp_microsecond_value(
-                array,
-                mapping,
-                column,
-                row_index,
-                NanosecondPolicy::default(),
-            )?;
-            Ok((temporal_value_cell_len(column, value)?, value))
-        },
-    )
-}
-
-pub(crate) fn append_timestamp_nanosecond_cell(
-    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
-    array: &TimestampNanosecondArray,
-    mapping: &SchemaMapping,
-    column: &DirectColumnPlan,
-    nanosecond_policy: NanosecondPolicy,
+    datetime_rounding: DateTimeRounding,
     row_index: usize,
     measured_len: usize,
 ) -> Result<()> {
@@ -771,7 +712,91 @@ pub(crate) fn append_timestamp_nanosecond_cell(
         measured_len,
         |array, mapping, row_index| {
             let value =
-                timestamp_nanosecond_value(array, mapping, column, row_index, nanosecond_policy)?;
+                timestamp_second_value(array, mapping, column, row_index, datetime_rounding)?;
+            Ok((temporal_value_cell_len(column, value)?, value))
+        },
+    )
+}
+
+/// Appends one Arrow millisecond timestamp cell to a direct raw-row buffer.
+pub(crate) fn append_timestamp_millisecond_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    array: &TimestampMillisecondArray,
+    mapping: &SchemaMapping,
+    column: &DirectColumnPlan,
+    datetime_rounding: DateTimeRounding,
+    row_index: usize,
+    measured_len: usize,
+) -> Result<()> {
+    append_temporal_value(
+        buf,
+        array,
+        mapping,
+        column,
+        row_index,
+        measured_len,
+        |array, mapping, row_index| {
+            let value =
+                timestamp_millisecond_value(array, mapping, column, row_index, datetime_rounding)?;
+            Ok((temporal_value_cell_len(column, value)?, value))
+        },
+    )
+}
+
+/// Appends one Arrow microsecond timestamp cell to a direct raw-row buffer.
+pub(crate) fn append_timestamp_microsecond_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    array: &TimestampMicrosecondArray,
+    mapping: &SchemaMapping,
+    column: &DirectColumnPlan,
+    datetime_rounding: DateTimeRounding,
+    row_index: usize,
+    measured_len: usize,
+) -> Result<()> {
+    append_temporal_value(
+        buf,
+        array,
+        mapping,
+        column,
+        row_index,
+        measured_len,
+        |array, mapping, row_index| {
+            let value =
+                timestamp_microsecond_value(array, mapping, column, row_index, datetime_rounding)?;
+            Ok((temporal_value_cell_len(column, value)?, value))
+        },
+    )
+}
+
+/// Appends one Arrow nanosecond timestamp cell to a direct raw-row buffer.
+///
+/// Nanosecond normalization and SQL Server `datetime` rounding both come from
+/// the runtime context.
+pub(crate) fn append_timestamp_nanosecond_cell(
+    buf: &mut tiberius::RawRowsAppendBuffer<'_>,
+    array: &TimestampNanosecondArray,
+    mapping: &SchemaMapping,
+    column: &DirectColumnPlan,
+    runtime_context: RuntimeConversionContext,
+    row_index: usize,
+    measured_len: usize,
+) -> Result<()> {
+    append_temporal_value(
+        buf,
+        array,
+        mapping,
+        column,
+        row_index,
+        measured_len,
+        |array, mapping, row_index| {
+            let value = timestamp_nanosecond_value(
+                array,
+                mapping,
+                column,
+                row_index,
+                runtime_context.nanosecond_policy(),
+                runtime_context.datetime_rounding(),
+            )?;
             Ok((temporal_value_cell_len(column, value)?, value))
         },
     )
@@ -1006,18 +1031,22 @@ pub(crate) fn append_time64_nanosecond_cell(
     )
 }
 
+/// Converts one timestamp-second value to the planned SQL Server temporal value.
 fn timestamp_second_value(
     array: &TimestampSecondArray,
     mapping: &SchemaMapping,
     column: &DirectColumnPlan,
     row_index: usize,
-    _policy: NanosecondPolicy,
+    rounding: DateTimeRounding,
 ) -> Result<TemporalValue> {
     match column.target_type() {
-        MssqlType::DateTime => {
-            mssql_datetime_from_arrow_timestamp_second(mapping, row_index, array.value(row_index))
-                .map(TemporalValue::DateTime)
-        }
+        MssqlType::DateTime => mssql_datetime_from_arrow_timestamp_second(
+            mapping,
+            row_index,
+            array.value(row_index),
+            rounding,
+        )
+        .map(TemporalValue::DateTime),
         MssqlType::DateTime2 { .. } => {
             mssql_datetime2_from_arrow_timestamp_second(mapping, row_index, array.value(row_index))
                 .map(TemporalValue::DateTime2)
@@ -1026,18 +1055,20 @@ fn timestamp_second_value(
     }
 }
 
+/// Converts one timestamp-millisecond value to the planned SQL Server temporal value.
 fn timestamp_millisecond_value(
     array: &TimestampMillisecondArray,
     mapping: &SchemaMapping,
     column: &DirectColumnPlan,
     row_index: usize,
-    _policy: NanosecondPolicy,
+    rounding: DateTimeRounding,
 ) -> Result<TemporalValue> {
     match column.target_type() {
         MssqlType::DateTime => mssql_datetime_from_arrow_timestamp_millisecond(
             mapping,
             row_index,
             array.value(row_index),
+            rounding,
         )
         .map(TemporalValue::DateTime),
         MssqlType::DateTime2 { .. } => mssql_datetime2_from_arrow_timestamp_millisecond(
@@ -1050,18 +1081,20 @@ fn timestamp_millisecond_value(
     }
 }
 
+/// Converts one timestamp-microsecond value to the planned SQL Server temporal value.
 fn timestamp_microsecond_value(
     array: &TimestampMicrosecondArray,
     mapping: &SchemaMapping,
     column: &DirectColumnPlan,
     row_index: usize,
-    _policy: NanosecondPolicy,
+    rounding: DateTimeRounding,
 ) -> Result<TemporalValue> {
     match column.target_type() {
         MssqlType::DateTime => mssql_datetime_from_arrow_timestamp_microsecond(
             mapping,
             row_index,
             array.value(row_index),
+            rounding,
         )
         .map(TemporalValue::DateTime),
         MssqlType::DateTime2 { .. } => mssql_datetime2_from_arrow_timestamp_microsecond(
@@ -1074,12 +1107,17 @@ fn timestamp_microsecond_value(
     }
 }
 
+/// Converts one timestamp-nanosecond value to the planned SQL Server temporal value.
+///
+/// The nanosecond policy controls 100ns normalization before any SQL Server
+/// `datetime` rounding behavior is applied.
 fn timestamp_nanosecond_value(
     array: &TimestampNanosecondArray,
     mapping: &SchemaMapping,
     column: &DirectColumnPlan,
     row_index: usize,
     policy: NanosecondPolicy,
+    rounding: DateTimeRounding,
 ) -> Result<TemporalValue> {
     match column.target_type() {
         MssqlType::DateTime => mssql_datetime_from_arrow_timestamp_nanosecond(
@@ -1087,6 +1125,7 @@ fn timestamp_nanosecond_value(
             row_index,
             array.value(row_index),
             policy,
+            rounding,
         )
         .map(TemporalValue::DateTime),
         MssqlType::DateTime2 { .. } => mssql_datetime2_from_arrow_timestamp_nanosecond(
@@ -1129,6 +1168,10 @@ where
     Ok(())
 }
 
+/// Fills one direct timestamp column into an already allocated row payload.
+///
+/// The supplied value converter receives the profile-selected `datetime`
+/// rounding behavior for every non-null value.
 fn fill_timestamp_column<A, F>(
     array: &A,
     context: TemporalColumnContext<'_>,
@@ -1138,7 +1181,7 @@ fn fill_timestamp_column<A, F>(
 ) -> Result<()>
 where
     A: Array,
-    F: Fn(&A, &SchemaMapping, &DirectColumnPlan, usize, NanosecondPolicy) -> Result<TemporalValue>,
+    F: Fn(&A, &SchemaMapping, &DirectColumnPlan, usize, DateTimeRounding) -> Result<TemporalValue>,
 {
     for row_index in 0..array.len() {
         let cell = cell_position(
@@ -1158,7 +1201,7 @@ where
                 context.mapping,
                 context.column,
                 row_index,
-                context.plan_options.nanosecond_policy,
+                context.runtime_context.datetime_rounding(),
             )?;
             write_direct_temporal_value_cell(bytes, cell, context.column, value)?;
         }

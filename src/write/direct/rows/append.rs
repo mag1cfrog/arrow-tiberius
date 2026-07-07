@@ -51,7 +51,7 @@ pub(crate) fn encode_measured_batch_range_into(
 
         for (column_index, column) in bound.columns().iter().enumerate() {
             let measured_len = measured.cell_len(row_index, column_index)?;
-            column.append_cell(buf, row_index, measured_len)?;
+            column.append_cell(bound.runtime_context(), buf, row_index, measured_len)?;
             written = checked_add(written, measured_len)?;
         }
     }

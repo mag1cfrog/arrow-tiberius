@@ -3286,6 +3286,159 @@ async fn writer_round_trips_non_nullable_timestamp_ns_datetime_issue_171() -> Te
 }
 
 #[tokio::test]
+async fn writer_rounds_datetime_timestamp_boundaries_like_sql_server_casts() -> TestResult<()> {
+    let Some((connection_string, database)) = integration_config() else {
+        eprintln!(
+            "skipping SQL Server timestamp datetime boundary rounding integration test: {CONNECTION_STRING_ENV} or {TEST_DATABASE_ENV} is not set"
+        );
+        return Ok(());
+    };
+
+    let cases = [
+        (
+            1_i32,
+            1_780_529_793_684_400_i64,
+            "2026-06-03T23:36:33.684400",
+        ),
+        (2, 1_780_529_793_684_582, "2026-06-03T23:36:33.684582"),
+        (3, 1_780_529_793_685_000, "2026-06-03T23:36:33.685000"),
+        (4, 1_778_615_767_491_000, "2026-05-12T19:56:07.491000"),
+        (5, 1_778_615_767_492_000, "2026-05-12T19:56:07.492000"),
+        (6, 1_774_840_482_425_000, "2026-03-30T03:14:42.425000"),
+        (7, 1_774_840_482_426_000, "2026-03-30T03:14:42.426000"),
+        (8, 1_767_311_999_999_500, "2026-01-01T23:59:59.999500"),
+    ];
+    let expected_values_sql = cases
+        .iter()
+        .map(|(row_id, _micros, literal)| {
+            format!("({row_id}, CAST(CAST(N'{literal}' AS datetime2(6)) AS datetime))")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let plan_options = PlanOptions {
+        timestamp_policy: TimestampPolicy::DateTime,
+        ..PlanOptions::default()
+    };
+    let profile = integration_mssql_profile();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::Int32, false),
+        Field::new(
+            "created_at",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        ),
+    ]));
+    let (planned_schema, _diagnostics) =
+        plan_arrow_schema_to_mssql_mappings(Arc::clone(&schema), profile, plan_options)?
+            .into_parts();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(
+                cases
+                    .iter()
+                    .map(|(row_id, _micros, _literal)| *row_id)
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(TimestampMicrosecondArray::from(
+                cases
+                    .iter()
+                    .map(|(_row_id, micros, _literal)| *micros)
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+
+    for backend in [WriteBackend::BaselineTokenRow, WriteBackend::DirectRawBulk] {
+        let mut client = connect(&connection_string, &database).await?;
+        ensure_database_compatibility_matches_profile(
+            &mut client,
+            profile,
+            "timestamp datetime boundary compatibility level",
+        )
+        .await?;
+        let table = unique_table_name()?;
+
+        execute_sql(
+            &mut client,
+            create_table_sql_from_mappings(&table, &planned_schema),
+        )
+        .await?;
+
+        let result = async {
+            let mut writer = BulkWriter::new(
+                &mut client,
+                table.clone(),
+                planned_schema.clone(),
+                WriteOptions {
+                    backend,
+                    ..WriteOptions::default()
+                },
+            )
+            .await?;
+            let stats = writer.write_batch(&batch).await?;
+
+            ensure_eq(
+                stats.rows_written,
+                cases.len() as u64,
+                "timestamp datetime boundary rows_written",
+            )?;
+            ensure_eq(
+                writer.finish().await?,
+                stats,
+                "timestamp datetime boundary finish stats",
+            )?;
+
+            let actual_rows = client
+                .simple_query(format!(
+                    "SELECT [row_id], CONVERT(varchar(40), [created_at], 126) FROM {} ORDER BY [row_id]",
+                    table.quoted_sql()
+                ))
+                .await?
+                .into_first_result()
+                .await?;
+            let expected_rows = client
+                .simple_query(format!(
+                    "SELECT [row_id], CONVERT(varchar(40), [expected_at], 126) FROM (VALUES {expected_values_sql}) AS v([row_id], [expected_at]) ORDER BY [row_id]"
+                ))
+                .await?
+                .into_first_result()
+                .await?;
+
+            ensure_eq(
+                actual_rows.len(),
+                expected_rows.len(),
+                "timestamp datetime boundary row count",
+            )?;
+            for (index, (actual, expected)) in
+                actual_rows.iter().zip(expected_rows.iter()).enumerate()
+            {
+                ensure_eq(
+                    actual.get::<i32, _>(0),
+                    expected.get::<i32, _>(0),
+                    &format!("timestamp datetime boundary row {index} id"),
+                )?;
+                ensure_eq(
+                    actual.get::<&str, _>(1),
+                    expected.get::<&str, _>(1),
+                    &format!("timestamp datetime boundary row {index} value"),
+                )?;
+            }
+
+            Ok::<(), Box<dyn std::error::Error>>(())
+        }
+        .await;
+
+        let drop_result = drop_table(&mut client, &table).await;
+        result?;
+        drop_result?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn writer_rejects_datetime_timestamp_out_of_range_without_partial_insert() -> TestResult<()> {
     let Some((connection_string, database)) = integration_config() else {
         eprintln!(
@@ -4464,6 +4617,27 @@ async fn execute_sql(client: &mut TestClient, sql: String) -> tiberius::Result<(
     client.simple_query(sql).await?.into_results().await?;
 
     Ok(())
+}
+
+async fn ensure_database_compatibility_matches_profile(
+    client: &mut TestClient,
+    profile: MssqlProfile,
+    context: &str,
+) -> TestResult<()> {
+    let row = client
+        .simple_query(
+            "SELECT CAST(compatibility_level AS int) FROM sys.databases WHERE name = DB_NAME()",
+        )
+        .await?
+        .into_row()
+        .await?
+        .ok_or_else(|| std::io::Error::other("compatibility level query returned no rows"))?;
+    let actual = row
+        .get::<i32, _>(0)
+        .ok_or_else(|| std::io::Error::other("compatibility level query returned NULL"))?;
+    let expected = i32::from(profile.compatibility_level().as_u16());
+
+    ensure_eq(actual, expected, context)
 }
 
 async fn drop_table(client: &mut TestClient, table: &TableName) -> tiberius::Result<()> {

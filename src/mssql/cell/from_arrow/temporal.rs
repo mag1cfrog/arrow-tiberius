@@ -53,20 +53,31 @@ pub(super) fn mssql_datetime_value(
     cell: ArrowCell<'_>,
 ) -> Result<MssqlDateTime> {
     let mapping = runtime_mapping.mapping();
+    let datetime_rounding = runtime_mapping.datetime_rounding();
     datetime_mapping_kind(mapping, row_index)?;
 
     match cell {
         ArrowCell::TimestampSecond(value) => {
             validate_mapping_timestamp_timezone_metadata(mapping, row_index)?;
-            mssql_datetime_from_arrow_timestamp_second(mapping, row_index, value)
+            mssql_datetime_from_arrow_timestamp_second(mapping, row_index, value, datetime_rounding)
         }
         ArrowCell::TimestampMillisecond(value) => {
             validate_mapping_timestamp_timezone_metadata(mapping, row_index)?;
-            mssql_datetime_from_arrow_timestamp_millisecond(mapping, row_index, value)
+            mssql_datetime_from_arrow_timestamp_millisecond(
+                mapping,
+                row_index,
+                value,
+                datetime_rounding,
+            )
         }
         ArrowCell::TimestampMicrosecond(value) => {
             validate_mapping_timestamp_timezone_metadata(mapping, row_index)?;
-            mssql_datetime_from_arrow_timestamp_microsecond(mapping, row_index, value)
+            mssql_datetime_from_arrow_timestamp_microsecond(
+                mapping,
+                row_index,
+                value,
+                datetime_rounding,
+            )
         }
         ArrowCell::TimestampNanosecond(value) => {
             validate_mapping_timestamp_timezone_metadata(mapping, row_index)?;
@@ -75,6 +86,7 @@ pub(super) fn mssql_datetime_value(
                 row_index,
                 value,
                 runtime_mapping.nanosecond_policy(),
+                datetime_rounding,
             )
         }
         other => Err(value_conversion_error(row_mapping_diagnostic(

@@ -1,4 +1,4 @@
-use crate::Result;
+use crate::{Result, write::context::RuntimeConversionContext};
 
 use super::super::types::{
     decimal::{
@@ -28,6 +28,7 @@ use super::BoundDirectColumn;
 impl BoundDirectColumn<'_> {
     pub(crate) fn append_cell(
         &self,
+        runtime_context: RuntimeConversionContext,
         buf: &mut tiberius::RawRowsAppendBuffer<'_>,
         row_index: usize,
         measured_len: usize,
@@ -144,7 +145,15 @@ impl BoundDirectColumn<'_> {
                 column,
                 mapping,
                 array,
-            } => append_timestamp_second_cell(buf, array, mapping, column, row_index, measured_len),
+            } => append_timestamp_second_cell(
+                buf,
+                array,
+                mapping,
+                column,
+                runtime_context.datetime_rounding(),
+                row_index,
+                measured_len,
+            ),
             Self::TimestampMillisecond {
                 column,
                 mapping,
@@ -154,6 +163,7 @@ impl BoundDirectColumn<'_> {
                 array,
                 mapping,
                 column,
+                runtime_context.datetime_rounding(),
                 row_index,
                 measured_len,
             ),
@@ -166,20 +176,20 @@ impl BoundDirectColumn<'_> {
                 array,
                 mapping,
                 column,
+                runtime_context.datetime_rounding(),
                 row_index,
                 measured_len,
             ),
             Self::TimestampNanosecond {
                 column,
                 mapping,
-                nanosecond_policy,
                 array,
             } => append_timestamp_nanosecond_cell(
                 buf,
                 array,
                 mapping,
                 column,
-                *nanosecond_policy,
+                runtime_context,
                 row_index,
                 measured_len,
             ),
@@ -205,14 +215,13 @@ impl BoundDirectColumn<'_> {
             Self::Time64Nanosecond {
                 column,
                 mapping,
-                nanosecond_policy,
                 array,
             } => append_time64_nanosecond_cell(
                 buf,
                 array,
                 mapping,
                 column,
-                *nanosecond_policy,
+                runtime_context.nanosecond_policy(),
                 row_index,
                 measured_len,
             ),
@@ -255,14 +264,13 @@ impl BoundDirectColumn<'_> {
             Self::DateTimeOffsetNanosecond {
                 column,
                 mapping,
-                nanosecond_policy,
                 array,
             } => append_datetimeoffset_nanosecond_cell(
                 buf,
                 array,
                 mapping,
                 column,
-                *nanosecond_policy,
+                runtime_context.nanosecond_policy(),
                 row_index,
                 measured_len,
             ),
