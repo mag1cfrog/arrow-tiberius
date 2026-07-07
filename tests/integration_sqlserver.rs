@@ -3286,7 +3286,6 @@ async fn writer_round_trips_non_nullable_timestamp_ns_datetime_issue_171() -> Te
 }
 
 #[tokio::test]
-#[ignore = "reproduces #170 until profile-aware datetime rounding is implemented"]
 async fn writer_rounds_datetime_timestamp_boundaries_like_sql_server_casts() -> TestResult<()> {
     let Some((connection_string, database)) = integration_config() else {
         eprintln!(
@@ -3321,6 +3320,7 @@ async fn writer_rounds_datetime_timestamp_boundaries_like_sql_server_casts() -> 
         timestamp_policy: TimestampPolicy::DateTime,
         ..PlanOptions::default()
     };
+    let profile = integration_mssql_profile();
     let schema = Arc::new(Schema::new(vec![
         Field::new("row_id", DataType::Int32, false),
         Field::new(
@@ -3329,12 +3329,9 @@ async fn writer_rounds_datetime_timestamp_boundaries_like_sql_server_casts() -> 
             true,
         ),
     ]));
-    let (mappings, _diagnostics) = plan_arrow_schema_to_mssql_mappings(
-        Arc::clone(&schema),
-        integration_mssql_profile(),
-        plan_options,
-    )?
-    .into_parts();
+    let (planned_schema, _diagnostics) =
+        plan_arrow_schema_to_mssql_mappings(Arc::clone(&schema), profile, plan_options)?
+            .into_parts();
     let batch = RecordBatch::try_new(
         schema,
         vec![
@@ -3355,11 +3352,17 @@ async fn writer_rounds_datetime_timestamp_boundaries_like_sql_server_casts() -> 
 
     for backend in [WriteBackend::BaselineTokenRow, WriteBackend::DirectRawBulk] {
         let mut client = connect(&connection_string, &database).await?;
+        ensure_database_compatibility_matches_profile(
+            &mut client,
+            profile,
+            "timestamp datetime boundary compatibility level",
+        )
+        .await?;
         let table = unique_table_name()?;
 
         execute_sql(
             &mut client,
-            create_table_sql_from_mappings(&table, &mappings),
+            create_table_sql_from_mappings(&table, &planned_schema),
         )
         .await?;
 
@@ -3367,7 +3370,7 @@ async fn writer_rounds_datetime_timestamp_boundaries_like_sql_server_casts() -> 
             let mut writer = BulkWriter::new(
                 &mut client,
                 table.clone(),
-                mappings.clone(),
+                planned_schema.clone(),
                 WriteOptions {
                     backend,
                     ..WriteOptions::default()
@@ -4614,6 +4617,27 @@ async fn execute_sql(client: &mut TestClient, sql: String) -> tiberius::Result<(
     client.simple_query(sql).await?.into_results().await?;
 
     Ok(())
+}
+
+async fn ensure_database_compatibility_matches_profile(
+    client: &mut TestClient,
+    profile: MssqlProfile,
+    context: &str,
+) -> TestResult<()> {
+    let row = client
+        .simple_query(
+            "SELECT CAST(compatibility_level AS int) FROM sys.databases WHERE name = DB_NAME()",
+        )
+        .await?
+        .into_row()
+        .await?
+        .ok_or_else(|| std::io::Error::other("compatibility level query returned no rows"))?;
+    let actual = row
+        .get::<i32, _>(0)
+        .ok_or_else(|| std::io::Error::other("compatibility level query returned NULL"))?;
+    let expected = i32::from(profile.compatibility_level().as_u16());
+
+    ensure_eq(actual, expected, context)
 }
 
 async fn drop_table(client: &mut TestClient, table: &TableName) -> tiberius::Result<()> {
