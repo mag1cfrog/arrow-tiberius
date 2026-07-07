@@ -108,6 +108,7 @@ fn run_sqlserver_compat_probe(options: &SqlServerCompatProbeOptions) -> Result<(
     }
 
     println!("  compatibility level: {}", options.compatibility_level);
+    println!("  SQL Server version: {}", options.server_version);
     println!("  keep container: {}", options.connection.keep_container);
 
     let connection = options
@@ -132,6 +133,10 @@ fn run_sqlserver_compat_probe(options: &SqlServerCompatProbeOptions) -> Result<(
         .env(
             sqlserver::COMPATIBILITY_LEVEL_ENV,
             options.compatibility_level.to_string(),
+        )
+        .env(
+            sqlserver::SERVER_VERSION_ENV,
+            options.server_version.as_str(),
         );
 
     run_command(
@@ -155,7 +160,7 @@ fn print_sqlserver_test_help() {
 
 fn print_sqlserver_compat_probe_help() {
     println!(
-        "Usage:\n  cargo xtask sqlserver-compat-probe [OPTIONS]\n\nOptions:\n  --container-runtime <PATH>     Container runtime executable, such as docker or podman\n  --connection-string <URL>      Use an existing SQL Server instead of a local container\n  --image <IMAGE>                SQL Server container image\n  --database <NAME>              Test database name\n  --compatibility-level <LEVEL>  SQL Server database compatibility level\n  --keep-container               Keep the container after the task exits\n  -h, --help                     Print help"
+        "Usage:\n  cargo xtask sqlserver-compat-probe [OPTIONS]\n\nOptions:\n  --container-runtime <PATH>     Container runtime executable, such as docker or podman\n  --connection-string <URL>      Use an existing SQL Server instead of a local container\n  --image <IMAGE>                SQL Server container image\n  --database <NAME>              Test database name\n  --version <YEAR>               SQL Server version: 2017, 2019, 2022, or 2025\n  --compatibility-level <LEVEL>  SQL Server database compatibility level\n  --keep-container               Keep the container after the task exits\n  -h, --help                     Print help"
     );
 }
 
@@ -220,6 +225,7 @@ impl SqlServerTestOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SqlServerCompatProbeOptions {
     connection: sqlserver::SqlServerConnectionOptions,
+    server_version: String,
     compatibility_level: u16,
 }
 
@@ -230,6 +236,7 @@ impl Default for SqlServerCompatProbeOptions {
 
         Self {
             connection,
+            server_version: "2017".to_owned(),
             compatibility_level: 100,
         }
     }
@@ -265,6 +272,14 @@ impl SqlServerCompatProbeOptions {
                 }
                 "--database" => {
                     options.connection.database = required_value(args, index)?;
+                    index += 1;
+                }
+                "--version" => {
+                    let value = required_value(args, index)?;
+                    if !is_supported_sqlserver_version(&value) {
+                        return Err(XtaskError::InvalidSqlServerVersion(value));
+                    }
+                    options.server_version = value;
                     index += 1;
                 }
                 "--compatibility-level" => {
@@ -305,6 +320,10 @@ fn option_name(args: &[OsString], index: usize) -> String {
         .to_owned()
 }
 
+fn is_supported_sqlserver_version(value: &str) -> bool {
+    matches!(value, "2017" | "2019" | "2022" | "2025")
+}
+
 fn run_command(command: &mut Command, description: &'static str) -> Result<(), XtaskError> {
     let status = command
         .status()
@@ -329,6 +348,7 @@ enum XtaskError {
     UnknownOption(String),
     MissingOptionValue(String),
     InvalidCompatibilityLevel(String),
+    InvalidSqlServerVersion(String),
     InvalidUtf8Argument(OsString),
     CommandSpawn {
         description: &'static str,
@@ -350,6 +370,9 @@ impl fmt::Display for XtaskError {
             Self::MissingOptionValue(option) => write!(f, "missing value for `{option}`"),
             Self::InvalidCompatibilityLevel(value) => {
                 write!(f, "invalid SQL Server compatibility level `{value}`")
+            }
+            Self::InvalidSqlServerVersion(value) => {
+                write!(f, "invalid SQL Server version `{value}`")
             }
             Self::InvalidUtf8Argument(arg) => write!(f, "argument is not valid UTF-8: {arg:?}"),
             Self::CommandSpawn {
@@ -416,6 +439,8 @@ mod tests {
             OsString::from("custom-sqlserver"),
             OsString::from("--database"),
             OsString::from("custom_db"),
+            OsString::from("--version"),
+            OsString::from("2022"),
             OsString::from("--compatibility-level"),
             OsString::from("140"),
             OsString::from("--keep-container"),
@@ -433,6 +458,7 @@ mod tests {
         );
         assert_eq!(options.connection.image, "custom-sqlserver");
         assert_eq!(options.connection.database, "custom_db");
+        assert_eq!(options.server_version, "2022");
         assert_eq!(options.compatibility_level, 140);
         assert!(options.connection.keep_container);
     }
@@ -442,6 +468,7 @@ mod tests {
         let options = SqlServerCompatProbeOptions::default();
 
         assert_eq!(options.connection.database, "arrow_tiberius_compat_probe");
+        assert_eq!(options.server_version, "2017");
         assert_eq!(options.compatibility_level, 100);
     }
 
@@ -456,6 +483,14 @@ mod tests {
         assert!(
             matches!(err, XtaskError::InvalidCompatibilityLevel(value) if value == "not-a-level")
         );
+    }
+
+    #[test]
+    fn rejects_invalid_sqlserver_version() {
+        let args = [OsString::from("--version"), OsString::from("2014")];
+        let err = SqlServerCompatProbeOptions::parse(&args).unwrap_err();
+
+        assert!(matches!(err, XtaskError::InvalidSqlServerVersion(value) if value == "2014"));
     }
 
     #[test]

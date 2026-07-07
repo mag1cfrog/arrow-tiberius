@@ -19,6 +19,7 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 const CONNECTION_STRING_ENV: &str = "ARROW_TIBERIUS_TEST_MSSQL_URL";
 const TEST_DATABASE_ENV: &str = "ARROW_TIBERIUS_TEST_MSSQL_DATABASE";
 const COMPATIBILITY_LEVEL_ENV: &str = "ARROW_TIBERIUS_TEST_MSSQL_COMPATIBILITY_LEVEL";
+const SERVER_VERSION_ENV: &str = "ARROW_TIBERIUS_TEST_MSSQL_VERSION";
 static TABLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 type TestClient = tiberius::Client<Compat<TcpStream>>;
@@ -95,6 +96,12 @@ async fn datetime_rounding_matches_sql_server_casts() -> TestResult<()> {
             &mut client,
             profile,
             "datetime compatibility probe database compatibility level",
+        )
+        .await?;
+        ensure_server_version_matches_profile(
+            &mut client,
+            profile,
+            "datetime compatibility probe SQL Server version",
         )
         .await?;
         let table = unique_table_name()?;
@@ -178,6 +185,7 @@ async fn datetime_rounding_matches_sql_server_casts() -> TestResult<()> {
 }
 
 fn compatibility_profile() -> TestResult<MssqlProfile> {
+    let version = mssql_version_from_env()?;
     let level = env::var(COMPATIBILITY_LEVEL_ENV)
         .unwrap_or_else(|_| "100".to_owned())
         .parse::<u16>()
@@ -185,10 +193,21 @@ fn compatibility_profile() -> TestResult<MssqlProfile> {
 
     let compatibility_level = CompatibilityLevel::new(level)?;
 
-    Ok(MssqlProfile::new(
-        MssqlVersion::SqlServer2017,
-        compatibility_level,
-    )?)
+    Ok(MssqlProfile::new(version, compatibility_level)?)
+}
+
+fn mssql_version_from_env() -> TestResult<MssqlVersion> {
+    let value = env::var(SERVER_VERSION_ENV).unwrap_or_else(|_| "2017".to_owned());
+
+    match value.as_str() {
+        "2017" => Ok(MssqlVersion::SqlServer2017),
+        "2019" => Ok(MssqlVersion::SqlServer2019),
+        "2022" => Ok(MssqlVersion::SqlServer2022),
+        "2025" => Ok(MssqlVersion::SqlServer2025),
+        other => Err(test_error(format!(
+            "unsupported {SERVER_VERSION_ENV}: {other}"
+        ))),
+    }
 }
 
 async fn connect(connection_string: &str, database: &str) -> tiberius::Result<TestClient> {
@@ -224,6 +243,36 @@ async fn ensure_database_compatibility_matches_profile(
     let expected = i32::from(profile.compatibility_level().as_u16());
 
     ensure_eq(actual, expected, context)
+}
+
+async fn ensure_server_version_matches_profile(
+    client: &mut TestClient,
+    profile: MssqlProfile,
+    context: &str,
+) -> TestResult<()> {
+    let row = client
+        .simple_query("SELECT CAST(SERVERPROPERTY('ProductMajorVersion') AS int)")
+        .await?
+        .into_row()
+        .await?
+        .ok_or_else(|| std::io::Error::other("server version query returned no rows"))?;
+    let actual = row
+        .get::<i32, _>(0)
+        .ok_or_else(|| std::io::Error::other("server version query returned NULL"))?;
+    let expected = expected_product_major_version(profile.version())?;
+
+    ensure_eq(actual, expected, context)
+}
+
+fn expected_product_major_version(version: MssqlVersion) -> TestResult<i32> {
+    match version {
+        MssqlVersion::SqlServer2016 => Ok(13),
+        MssqlVersion::SqlServer2017 => Ok(14),
+        MssqlVersion::SqlServer2019 => Ok(15),
+        MssqlVersion::SqlServer2022 => Ok(16),
+        MssqlVersion::SqlServer2025 => Ok(17),
+        _ => Err(test_error("unsupported SQL Server version")),
+    }
 }
 
 async fn drop_table(client: &mut TestClient, table: &TableName) -> tiberius::Result<()> {
