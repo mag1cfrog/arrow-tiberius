@@ -4,7 +4,7 @@ use std::fmt::{self, Write as _};
 
 use snafu::Snafu;
 
-use crate::{DiagnosticCode, DiagnosticSet, WriteBackend};
+use crate::{DiagnosticCode, DiagnosticSet, MssqlVersion, WriteBackend};
 
 /// Crate-local result type.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -127,6 +127,18 @@ pub enum Error {
     InvalidCompatibilityLevel {
         /// The unsupported compatibility level value.
         level: u16,
+    },
+
+    /// A SQL Server database compatibility level is not supported by the
+    /// selected SQL Server engine version.
+    #[snafu(display(
+        "{version:?} does not support database compatibility level {compatibility_level}"
+    ))]
+    UnsupportedCompatibilityLevel {
+        /// SQL Server engine version.
+        version: MssqlVersion,
+        /// Unsupported compatibility level value for the selected version.
+        compatibility_level: u16,
     },
 
     /// A SQL Server identifier is invalid for the selected identifier policy.
@@ -277,6 +289,7 @@ impl Error {
         match self {
             Self::WritePhaseContext { source, .. } => source.kind(),
             Self::InvalidCompatibilityLevel { .. } => "InvalidCompatibilityLevel",
+            Self::UnsupportedCompatibilityLevel { .. } => "UnsupportedCompatibilityLevel",
             Self::InvalidIdentifier { .. } => "InvalidIdentifier",
             Self::Planning { .. } => "Planning",
             Self::ValueConversion { .. } => "ValueConversion",
@@ -298,6 +311,9 @@ impl Error {
         match self {
             Self::WritePhaseContext { source, .. } => source.safe_summary(),
             Self::InvalidCompatibilityLevel { .. } => "invalid compatibility level",
+            Self::UnsupportedCompatibilityLevel { .. } => {
+                "compatibility level is not supported by SQL Server version"
+            }
             Self::InvalidIdentifier { .. } => "invalid identifier",
             Self::Planning { .. } => "planning failed with diagnostics",
             Self::ValueConversion { .. } => "value conversion failed with diagnostics",

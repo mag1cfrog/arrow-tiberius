@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use arrow_tiberius::{
-    BulkWriter, MssqlProfile, PlanOptions, TableName, TimestampPolicy, WriteBackend, WriteOptions,
-    create_table_sql_from_mappings,
+    BulkWriter, CompatibilityLevel, MssqlProfile, MssqlVersion, PlanOptions, TableName,
+    TimestampPolicy, WriteBackend, WriteOptions, create_table_sql_from_mappings,
 };
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -183,16 +183,12 @@ fn compatibility_profile() -> TestResult<MssqlProfile> {
         .parse::<u16>()
         .map_err(|err| test_error(format!("invalid {COMPATIBILITY_LEVEL_ENV}: {err}")))?;
 
-    match level {
-        100 => Ok(MssqlProfile::sql_server_2017_compat_100()),
-        110 => Ok(MssqlProfile::sql_server_2017_compat_110()),
-        120 => Ok(MssqlProfile::sql_server_2017_compat_120()),
-        130 => Ok(MssqlProfile::sql_server_2017_compat_130()),
-        140 => Ok(MssqlProfile::sql_server_2017_compat_140()),
-        other => Err(test_error(format!(
-            "unsupported {COMPATIBILITY_LEVEL_ENV}: {other}"
-        ))),
-    }
+    let compatibility_level = CompatibilityLevel::new(level)?;
+
+    Ok(MssqlProfile::new(
+        MssqlVersion::SqlServer2017,
+        compatibility_level,
+    )?)
 }
 
 async fn connect(connection_string: &str, database: &str) -> tiberius::Result<TestClient> {
