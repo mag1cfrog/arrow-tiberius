@@ -178,6 +178,22 @@ fn timestamp_out_of_datetime_range(
 }
 
 /// Selects the SQL Server `datetime` fragment-rounding rule for a profile.
+///
+/// The returned value is a fragment count measured from the Unix epoch, not a
+/// time-of-day fragment count. The caller splits it into date and time
+/// components after range validation, so rounding can safely carry across day
+/// boundaries.
+///
+/// Compatibility levels before 130 emulate SQL Server's legacy high-precision
+/// temporal cast path: round the source instant to whole milliseconds first,
+/// then round that millisecond value to `datetime` fragments. Compatibility
+/// level 130 and later skip the millisecond step and round the original 100ns
+/// ticks directly to the nearest `datetime` fragment.
+///
+/// The legacy path can produce a larger displayed `datetime` tick, but that is
+/// not higher precision. For `.684582`, legacy rounds to `.685` first and then
+/// stores the `.687` fragment; compat 130+ rounds the original `.684582`
+/// directly and stores the closer `.683` fragment.
 fn round_100ns_ticks_to_datetime_fragments(
     mapping: &SchemaMapping,
     row_index: usize,
@@ -185,13 +201,66 @@ fn round_100ns_ticks_to_datetime_fragments(
     rounding: DateTimeRounding,
 ) -> Result<i128> {
     match rounding {
-        DateTimeRounding::LegacyPre130 | DateTimeRounding::Compat130Plus => {
+        DateTimeRounding::LegacyPre130 => {
+            let ticks = round_100ns_ticks_to_nearest_millisecond(mapping, row_index, ticks)?;
+            round_100ns_ticks_to_nearest_datetime_fragment(mapping, row_index, ticks)
+        }
+        DateTimeRounding::Compat130Plus => {
             round_100ns_ticks_to_nearest_datetime_fragment(mapping, row_index, ticks)
         }
     }
 }
 
+/// Rounds Unix-epoch 100ns ticks to the nearest whole millisecond.
+///
+/// This is the legacy pre-130 compatibility step for high-precision temporal
+/// casts to `datetime`. SQL Server `datetime` ultimately stores 1/300-second
+/// fragments, but older compatibility levels first lose precision to
+/// milliseconds. That intermediate step is what makes `.684582` behave like
+/// `.685`, which then ties upward to the `.687` `datetime` fragment.
+/// Compatibility level 130+ avoids this intermediate precision loss.
+///
+/// Euclidean division keeps the remainder non-negative for negative timestamps,
+/// so the same half-millisecond threshold applies consistently across the Unix
+/// epoch and day-boundary rollovers.
+fn round_100ns_ticks_to_nearest_millisecond(
+    mapping: &SchemaMapping,
+    row_index: usize,
+    ticks: i128,
+) -> Result<i128> {
+    let base = ticks.div_euclid(TICKS_100NS_PER_MILLISECOND);
+    let remainder = ticks.rem_euclid(TICKS_100NS_PER_MILLISECOND);
+    let milliseconds = if remainder * 2 >= TICKS_100NS_PER_MILLISECOND {
+        base.checked_add(1).ok_or_else(|| {
+            value_conversion_error(row_mapping_diagnostic(
+                mapping,
+                row_index,
+                DiagnosticCode::TimestampOutOfRange,
+                "Arrow timestamp overflows while rounding to millisecond precision",
+            ))
+        })?
+    } else {
+        base
+    };
+
+    milliseconds
+        .checked_mul(TICKS_100NS_PER_MILLISECOND)
+        .ok_or_else(|| {
+            value_conversion_error(row_mapping_diagnostic(
+                mapping,
+                row_index,
+                DiagnosticCode::TimestampOutOfRange,
+                "Arrow timestamp overflows while rounding to millisecond precision",
+            ))
+        })
+}
+
 /// Rounds Unix-epoch 100ns ticks to SQL Server `datetime` 1/300-second fragments.
+///
+/// SQL Server `datetime` stores the time component as 300 fragments per second.
+/// This helper performs the final nearest-fragment conversion using integer
+/// arithmetic so fractional boundaries and large values do not depend on
+/// floating-point precision.
 fn round_100ns_ticks_to_nearest_datetime_fragment(
     mapping: &SchemaMapping,
     row_index: usize,
@@ -236,7 +305,9 @@ mod tests {
         TimestampPolicy, TimezonePolicy,
         arrow::cell::ArrowCell,
         mssql::cell::{MssqlCell, MssqlDateTime},
+        mssql::profile::DateTimeRounding,
         plan_arrow_schema_to_mssql_mappings,
+        write::context::RuntimeConversionContext,
     };
 
     #[test]
@@ -392,6 +463,176 @@ mod tests {
     }
 
     #[test]
+    fn selects_datetime_rounding_by_profile_compatibility_level() {
+        let options = PlanOptions {
+            timestamp_policy: TimestampPolicy::DateTime,
+            ..PlanOptions::default()
+        };
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            )]),
+            options,
+        );
+        // Each case is `(source_micros, legacy_pre_130, compat_130_plus)`.
+        // The first case mirrors Microsoft's documented 4.5ms boundary; the
+        // .684582 case is the downstream repro from issue #170.
+        let cases = [
+            (
+                4_500,
+                MssqlDateTime::new(25_567, 2),
+                MssqlDateTime::new(25_567, 1),
+            ),
+            (
+                1_780_529_793_684_400,
+                MssqlDateTime::new(46_174, 25_498_105),
+                MssqlDateTime::new(46_174, 25_498_105),
+            ),
+            (
+                1_780_529_793_684_582,
+                MssqlDateTime::new(46_174, 25_498_106),
+                MssqlDateTime::new(46_174, 25_498_105),
+            ),
+            (
+                1_780_529_793_685_000,
+                MssqlDateTime::new(46_174, 25_498_106),
+                MssqlDateTime::new(46_174, 25_498_106),
+            ),
+            (
+                1_767_311_999_999_500,
+                MssqlDateTime::new(46_022, 0),
+                MssqlDateTime::new(46_022, 0),
+            ),
+            (
+                -1_584,
+                // Legacy rounds to -2ms before datetime-fragment rounding;
+                // compat 130+ rounds the original instant directly to epoch.
+                MssqlDateTime::new(25_566, 25_919_999),
+                MssqlDateTime::new(25_567, 0),
+            ),
+        ];
+
+        for (row_index, (micros, legacy_expected, compat_expected)) in cases.into_iter().enumerate()
+        {
+            for profile in [
+                MssqlProfile::sql_server_2016_compat_100(),
+                MssqlProfile::sql_server_2017_compat_100(),
+                MssqlProfile::sql_server_2017_compat_110(),
+                MssqlProfile::sql_server_2017_compat_120(),
+            ] {
+                assert_eq!(
+                    convert_cell_with_profile_and_options(
+                        &mappings[0],
+                        ArrowCell::TimestampMicrosecond(micros),
+                        row_index,
+                        profile,
+                        &options,
+                    )
+                    .unwrap(),
+                    MssqlCell::DateTime(Some(legacy_expected))
+                );
+            }
+
+            for profile in [
+                MssqlProfile::sql_server_2017_compat_130(),
+                MssqlProfile::sql_server_2017_compat_140(),
+            ] {
+                assert_eq!(
+                    convert_cell_with_profile_and_options(
+                        &mappings[0],
+                        ArrowCell::TimestampMicrosecond(micros),
+                        row_index,
+                        profile,
+                        &options,
+                    )
+                    .unwrap(),
+                    MssqlCell::DateTime(Some(compat_expected))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn applies_nanosecond_policy_before_profile_datetime_rounding() {
+        let options = PlanOptions {
+            timestamp_policy: TimestampPolicy::DateTime,
+            nanosecond_policy: NanosecondPolicy::RoundTo100ns,
+            ..PlanOptions::default()
+        };
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            )]),
+            options,
+        );
+
+        assert_eq!(
+            convert_cell_with_profile_and_options(
+                &mappings[0],
+                ArrowCell::TimestampNanosecond(4_500_050),
+                0,
+                MssqlProfile::sql_server_2017_compat_100(),
+                &options,
+            )
+            .unwrap(),
+            MssqlCell::DateTime(Some(MssqlDateTime::new(25_567, 2)))
+        );
+        assert_eq!(
+            convert_cell_with_profile_and_options(
+                &mappings[0],
+                ArrowCell::TimestampNanosecond(4_500_050),
+                0,
+                MssqlProfile::sql_server_2017_compat_140(),
+                &options,
+            )
+            .unwrap(),
+            MssqlCell::DateTime(Some(MssqlDateTime::new(25_567, 1)))
+        );
+    }
+
+    #[test]
+    fn rejects_overflow_while_profile_datetime_rounding() {
+        let options = PlanOptions {
+            timestamp_policy: TimestampPolicy::DateTime,
+            ..PlanOptions::default()
+        };
+        let mappings = mappings_for_schema_with_options(
+            Schema::new(vec![Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            )]),
+            options,
+        );
+
+        for rounding in [
+            DateTimeRounding::LegacyPre130,
+            DateTimeRounding::Compat130Plus,
+        ] {
+            let err = super::mssql_datetime_from_unix_epoch_100ns_ticks(
+                &mappings[0],
+                0,
+                i128::MAX,
+                "test",
+                0,
+                rounding,
+            )
+            .expect_err("overflow-prone datetime tick values should fail");
+
+            assert_single_diagnostic(
+                err,
+                DiagnosticCode::TimestampOutOfRange,
+                Some(0),
+                Some((0, "ts")),
+            );
+        }
+    }
+
+    #[test]
     fn rejects_datetime_values_outside_sql_server_range_after_rounding() {
         let options = PlanOptions {
             timestamp_policy: TimestampPolicy::DateTime,
@@ -478,6 +719,23 @@ mod tests {
     ) -> crate::Result<MssqlCell<'a>> {
         mssql_cell_from_arrow_cell(
             ArrowToMssqlRuntimeMapping::new_with_options(mapping, options),
+            cell,
+            row_index,
+        )
+    }
+
+    fn convert_cell_with_profile_and_options<'a>(
+        mapping: &SchemaMapping,
+        cell: ArrowCell<'a>,
+        row_index: usize,
+        profile: MssqlProfile,
+        options: &PlanOptions,
+    ) -> crate::Result<MssqlCell<'a>> {
+        mssql_cell_from_arrow_cell(
+            ArrowToMssqlRuntimeMapping::new(
+                mapping,
+                RuntimeConversionContext::new(profile, *options),
+            ),
             cell,
             row_index,
         )
