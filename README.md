@@ -187,7 +187,7 @@ target those exact environments.
 crate name `tiberius` and owns that compatibility boundary internally:
 
 ```toml
-tiberius = { package = "tiberius-raw-bulk", version = "=0.12.3-raw-bulk.14", default-features = false, features = [
+tiberius = { package = "tiberius-raw-bulk", version = "=0.12.3-raw-bulk.15", default-features = false, features = [
     "tds73",
     "winauth",
     "native-tls",
