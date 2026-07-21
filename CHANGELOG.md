@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/mag1cfrog/arrow-tiberius/compare/v0.2.0...v0.2.1) - 2026-07-21
+
+### Added
+
+- expose detailed SQL Server bulk finalization tracing ([#183](https://github.com/mag1cfrog/arrow-tiberius/pull/183))
+
+### Other
+
+- refresh public docs for 0.2 profiles ([#181](https://github.com/mag1cfrog/arrow-tiberius/pull/181))
+
 ## [0.2.0](https://github.com/mag1cfrog/arrow-tiberius/compare/v0.1.6...v0.2.0) - 2026-07-07
 
 ### Added
